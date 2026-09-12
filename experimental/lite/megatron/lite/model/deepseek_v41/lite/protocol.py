@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Text protocol and PP-only local construction; mixed parallel routing is separate."""
+"""Text protocol with single-rank construction; distributed integration is pending."""
 
 import math
 from contextlib import nullcontext
@@ -59,12 +59,12 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'ep', 'cp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'ep', 'cp', 'vpp'))
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
         raise NotImplementedError(
-            'V4.1 stage construction supports PP only; TP/EP/CP/VPP remain pending'
+            'V4.1 model construction requires single-rank execution; distributed integration remains pending'
         )
     ps = ParallelState()
     layer_range = None

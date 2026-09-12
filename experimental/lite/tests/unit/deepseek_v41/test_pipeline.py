@@ -102,3 +102,18 @@ def test_contiguous_override_and_legacy_default(rank):
         protocol_utils.pack_routed_experts(
             model, batch, routes, contiguous_padding=True
         )
+
+
+@pytest.mark.parametrize('pp', [2, 4])
+def test_pipeline_build_rejects_unsupported_parallelism(moe, model_config, pp):
+    with pytest.raises(
+        NotImplementedError,
+        match='^V4.1 model construction requires single-rank execution; distributed integration remains pending$',
+    ) as error:
+        protocol.build_model(
+            model_config,
+            impl_cfg=protocol.ImplConfig(
+                parallel=protocol.ParallelConfig(pp=pp), device='cpu'
+            ),
+        )
+    assert 'supports PP only' not in str(error.value)

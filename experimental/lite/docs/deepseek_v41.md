@@ -34,4 +34,5 @@ print(sum(p.numel() for p in bundle.chunks[0].parameters()))
 ```
 Meta construction inspects assembly; execution needs a tokenizer-derived Engram
 map and materialized weights. Select post-training trainability explicitly.
-Single-rank execution is supported; distributed integration remains incomplete.
+Single-rank execution is supported. `build_model` rejects PP > 1 (and TP/EP/CP/VPP)
+at construction time; local pipeline range helpers are not a supported PP runtime.
