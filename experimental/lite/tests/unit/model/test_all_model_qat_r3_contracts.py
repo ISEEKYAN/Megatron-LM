@@ -262,6 +262,11 @@ def _install_csa_import_stubs(monkeypatch):
     dsa_kernels = types.ModuleType(
         "megatron.core.transformer.experimental_attention_variant.dsa_kernels"
     )
+    csa_kernels = types.ModuleType(
+        "megatron.core.transformer.experimental_attention_variant.csa_kernels"
+    )
+    csa_kernels.FusedCSAIndexerSparseAttnFromTopkFunc = torch.autograd.Function
+    csa_kernels.csa_sparse_attn = unavailable
     core_csa._unfused_indexer_sparse_attn_from_topk = unavailable
     core_csa.unfused_compressed_sparse_attn = unavailable
     core_dsa.DSAIndexerLossAutoScaler = torch.autograd.Function
@@ -281,9 +286,15 @@ def _install_csa_import_stubs(monkeypatch):
         "megatron.core.transformer.experimental_attention_variant.csa": core_csa,
         "megatron.core.transformer.experimental_attention_variant.dsa": core_dsa,
         "megatron.core.transformer.experimental_attention_variant.dsa_kernels": dsa_kernels,
+        "megatron.core.transformer.experimental_attention_variant.csa_kernels": csa_kernels,
     }
+    for package in (core, tensor_parallel, transformer, variants):
+        package.__path__ = []
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
+        parent_name, _, child_name = name.rpartition(".")
+        if parent_name in modules:
+            setattr(modules[parent_name], child_name, module)
 
 
 def _train_config():
