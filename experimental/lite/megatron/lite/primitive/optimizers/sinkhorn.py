@@ -154,14 +154,9 @@ class Sinkhorn(StagedMatrixOptimizer):
                     or gradient.shape != parameter.shape
                     or gradient.device != parameter.device
                 )
-                if _any(invalid, parameter.device, self.row_group, self.column_group):
+                if self._any(invalid, parameter):
                     raise ValueError('Sinkhorn requires matching native FP32 gradients')
-                if _any(
-                    not torch.isfinite(gradient).all(),
-                    parameter.device,
-                    self.row_group,
-                    self.column_group,
-                ):
+                if self._any(not torch.isfinite(gradient).all(), parameter):
                     return False
                 inputs.append((parameter, gradient, lr, multiplier))
         prepared = []
@@ -173,32 +168,24 @@ class Sinkhorn(StagedMatrixOptimizer):
                 previous = torch.zeros_like(gradient)
             momentum = 0.95 * previous + 0.05 * gradient
             nesterov = 0.95 * momentum + 0.05 * gradient
-            if _any(
-                not torch.isfinite(nesterov).all(),
-                parameter.device,
-                self.row_group,
-                self.column_group,
-            ):
+            if self._any(not torch.isfinite(nesterov).all(), parameter):
                 return False
             direction = sinkhorn_direction(
                 nesterov, row_group=self.row_group, column_group=self.column_group
             )
             candidate = parameter[start:end] - (GAMMA * lr * multiplier) * direction
-            if _any(
-                not torch.isfinite(candidate).all(),
-                parameter.device,
-                self.row_group,
-                self.column_group,
-            ):
+            if self._any(not torch.isfinite(candidate).all(), parameter):
                 return False
             prepared.append((parameter, self._replicate(candidate, parameter.shape[0]), momentum))
         self._prepared = prepared
         return True
 
+    def _any(self, flag, parameter):
+        return _any(flag, parameter.device, self.row_group, self.column_group)
+
     def agree_skip(self, skip):
         """OR a publication/skip decision across the logical matrix grid."""
-        parameter = self.param_groups[0]['params'][0]
-        return _any(skip, parameter.device, self.row_group, self.column_group)
+        return self._any(skip, self.param_groups[0]['params'][0])
 
     def state_dict(self):
         result = super().state_dict()

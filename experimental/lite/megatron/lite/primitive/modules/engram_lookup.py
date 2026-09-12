@@ -274,9 +274,7 @@ def build_compressed_token_map(tokenizer):
             key = backend.id_to_token(token_id)
         else:
             key = normalizer.normalize_str(text) or text
-        if key not in keys:
-            keys[key] = len(keys)
-        mapping.append(keys[key])
+        mapping.append(keys.setdefault(key, len(keys)))
     return mapping, len(keys)
 
 
@@ -301,16 +299,13 @@ def hash_multipliers(layer_ids, max_ngram_size, vocab_size):
 def prime_buckets(layer_ids, max_ngram_size, heads, vocab_size):
     from sympy import nextprime
 
-    seen, result = set(), []
+    current, result = vocab_size - 1, []
     for _ in layer_ids:
         layer = []
         for _ in range(max_ngram_size - 1):
-            current, sizes = vocab_size - 1, []
+            sizes = []
             for _ in range(heads):
                 current = int(nextprime(current))
-                while current in seen:
-                    current = int(nextprime(current))
-                seen.add(current)
                 sizes.append(current)
             layer.append(sizes)
         result.append(layer)
