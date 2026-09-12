@@ -1,17 +1,26 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=mlite_miles_grpo
 #SBATCH --partition=batch
-#SBATCH --account=coreai_devtech_all
 #SBATCH --nodes=2
 #SBATCH --ntasks-per-node=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=1000G
 #SBATCH --time=04:00:00
-#SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_grpo-%j.log
+#SBATCH --output=mlite_miles_grpo-%j.log
 
 # Qwen3 MoE GRPO using miles' qwen3-next-80B-A3B 8-GPU recipe, with only
 # the training backend swapped to Megatron Lite.
+# Export site-specific settings before submission (sbatch --export=ALL):
+# CONTAINER_IMAGE: readable container image; CONTAINER_MOUNTS: comma-separated
+# host:container mounts covering this checkout, miles, model, data and outputs.
+# Both are required outside the container. Keep paths identical inside/outside.
+# MILES_ROOT: miles checkout; MODEL_PATH: local Hugging Face model directory.
+# RUN_ROOT: writable shared output directory (required on all participating nodes).
+# MEGATRON_ROOT: optional Megatron checkout, defaults to this repository.
+# Set SBATCH_ACCOUNT or pass sbatch --account for your project allocation.
+# Logs default to the submission directory; override with sbatch --output.
+# DAPO_MATH_DATA: GRPO prompt JSONL; LOAD_DIR: input SFT checkpoint directory.
 set -euo pipefail
 
 if [[ "${VERBOSE:-0}" == "1" ]]; then set -x; fi
@@ -35,8 +44,8 @@ resolve_script_path() {
 }
 
 SCRIPT_PATH="$(resolve_script_path)"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/miles.sqsh}"
-CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-}"
 DRY_RUN="${DRY_RUN:-0}"
 RAY_PORT="${RAY_PORT:-6379}"
 RAY_DASHBOARD_PORT="${RAY_DASHBOARD_PORT:-8265}"
@@ -55,6 +64,8 @@ MLITE_DELETE_CHECKPOINT_AFTER_LOAD="${MLITE_DELETE_CHECKPOINT_AFTER_LOAD:-1}"
 MLITE_RESET_ROLLOUT_AFTER_LOAD="${MLITE_RESET_ROLLOUT_AFTER_LOAD:-1}"
 
 if [[ "${IN_MILES_CONTAINER:-0}" != "1" ]]; then
+   : "${CONTAINER_IMAGE:?Set CONTAINER_IMAGE to a readable container image.}"
+   : "${CONTAINER_MOUNTS:?Set CONTAINER_MOUNTS to the required host:container mounts.}"
    if [[ ! -r "${CONTAINER_IMAGE}" ]]; then
       echo "Container image not readable: ${CONTAINER_IMAGE}" >&2
       exit 2
@@ -129,12 +140,12 @@ EXAMPLE_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd -L)"
 LITE_ROOT="$(cd "${EXAMPLE_ROOT}/../.." && pwd -L)"
 REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
 
-MILES_ROOT="${MILES_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/miles}"
-MEGATRON_ROOT="${MEGATRON_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/megatron_lite/Megatron-LM}"
-MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/shunyad/models/Qwen/Qwen3-30B-A3B}"
-RUN_ROOT="${RUN_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_runs}"
-DAPO_MATH_DATA="${DAPO_MATH_DATA:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/achartier/dapo-math-17k/dapo-math-17k.jsonl}"
-LOAD_DIR="${LOAD_DIR:-${RUN_ROOT}/qwen3moe_sft_mlite/13021984}"
+MILES_ROOT="${MILES_ROOT:?Set MILES_ROOT to the miles checkout.}"
+MEGATRON_ROOT="${MEGATRON_ROOT:-${REPO_ROOT}}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the local Hugging Face model directory.}"
+RUN_ROOT="${RUN_ROOT:?Set RUN_ROOT to a writable shared output directory.}"
+DAPO_MATH_DATA="${DAPO_MATH_DATA:?Set DAPO_MATH_DATA to the GRPO prompt JSONL file.}"
+LOAD_DIR="${LOAD_DIR:?Set LOAD_DIR to the input SFT checkpoint directory.}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/qwen3moe_grpo_mlite/${SLURM_JOB_ID:-dryrun}}"
 REF_LOAD="${REF_LOAD:-${MODEL_PATH}}"
 

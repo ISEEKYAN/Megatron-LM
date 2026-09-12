@@ -1,16 +1,25 @@
 #!/usr/bin/env bash
 #SBATCH --job-name=mlite_miles_sft
 #SBATCH --partition=batch
-#SBATCH --account=coreai_devtech_all
 #SBATCH --nodes=1
 #SBATCH --ntasks=1
 #SBATCH --gres=gpu:8
 #SBATCH --cpus-per-task=64
 #SBATCH --mem=2010G
 #SBATCH --time=00:45:00
-#SBATCH --output=/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_sft-%j.log
+#SBATCH --output=mlite_miles_sft-%j.log
 
 # Qwen3 MoE SFT with miles using either the Megatron Lite patch or native Megatron.
+# Export site-specific settings before submission (sbatch --export=ALL):
+# CONTAINER_IMAGE: readable container image; CONTAINER_MOUNTS: comma-separated
+# host:container mounts covering this checkout, miles, model, data and outputs.
+# Both are required outside the container. Keep paths identical inside/outside.
+# MILES_ROOT: miles checkout; MODEL_PATH: local Hugging Face model directory.
+# RUN_ROOT: writable shared output directory (required on all participating nodes).
+# MEGATRON_ROOT: optional Megatron checkout, defaults to this repository.
+# Set SBATCH_ACCOUNT or pass sbatch --account for your project allocation.
+# Logs default to the submission directory; override with sbatch --output.
+# TRAIN_DATA: SFT messages parquet file.
 set -euo pipefail
 
 if [[ "${VERBOSE:-0}" == "1" ]]; then set -x; fi
@@ -34,12 +43,14 @@ resolve_script_path() {
 }
 
 SCRIPT_PATH="$(resolve_script_path)"
-CONTAINER_IMAGE="${CONTAINER_IMAGE:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/miles.sqsh}"
-CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-/lustre:/lustre}"
+CONTAINER_IMAGE="${CONTAINER_IMAGE:-}"
+CONTAINER_MOUNTS="${CONTAINER_MOUNTS:-}"
 DRY_RUN="${DRY_RUN:-0}"
 unset PYTORCH_CUDA_ALLOC_CONF PYTORCH_ALLOC_CONF
 
 if [[ "${IN_MILES_CONTAINER:-0}" != "1" ]]; then
+   : "${CONTAINER_IMAGE:?Set CONTAINER_IMAGE to a readable container image.}"
+   : "${CONTAINER_MOUNTS:?Set CONTAINER_MOUNTS to the required host:container mounts.}"
    if [[ ! -r "${CONTAINER_IMAGE}" ]]; then
       echo "Container image not readable: ${CONTAINER_IMAGE}" >&2
       exit 2
@@ -77,9 +88,9 @@ REPO_ROOT="$(cd "${LITE_ROOT}/../.." && pwd -L)"
 
 add_pythonpath() { [[ -n "${1:-}" ]] && export PYTHONPATH="${1}:${PYTHONPATH:-}"; }
 
-MILES_ROOT="${MILES_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/miles}"
-MEGATRON_ROOT="${MEGATRON_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/megatron_lite/Megatron-LM}"
-MODEL_PATH="${MODEL_PATH:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/shunyad/models/Qwen/Qwen3-30B-A3B}"
+MILES_ROOT="${MILES_ROOT:?Set MILES_ROOT to the miles checkout.}"
+MEGATRON_ROOT="${MEGATRON_ROOT:-${REPO_ROOT}}"
+MODEL_PATH="${MODEL_PATH:?Set MODEL_PATH to the local Hugging Face model directory.}"
 TRAIN_DATA="${TRAIN_DATA:?Set TRAIN_DATA to a messages parquet file for miles SFT.}"
 
 add_pythonpath "${EXAMPLE_ROOT}"
@@ -96,7 +107,7 @@ case "${TRAIN_BACKEND}" in
    mlite|megatron) ;;
    *) echo "TRAIN_BACKEND must be 'mlite' or 'megatron'." >&2; exit 2 ;;
 esac
-RUN_ROOT="${RUN_ROOT:-/lustre/fs1/portfolios/coreai/projects/coreai_devtech_all/users/bayan/code/env/mlite_miles_runs}"
+RUN_ROOT="${RUN_ROOT:?Set RUN_ROOT to a writable shared output directory.}"
 SAVE_DIR="${SAVE_DIR:-${RUN_ROOT}/qwen3moe_sft_${TRAIN_BACKEND}/${SLURM_JOB_ID:-dryrun}}"
 LOG_DIR="${LOG_DIR:-${RUN_ROOT}/logs}"
 
