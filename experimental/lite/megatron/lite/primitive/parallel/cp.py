@@ -10,10 +10,7 @@ import torch.distributed as dist
 
 
 def zigzag_split_for_cp(
-    tensor: torch.Tensor,
-    cp_rank: int,
-    cp_size: int,
-    seq_dim: int = 1,
+    tensor: torch.Tensor, cp_rank: int, cp_size: int, seq_dim: int = 1
 ) -> torch.Tensor:
     """Split tensor along sequence dim using zigzag (striped) pattern for CP.
 
@@ -34,9 +31,7 @@ def zigzag_split_for_cp(
     shape[seq_dim : seq_dim + 1] = [2 * cp_size, seq_len // (2 * cp_size)]
     tensor = tensor.view(*shape)
     idx = torch.tensor(
-        [cp_rank, 2 * cp_size - cp_rank - 1],
-        dtype=torch.long,
-        device=tensor.device,
+        [cp_rank, 2 * cp_size - cp_rank - 1], dtype=torch.long, device=tensor.device
     )
     tensor = tensor.index_select(seq_dim, idx)
     shape[seq_dim : seq_dim + 2] = [seq_len // cp_size]
@@ -103,10 +98,7 @@ def contiguous_slice_for_cp(
 
 
 def contiguous_position_ids_for_cp(
-    seq_len: int,
-    cp_rank: int,
-    cp_size: int,
-    device: torch.device,
+    seq_len: int, cp_rank: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:
     """Return global position IDs for this CP rank under contiguous splitting."""
     if cp_size <= 1:
@@ -190,7 +182,12 @@ def zigzag_to_contiguous_chunks(
     """
     if cu_seqlens is not None:
         return _zigzag_contiguous_thd_swap(
-            tensor, cp_group, seq_dim, cu_seqlens, source_layout="zigzag", target_layout="contiguous"
+            tensor,
+            cp_group,
+            seq_dim,
+            cu_seqlens,
+            source_layout="zigzag",
+            target_layout="contiguous",
         )
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=True)
 
@@ -204,7 +201,12 @@ def contiguous_to_zigzag_chunks(
     """Inverse of :func:`zigzag_to_contiguous_chunks`."""
     if cu_seqlens is not None:
         return _zigzag_contiguous_thd_swap(
-            tensor, cp_group, seq_dim, cu_seqlens, source_layout="contiguous", target_layout="zigzag"
+            tensor,
+            cp_group,
+            seq_dim,
+            cu_seqlens,
+            source_layout="contiguous",
+            target_layout="zigzag",
         )
     return _zigzag_contiguous_chunk_swap(tensor, cp_group, seq_dim, to_contiguous=False)
 
@@ -248,9 +250,13 @@ def _zigzag_contiguous_chunk_swap(
     target_in_zigzag = not to_contiguous
     local_chunks = [tensor[:chunk_len], tensor[chunk_len:]]
     local_chunk_indices = rank_to_chunks(cp_rank, source_in_zigzag)
-    local_dests = [chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in local_chunk_indices]
+    local_dests = [
+        chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in local_chunk_indices
+    ]
     local_slot_order = sorted(range(2), key=lambda slot: local_dests[slot])
-    send_buf = torch.cat([local_chunks[slot] for slot in local_slot_order], dim=0).contiguous()
+    send_buf = torch.cat(
+        [local_chunks[slot] for slot in local_slot_order], dim=0
+    ).contiguous()
 
     input_split_chunks = [0] * cp_size
     for dst_rank, _dst_slot in local_dests:
@@ -260,7 +266,9 @@ def _zigzag_contiguous_chunk_swap(
     recv_dst_slots_per_source: list[list[int]] = [[] for _ in range(cp_size)]
     for src_rank in range(cp_size):
         src_chunks = rank_to_chunks(src_rank, source_in_zigzag)
-        src_dests = [chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in src_chunks]
+        src_dests = [
+            chunk_to_dest(chunk_idx, target_in_zigzag) for chunk_idx in src_chunks
+        ]
         src_slot_order = sorted(range(2), key=lambda slot: src_dests[slot])
         for slot in src_slot_order:
             dst_rank, dst_slot = src_dests[slot]
@@ -320,7 +328,9 @@ def get_thd_context_parallel_rank_indices(
     if not 0 <= cp_rank < cp_size:
         raise ValueError(f"cp_rank must be in [0, {cp_size}), got {cp_rank}.")
     if cu_seqlens.dim() != 1:
-        raise ValueError(f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}.")
+        raise ValueError(
+            f"cu_seqlens must be 1-D, got shape {tuple(cu_seqlens.shape)}."
+        )
 
     cu = cu_seqlens.to(dtype=torch.long)
     if cu.numel() == 0 or cu[0].item() != 0:
@@ -360,7 +370,9 @@ def get_thd_context_parallel_rank_indices(
     offset = pos_in_seq - chunk * chunk_lens
 
     owner = torch.where(chunk < cp_size, chunk, 2 * cp_size - chunk - 1)
-    local_slot = torch.where(chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk))
+    local_slot = torch.where(
+        chunk < cp_size, torch.zeros_like(chunk), torch.ones_like(chunk)
+    )
 
     local_starts = (global_starts // cp_size)[seq_idx]
     local_pos = local_starts + local_slot * chunk_lens + offset
@@ -480,10 +492,7 @@ def _zigzag_contiguous_thd_swap(
 
 
 def zigzag_position_ids_for_cp(
-    seq_len: int,
-    cp_rank: int,
-    cp_size: int,
-    device: torch.device,
+    seq_len: int, cp_rank: int, cp_size: int, device: torch.device
 ) -> torch.Tensor:
     """Return global position IDs for this CP rank under zigzag splitting.
 
@@ -549,9 +558,7 @@ def split_packed_for_cp(
 
 
 def build_headwise_section_perm(
-    split_sections: tuple[int, ...] | list[int],
-    cp_size: int,
-    device: torch.device,
+    split_sections: tuple[int, ...] | list[int], cp_size: int, device: torch.device
 ) -> torch.Tensor:
     """Permutation over the hidden dim so a single contiguous ``1/cp`` slice equals
     the concatenation of each section's ``k``-th contiguous block.
@@ -571,7 +578,9 @@ def build_headwise_section_perm(
     parts = []
     for s in split_sections:
         parts.append(
-            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(cp_size, -1)
+            torch.arange(offset, offset + s, device=device, dtype=torch.long).view(
+                cp_size, -1
+            )
         )
         offset += s
     return torch.cat(parts, dim=-1).view(-1)
@@ -612,8 +621,7 @@ def get_parameter_local_cp_headwise(
 
 
 def all_to_all_hidden_shards(
-    send_parts: list[torch.Tensor],
-    cp_group: dist.ProcessGroup | None,
+    send_parts: list[torch.Tensor], cp_group: dist.ProcessGroup | None
 ) -> list[torch.Tensor]:
     """Even all-to-all over a CP group: ``send_parts[j]`` is delivered to rank ``j``;
     the returned ``recv[i]`` is the tensor rank ``i`` sent to this rank.
@@ -650,3 +658,26 @@ __all__ = [
     "zigzag_slice_for_cp",
     "zigzag_split_for_cp",
 ]
+
+
+def _all_gather_cp(
+    tensor: torch.Tensor, group: dist.ProcessGroup
+) -> list[torch.Tensor]:
+    from torch.distributed.nn.functional import all_gather
+
+    return list(all_gather(tensor.contiguous(), group=group))
+
+
+def _gather_contiguous_tail(tensor, *, tail_len, cp_size, cp_group, seq_dim):
+    if cp_size <= 1 or tail_len <= 0:
+        return None
+    if cp_group is None:
+        raise RuntimeError(
+            "CP chunk-tail gather requires a context-parallel process group."
+        )
+    if tensor.size(seq_dim) < tail_len:
+        raise ValueError(
+            f"CP chunk tail needs len >= {tail_len}, got {tensor.size(seq_dim)}."
+        )
+    tail = tensor.narrow(seq_dim, tensor.size(seq_dim) - tail_len, tail_len)
+    return _all_gather_cp(tail.contiguous(), cp_group)

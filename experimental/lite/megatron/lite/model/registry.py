@@ -82,7 +82,9 @@ register_model(
 )
 
 register_model(
-    "qwen3_moe", package="megatron.lite.model.qwen3_moe", impls={"lite": _QWEN3_MOE_LITE}
+    "qwen3_moe",
+    package="megatron.lite.model.qwen3_moe",
+    impls={"lite": _QWEN3_MOE_LITE},
 )
 
 register_model(
@@ -114,6 +116,17 @@ register_model(
 )
 
 
+register_model(
+    "qwen3_8_flash_next",
+    package="megatron.lite.model.qwen3_8_flash_next",
+    hf_model_types=[
+        "qwen3_8_flash_next",
+        "qwen3_8_flash_next_text",
+        "qwen4_exp",
+        "qwen4_exp_text",
+    ],
+)
+
 # ---------------------------------------------------------------------------
 # Lookup functions
 # ---------------------------------------------------------------------------
@@ -121,21 +134,36 @@ register_model(
 
 def get_model_package(model_name: str):
     if model_name not in MODEL_PACKAGES:
-        raise ValueError(f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}")
+        raise ValueError(
+            f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}"
+        )
     return importlib.import_module(MODEL_PACKAGES[model_name])
 
 
 def get_train_runtime_module(model_name: str):
     if model_name in TRAIN_RUNTIME_MODULES:
         return importlib.import_module(TRAIN_RUNTIME_MODULES[model_name])
+    if model_name in MODEL_PACKAGES and not any(
+        name == model_name for name, _ in _IMPL_TO_RUNTIME_MODEL
+    ):
+        raise ValueError(
+            f"Model {model_name!r} is not yet assembled: no training protocol is registered."
+        )
     raise ValueError(f"No protocol module for: {model_name!r}")
 
 
 def resolve_runtime_model_name(model_name: str, impl: str) -> str:
     key = (model_name, impl)
     if key not in _IMPL_TO_RUNTIME_MODEL:
+        if model_name in MODEL_PACKAGES and not any(
+            name == model_name for name, _ in _IMPL_TO_RUNTIME_MODEL
+        ):
+            raise ValueError(
+                f"Model {model_name!r} is not yet assembled: no runtime implementation is registered."
+            )
         raise ValueError(
-            f"No runtime for ({model_name!r}, {impl!r}). " f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"
+            f"No runtime for ({model_name!r}, {impl!r}). "
+            f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"
         )
     return _IMPL_TO_RUNTIME_MODEL[key]
 
