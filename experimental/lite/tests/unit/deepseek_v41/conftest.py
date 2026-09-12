@@ -30,6 +30,7 @@ def official(monkeypatch):
     def load(name, cls=None, method=None):
         path = root / name
         if cls:
+
             def named(nodes, kind, label):
                 return next(n for n in nodes if isinstance(n, kind) and n.name == label)
 

@@ -25,7 +25,6 @@ def test_ced_chain_and_gradient(official, model_config, dtype):
         attention.indexer.wk,
         attention.indexer.k_norm,
     ]
-    # Nonuniform norms make skipping either normalization distinguishable.
     with torch.no_grad():
         for module in (modules[0], modules[2], modules[4]):
             module.weight.copy_(torch.linspace(0.3, 1.7, module.weight.numel()))
