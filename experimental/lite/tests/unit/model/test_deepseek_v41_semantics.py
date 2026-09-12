@@ -3009,6 +3009,11 @@ def _context_model_worker(rank, rendezvous):
 
     torch.cuda.set_device(rank)
     device = torch.device('cuda', rank)
+    # CP changes GEMM batch dimensions. Keep both reference and sharded
+    # numerical providers on FP32 rather than shape-dependent TF32 kernels.
+    torch.set_float32_matmul_precision('highest')
+    torch.backends.cuda.matmul.allow_tf32 = False
+    torch.backends.cudnn.allow_tf32 = False
     torch.manual_seed(917)
     options = dict(
         device=str(device),
