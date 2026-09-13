@@ -37,6 +37,19 @@ def is_expert_param(name):
     return '.experts.' in name
 
 
+def parameter_placements(name):
+    from torch.distributed.tensor import Replicate, Shard
+
+    # Match the existing Qwen3.5 GroupedLinear owner layout. weightN denotes
+    # a local expert: these checkpoints currently require the same EP size.
+    return [
+        Replicate(),
+        Replicate(),
+        Shard(0) if is_expert_param(name) else Replicate(),
+        Replicate(),
+    ]
+
+
 def _forward_step(model, batch):
     lengths = batch.seq_lens.tolist()
     cu = torch.tensor(
@@ -103,7 +116,9 @@ def build_model(model_cfg, *, impl_cfg):
             deterministic=impl_cfg.deterministic,
         )
         register_training_hooks(chunks, optimizer)
-        attach_model_sharded_state_dict(chunks, ps, is_expert=is_expert_param)
+        attach_model_sharded_state_dict(
+            chunks, ps, get_placements=parameter_placements, is_expert=is_expert_param
+        )
     elif impl_cfg.optimizer is not None:
         raise ValueError(f'Unsupported Qwen3.8 optimizer: {impl_cfg.optimizer}')
     return ModelBundle(

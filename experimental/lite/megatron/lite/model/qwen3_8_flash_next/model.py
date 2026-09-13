@@ -129,8 +129,7 @@ class Qwen38Model(nn.Module):
     def __init__(self, config, ps, *, ngram_primes=None):
         super().__init__()
         if any(
-            getattr(ps, k) != 1
-            for k in ('tp_size', 'ep_size', 'etp_size', 'cp_size', 'pp_size')
+            getattr(ps, k) != 1 for k in ('tp_size', 'etp_size', 'cp_size', 'pp_size')
         ):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
         if config.tie_word_embeddings or not config.norm_topk_prob:

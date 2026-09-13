@@ -103,6 +103,39 @@ def test_model_allows_data_parallel_replicas(
     assert model.ps.dp_size == 2
 
 
+@pytest.mark.parametrize('ep', [1, 2])
+def test_model_allows_expert_owners(transformer_engine_import_stub, monkeypatch, ep):
+    transformer_engine_import_stub()
+    from types import SimpleNamespace
+
+    from megatron.lite.model.qwen3_8_flash_next import model as module
+    from megatron.lite.model.qwen3_8_flash_next.protocol import build_model_config
+
+    monkeypatch.setattr(module, 'Qwen38Layer', lambda *a, **kw: torch.nn.Identity())
+    ps = SimpleNamespace(
+        tp_size=1, ep_size=ep, etp_size=1, cp_size=1, pp_size=1, dp_size=2
+    )
+    assert (
+        module.Qwen38Model(build_model_config(tiny_training_config()), ps).ps.ep_size
+        == ep
+    )
+
+
+def test_protocol_expert_checkpoint_placement():
+    from megatron.lite.model.qwen3_8_flash_next.protocol import parameter_placements
+    from torch.distributed.tensor import Replicate, Shard
+
+    for suffix in ('fc1.weight0', 'fc2.weight1'):
+        places = parameter_placements('layers.0.mlp.experts.' + suffix)
+        assert places == [Replicate(), Replicate(), Shard(0), Replicate()]
+    for name in (
+        'layers.0.mlp.router.gate.weight',
+        'layers.0.mlp.shared_expert.shared_gate.weight',
+        'layers.1.ple.embedding.table.weight',
+    ):
+        assert parameter_placements(name) == [Replicate()] * 4
+
+
 @pytest.fixture
 def isolated_training_groups():
     from megatron.core import parallel_state as mpu
