@@ -43,6 +43,12 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
             config, impl_cfg=replace(impl, parallel=ParallelConfig(ep=2))
         )
         assert parallel.parallel_state.ep_size == 2, 'EP topology must be active'
+        ps = parallel.parallel_state
+        execution = parallel.forward_step.keywords['execution_model']
+        assert execution.process_group is ps.dp_group, 'EP_DENSE_USES_DP_GROUP'
+        assert ps.dp_size == 2 and ps.expert_dp_size == 1, 'EP_WORLD_DECOMPOSITION'
+        assert 'embed.weight' not in execution.parameters_to_ignore, 'EP_EMBED_IS_DENSE'
+
         model = parallel.chunks[0]
         reference = serial.chunks[0]
         local_state = model.state_dict()
@@ -61,8 +67,11 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
         if optimizer_failure is not None:
             _check_optimizer_contract(parallel, rank, optimizer_failure)
             return
+        records = {}
+        _capture_expert_linear_inputs(reference, records)
         errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
         for step in range(2):
+            records.clear()
             batches = []
             for other_rank in range(2):
                 ids = torch.arange(1 + step, 5 + step + other_rank * 2, device=rank)
@@ -89,10 +98,13 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                 )
                 if bundle.finalize_grads is not None:
                     bundle.finalize_grads()
+            _diagnose_expert_wgrad(records, reference, rank)
             diagnostics = {}
             serial_parameters = dict(reference.named_parameters())
             for name, parameter in model.named_parameters():
                 reference_gradient = serial_parameters[name].grad
+                if (parameter.grad is None) != (reference_gradient is None):
+                    diagnostics[name] = {'gradient_presence_mismatch': True}
                 if parameter.grad is not None and reference_gradient is not None:
                     delta = float((parameter.grad - reference_gradient).abs().max())
                     if delta:
@@ -107,8 +119,11 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                 f'EP gradient differences rank={rank}: {json.dumps(diagnostics)}',
                 flush=True,
             )
+            failures = [None, None]
+            dist.all_gather_object(failures, next(iter(diagnostics), None))
+            assert not any(failures), f'EP_GRADIENT_PARITY: {failures}'
             for name, p in model.named_parameters():
-                q = dict(reference.named_parameters())[name]
+                q = serial_parameters[name]
                 assert (p.grad is None) == (q.grad is None), name
                 if p.grad is not None:
                     errors['gradient_max_abs'] = max(
@@ -119,7 +134,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
             assert serial.optimizer.step()[0]
             assert parallel.optimizer.step()[0]
             for name, p in model.named_parameters():
-                q = dict(reference.named_parameters())[name]
+                q = serial_parameters[name]
                 torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
                 errors['parameter_max_abs'] = max(
                     errors['parameter_max_abs'], float((p - q).detach().abs().max())
@@ -228,3 +243,53 @@ def test_ep_global_norm_and_atomic_skip(model_config, failure, tmp_path):
         nprocs=2,
         join=True,
     )
+
+
+def _capture_expert_linear_inputs(model, records):
+    from megatron.lite.model.deepseek_v41.lite.attention import Linear
+
+    def capture(name, module, args, output):
+        if not torch.is_grad_enabled():
+            return
+        entry = [args[0].detach(), None]
+        records.setdefault(name + '.weight', []).append(entry)
+
+        def gradient(value):
+            entry[1] = value.detach()
+
+        output.register_hook(gradient)
+
+    from functools import partial
+
+    for name, module in model.named_modules():
+        if '.ffn.experts.' in name and isinstance(module, Linear):
+            module.register_forward_hook(partial(capture, name))
+
+
+def _diagnose_expert_wgrad(records, reference, rank):
+    summary = {
+        'fp32_partition_difference': 0.0,
+        'fp64_partition_difference': 0.0,
+        'fp64_rounded_fp32_difference': 0.0,
+    }
+    for name, entries in records.items():
+        xs, dys = zip(*entries)
+        xs = [x.reshape(-1, x.shape[-1]) for x in xs]
+        dys = [dy.reshape(-1, dy.shape[-1]) for dy in dys]
+        for dtype in (torch.float32, torch.float64):
+            x = torch.cat(xs).to(dtype)
+            dy = torch.cat(dys).to(dtype)
+            joined = dy.T @ x
+            split = sum(d.to(dtype).T @ a.to(dtype) for a, d in zip(xs, dys))
+            key = (
+                'fp32_partition_difference'
+                if dtype == torch.float32
+                else 'fp64_partition_difference'
+            )
+            summary[key] = max(summary[key], float((joined - split).abs().max()))
+            if dtype == torch.float64:
+                summary['fp64_rounded_fp32_difference'] = max(
+                    summary['fp64_rounded_fp32_difference'],
+                    float((joined.float() - split.float()).abs().max()),
+                )
+    print(f'EP_WGRAD_PRECISION rank={rank}: {json.dumps(summary)}', flush=True)
