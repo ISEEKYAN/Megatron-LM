@@ -25,6 +25,7 @@ from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 from torch import nn
+from torch.nn import functional as F
 
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
@@ -158,7 +159,7 @@ class DeepseekV41Model(nn.Module):
             self.embed = nn.Embedding(t.vocab_size, dim, dtype=torch.bfloat16)
         if end == count:
             self.norm = RMSNorm(dim, eps)
-            self.head = Linear(dim, t.vocab_size, dtype=torch.float32)
+            self.head = nn.Linear(dim, t.vocab_size, bias=False, dtype=torch.float32)
         self.layers = nn.ModuleList([None] * count)
         ac = config.attention_config(
             **dict.fromkeys(
@@ -561,7 +562,7 @@ class DeepseekV41Model(nn.Module):
         if self.head is None or self.norm is None:
             raise RuntimeError('Only the final pipeline stage owns the output head')
         hidden = self.norm(contract_hc(payload.h, payload.p))
-        return self.head(hidden.float())
+        return F.linear(hidden.float(), self.head.weight.float())
 
     def forward(self, input_ids, *, cu_seqlens=None, images=None, token_types=None):
         if self.local_layer_range != (0, len(self.layers)):
@@ -608,7 +609,7 @@ class DeepseekV41Model(nn.Module):
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.
         return {
-            'logits': self.head(hidden.float()),
+            'logits': F.linear(hidden.float(), self.head.weight.float()),
             'modality_loads': tuple(tuple(entries) for entries in loads),
         }
 

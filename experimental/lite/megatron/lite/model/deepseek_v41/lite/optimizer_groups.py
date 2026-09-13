@@ -13,11 +13,6 @@ from operator import attrgetter
 
 import torch
 from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
-from megatron.lite.primitive.parallel.matrix import (
-    agree_finite,
-    full_matrix_parameters,
-    logical_shape,
-)
 
 
 @dataclass(frozen=True)
@@ -110,13 +105,12 @@ def parameter_groups(model, *, lr, vision_policy=None):
             raise ValueError(
                 'Matrix optimizer requires the declared two-dimensional owner'
             )
-        physical = logical_shape(p)
-        if shape is not None and math.prod(shape) != math.prod(physical):
+        if shape is not None and math.prod(shape) != p.numel():
             raise ValueError('Logical matrix shape disagrees with actual owner')
         if (
             shape is not None
             and len(shape) == 3
-            and physical != (shape[0] * shape[1], shape[2])
+            and tuple(p.shape) != (shape[0] * shape[1], shape[2])
         ):
             raise ValueError('Head layout disagrees with physical matrix axes')
         decay = vector_decay if vector else matrix_decay
@@ -125,7 +119,7 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 params=[p],
                 algorithm=algorithm,
                 owner_key=b.release_key,
-                matrix_shape=physical if shape is None else tuple(shape),
+                matrix_shape=tuple(p.shape) if shape is None else tuple(shape),
                 matrix_partitions=partitions,
                 lr=lr * policy.get('multiplier', multiplier),
                 weight_decay=policy.get('decay', decay),
@@ -302,8 +296,7 @@ class V41Optimizer(MixedOptimizer):
             for b in model.layers
             if b.engram is not None and b.engram.embed.master is not None
         ]
-        with full_matrix_parameters(model.parameters(), model.ps.tp_group):
-            super().__init__(groups, config, tables)
+        super().__init__(groups, config, tables)
 
     @torch.no_grad()
     def finalize_expert_grads(self):
@@ -342,10 +335,6 @@ class V41Optimizer(MixedOptimizer):
         return (dense + expert).sqrt()
 
     def _all_finite(self, valid):
-        if self.ps is not None and self.ps.tp_size > 1:
-            return agree_finite(
-                valid, self.ps.tp_group, next(self.model.parameters()).device
-            )
         if self.ps is None or self.ps.ep_size == 1:
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
@@ -381,10 +370,7 @@ class V41Optimizer(MixedOptimizer):
         self._modality_loads = [None] * len(self.routers)
 
     def step(self):
-        with full_matrix_parameters(
-            self.model.parameters(), self.model.ps.tp_group, publish=True
-        ):
-            result = super().step()
+        result = super().step()
         if result[0]:
             for router, stats in zip(self.routers, self._modality_loads, strict=True):
                 if stats is not None:
@@ -398,14 +384,6 @@ class V41Optimizer(MixedOptimizer):
         # Exceptions from the transactional backend retain statistics for retry.
         self._modality_loads = [None] * len(self.routers)
         return result
-
-    def state_dict(self):
-        with full_matrix_parameters(self.model.parameters(), self.model.ps.tp_group):
-            return super().state_dict()
-
-    def load_state_dict(self, state):
-        with full_matrix_parameters(self.model.parameters(), self.model.ps.tp_group):
-            return super().load_state_dict(state)
 
     def reconfigure_vision(self, mask):
         """Change a completed training stage, retaining common owners' momentum.

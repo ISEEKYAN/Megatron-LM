@@ -52,7 +52,7 @@ The two-GPU regression preserves all 40 layers with reduced dimensions in the
 floating diagnostic mode. It checks two optimizer steps, unequal token counts,
 replica equality, and comparison with a single-process global batch. This does
 not establish full-size or native quantized training support. `build_model` still
-rejects PP > 1 (and CP/VPP/ETP); local pipeline range helpers are not a supported
+rejects PP > 1 (and TP/CP/VPP/ETP); local pipeline range helpers are not a supported
 PP runtime.
 
 
@@ -85,43 +85,6 @@ and independently checks nonfinite-gradient skips, candidate rejection, missing
 participants, and EP2 with two replicas per expert. These are reduced-dimension
 floating tests, not full-size native-quantized or combined TP/CP/PP validation.
 
-
-## Tensor parallel text training
-
-After distributed initialization, select
-`ImplConfig(parallel=ParallelConfig(tp=2), optimizer="muon", quantized=False, ...)`.
-The initial integration requires a TP-only world: DP/EP/CP/PP/VPP/ETP combinations
-remain rejected. Column shards own attention's `wq_a`, `wq_b`, `wkv`, `wo_b`,
-compressor projections and the vocabulary head. Shared primitive collectives
-gather projection outputs and sum input gradients. Grouped `wo_a`, ETP=1
-experts, embeddings and attention operations remain replicated.
-
-FP32 masters and native FP32 weight gradients remain local during forward and
-backward. At each optimizer step, a primitive gathers logical masters and
-gradients, then publishes each rank's updated slice. Muon and Sinkhorn operate
-on complete matrices: `wq_a` remains one shared matrix and `wq_b` retains its
-per-head matrix grouping. Optimizer momentum is currently replicated and the
-step temporarily materializes full matrices. This implementation reduces model
-parameter storage and projection work, without claiming sharded optimizer memory.
-
-The regression retains all 40 reduced-width layers, all three CSA2 modes,
-CED/mHC, frozen indexers and both Engram modes for two real optimizer steps.
-It records native FP32 trajectory differences, then requires exact agreement
-with an independent single-process full-matrix FP64 oracle after FP32 publication.
-Only projection accumulation precision changes for that diagnostic; the real
-TP collectives and full-matrix optimizers still execute. A separate sensitivity
-probe replays measured gradient perturbations through an identical full-matrix
-optimizer to check the resulting parameter and next-forward differences. This
-probe is not the independent parity reference. The tests also require real
-collective calls, reduced local parameter counts and FP32 gradient low bits.
-Native quantized/full-size training is not established by these floating tests;
-FP8 column shards must preserve complete 32-row blocks.
-
-HF export gathers full logical tensors once. All TP ranks participate in save;
-TP rank zero writes the checkpoint. Load slices full tensors exactly once for
-TP owners, and TP1 loads them without slicing. Tests save at TP2 and reload at
-TP1 with bitwise parameter/buffer checks, then reload at TP2 to detect double
-slicing. Optimizer state serialization retains the full logical matrix layout.
 
 ## Weight export
 The registered protocol accepts the Verl engine's `export_dtype`, `cpu` and

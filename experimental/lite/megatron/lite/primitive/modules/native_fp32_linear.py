@@ -24,13 +24,10 @@ class _NativeLinear(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         dx = grad @ weight
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            # FP64 activations are an explicit precision diagnostic. Preserve
-            # that accumulation before publishing to the FP32 master leaf.
-            dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
             dw = (
-                grad.reshape(-1, weight.shape[0]).to(dtype).T
-                @ x.reshape(-1, weight.shape[1]).to(dtype)
-            ).float()
+                grad.reshape(-1, weight.shape[0]).float().T
+                @ x.reshape(-1, weight.shape[1]).float()
+            )
         return dx, dw
 
 
@@ -46,15 +43,6 @@ class Linear(torch.nn.Linear):
         self.fp8 = fp8
 
     def forward(self, x):
-        if getattr(self, 'tp_size', 1) > 1:
-            from megatron.lite.primitive.parallel.linear import column_parallel_forward
-
-            return column_parallel_forward(
-                x, self._local_forward, self.tp_size, self.tp_group
-            )
-        return self._local_forward(x)
-
-    def _local_forward(self, x):
         weight = self.weight
         if getattr(self, 'quantized', False):
             from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
