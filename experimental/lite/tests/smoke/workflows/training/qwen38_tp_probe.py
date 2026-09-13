@@ -325,6 +325,10 @@ def main():
             if reference is not None:
                 for microbatch, row in enumerate(traces['lm_head.weight']):
                     target = reference['head_partials'][microbatch]
+                    if serial is not None:
+                        modeled_dx = bf16_ordered_sum(target['serial_partials'])
+                        serial_dx = serial['head_partials'][microbatch]['dx']
+                        assert_dgrad_reference(row['dx'], modeled_dx, serial_dx)
                     assert torch.equal(row['dy'], target['dy']), 'TP_HEAD_PARTIAL_DY'
                     assert torch.equal(
                         row['weight'], target['weight'].chunk(2, 0)[rank]
@@ -335,10 +339,6 @@ def main():
                     assert torch.equal(
                         row['post_reduce'], row['dx']
                     ), 'TP_HEAD_POST_REDUCE_DX'
-                    if serial is not None:
-                        modeled_dx = bf16_ordered_sum(target['serial_partials'])
-                        serial_dx = serial['head_partials'][microbatch]['dx']
-                        assert_dgrad_reference(row['dx'], modeled_dx, serial_dx)
                 if serial is not None:
                     print('TP_DGRAD_BF16_MODEL_SERIAL_EXPLAINED_OK', rank, flush=True)
                 print('TP_HEAD_PRE_REDUCE_PARTIALS_BITWISE_OK', rank, flush=True)
