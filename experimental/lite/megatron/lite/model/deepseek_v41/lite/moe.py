@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Single-rank V4.1 expert computation and explicit modality bias statistics."""
+"""V4.1 expert computation through shared dispatch and modality statistics."""
 
 from dataclasses import dataclass
 
@@ -107,26 +107,22 @@ class SwiGLUExpert(nn.Module):
 
 
 class DeepseekV41MoE(nn.Module):
-    """Local dispatch over injected expert providers, including shared experts.
-
-    EP dispatch and optimizer-step publication belong to the distributed layer.
-    """
+    """Global expert slots with local owners and primitive token transport."""
 
     def __init__(self, router, experts, shared_experts=None, *, ps=None):
         super().__init__()
         self.gate = router
         self.experts = nn.ModuleList(experts)
         self.shared_experts = shared_experts
-        self.dispatcher = None
-        if ps is not None and ps.ep_size > 1:
-            from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+        from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+        from megatron.lite.primitive.parallel.state import ParallelState
 
-            self.dispatcher = TokenDispatcher(
-                router.router.num_experts,
-                router.router.gate.in_features,
-                ps,
-                use_deepep=False,
-            )
+        self.dispatcher = TokenDispatcher(
+            router.router.num_experts,
+            router.router.gate.in_features,
+            ps or ParallelState(),
+            use_deepep=False,
+        )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
 
@@ -139,37 +135,22 @@ class DeepseekV41MoE(nn.Module):
     def forward_with_stats(self, x, *, image_mask=None):
         flat = x.reshape(-1, x.shape[-1])
         weights, indices, stats = self.gate(flat, image_mask)
-        if self.dispatcher is not None:
-            dispatched, counts, scores = self.dispatcher.dispatch(
-                flat, weights, indices
+        dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
+        values = []
+        for expert, tokens, probs in zip(
+            (e for e in self.experts if e is not None),
+            dispatched.split(counts.tolist()),
+            scores.split(counts.tolist()),
+            strict=True,
+        ):
+            # Empty experts retain both dispatch autograd edges; their
+            # parameters stay inactive, as in the single-rank reference.
+            values.append(
+                expert(tokens, weights=probs[:, None])
+                if tokens.shape[0]
+                else tokens * probs[:, None]
             )
-            values = []
-            for expert, tokens, probs in zip(
-                (e for e in self.experts if e is not None),
-                dispatched.split(counts.tolist()),
-                scores.split(counts.tolist()),
-                strict=True,
-            ):
-                # Empty experts retain both dispatch autograd edges; their
-                # parameters stay inactive, as in the single-rank reference.
-                values.append(
-                    expert(tokens, weights=probs[:, None])
-                    if tokens.shape[0]
-                    else tokens * probs[:, None]
-                )
-            output = self.dispatcher.combine(torch.cat(values))
-        else:
-            output = self._local_forward(flat, weights, indices)
+        output = self.dispatcher.combine(torch.cat(values))
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat)
         return output.reshape_as(x), stats
-
-    def _local_forward(self, flat, weights, indices):
-        output = torch.zeros_like(flat)
-        for index, expert in enumerate(self.experts):
-            rows, slots = torch.where(indices == index)
-            if rows.numel():
-                # Weight before down projection/cast, matching official Expert.
-                values = expert(flat[rows], weights=weights[rows, slots, None])
-                output = output.index_add(0, rows, values)
-        return output

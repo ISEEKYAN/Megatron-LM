@@ -16,7 +16,7 @@ from megatron.lite.primitive.train_step import run_microbatch_loop
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
 
-def _ep_worker(rank, config, trainable, directory):
+def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     torch.manual_seed(19)
@@ -58,6 +58,9 @@ def _ep_worker(rank, config, trainable, directory):
             assert owned == list(
                 range(rank * 2, rank * 2 + 2)
             ), 'global expert ownership'
+        if optimizer_failure is not None:
+            _check_optimizer_contract(parallel, rank, optimizer_failure)
+            return
         errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
         for step in range(2):
             batches = []
@@ -86,6 +89,24 @@ def _ep_worker(rank, config, trainable, directory):
                 )
                 if bundle.finalize_grads is not None:
                     bundle.finalize_grads()
+            diagnostics = {}
+            serial_parameters = dict(reference.named_parameters())
+            for name, parameter in model.named_parameters():
+                reference_gradient = serial_parameters[name].grad
+                if parameter.grad is not None and reference_gradient is not None:
+                    delta = float((parameter.grad - reference_gradient).abs().max())
+                    if delta:
+                        diagnostics[name] = {
+                            'max_abs': delta,
+                            'reference_max': float(reference_gradient.abs().max()),
+                        }
+            Path(directory, f'gradient-rank-{rank}.json').write_text(
+                json.dumps(diagnostics)
+            )
+            print(
+                f'EP gradient differences rank={rank}: {json.dumps(diagnostics)}',
+                flush=True,
+            )
             for name, p in model.named_parameters():
                 q = dict(reference.named_parameters())[name]
                 assert (p.grad is None) == (q.grad is None), name
@@ -163,3 +184,47 @@ def test_ep_does_not_unlock_other_dimensions(moe, model_config, dimension):
                 parallel=ParallelConfig(ep=2, **{dimension: 2}),
             ),
         )
+
+
+def _check_optimizer_contract(bundle, rank, failure):
+    model, optimizer = bundle.chunks[0], bundle.optimizer
+    dense = model.embed.weight
+    expert = optimizer.expert_parameters[0]
+    dense.grad = dense.main_grad = torch.zeros_like(dense)
+    expert.grad = expert.main_grad = torch.zeros_like(expert)
+    dense.grad.flatten()[0] = 3
+    expert.grad.flatten()[0] = 4 if rank == 0 else 12
+    norm = optimizer._grad_norm([dense, expert], [dense.grad, expert.grad])
+    assert float(norm) == 13.0, 'EP_NORM_COUNTS_DENSE_ONCE_AND_ALL_EXPERTS'
+    parameters = {name: p.detach().clone() for name, p in model.named_parameters()}
+    buffers = {
+        name: b.detach().contiguous().reshape(-1).view(torch.uint8).clone()
+        for name, b in model.named_buffers()
+    }
+    if failure == 'gradient':
+        if rank == 1:
+            expert.grad.flatten()[0] = float('inf')
+    elif rank == 1:
+        optimizer.optimizers[0].prepare_step = lambda: False
+    assert not optimizer.step()[0], 'EP_SKIP_MUST_REACH_EVERY_RANK'
+    for name, p in model.named_parameters():
+        torch.testing.assert_close(
+            p, parameters[name], atol=0, rtol=0, msg='EP_SKIP_PARAMETER:' + name
+        )
+    for name, b in model.named_buffers():
+        assert torch.equal(
+            b.contiguous().reshape(-1).view(torch.uint8), buffers[name]
+        ), ('EP_SKIP_BUFFER:' + name)
+    assert all(not backend.state for backend in optimizer.optimizers), 'EP_SKIP_STATE'
+
+
+@pytest.mark.gpus(2)
+@pytest.mark.parametrize('failure', ['gradient', 'candidate'])
+def test_ep_global_norm_and_atomic_skip(model_config, failure, tmp_path):
+    assert torch.cuda.device_count() >= 2, 'EP optimizer comparison requires two GPUs'
+    mp.spawn(
+        _ep_worker,
+        args=(model_config, True, str(tmp_path), failure),
+        nprocs=2,
+        join=True,
+    )
