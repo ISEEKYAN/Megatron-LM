@@ -69,6 +69,8 @@ def build_model(model_cfg, *, impl_cfg):
         raise NotImplementedError(
             'V4.1 model construction requires single-rank execution; distributed integration remains pending'
         )
+    if type(p.ep) is not int or p.ep < 1:
+        raise ValueError("EP size must be a positive integer")
     if p.ep > 1 and (
         not torch.distributed.is_initialized()
         or torch.distributed.get_world_size() < p.ep

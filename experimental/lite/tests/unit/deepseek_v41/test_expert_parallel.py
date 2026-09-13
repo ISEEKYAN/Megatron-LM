@@ -450,3 +450,14 @@ def test_ep_matching_expert_replica_groups(model_config, tmp_path):
         nprocs=4,
         join=True,
     )
+
+
+@pytest.mark.parametrize('ep', [0, -1, 1.5, True])
+def test_ep_size_requires_a_positive_integer(moe, model_config, ep):
+    with pytest.raises(ValueError, match='EP size must be a positive integer'):
+        protocol.build_model(
+            model_config,
+            impl_cfg=protocol.ImplConfig(
+                device='meta', quantized=False, parallel=ParallelConfig(ep=ep)
+            ),
+        )
