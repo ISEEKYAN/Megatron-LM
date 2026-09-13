@@ -24,10 +24,13 @@ class _NativeLinear(torch.autograd.Function):
         x, weight = ctx.saved_tensors
         dx = grad @ weight
         with torch.autocast(device_type=grad.device.type, enabled=False):
+            # FP64 activations are an explicit precision diagnostic. Preserve
+            # that accumulation before publishing to the FP32 master leaf.
+            dtype = torch.float64 if x.dtype == torch.float64 else torch.float32
             dw = (
-                grad.reshape(-1, weight.shape[0]).float().T
-                @ x.reshape(-1, weight.shape[1]).float()
-            )
+                grad.reshape(-1, weight.shape[0]).to(dtype).T
+                @ x.reshape(-1, weight.shape[1]).to(dtype)
+            ).float()
         return dx, dw
 
 

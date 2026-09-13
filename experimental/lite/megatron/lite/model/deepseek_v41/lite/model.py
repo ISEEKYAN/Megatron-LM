@@ -25,7 +25,6 @@ from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 from torch import nn
-from torch.nn import functional as F
 
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc

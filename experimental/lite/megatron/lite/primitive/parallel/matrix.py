@@ -22,10 +22,23 @@ class TensorShard:
     size: int
 
     def __post_init__(self):
+        if (
+            any(type(value) is not int for value in (self.dim, self.rank, self.size))
+            or self.size < 1
+            or not self.shape
+            or any(type(value) is not int or value < 1 for value in self.shape)
+        ):
+            raise ValueError('Tensor shard requires positive integral dimensions')
         if not 0 <= self.rank < self.size or not 0 <= self.dim < len(self.shape):
             raise ValueError('Invalid tensor shard rank or axis')
         if self.shape[self.dim] % self.size:
             raise ValueError('Tensor shard axis must be divisible by TP size')
+
+    @property
+    def local_shape(self):
+        shape = list(self.shape)
+        shape[self.dim] //= self.size
+        return tuple(shape)
 
     def slice(self, full):
         if tuple(full.shape) != self.shape:
@@ -46,6 +59,8 @@ def gather_parameter(parameter, group, value=None):
     layout = getattr(parameter, 'tp_shard', None)
     if layout is None:
         return value
+    if tuple(value.shape) != layout.local_shape:
+        raise ValueError('Tensor shard storage disagrees with its declared local shape')
     return allgather_concat(value, layout.size, group, layout.dim)
 
 
