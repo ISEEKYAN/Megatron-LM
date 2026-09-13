@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen mathematical components; sparse attention uses explicit gathered rows."""
+
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -109,7 +110,7 @@ def qsa_routes(q, k, lengths, *, token_budget=2048, compress_ratio=4, offset=0):
     return result
 
 
-def sparse_attention(q, k, v, routes):
+def sparse_attention(q, k, v, routes, *, select_kv=None):
     if (
         q.ndim != 4
         or k.shape != v.shape
@@ -126,12 +127,17 @@ def sparse_attention(q, k, v, routes):
     ):
         raise ValueError('QSA_ROUTE_RANGE')
     batch = torch.arange(q.shape[0], device=q.device)[:, None, None]
-    selected_k = k[batch, routes.clamp_min(0)].repeat_interleave(
-        q.shape[2] // k.shape[2], dim=3
-    )
-    selected_v = v[batch, routes.clamp_min(0)].repeat_interleave(
-        q.shape[2] // k.shape[2], dim=3
-    )
+    if select_kv is None:
+        selected_k = k[batch, routes.clamp_min(0)].repeat_interleave(
+            q.shape[2] // k.shape[2], dim=3
+        )
+        selected_v = v[batch, routes.clamp_min(0)].repeat_interleave(
+            q.shape[2] // k.shape[2], dim=3
+        )
+    else:
+        selected_k, selected_v = select_kv(k, v, batch, routes.clamp_min(0))
+        selected_k = selected_k.repeat_interleave(q.shape[2] // k.shape[2], dim=3)
+        selected_v = selected_v.repeat_interleave(q.shape[2] // k.shape[2], dim=3)
     scores = (
         torch.einsum('bshd,bskhd->bshk', q.float(), selected_k.float())
         / q.shape[-1] ** 0.5

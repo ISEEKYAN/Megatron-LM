@@ -13,6 +13,7 @@ from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'unit' / 'model'))
 from megatron.lite.model.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
@@ -74,11 +75,13 @@ def capture_qsa_boundaries(module, records):
             hook.remove()
 
 
+@record
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--reference', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument('--capture-boundaries', action='store_true')
+    parser.add_argument('--mutation', choices=('reverse_owners', 'skip_document'))
     args = parser.parse_args()
     world, rank = int(os.environ['WORLD_SIZE']), int(os.environ['RANK'])
     assert world in (1, 2)
@@ -94,6 +97,22 @@ def main():
         ngram_primes=(17, 19, 23, 29, 31, 37, 41, 43, 47, 53, 59, 61, 67, 71, 73, 79),
     ).to(device='cuda', dtype=torch.bfloat16)
     modules = {'PLE': layer.ple, 'QSA': layer.self_attn}
+    if args.mutation is not None:
+        assert world == 2, 'QSA_MUTATION_CP2_ONLY'
+        from megatron.lite.model.qwen3_8_flash_next import qsa_ordered
+
+        if args.mutation == 'reverse_owners':
+            original = qsa_ordered.document_owners
+            qsa_ordered.document_owners = lambda *a: tuple(reversed(original(*a)))
+        else:
+            original = qsa_ordered.accumulate_selected
+
+            def skip_document(*a, **kwargs):
+                if kwargs['document_start'] == 5 and kwargs['rank'] == 1:
+                    return
+                return original(*a, **kwargs)
+
+            qsa_ordered.accumulate_selected = skip_document
     reference = torch.load(args.reference, weights_only=True) if world > 1 else None
     if reference is not None:
         assert (
@@ -202,6 +221,13 @@ def main():
         else:
             target = reference['modules'][name]
             valid = torch.arange(start, end) < 13
+            if name == 'QSA':
+                checks.append(
+                    (
+                        'QSA_ORDERED_TRUE_SERIAL_BITWISE',
+                        torch.equal(actual['dx'], target['dx'][:, start:end]),
+                    )
+                )
             checks.extend(
                 [
                     (

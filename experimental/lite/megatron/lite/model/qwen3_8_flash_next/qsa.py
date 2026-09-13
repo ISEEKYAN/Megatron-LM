@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Qwen sparse attention for complete padded or packed rows (no CP transport)."""
+"""Qwen sparse attention with local CP queries and ordered K/V adjoints."""
+
 import torch
 from megatron.lite.primitive.utils.rope import _apply_rotary_pos_emb_bshd
 from torch import nn
@@ -131,6 +132,7 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
 
     def _forward_cp(self, x, angles, context):
         from .cp import qwen3_8_flash_next_cp_all_gather as gather
+        from .qsa_ordered import ordered_select_kv
 
         c = self.config
         b, s, _ = x.shape
@@ -150,13 +152,11 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
             .chunk(2, -1)
         )
         q = _apply_rotary_pos_emb_bshd(self._norm(q, self.q_norm), angles)
-        k = self.k_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim)
-        k = gather(
-            _apply_rotary_pos_emb_bshd(self._norm(k, self.k_norm), angles), context
-        )
-        v = gather(
-            self.v_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim), context
-        )
+        local_k = self.k_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim)
+        local_k = _apply_rotary_pos_emb_bshd(self._norm(local_k, self.k_norm), angles)
+        local_v = self.v_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim)
+        k = gather(local_k, context, differentiable=False)
+        v = gather(local_v, context, differentiable=False)
         global_angles = gather(angles, context, differentiable=False)
         cu = context.global_cu_seqlens
         boundaries = [0] if cu is None else cu.tolist()
@@ -193,14 +193,20 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
                     compress_ratio=c.indexer_compress_ratio,
                     offset=left - a,
                 )
+
+            def select_kv(doc_k, doc_v, batch, indices, a=a, z=z):
+                return ordered_select_kv(
+                    local_k, local_v, doc_k, doc_v, batch, indices, context, a, z
+                )
+
             pieces.append(
                 sparse_attention(
                     q[:, local],
                     k[:, a:z],
                     v[:, a:z],
                     routes[..., : min(z - a, routes.shape[-1])],
+                    select_kv=select_kv,
                 )
             )
-        # Keep the same differentiable collectives on ranks with disjoint docs.
-        output = torch.cat(pieces, 1) + (k[:, :0].sum() + v[:, :0].sum())
+        output = torch.cat(pieces, 1)
         return self.o_proj((output * gate.sigmoid()).flatten(-2))
