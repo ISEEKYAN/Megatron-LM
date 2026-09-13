@@ -56,6 +56,53 @@ def test_protocol_next_token_targets_stop_at_document_boundaries():
     assert captured['labels'].tolist() == [[2, -100, -100, 5, -100]]
 
 
+def tiny_training_config():
+    return dict(
+        model_type='qwen4_exp_text',
+        hidden_size=128,
+        num_hidden_layers=2,
+        vocab_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        shared_expert_intermediate_size=128,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=128,
+        linear_num_key_heads=1,
+        linear_num_value_heads=2,
+        linear_key_head_dim=128,
+        linear_value_head_dim=128,
+        hc_count=4,
+        hc_lowrank=16,
+        ple_layer_ids=[2],
+        ple_embed_dim=128,
+        layer_types=['linear_attention', 'full_attention'],
+        eos_token_id=127,
+        indexer_n_heads=2,
+        indexer_head_dim=128,
+        indexer_compress_ratio=4,
+        indexer_budget=16,
+    )
+
+
+def test_model_allows_data_parallel_replicas(
+    transformer_engine_import_stub, monkeypatch
+):
+    transformer_engine_import_stub()
+    from types import SimpleNamespace
+
+    from megatron.lite.model.qwen3_8_flash_next import model as module
+    from megatron.lite.model.qwen3_8_flash_next.protocol import build_model_config
+
+    monkeypatch.setattr(module, 'Qwen38Layer', lambda *a, **kw: torch.nn.Identity())
+    ps = SimpleNamespace(
+        tp_size=1, ep_size=1, etp_size=1, cp_size=1, pp_size=1, dp_size=2
+    )
+    model = module.Qwen38Model(build_model_config(tiny_training_config()), ps)
+    assert model.ps.dp_size == 2
+
+
 @pytest.fixture
 def isolated_training_groups():
     from megatron.core import parallel_state as mpu
@@ -94,33 +141,7 @@ def test_native_runtime_trains_all_decoder_branches(
 
         monkeypatch.setattr(gdn_primitive, name, counted)
 
-    config = dict(
-        model_type='qwen4_exp_text',
-        hidden_size=128,
-        num_hidden_layers=2,
-        vocab_size=128,
-        num_experts=4,
-        num_experts_per_tok=2,
-        moe_intermediate_size=128,
-        shared_expert_intermediate_size=128,
-        num_attention_heads=2,
-        num_key_value_heads=1,
-        head_dim=128,
-        linear_num_key_heads=1,
-        linear_num_value_heads=2,
-        linear_key_head_dim=128,
-        linear_value_head_dim=128,
-        hc_count=4,
-        hc_lowrank=16,
-        ple_layer_ids=[2],
-        ple_embed_dim=128,
-        layer_types=['linear_attention', 'full_attention'],
-        eos_token_id=127,
-        indexer_n_heads=2,
-        indexer_head_dim=128,
-        indexer_compress_ratio=4,
-        indexer_budget=16,
-    )
+    config = tiny_training_config()
     (tmp_path / 'config.json').write_text(json.dumps(config))
     cfg = MegatronLiteConfig(
         model_name='qwen3_8_flash_next',
