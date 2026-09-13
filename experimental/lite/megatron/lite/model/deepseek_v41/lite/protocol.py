@@ -15,10 +15,7 @@ from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.ckpt.hf_weights import (
-    DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
-    allgather_concat,
-)
+from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -450,40 +447,12 @@ def _single(chunks):
     return chunks[0]
 
 
-def export_hf_weights(
-    chunks,
-    model_cfg,
-    ps,
-    *,
-    export_dtype=None,
-    cpu=False,
-    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
-):
-    yield from export_checkpoint(
-        _single(chunks),
-        export_dtype=export_dtype,
-        cpu=cpu,
-        buffer_max_size_bytes=buffer_max_size_bytes,
-    )
+def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    yield from export_checkpoint(_single(chunks), **kwargs)
 
 
-def save_hf_weights(
-    chunks,
-    path,
-    model_cfg,
-    ps,
-    *,
-    export_dtype=None,
-    cpu=True,
-    buffer_max_size_bytes=None
-):
-    save_model(
-        _single(chunks),
-        path,
-        export_dtype=export_dtype,
-        cpu=cpu,
-        buffer_max_size_bytes=buffer_max_size_bytes,
-    )
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    save_model(_single(chunks), path, **kwargs)
 
 
 def vocab_size(model_cfg):
