@@ -281,7 +281,7 @@ def test_environment_survives_restricted_reference_loading(monkeypatch, tmp_path
     monkeypatch.setitem(sys.modules, 'transformer_engine', te)
     monkeypatch.setitem(sys.modules, gdn.__name__, gdn)
     monkeypatch.setattr(torch.cuda, 'get_device_name', lambda: 'NVIDIA H100 80GB HBM3')
-    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda: (9, 0))
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda device=None: (9, 0))
     for key in os.environ:
         if key.startswith(('NVTE_', 'MEGATRON_LITE_', 'MLITE_', 'FLA_', 'CUBLAS_')):
             monkeypatch.delenv(key)
