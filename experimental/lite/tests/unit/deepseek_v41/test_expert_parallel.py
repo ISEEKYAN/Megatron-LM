@@ -72,6 +72,12 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
         errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
         for step in range(2):
             records.clear()
+            # Step 0 leaves one receiving rank empty; step 1 exercises both
+            # owners while leaving one expert empty on each rank.
+            for bundle in (serial, parallel):
+                for layer in bundle.chunks[0].layers:
+                    layer.ffn.gate.bias.fill_(-100)
+                    layer.ffn.gate.bias[[0, 1 if step == 0 else 2]] = 100
             batches = []
             for other_rank in range(2):
                 ids = torch.arange(1 + step, 5 + step + other_rank * 2, device=rank)
@@ -98,7 +104,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                 )
                 if bundle.finalize_grads is not None:
                     bundle.finalize_grads()
-            _diagnose_expert_wgrad(records, reference, rank)
+            _finalize_reference_expert_wgrad(records, reference, rank)
             diagnostics = {}
             serial_parameters = dict(reference.named_parameters())
             for name, parameter in model.named_parameters():
@@ -133,6 +139,17 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                     torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0, msg=name)
             assert serial.optimizer.step()[0]
             assert parallel.optimizer.step()[0]
+            changed = next(
+                (
+                    name
+                    for name, parameter in model.named_parameters()
+                    if not torch.equal(parameter, serial_parameters[name])
+                ),
+                None,
+            )
+            failures = [None, None]
+            dist.all_gather_object(failures, changed)
+            assert not any(failures), f'EP_PARAMETER_PARITY: {failures}'
             for name, p in model.named_parameters():
                 q = serial_parameters[name]
                 torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
@@ -266,7 +283,14 @@ def _capture_expert_linear_inputs(model, records):
             module.register_forward_hook(partial(capture, name))
 
 
-def _diagnose_expert_wgrad(records, reference, rank):
+def _finalize_reference_expert_wgrad(records, reference, rank):
+    """Independent serial autograd supplies expert inputs and output gradients.
+
+    EP concatenates source tokens before the weight GEMM. Match that reduction
+    order in this oracle, while retaining the serial global-batch objective.
+    Never use the parallel model's tensors or gradients as reference values.
+    """
+    parameters = dict(reference.named_parameters())
     summary = {
         'fp32_partition_difference': 0.0,
         'fp64_partition_difference': 0.0,
@@ -287,9 +311,81 @@ def _diagnose_expert_wgrad(records, reference, rank):
                 else 'fp64_partition_difference'
             )
             summary[key] = max(summary[key], float((joined - split).abs().max()))
+            if dtype == torch.float32:
+                torch.testing.assert_close(
+                    parameters[name].grad,
+                    split,
+                    atol=0,
+                    rtol=0,
+                    msg='SERIAL_EXPERT_AUTOGRAD_RECONSTRUCTION:' + name,
+                )
+                parameters[name].grad = parameters[name].main_grad = joined
             if dtype == torch.float64:
+                torch.testing.assert_close(
+                    joined.float(),
+                    split.float(),
+                    atol=0,
+                    rtol=0,
+                    msg='EXPERT_FP64_REDUCTION_ROUNDED_TO_MASTER:' + name,
+                )
                 summary['fp64_rounded_fp32_difference'] = max(
                     summary['fp64_rounded_fp32_difference'],
                     float((joined.float() - split.float()).abs().max()),
                 )
     print(f'EP_WGRAD_PRECISION rank={rank}: {json.dumps(summary)}', flush=True)
+
+
+def _missing_ep_peer_worker(rank, directory):
+    from megatron.lite.primitive.modules import dispatcher as dispatch_module
+    from megatron.lite.primitive.modules import ep_participation
+    from megatron.lite.primitive.parallel.state import init_parallel
+
+    torch.cuda.set_device(rank)
+    dist.init_process_group(
+        'nccl',
+        init_method=(Path(directory) / 'rendezvous').as_uri(),
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=30),
+    )
+    try:
+        ps = init_parallel(ParallelConfig(ep=2))
+        dispatcher = dispatch_module.TokenDispatcher(4, 2, ps, use_deepep=False)
+        ep_participation._TIMEOUT = 0.5
+        dist.barrier()
+        failure = None
+        if rank == 0:
+
+            def transport(*args, **kwargs):
+                raise AssertionError('EP_MISSING_PEER_REACHED_TRANSPORT')
+
+            dispatch_module.dist.all_gather_into_tensor = transport
+            try:
+                dispatcher.dispatch(
+                    torch.ones(1, 2, device=rank),
+                    torch.ones(1, 1, device=rank),
+                    torch.zeros(1, 1, device=rank, dtype=torch.long),
+                )
+            except RuntimeError as error:
+                if not (
+                    'EP participation failed before dispatch.metadata' in str(error)
+                    and 'expected participants=2 actual=1' in str(error)
+                ):
+                    failure = str(error)
+            except AssertionError as error:
+                failure = str(error)
+            else:
+                failure = 'EP_MISSING_PEER_DID_NOT_RAISE'
+        failures = [None, None]
+        dist.all_gather_object(failures, failure)
+        assert not any(failures), f'EP_MISSING_PEER_CONTRACT: {failures}'
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpus(2)
+def test_native_ep_missing_peer_fails_before_transport(tmp_path):
+    assert (
+        torch.cuda.device_count() >= 2
+    ), 'EP participation requires two allocated GPUs'
+    mp.spawn(_missing_ep_peer_worker, args=(str(tmp_path),), nprocs=2, join=True)
