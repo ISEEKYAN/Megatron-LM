@@ -8,9 +8,17 @@ from functools import partial
 
 import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v4.lite import protocol as v4_protocol
+from megatron.lite.model.protocol_utils import (
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
+    pack_routed_experts as _pack_routed_experts,
+)
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
+from megatron.lite.primitive.ckpt.hf_weights import (
+    DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    allgather_concat,
+)
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -39,9 +47,14 @@ class ImplConfig:
     enable_dspark_execution: bool = False
 
 
-build_model_config = partial(
-    v4_protocol.build_model_config, config_type=DeepseekV41Config, allow_overrides=False
-)
+def build_model_config(source, **overrides):
+    if overrides:
+        raise ValueError('Apply overrides to the explicit nested source config')
+    return (
+        DeepseekV41Config(source)
+        if isinstance(source, dict)
+        else DeepseekV41Config.from_hf(source)
+    )
 
 
 def build_model(model_cfg, *, impl_cfg):
@@ -426,17 +439,50 @@ def unpack_forward_output(model, batch, output):
     return output
 
 
-load_hf_weights = partial(
-    v4_protocol.load_hf_weights, loader=load_model, model_only=True
-)
-export_hf_weights = partial(
-    v4_protocol.export_hf_weights, exporter=export_checkpoint, model_only=True
-)
+def load_hf_weights(chunk, hf_path, model_cfg, ps):
+    if hf_path:
+        load_model(chunk, hf_path)
 
 
-def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
-    v4_protocol.save_hf_weights(
-        chunks, path, model_cfg, ps, saver=save_model, model_only=True, **kwargs
+def _single(chunks):
+    if len(chunks) != 1:
+        raise NotImplementedError('Single-rank V4.1 export requires one chunk')
+    return chunks[0]
+
+
+def export_hf_weights(
+    chunks,
+    model_cfg,
+    ps,
+    *,
+    export_dtype=None,
+    cpu=False,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+):
+    yield from export_checkpoint(
+        _single(chunks),
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
+    )
+
+
+def save_hf_weights(
+    chunks,
+    path,
+    model_cfg,
+    ps,
+    *,
+    export_dtype=None,
+    cpu=True,
+    buffer_max_size_bytes=None
+):
+    save_model(
+        _single(chunks),
+        path,
+        export_dtype=export_dtype,
+        cpu=cpu,
+        buffer_max_size_bytes=buffer_max_size_bytes,
     )
 
 
@@ -444,9 +490,16 @@ def vocab_size(model_cfg):
     return model_cfg.to_hf_dict()['text_config']['vocab_size']
 
 
-# V4 retains TE-aligned padding; V4.1 uses the contiguous THD layout.
-pack_routed_experts = partial(v4_protocol.pack_routed_experts, contiguous_padding=True)
-pack_r3_replay_mask = partial(v4_protocol.pack_r3_replay_mask, contiguous_padding=True)
+def pack_routed_experts(model, batch, routed_experts):
+    """Use shared THD padding followed by contiguous CP and then TP slicing."""
+    return _pack_routed_experts(
+        model, batch, routed_experts, contiguous=True, contiguous_padding=True
+    )
+
+
+def pack_r3_replay_mask(model, batch):
+    """Keep the causal replay mask in exactly the same token layout as routes."""
+    return _pack_r3_replay_mask(model, batch, contiguous=True, contiguous_padding=True)
 
 
 def router_replay_roots(chunk):
