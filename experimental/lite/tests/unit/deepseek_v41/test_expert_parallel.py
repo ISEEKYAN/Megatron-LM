@@ -160,13 +160,13 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                     replicas = [torch.empty_like(p) for _ in range(2)]
                     dist.all_gather(replicas, p)
                     torch.testing.assert_close(*replicas, atol=0, rtol=0, msg=name)
-            for block, reference in zip(
+            for block, reference_block in zip(
                 parallel.chunks[0].layers, serial.chunks[0].layers
             ):
                 for name in ('bias', 'bias_vl'):
                     torch.testing.assert_close(
                         getattr(block.ffn.gate, name),
-                        getattr(reference.ffn.gate, name),
+                        getattr(reference_block.ffn.gate, name),
                         atol=0,
                         rtol=0,
                     )
@@ -389,3 +389,64 @@ def test_native_ep_missing_peer_fails_before_transport(tmp_path):
         torch.cuda.device_count() >= 2
     ), 'EP participation requires two allocated GPUs'
     mp.spawn(_missing_ep_peer_worker, args=(str(tmp_path),), nprocs=2, join=True)
+
+
+def _expert_replica_group_worker(rank, config, directory):
+    torch.cuda.set_device(rank)
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        'nccl',
+        init_method=(Path(directory) / 'rendezvous').as_uri(),
+        rank=rank,
+        world_size=4,
+        timeout=timedelta(seconds=60),
+    )
+    try:
+        bundle = protocol.build_model(
+            config,
+            impl_cfg=protocol.ImplConfig(
+                parallel=ParallelConfig(ep=2),
+                device=f'cuda:{rank}',
+                dtype=torch.float32,
+                quantized=False,
+                token_map=list(range(256)),
+                optimizer='muon',
+                optimizer_config=OptimizerConfig(0.0001, 5, 'quintic'),
+            ),
+        )
+        ps, optimizer = bundle.parallel_state, bundle.optimizer
+        assert ps.dp_size == 4 and ps.ep_size == 2 and ps.expert_dp_size == 2
+        assert dist.get_process_group_ranks(ps.dp_group) == [0, 1, 2, 3]
+        assert dist.get_process_group_ranks(ps.ep_dp_group) == [rank % 2, rank % 2 + 2]
+        dense = bundle.chunks[0].embed.weight
+        expert = optimizer.expert_parameters[0]
+        dense.grad = dense.main_grad = torch.zeros_like(dense)
+        expert.grad = expert.main_grad = torch.zeros_like(expert)
+        dense.grad.flatten()[0] = 3
+        expert.grad.flatten()[0] = (1 if rank % 2 == 0 else 3) * (4 if rank < 2 else 12)
+        bundle.finalize_grads()
+        expected = torch.zeros_like(expert)
+        expected.flatten()[0] = 4 if rank % 2 == 0 else 12
+        correct = torch.tensor(int(torch.equal(expert.grad, expected)), device=rank)
+        dist.all_reduce(correct, op=dist.ReduceOp.MIN)
+        assert (
+            correct.item()
+        ), 'EP_REPLICA_REDUCTION_USES_MATCHING_EXPERTS_AND_DENSE_SCALE'
+        assert float(dense.grad.flatten()[0]) == 3, 'EP_FINALIZE_MUST_NOT_RESCALE_DENSE'
+        norm = optimizer._grad_norm([dense, expert], [dense.grad, expert.grad])
+        assert float(norm) == 13.0, 'EP_REPLICA_NORM_COUNTS_UNIQUE_OWNERS'
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.gpus(4)
+def test_ep_matching_expert_replica_groups(model_config, tmp_path):
+    assert (
+        torch.cuda.device_count() >= 4
+    ), 'EP replica groups require four allocated GPUs'
+    mp.spawn(
+        _expert_replica_group_worker,
+        args=(model_config, str(tmp_path)),
+        nprocs=4,
+        join=True,
+    )
