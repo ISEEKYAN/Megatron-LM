@@ -29,6 +29,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--reference', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--checkpoint', action='store_true')
     args = parser.parse_args()
     world = int(os.environ['WORLD_SIZE'])
     rank = int(os.environ['RANK'])
@@ -187,6 +188,10 @@ def main():
             'calls': dict(calls),
         }
         records.append(record)
+        if args.checkpoint and step == 1:
+            runtime.save_checkpoint(
+                handle, str(args.output / 'checkpoint'), step=2, save_rng=False
+            )
         traces = {}
         if reference is not None:
             torch.save(record, args.output / f'step{step}-rank{rank}.pt')
@@ -235,6 +240,35 @@ def main():
         'EP_ALLTOALL_NOT_EXECUTED',
         calls,
     )
+    if args.checkpoint:
+        restored_step = runtime.load_checkpoint(
+            handle, str(args.output / 'checkpoint'), load_rng=False
+        )
+        assert restored_step == 2, ('EP_CHECKPOINT_STEP', restored_step)
+        for name, value in state().items():
+            assert torch.equal(value, records[1]['state'][name]), (
+                'EP_CHECKPOINT_RESTORE',
+                name,
+            )
+        losses = []
+        runtime.zero_grad(handle)
+        runtime.forward_backward(
+            handle, batches, loss_fn, num_microbatches=len(batches)
+        )
+        restored_gradients = reduced_gradients(handle._model, model)
+        success, norm, _ = runtime.optimizer_step(handle)
+        assert success
+        for name, value in state().items():
+            assert torch.equal(value, records[2]['state'][name]), (
+                'EP_CHECKPOINT_CONTINUATION',
+                name,
+            )
+        for name, value in restored_gradients.items():
+            assert torch.equal(value, records[2]['gradients'][name]), (
+                'EP_CHECKPOINT_GRADIENT',
+                name,
+            )
+        print('QWEN38_SAME_EP_CHECKPOINT_CONTINUITY_OK', world, rank, flush=True)
     result = {'initial': initial, 'steps': records}
     torch.save(result, args.output / f'result-rank{rank}.pt')
     assert not any(loss or grads or params for _, loss, grads, params in mismatches), (
