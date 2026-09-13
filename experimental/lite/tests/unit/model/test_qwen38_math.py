@@ -234,6 +234,9 @@ def test_canonical_hash_and_owner_boundary():
         process_group=None, device='cpu', dtype=torch.float32
     )
     torch.testing.assert_close(table(torch.tensor([1])), table.weight[1:2])
+    table.lookup = object()
+    with expect_guard('ROW_LOOKUP_GATHER_ROWS_REQUIRED'):
+        table(torch.tensor([1]))
     seen = []
 
     def gather(values, ids):
