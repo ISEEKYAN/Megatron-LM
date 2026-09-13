@@ -11,10 +11,6 @@ from pathlib import Path
 from types import MappingProxyType
 
 import torch
-from megatron.lite.model.deepseek_v4.lite.checkpoint import (
-    DeepseekV4WeightSpec,
-    _map_block_attr,
-)
 from megatron.lite.primitive.ckpt.hf_weights import (
     DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
     _resolve_export_dtype,
@@ -25,21 +21,6 @@ from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 from safetensors import SafetensorError, safe_open
 
 _CHUNK = 8 * 1024 * 1024
-
-
-def _release_names(name, config):
-    # V4.1 keeps unfused projections and global expert/layer IDs. Reuse V4's
-    # release spelling for the shifted HC owners and nested router projection.
-    del config
-    for side in ('attn', 'ffn'):
-        marker = f'.{side}_mixes.'
-        if marker in name:
-            prefix, attr = name.split(marker)
-            return [f"{prefix}.{_map_block_attr(f'{side}_hc.{attr}', 'layers')}"]
-    if '.ffn.gate.router.gate.' in name:
-        prefix, attr = name.split('.ffn.gate.router.gate.')
-        return [f"{prefix}.{_map_block_attr(f'mlp.gate.gate.{attr}', 'layers')}"]
-    return [name.replace('.engram.embed.master', '.engram.embed.weight')]
 
 
 def validate_execution(*, enable_dspark_execution: bool = False) -> None:
