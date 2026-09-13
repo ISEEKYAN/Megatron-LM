@@ -40,10 +40,12 @@ def is_expert_param(name):
 def parameter_placements(name):
     from torch.distributed.tensor import Replicate, Shard
 
+    from .tp import projection_shard
+
     # Match the existing Qwen3.5 GroupedLinear owner layout. weightN denotes
     # a local expert: these checkpoints currently require the same EP size.
     return [
-        Replicate(),
+        Shard(0) if projection_shard(name) else Replicate(),
         Replicate(),
         Shard(0) if is_expert_param(name) else Replicate(),
         Replicate(),

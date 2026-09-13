@@ -4,6 +4,8 @@
 Layer order and GDN normalization follow NVIDIA-NeMo/Automodel #3690,
 5cfe13b160eb7e23ac5a4868bbf611707cdf98fb (fetched 2026-09-13).
 """
+from copy import copy
+
 import torch
 from megatron.lite.model.qwen3_5.lite.model import MoELayer
 from megatron.lite.primitive.modules.gated_delta_net import GatedDeltaNet
@@ -131,19 +133,21 @@ class Qwen38Layer(nn.Module):
 class Qwen38Model(nn.Module):
     def __init__(self, config, ps, *, ngram_primes=None, fuse_wgrad_accumulation=False):
         super().__init__()
-        if any(
-            getattr(ps, k) != 1 for k in ('tp_size', 'etp_size', 'cp_size', 'pp_size')
-        ):
+        if any(getattr(ps, k) != 1 for k in ('etp_size', 'cp_size', 'pp_size')):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
         if config.tie_word_embeddings or not config.norm_topk_prob:
             raise ValueError('QWEN38_RELEASE_TIED_OR_ROUTER_CONTRACT')
         self.config, self.ps = config, ps
+        # Replicated consumers see complete projection outputs. Preserve EP/EDP
+        # groups; dense projections below own the actual TP group.
+        consumer_ps = copy(ps)
+        consumer_ps.tp_size, consumer_ps.tp_rank, consumer_ps.tp_group = 1, 0, None
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
                 Qwen38Layer(
                     config,
-                    ps,
+                    consumer_ps,
                     i,
                     ngram_primes=ngram_primes,
                     fuse_wgrad_accumulation=fuse_wgrad_accumulation,
@@ -159,6 +163,10 @@ class Qwen38Model(nn.Module):
             write=False,
         )
         self.lm_head = nn.Linear(config.hidden_size, config.vocab_size, bias=False)
+        if ps.tp_size > 1:
+            from .tp import parallelize_projections
+
+            parallelize_projections(self, ps)
 
     def forward(self, input_ids, *, labels=None, cu_seqlens=None, position_ids=None):
         c = self.config
