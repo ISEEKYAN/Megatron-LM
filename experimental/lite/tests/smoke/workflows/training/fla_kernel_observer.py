@@ -32,7 +32,7 @@ class FLAKernelObserver:
                     options={"num_warps": 8, "num_stages": 3, "enable_fp_fusion": True},
                 )
                 rows = int(args[4])
-                result = binary[((rows + 31) // 32,)](
+                result = binary[((rows + 31) // 32, 1, 1)](
                     *args[:5],
                     constants["D"],
                     constants["BD"],
