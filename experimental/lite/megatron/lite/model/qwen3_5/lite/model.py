@@ -188,6 +188,7 @@ class MoELayer(nn.Module):
         preserve_3d_graph: bool = False,
         shared_expert_plain_te: bool = False,
         moe_permute_fusion: bool | None = None,
+        fuse_wgrad_accumulation: bool = False,
     ):
         super().__init__()
         if fp8:
@@ -199,7 +200,10 @@ class MoELayer(nn.Module):
             compute_aux_loss=True,
             router_dtype=router_dtype,
         )
-        self.experts = Experts(config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute)
+        self.experts = Experts(
+            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+        )
         self.dispatcher = TokenDispatcher(
             config.num_experts,
             config.hidden_size,

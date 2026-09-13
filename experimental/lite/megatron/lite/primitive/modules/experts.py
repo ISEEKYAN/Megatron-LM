@@ -77,6 +77,7 @@ class Experts(nn.Module):
         *,
         fp8: bool = False,
         moe_act_recompute: bool = False,
+        fuse_wgrad_accumulation: bool = False,
         lora_config: LoraConfig | dict | None = None,
     ):
         super().__init__()
@@ -91,6 +92,7 @@ class Experts(nn.Module):
             config.moe_intermediate_size * 2 // ps.etp_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
         self.fc2 = te.GroupedLinear(
             self.num_local_experts,
@@ -98,6 +100,7 @@ class Experts(nn.Module):
             config.hidden_size,
             bias=False,
             params_dtype=torch.bfloat16,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None

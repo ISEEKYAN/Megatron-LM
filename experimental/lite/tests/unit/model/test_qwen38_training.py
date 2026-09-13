@@ -245,16 +245,6 @@ def test_native_runtime_trains_all_decoder_branches(
         )
     ]
     gradients = set()
-    hooks = []
-    for name, param in model.named_parameters():
-        if param.requires_grad:
-
-            def capture(grad, name=name):
-                assert torch.isfinite(grad).all(), name
-                if grad.float().norm() > 0:
-                    gradients.update(key for key in required if key in name)
-
-            hooks.append(param.register_hook(capture))
     before = model.layers[1].ple.ple_embedding.ngram_embedding.weight.detach().clone()
     ids = torch.arange(64, device='cuda') % 32
     batch = PackedBatch(ids, ids.clone(), torch.tensor([64], device='cuda'))
@@ -280,38 +270,44 @@ def test_native_runtime_trains_all_decoder_branches(
         losses.append(float(out['loss'].detach()))
         return out['loss'], {}
 
-    try:
-        for _ in range(12):
-            runtime.zero_grad(handle)
-            runtime.forward_backward(handle, [batch], loss_fn)
-            success, norm, _ = runtime.optimizer_step(handle)
-            assert success and 0 < norm < float('inf')
-        assert all(torch.isfinite(torch.tensor(losses)))
-        assert losses[-1] < losses[0] * 0.9, losses
-        assert gradients == set(required), sorted(set(required) - gradients)
-        assert not torch.equal(
-            before, model.layers[1].ple.ple_embedding.ngram_embedding.weight
-        )
-        assert all(
-            p.grad is None for p in model.layers[1].self_attn.indexer.parameters()
-        )
-        torch.save(model.state_dict(), tmp_path / 'model.pt')
-        expected = model.lm_head.weight.detach().clone()
-        with torch.no_grad():
-            model.lm_head.weight.zero_()
-        model.load_state_dict(torch.load(tmp_path / 'model.pt', weights_only=True))
-        assert torch.equal(expected, model.lm_head.weight)
-        print(
-            'QWEN38_STAGE1_LOSSES',
-            losses,
-            'GRADIENT_BRANCHES',
-            sorted(gradients),
-            'GDN_BACKENDS',
-            backends,
-        )
-    finally:
-        for hook in hooks:
-            hook.remove()
+    for _ in range(12):
+        runtime.zero_grad(handle)
+        runtime.forward_backward(handle, [batch], loss_fn)
+        for name, param in model.named_parameters():
+            if not param.requires_grad:
+                continue
+            grad = param.main_grad
+            assert grad.dtype == torch.float32 and torch.isfinite(grad).all(), name
+            if grad.norm() > 0:
+                gradients.update(key for key in required if key in name)
+            if '.experts.' in name:
+                assert not torch.equal(grad, grad.bfloat16().float()), (
+                    'EXPERT_WGRAD_BF16_TRUNCATED',
+                    name,
+                )
+        success, norm, _ = runtime.optimizer_step(handle)
+        assert success and 0 < norm < float('inf')
+    assert all(torch.isfinite(torch.tensor(losses)))
+    assert losses[-1] < losses[0] * 0.9, losses
+    assert gradients == set(required), sorted(set(required) - gradients)
+    assert not torch.equal(
+        before, model.layers[1].ple.ple_embedding.ngram_embedding.weight
+    )
+    assert all(p.grad is None for p in model.layers[1].self_attn.indexer.parameters())
+    torch.save(model.state_dict(), tmp_path / 'model.pt')
+    expected = model.lm_head.weight.detach().clone()
+    with torch.no_grad():
+        model.lm_head.weight.zero_()
+    model.load_state_dict(torch.load(tmp_path / 'model.pt', weights_only=True))
+    assert torch.equal(expected, model.lm_head.weight)
+    print(
+        'QWEN38_STAGE1_LOSSES',
+        losses,
+        'GRADIENT_BRANCHES',
+        sorted(gradients),
+        'GDN_BACKENDS',
+        backends,
+    )
 
 
 def test_runtime_checkpoint_uses_expert_placements():
@@ -325,3 +321,81 @@ def test_runtime_checkpoint_uses_expert_placements():
     )
     assert places is protocol.parameter_placements
     assert classifier is protocol.is_expert_param
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_experts_select_native_fp32_wgrad(
+    transformer_engine_import_stub, monkeypatch, enabled
+):
+    transformer_engine_import_stub()
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.modules import experts
+
+    calls = []
+
+    def grouped(*args, **kwargs):
+        calls.append(kwargs.get('fuse_wgrad_accumulation', False))
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(experts.te, 'GroupedLinear', grouped)
+    ps = SimpleNamespace(ep_size=2, etp_size=1, tp_size=1)
+    kwargs = {'fuse_wgrad_accumulation': True} if enabled else {}
+    experts.Experts(SimpleNamespace(**tiny_training_config()), ps, **kwargs)
+    assert calls == [enabled, enabled]
+
+
+@pytest.mark.parametrize('optimizer, expected', [(None, False), ('dist_opt', True)])
+def test_protocol_selects_wgrad_only_with_main_grad_owner(
+    transformer_engine_import_stub, monkeypatch, optimizer, expected
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_8_flash_next import model, protocol
+
+    monkeypatch.setattr(protocol, 'init_parallel', lambda _: object())
+
+    class StopAfterConstruction(Exception):
+        pass
+
+    def construct(*args, **kwargs):
+        assert kwargs['fuse_wgrad_accumulation'] is expected
+        raise StopAfterConstruction
+
+    monkeypatch.setattr(model, 'Qwen38Model', construct)
+    with pytest.raises(StopAfterConstruction):
+        protocol.build_model(
+            protocol.build_model_config(tiny_training_config()),
+            impl_cfg=protocol.ImplConfig(optimizer=optimizer),
+        )
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+def test_qwen35_moe_preserves_default_wgrad_mode(
+    transformer_engine_import_stub, monkeypatch, enabled
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_5.lite import model
+
+    seen = []
+
+    def experts(*args, **kwargs):
+        seen.append(kwargs['fuse_wgrad_accumulation'])
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(model, 'Experts', experts)
+    monkeypatch.setattr(model, 'TopKRouter', lambda *a, **kw: torch.nn.Identity())
+    monkeypatch.setattr(model, 'TokenDispatcher', lambda *a, **kw: object())
+    monkeypatch.setattr(model, 'SharedExpert', lambda *a, **kw: torch.nn.Identity())
+    from types import SimpleNamespace
+
+    kwargs = {'fuse_wgrad_accumulation': True} if enabled else {}
+    model.MoELayer(
+        SimpleNamespace(**tiny_training_config()),
+        object(),
+        use_deepep=False,
+        router_bias_rate=0.0,
+        fp8=False,
+        moe_act_recompute=False,
+        **kwargs,
+    )
+    assert seen == [enabled]

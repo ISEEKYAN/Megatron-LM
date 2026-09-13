@@ -98,7 +98,15 @@ def build_model(model_cfg, *, impl_cfg):
         model_cfg.router_aux_loss_coef = impl_cfg.router_aux_loss_coef
     ps = init_parallel(impl_cfg.parallel)
     chunks = [
-        Qwen38Model(model_cfg, ps, ngram_primes=impl_cfg.ngram_primes)
+        # MCore TEGroupedLinear, nv/dev 0cd11658f4435, fetched
+        # 2026-09-13T11:11:23Z: use native FP32 wgrad accumulation only
+        # when dist_opt supplies main_grad; BF16-then-cast loses cancellation.
+        Qwen38Model(
+            model_cfg,
+            ps,
+            ngram_primes=impl_cfg.ngram_primes,
+            fuse_wgrad_accumulation=impl_cfg.optimizer == 'dist_opt',
+        )
         .to(torch.bfloat16)
         .cuda()
     ]

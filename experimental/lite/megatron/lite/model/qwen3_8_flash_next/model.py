@@ -52,7 +52,9 @@ class Qwen38GatedDeltaNet(GatedDeltaNet):
 
 
 class Qwen38Layer(nn.Module):
-    def __init__(self, config, ps, layer_idx, *, ngram_primes=None):
+    def __init__(
+        self, config, ps, layer_idx, *, ngram_primes=None, fuse_wgrad_accumulation=False
+    ):
         super().__init__()
         c = config
         self.linear_attn = (
@@ -71,6 +73,7 @@ class Qwen38Layer(nn.Module):
             fp8=False,
             moe_act_recompute=False,
             router_dtype=torch.float32,
+            fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
         self.attn_hyper_connection = HyperConnection(
             c.hidden_size, c.hc_count, c.hc_lowrank, c.rms_norm_eps
@@ -126,7 +129,7 @@ class Qwen38Layer(nn.Module):
 
 
 class Qwen38Model(nn.Module):
-    def __init__(self, config, ps, *, ngram_primes=None):
+    def __init__(self, config, ps, *, ngram_primes=None, fuse_wgrad_accumulation=False):
         super().__init__()
         if any(
             getattr(ps, k) != 1 for k in ('tp_size', 'etp_size', 'cp_size', 'pp_size')
@@ -138,7 +141,13 @@ class Qwen38Model(nn.Module):
         self.embed_tokens = nn.Embedding(config.vocab_size, config.hidden_size)
         self.layers = nn.ModuleList(
             [
-                Qwen38Layer(config, ps, i, ngram_primes=ngram_primes)
+                Qwen38Layer(
+                    config,
+                    ps,
+                    i,
+                    ngram_primes=ngram_primes,
+                    fuse_wgrad_accumulation=fuse_wgrad_accumulation,
+                )
                 for i in range(config.num_hidden_layers)
             ]
         )
