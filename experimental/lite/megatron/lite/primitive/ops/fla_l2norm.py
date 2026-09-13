@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fixed execution policy for the original FLA L2Norm kernels.
 
-The policy is code-versioned, not benchmark-selected or environment-dependent.
+The policy is code-versioned; runtime benchmarks never select it.
 Changing it changes numerical execution and requires a new policy version.
 Policy v2 selects the measured stable BT8/w8 small-feature configuration.
 The large-feature branch retains four warps. Other FLA operators are outside
