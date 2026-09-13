@@ -26,9 +26,11 @@ def build_model_config(source, **overrides):
     config = (
         dict(source) if isinstance(source, dict) else load_hf_config_dict(str(source))
     )
-    text = dict(config.get('text_config', config))
-    text.update(overrides)
-    return Qwen3_8_FlashNextTextConfig.from_hf_dict(text)
+    if 'text_config' in config:
+        config['text_config'] = {**config['text_config'], **overrides}
+    else:
+        config.update(overrides)
+    return Qwen3_8_FlashNextTextConfig.from_hf_dict(config)
 
 
 def is_expert_param(name):
@@ -44,9 +46,19 @@ def _forward_step(model, batch):
     )
     labels = None
     if batch.labels is not None:
-        labels = torch.cat(
-            [part.roll(-1) for part in batch.labels.flatten().split(lengths)]
-        ).reshape(1, -1)
+        targets = []
+        masks = (
+            [None] * len(lengths)
+            if batch.loss_mask is None
+            else batch.loss_mask.flatten().split(lengths)
+        )
+        for part, mask in zip(batch.labels.flatten().split(lengths), masks):
+            target = part.roll(-1)
+            if mask is not None:
+                target = target.masked_fill(~mask.roll(-1).bool(), -100)
+            target[-1] = -100
+            targets.append(target)
+        labels = torch.cat(targets).reshape(1, -1)
     return model(
         input_ids=batch.input_ids.reshape(1, -1),
         labels=labels,

@@ -14,6 +14,19 @@ def test_training_runtime_is_registered():
     )
 
 
+def test_protocol_preserves_wrapped_config_metadata():
+    from megatron.lite.model.qwen3_8_flash_next.protocol import build_model_config
+
+    source = {
+        'model_type': 'qwen4_exp',
+        'text_config': {},
+        'vision_config': {'depth': 27},
+    }
+    config = build_model_config(source, num_hidden_layers=2)
+    assert config.num_hidden_layers == 2 and config.vision_config == {'depth': 27}
+    assert source['text_config'] == {}
+
+
 def test_owner_table_lookup_accumulates_duplicate_gradients():
     table = Qwen3_8_FlashNextEngramTableConfig(4, 2).build(
         process_group=None, device='cpu', dtype=torch.float32
@@ -31,12 +44,38 @@ def test_owner_table_lookup_accumulates_duplicate_gradients():
     )
 
 
+def test_protocol_next_token_targets_stop_at_document_boundaries():
+    from megatron.lite.model.qwen3_8_flash_next.protocol import _forward_step
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    ids = torch.tensor([1, 2, 3, 4, 5])
+    batch = PackedBatch(
+        ids, ids, torch.tensor([3, 2]), loss_mask=torch.tensor([1, 1, 0, 1, 1])
+    )
+    captured = _forward_step(lambda **kwargs: kwargs, batch)
+    assert captured['labels'].tolist() == [[2, -100, -100, 5, -100]]
+
+
 @pytest.mark.gpu
-def test_native_runtime_trains_all_decoder_branches(tmp_path):
+def test_native_runtime_trains_all_decoder_branches(tmp_path, monkeypatch):
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
+    from megatron.lite.primitive.modules import gated_delta_net as gdn_primitive
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
     from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch
+
+    torch.manual_seed(1234)
+    backends = {}
+    for name in ('torch_chunk_gated_delta_rule', '_fla_chunk_gated_delta_rule'):
+        if not hasattr(gdn_primitive, name):
+            continue
+        original = getattr(gdn_primitive, name)
+
+        def counted(*args, original=original, name=name, **kwargs):
+            backends[name] = backends.get(name, 0) + 1
+            return original(*args, **kwargs)
+
+        monkeypatch.setattr(gdn_primitive, name, counted)
 
     config = dict(
         model_type='qwen4_exp_text',
@@ -117,17 +156,22 @@ def test_native_runtime_trains_all_decoder_branches(tmp_path):
         atol=0.01,
     )
     required = [
-        'linear_attn.in_proj',
-        'linear_attn.norm',
-        'self_attn.q_proj',
-        'attn_hyper_connection',
-        'mlp_hyper_connection',
+        'layers.0.linear_attn.in_proj',
+        'layers.0.linear_attn.norm',
+        'layers.1.self_attn.q_proj',
         'hyper_connection_mixer',
-        'ple.ple_embedding',
-        'ple.conv1d',
-        'mlp.experts',
-        'mlp.router',
-        'mlp.shared_expert',
+        'layers.1.ple.ple_embedding',
+        'layers.1.ple.conv1d',
+    ] + [
+        f'layers.{i}.{branch}'
+        for i in range(2)
+        for branch in (
+            'attn_hyper_connection',
+            'mlp_hyper_connection',
+            'mlp.experts',
+            'mlp.router',
+            'mlp.shared_expert',
+        )
     ]
     gradients = set()
     hooks = []
@@ -146,6 +190,22 @@ def test_native_runtime_trains_all_decoder_branches(tmp_path):
     losses = []
 
     def loss_fn(out, batch):
+        if not losses:
+            pending, visited, leaves = [out['loss'].grad_fn], set(), set()
+            while pending:
+                node = pending.pop()
+                if node is None or node in visited:
+                    continue
+                visited.add(node)
+                if hasattr(node, 'variable'):
+                    leaves.add(id(node.variable))
+                pending.extend(edge[0] for edge in node.next_functions)
+            missing = [
+                name
+                for name, param in model.named_parameters()
+                if param.requires_grad and id(param) not in leaves
+            ]
+            assert not missing, ('TRAINING_GRAPH_MISSING_PARAMETERS', missing)
         losses.append(float(out['loss'].detach()))
         return out['loss'], {}
 
@@ -170,7 +230,14 @@ def test_native_runtime_trains_all_decoder_branches(tmp_path):
             model.lm_head.weight.zero_()
         model.load_state_dict(torch.load(tmp_path / 'model.pt', weights_only=True))
         assert torch.equal(expected, model.lm_head.weight)
-        print('QWEN38_STAGE1_LOSSES', losses, 'GRADIENT_BRANCHES', sorted(gradients))
+        print(
+            'QWEN38_STAGE1_LOSSES',
+            losses,
+            'GRADIENT_BRANCHES',
+            sorted(gradients),
+            'GDN_BACKENDS',
+            backends,
+        )
     finally:
         for hook in hooks:
             hook.remove()
