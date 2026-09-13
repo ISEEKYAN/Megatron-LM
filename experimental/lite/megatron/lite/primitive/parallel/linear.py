@@ -8,10 +8,8 @@ from typing import TYPE_CHECKING
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.utils import ensure_divisible
-
 
 if TYPE_CHECKING:
     from megatron.lite.primitive.parallel.state import ParallelState
