@@ -5,7 +5,7 @@ import pytest
 import torch
 from megatron.lite.model.deepseek_v41.lite import attention as attn
 from megatron.lite.model.deepseek_v41.lite import block as hc
-from megatron.lite.model.deepseek_v41.lite import candidates
+from megatron.lite.primitive.modules import csa2 as candidates
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])

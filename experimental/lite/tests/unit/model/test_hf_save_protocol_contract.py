@@ -330,7 +330,7 @@ def test_v41_conversion_copy_obeys_buffer_budget(
 def test_v41_export_preserves_encoded_engram(tmp_path, transformer_engine_import_stub):
     transformer_engine_import_stub()
     from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.model.deepseek_v41.lite.engram import EngramTable
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
     model, _, _ = _v41_export_model(tmp_path)
     weight = (

@@ -319,7 +319,7 @@ def export_model(model):
     plain-export contract requires. Frozen Engram tables retain FP8 row storage.
     This is a lossless training export, not a quantized deployment conversion.
     """
-    from .engram import EngramTable
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
     if model.local_layer_range != (0, len(model.layers)):
         raise NotImplementedError(
@@ -464,7 +464,7 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
 @torch.no_grad()
 def load_model(model, path):
     """Bind every header before loading any live tensor, retaining archive bytes."""
-    from .engram import EngramTable
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
     path = Path(path)
     if json.loads((path / 'config.json').read_text()) != model.config.to_hf_dict():

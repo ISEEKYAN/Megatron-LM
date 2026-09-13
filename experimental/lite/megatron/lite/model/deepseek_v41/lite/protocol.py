@@ -96,8 +96,9 @@ def build_model(model_cfg, *, impl_cfg):
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
         )
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
+
     from .attention import Linear
-    from .engram import EngramTable
 
     optimizing = impl_cfg.optimizer == 'muon'
     if optimizing and impl_cfg.device == 'meta':

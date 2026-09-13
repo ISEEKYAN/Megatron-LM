@@ -12,18 +12,58 @@ from functools import partial
 from types import SimpleNamespace
 
 import torch
+from megatron.lite.primitive.modules.engram_lookup import (
+    Engram,
+    EngramTable,
+    NgramHash,
+    hash_multipliers,
+    prime_buckets,
+)
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
+from megatron.lite.primitive.modules.router_replay import PackedRouterReplay
+from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 from torch import nn
 from torch.nn import functional as F
 
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import validate_execution
-from .engram import Engram, EngramTable, NgramHash, hash_multipliers, prime_buckets
 from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
-from .packing import packed_forward
 from .vision import Aligner, ViT
+
+
+def packed_forward(
+    sequence_forward, hidden, pre_mix, cu_seqlens, *, input_ids=None, image_mask=None
+):
+    """Run a pure sequence callable over each logical sample, preserving its graph.
+
+    The callable returns (hidden, next_pre_mix), creates a fresh AttentionState
+    per invocation, and keeps bias/statistic publication outside forward. RNG is
+    consumed in sequence order, exactly as for independent calls. This is a
+    correctness path, not fused packed attention or distributed CP transport.
+    """
+    if hidden.ndim != 4 or hidden.shape[0] != 1 or pre_mix.shape != hidden.shape[:-1]:
+        raise ValueError("Expected packed hidden [1,T,HC,D] and pre_mix [1,T,HC]")
+    for tensor in (input_ids, image_mask):
+        if tensor is not None and tensor.shape != hidden.shape[:2]:
+            raise ValueError("Token inputs must match packed [1,T] dimensions")
+    outputs, mixes = [], []
+    replay = PackedRouterReplay(hidden.shape[1])
+    for begin, end in packed_sequence_ranges(cu_seqlens, hidden.shape[1]):
+        kwargs = {}
+        if input_ids is not None:
+            kwargs['input_ids'] = input_ids[:, begin:end]
+        if image_mask is not None:
+            kwargs['image_mask'] = image_mask[:, begin:end]
+        with replay.sequence(begin, end):
+            h, p = sequence_forward(
+                hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
+            )
+        outputs.append(h)
+        mixes.append(p)
+    replay.finish()
+    return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
 
 
 @dataclass(frozen=True)
@@ -265,6 +305,7 @@ class DeepseekV41Model(nn.Module):
             'norm': Rule('weight', 'norm'),
             'head': Rule('weight', 'head'),
             'layers.*.attn.wq_b': Rule('weight', 'wq_b', fp8, heads),
+            'layers.*.attn.indexer.wq_b': Rule('weight', 'indexer', fp8, index_heads),
             'layers.*.attn': Rule('attn_sink', 'attention_sink'),
             'layers.*.ffn.gate': Rule('bias bias_vl', 'router_bias'),
             'layers.*.ffn.gate.router.gate': Rule(
@@ -288,16 +329,12 @@ class DeepseekV41Model(nn.Module):
         )
         for role, names in (
             ('compressor', 'wkv norm wgate'),
-            ('indexer', 'wq_b weights_proj wk k_norm'),
+            ('indexer', 'weights_proj wk k_norm'),
         ):
-            for n in names.split():
-                indexed = role == 'indexer' and n == 'wq_b'
-                rules[f'layers.*.attn.{role}.{n}'] = Rule(
-                    'weight',
-                    role,
-                    fp8 if indexed else None,
-                    index_heads if indexed else None,
-                )
+            rules.update(
+                (f'layers.*.attn.{role}.{n}', Rule('weight', role))
+                for n in names.split()
+            )
         for side in ('attn', 'ffn'):
             rules[f'layers.*.{side}_norm'] = Rule('weight', 'norm')
             rules[f'layers.*.{side}_mixes'] = Rule(
@@ -443,6 +480,15 @@ class DeepseekV41Model(nn.Module):
             modality_loads,
         )[:2]
 
+    @staticmethod
+    def _validate_input_ids(input_ids):
+        if (
+            input_ids.ndim != 2
+            or input_ids.dtype != torch.int64
+            or not input_ids.shape[1]
+        ):
+            raise ValueError('Expected nonempty int64 input_ids [B,S]')
+
     def forward_pipeline_range(
         self, input_ids, *, start, end, payload=None, owners=(-1, -1)
     ):
@@ -463,12 +509,7 @@ class DeepseekV41Model(nn.Module):
         local_start, local_end = self.local_layer_range
         if not local_start <= start < end <= local_end:
             raise ValueError('Requested range is outside this pipeline stage')
-        if (
-            input_ids.ndim != 2
-            or input_ids.dtype != torch.int64
-            or not input_ids.shape[1]
-        ):
-            raise ValueError('Expected nonempty int64 input_ids [B,S]')
+        self._validate_input_ids(input_ids)
         if start == 0:
             if payload is not None or owners != (-1, -1):
                 raise ValueError('First pipeline range must start with fresh state')
@@ -516,12 +557,7 @@ class DeepseekV41Model(nn.Module):
     def forward(self, input_ids, *, cu_seqlens=None, images=None, token_types=None):
         if self.local_layer_range != (0, len(self.layers)):
             raise RuntimeError('A local pipeline stage requires the range protocol')
-        if (
-            input_ids.ndim != 2
-            or input_ids.dtype != torch.int64
-            or not input_ids.shape[1]
-        ):
-            raise ValueError('Expected nonempty int64 input_ids [B,S]')
+        self._validate_input_ids(input_ids)
         embeddings = self.embed(input_ids)
         if hasattr(self, 'residual_dtype'):
             embeddings = embeddings.to(self.residual_dtype)
@@ -556,19 +592,9 @@ class DeepseekV41Model(nn.Module):
         hidden, pre = expand_hc(embeddings, self.hc_mult)
         loads = [[] for _ in self.layers]
         sequence = partial(self._sequence, modality_loads=loads)
-        if cu_seqlens is None:
-            hidden, pre = sequence(
-                hidden, pre, input_ids=input_ids, image_mask=image_mask
-            )
-        else:
-            hidden, pre = packed_forward(
-                sequence,
-                hidden,
-                pre,
-                cu_seqlens,
-                input_ids=input_ids,
-                image_mask=image_mask,
-            )
+        if cu_seqlens is not None:
+            sequence = partial(packed_forward, sequence, cu_seqlens=cu_seqlens)
+        hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
         hidden = self.norm(contract_hc(hidden, pre))
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.
