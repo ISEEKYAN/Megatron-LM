@@ -52,8 +52,38 @@ The two-GPU regression preserves all 40 layers with reduced dimensions in the
 floating diagnostic mode. It checks two optimizer steps, unequal token counts,
 replica equality, and comparison with a single-process global batch. This does
 not establish full-size or native quantized training support. `build_model` still
-rejects PP > 1 (and TP/EP/CP/VPP); local pipeline range helpers are not a supported
+rejects PP > 1 (and TP/CP/VPP/ETP); local pipeline range helpers are not a supported
 PP runtime.
+
+
+## Expert parallel text training
+Set `ImplConfig(parallel=ParallelConfig(ep=2), optimizer="muon", ...)` after
+initializing the distributed world. Each rank allocates only its contiguous
+expert interval; module names retain global expert indices. Both EP=1 and EP>1
+use the shared `TokenDispatcher`. This assembly selects native all-to-all;
+the primitive also retains its DeepEP transport and participation checks.
+Native checks use `ep_group`; DeepEP checks use its buffer's `tp_ep_group`.
+Empty expert chunks preserve dispatch autograd edges and every rank participates
+in both forward and backward collectives.
+
+Dense parameters use DDP. Expert gradients sum only over replicas of the same
+expert and use the dense DP loss scale. The clipping norm counts each dense
+parameter once plus all expert shards; nonfinite gradients and failed optimizer
+candidates prevent publication on every rank. Invoke the bundle's
+`finalize_grads` after the microbatch loop and before the optimizer step, as the
+MLite runtime does.
+
+The EP regression uses an independent serial global batch and exact comparisons.
+Serial autograd supplies each expert projection's inputs and output gradients;
+the reference concatenates them in source-token order before its weight-gradient
+GEMM, matching the EP reduction order. It first reconstructs the unmodified
+serial gradients exactly. This avoids comparing separately rounded microbatch
+GEMMs with one combined GEMM. FP64 accumulation diagnostics retain their raw
+residuals and also check exact agreement after rounding to FP32 masters.
+The test alternates an empty receiving rank with active experts on both ranks,
+and independently checks nonfinite-gradient skips, candidate rejection, missing
+participants, and EP2 with two replicas per expert. These are reduced-dimension
+floating tests, not full-size native-quantized or combined TP/CP/PP validation.
 
 
 ## Weight export

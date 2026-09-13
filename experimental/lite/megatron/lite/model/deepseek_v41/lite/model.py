@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Single-rank text assembly with explicit live tensor and archival owners.
+"""Text assembly with local expert shards and explicit archival owners.
 
 Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
