@@ -312,3 +312,16 @@ def test_native_runtime_trains_all_decoder_branches(
     finally:
         for hook in hooks:
             hook.remove()
+
+
+def test_runtime_checkpoint_uses_expert_placements():
+    from types import SimpleNamespace
+
+    from megatron.lite.model.qwen3_8_flash_next import protocol
+    from megatron.lite.runtime.backends.mlite.runtime import _checkpoint_hooks
+
+    places, classifier = _checkpoint_hooks(
+        SimpleNamespace(_extras={'protocol': protocol})
+    )
+    assert places is protocol.parameter_placements
+    assert classifier is protocol.is_expert_param

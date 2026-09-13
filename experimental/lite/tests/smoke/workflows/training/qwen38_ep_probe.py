@@ -78,7 +78,7 @@ def main():
     local_experts = 4 // world
 
     def global_name(name):
-        if '.experts.' not in name:
+        if '.experts.' not in name or name.endswith('._extra_state'):
             return name
         match = re.fullmatch(r'(.*\.fc[12]\.weight)([0-9]+)', name)
         assert match, ('EP_UNKNOWN_EXPERT_PARAMETER', name)

@@ -50,6 +50,10 @@ def parameter_placements(name):
     ]
 
 
+PLACEMENT_FN = parameter_placements
+EXPERT_CLASSIFIER = is_expert_param
+
+
 def _forward_step(model, batch):
     lengths = batch.seq_lens.tolist()
     cu = torch.tensor(
