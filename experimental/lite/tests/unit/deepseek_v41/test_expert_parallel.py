@@ -461,3 +461,20 @@ def test_ep_size_requires_a_positive_integer(moe, model_config, ep):
                 device='meta', quantized=False, parallel=ParallelConfig(ep=ep)
             ),
         )
+
+
+def test_empty_expert_preserves_residual_dtype_and_backward(moe, model_config):
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    model = DeepseekV41Model(model_config, quantized=False, token_map=list(range(256)))
+    ffn = model.layers[0].ffn
+    ffn.gate.bias.fill_(-100)
+    ffn.gate.bias[:2] = 100
+    x = torch.randn(4, 32, dtype=torch.bfloat16, requires_grad=True)
+    output = ffn(x)
+    assert output.dtype == x.dtype, 'EP_EMPTY_EXPERT_MUST_PRESERVE_RESIDUAL_DTYPE'
+    output.float().square().sum().backward()
+    assert x.grad is not None and torch.isfinite(x.grad).all()
+    assert all(
+        p.grad is None for expert in ffn.experts[2:] for p in expert.parameters()
+    )

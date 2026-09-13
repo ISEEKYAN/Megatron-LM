@@ -148,7 +148,7 @@ class DeepseekV41MoE(nn.Module):
             values.append(
                 expert(tokens, weights=probs[:, None])
                 if tokens.shape[0]
-                else tokens * probs[:, None]
+                else (tokens * probs[:, None]).to(tokens.dtype)
             )
         output = self.dispatcher.combine(torch.cat(values))
         if self.shared_experts is not None:
