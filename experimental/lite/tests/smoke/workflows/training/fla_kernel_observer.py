@@ -1,9 +1,9 @@
 """Observe compiled FLA launches in Slurm probes; optional real arithmetic fault."""
 
 import triton
-from triton.compiler import ASTSource
 from fla.modules.l2norm import l2norm_fwd_kernel
 from torch._inductor.runtime.triton_heuristics import CachingAutotuner
+from triton.compiler import ASTSource
 
 
 class FLAKernelObserver:
@@ -33,11 +33,7 @@ class FLAKernelObserver:
                 )
                 rows = int(args[4])
                 result = binary[((rows + 31) // 32, 1, 1)](
-                    *args[:5],
-                    constants["D"],
-                    constants["BD"],
-                    constants["NB"],
-                    32,
+                    *args[:5], constants["D"], constants["BD"], constants["NB"], 32
                 )
             else:
                 result = observer.original(kernel, *args, **kwargs)

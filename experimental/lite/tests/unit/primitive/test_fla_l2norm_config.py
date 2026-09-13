@@ -3,8 +3,9 @@ import torch
 
 
 def test_fla_l2norm_fixed_policy_is_serializable():
-    from megatron.lite.primitive.ops import fla_l2norm
     import json
+
+    from megatron.lite.primitive.ops import fla_l2norm
 
     policy = fla_l2norm.kernel_policy()
     assert json.loads(json.dumps(policy)) == policy

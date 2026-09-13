@@ -11,13 +11,13 @@ from __future__ import annotations
 import torch
 
 try:
-    from fla.utils import input_guard
     from fla.modules.l2norm import (
         l2norm_bwd_kernel,
         l2norm_bwd_kernel1,
         l2norm_fwd_kernel,
         l2norm_fwd_kernel1,
     )
+    from fla.utils import input_guard
 
     # Unwrap only autotuning; retain the upstream JIT functions and arithmetic.
     _FWD, _BWD = l2norm_fwd_kernel.fn, l2norm_bwd_kernel.fn

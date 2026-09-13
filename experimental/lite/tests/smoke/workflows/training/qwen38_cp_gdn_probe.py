@@ -11,15 +11,15 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from fla_kernel_observer import FLAKernelObserver
-from megatron.lite.primitive.ops.fla_l2norm import (
-    kernel_policy,
-    assert_kernel_configs_match,
-)
-from megatron.lite.primitive.parallel.linear import ColumnParallelLinear
 from megatron.lite.model.qwen3_8_flash_next.config import Qwen3_8_FlashNextTextConfig
 from megatron.lite.model.qwen3_8_flash_next.model import Qwen38GatedDeltaNet
 from megatron.lite.primitive.modules import gated_delta_net as shared
+from megatron.lite.primitive.ops.fla_l2norm import (
+    assert_kernel_configs_match,
+    kernel_policy,
+)
 from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.primitive.parallel.linear import ColumnParallelLinear
 from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 from megatron.lite.runtime.contracts import ParallelConfig
 
@@ -53,19 +53,19 @@ def main():
     reference = torch.load(args.reference, weights_only=True) if world > 1 else None
     run_id = os.environ['QWEN_CP_RUN_ID']
     if reference is not None:
-        assert reference['world'] == 1 and reference['run_id'] == run_id, (
-            'CP_GDN_SINGLE_PROCESS_REFERENCE'
-        )
+        assert (
+            reference['world'] == 1 and reference['run_id'] == run_id
+        ), 'CP_GDN_SINGLE_PROCESS_REFERENCE'
         model.load_state_dict(reference['initial'])
         initial = reference['initial']
     if args.restore is not None:
         saved = torch.load(args.restore / f'rank{rank}.pt', weights_only=True)
-        assert saved['kernel_policy'] == kernel_policy(), (
-            'FLA_L2NORM_CHECKPOINT_POLICY_CHANGED'
-        )
-        assert saved['world'] == world and saved['rank'] == rank, (
-            'CP_GDN_RESTORE_TOPOLOGY'
-        )
+        assert (
+            saved['kernel_policy'] == kernel_policy()
+        ), 'FLA_L2NORM_CHECKPOINT_POLICY_CHANGED'
+        assert (
+            saved['world'] == world and saved['rank'] == rank
+        ), 'CP_GDN_RESTORE_TOPOLOGY'
         model.load_state_dict(saved['initial'])
         initial = saved['initial']
     # Global physical length 16, real length 13; document 5..13 crosses CP boundary 8.
