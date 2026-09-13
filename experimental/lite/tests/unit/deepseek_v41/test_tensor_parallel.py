@@ -37,6 +37,17 @@ def test_tp_requires_initialized_world(moe, model_config):
         )
 
 
+def test_fp64_diagnostic_preserves_accumulation_before_fp32_publication():
+    from megatron.lite.primitive.modules.native_fp32_linear import native_fp32_linear
+
+    # Casting operands to FP32 before the reduction loses the middle term.
+    x = torch.tensor([[1e8], [1.0], [-1e8]], dtype=torch.float64)
+    weight = torch.ones(1, 1, dtype=torch.float32, requires_grad=True)
+    native_fp32_linear(x, weight).sum().backward()
+    assert weight.grad.dtype == torch.float32
+    assert weight.grad.item() == 1.0, 'FP64_ACCUMULATION_BEFORE_FP32_PUBLICATION'
+
+
 def _worker(rank, config, directory, case, trainable=False):
     from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
@@ -60,6 +71,10 @@ def _worker(rank, config, directory, case, trainable=False):
     restored = (
         protocol.build_model(config, impl_cfg=impl) if case == 'training' else None
     )
+    # This sensitivity probe is separate from the untouched parity reference.
+    probe = protocol.build_model(config, impl_cfg=impl) if case == 'native' else None
+    if probe is not None:
+        probe.chunks[0].load_state_dict(serial.chunks[0].state_dict())
     if case == 'training':
         _full_precision_reference(serial.chunks[0])
     dist.init_process_group(
@@ -92,6 +107,18 @@ def _worker(rank, config, directory, case, trainable=False):
         assert (
             model.ps.tp_size == 2 and model.ps.dp_size == 1 and model.ps.etp_size == 1
         )
+        assert len(model.layers) == 40, 'TP_FULL_LAYER_CHAIN'
+        assert {block.attn.ratio for block in model.layers} == {
+            0,
+            1,
+            2,
+        }, 'TP_CSA2_THREE_MODES'
+        assert all(
+            not p.requires_grad
+            for block in model.layers
+            if block.attn.indexer is not None
+            for p in block.attn.indexer.parameters()
+        ), 'TP_INDEXER_MUST_REMAIN_FROZEN'
         print(
             f'TP_STORAGE rank={rank} local={local_count} serial={serial_count}',
             flush=True,
@@ -108,6 +135,7 @@ def _worker(rank, config, directory, case, trainable=False):
                 directory,
                 trainable,
                 exact=case == 'training',
+                probe=probe,
             )
     finally:
         dist.destroy_process_group()
@@ -171,7 +199,7 @@ def test_tp_training_and_checkpoint_roundtrip(model_config, tmp_path, trainable)
         )
 
 
-def _training(serial, parallel, restored, directory, trainable, *, exact):
+def _training(serial, parallel, restored, directory, trainable, *, exact, probe=None):
     from megatron.lite.primitive.parallel.matrix import slice_parameter
     from megatron.lite.primitive.train_step import run_microbatch_loop
     from megatron.lite.runtime.contracts import PackedBatch
@@ -190,7 +218,7 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
 
     for name in collectives:
         setattr(dist, name, count(name))
-    errors = []
+    errors, amplification = [], []
     for step in range(2):
         error = dict(logits=0.0, gradient=0.0, parameter=0.0)
         ids = torch.arange(1 + step, 9 + step, device=next(model.parameters()).device)
@@ -198,6 +226,22 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
         with torch.no_grad():
             expected = serial.forward_step(reference, batch)['logits']
             actual = parallel.forward_step(model, batch)['logits']
+            if probe is not None and step:
+                predicted = probe.forward_step(probe.chunks[0], batch)['logits']
+                amplification[-1].update(
+                    predicted_next_logits_delta=float(
+                        (predicted - expected).abs().max()
+                    ),
+                    measured_next_logits_delta=float((actual - expected).abs().max()),
+                    prediction_logits_residual=float((predicted - actual).abs().max()),
+                )
+                torch.testing.assert_close(
+                    predicted,
+                    actual,
+                    atol=0,
+                    rtol=0,
+                    msg='TP_UPDATE_AMPLIFICATION_LOGITS',
+                )
         assert actual.shape == expected.shape, 'TP_HEAD_MUST_GATHER_FULL_VOCAB'
         error['logits'] = float((actual - expected).abs().max())
         if exact:
@@ -213,10 +257,12 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
                 bundle.forward_step,
                 prepare_microbatches=bundle.extras['prepare_microbatches'],
             )
+        has_fp32_low_bits = False
         for name, p in model.named_parameters():
             q = reference_parameters[name]
             assert (p.grad is None) == (q.grad is None), 'TP_GRADIENT_PRESENCE:' + name
             if p.grad is not None:
+                has_fp32_low_bits |= not torch.equal(p.grad, p.grad.bfloat16().float())
                 assert p.grad.dtype == torch.float32 and torch.isfinite(p.grad).all(), (
                     'TP_NATIVE_FP32_MAIN_GRAD:' + name
                 )
@@ -232,8 +278,32 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
                         rtol=0,
                         msg=lambda detail: 'TP_GRADIENT_PARITY:' + name + '\n' + detail,
                     )
+        assert has_fp32_low_bits, 'TP_MAIN_GRAD_MUST_NOT_BE_UPCAST_BF16'
+        if probe is not None:
+            amplification.append(
+                _replay_gradient_perturbation(serial, parallel, probe, batch)
+            )
         assert serial.optimizer.step()[0]
         assert parallel.optimizer.step()[0]
+        if probe is not None:
+            assert probe.optimizer.step()[0]
+            predicted_parameters = dict(probe.chunks[0].named_parameters())
+            amplification[-1]['predicted_parameter_delta'] = max(
+                float((p - reference_parameters[name]).detach().abs().max())
+                for name, p in predicted_parameters.items()
+            )
+            residual = 0.0
+            for name, p in model.named_parameters():
+                predicted = slice_parameter(p, predicted_parameters[name])
+                residual = max(residual, float((p - predicted).detach().abs().max()))
+                torch.testing.assert_close(
+                    p,
+                    predicted,
+                    atol=0,
+                    rtol=0,
+                    msg='TP_UPDATE_AMPLIFICATION_PARAMETERS:' + name,
+                )
+            amplification[-1]['prediction_parameter_residual'] = residual
         for name, p in model.named_parameters():
             error['parameter'] = max(
                 error['parameter'],
@@ -253,6 +323,12 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
                     msg='TP_STEP_PARAMETER_PARITY:' + name,
                 )
         errors.append(error)
+        if probe is not None:
+            measured = torch.tensor(
+                error['parameter'], device=ids.device, dtype=torch.float64
+            )
+            dist.all_reduce(measured, op=dist.ReduceOp.MAX)
+            amplification[-1]['measured_parameter_delta'] = float(measured)
     print(
         f'TP_TRAINING trainable_engram={trainable} fp64_rounded_to_fp32={exact} errors={json.dumps(errors)}',
         flush=True,
@@ -261,8 +337,40 @@ def _training(serial, parallel, restored, directory, trainable, *, exact):
         setattr(dist, name, original)
     assert all(collectives.values()), 'TP_REAL_COLLECTIVES_REQUIRED'
     print('TP_COLLECTIVES ' + json.dumps(collectives), flush=True)
+    if probe is not None:
+        print('TP_UPDATE_AMPLIFICATION ' + json.dumps(amplification), flush=True)
     if exact:
         _roundtrip(serial, parallel, restored, directory)
+
+
+@torch.no_grad()
+def _replay_gradient_perturbation(serial, parallel, probe, batch):
+    """Measured-perturbation experiment, NOT the independent parity oracle.
+
+    Start from identical full matrices/state. Apply the measured gradient
+    perturbation to a separate serial optimizer; never copy TP updated weights.
+    Exact prediction residuals detect additional errors in clipping, momentum,
+    parameter publication or the next forward.
+    """
+    from megatron.lite.primitive.parallel.matrix import gather_parameter
+
+    probe.optimizer.zero_grad()
+    reference = dict(serial.chunks[0].named_parameters())
+    predicted = dict(probe.chunks[0].named_parameters())
+    gradient_delta = 0.0
+    for name, p in parallel.chunks[0].named_parameters():
+        if p.grad is None:
+            continue
+        measured = gather_parameter(p, parallel.parallel_state.tp_group, p.grad)
+        baseline = reference[name].grad
+        delta = measured.double() - baseline.double()
+        gradient_delta = max(gradient_delta, float(delta.abs().max()))
+        q = predicted[name]
+        q.grad = q.main_grad = (baseline.double() + delta).float()
+    # Routing statistics come from this full forward, never TP buffers.
+    output = probe.chunks[0](batch.input_ids[None], cu_seqlens=batch.cu_seqlens)
+    probe.optimizer.accumulate_modality_loads(output['modality_loads'])
+    return dict(gradient_input_delta=gradient_delta)
 
 
 def _projection_names(model):
@@ -345,14 +453,21 @@ def _roundtrip(serial, parallel, restored, directory):
     path = Path(directory) / 'tp-checkpoint'
     save_model(model, path)
     dist.barrier()
-    load_model(loaded, path)
+    try:
+        load_model(loaded, path)
+    except (ValueError, RuntimeError) as error:
+        raise AssertionError('TP_SAVE_TO_SERIAL_ROUNDTRIP') from error
     for name, value in reference.state_dict().items():
         actual = loaded.state_dict()[name]
         assert torch.equal(
-            value.contiguous().view(torch.uint8), actual.contiguous().view(torch.uint8)
+            value.contiguous().reshape(-1).view(torch.uint8),
+            actual.contiguous().reshape(-1).view(torch.uint8),
         ), ('TP_SAVE_TO_SERIAL_ROUNDTRIP:' + name)
     # Loading the same full checkpoint into TP applies precisely one slice.
-    load_model(model, path)
+    try:
+        load_model(model, path)
+    except (ValueError, RuntimeError) as error:
+        raise AssertionError('TP_CHECKPOINT_SINGLE_SLICE') from error
     expected = dict(reference.named_parameters())
     for name, parameter in model.named_parameters():
         torch.testing.assert_close(
