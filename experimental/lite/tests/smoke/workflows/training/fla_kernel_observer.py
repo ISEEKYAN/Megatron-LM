@@ -21,7 +21,7 @@ class FLAKernelObserver:
                 return observer.original(kernel, *args, **kwargs)
             meta = kernel.triton_meta
             if observer.mutate and name == "l2norm_fwd_kernel":
-                constants = dict(meta["constants"], BT=8)
+                constants = dict(meta["constants"], BT=32)
                 binary = triton.compile(
                     ASTSource(
                         l2norm_fwd_kernel.fn,
@@ -29,11 +29,11 @@ class FLAKernelObserver:
                         constexprs=constants,
                         attrs=meta["configs"][0],
                     ),
-                    options={"num_warps": 4, "num_stages": 3, "enable_fp_fusion": True},
+                    options={"num_warps": 8, "num_stages": 3, "enable_fp_fusion": True},
                 )
                 rows = int(args[4])
-                result = binary[((rows + 7) // 8, 1, 1)](
-                    *args[:5], constants["D"], constants["BD"], constants["NB"], 8
+                result = binary[((rows + 31) // 32, 1, 1)](
+                    *args[:5], constants["D"], constants["BD"], constants["NB"], 32
                 )
             else:
                 result = observer.original(kernel, *args, **kwargs)

@@ -9,13 +9,7 @@ def test_fla_l2norm_fixed_policy_is_serializable():
 
     policy = fla_l2norm.kernel_policy()
     assert json.loads(json.dumps(policy)) == policy
-    assert policy == {
-        "version": 2,
-        "BT": 8,
-        "num_warps": 8,
-        "num_stages": 3,
-        "large_num_warps": 4,
-    }
+    assert policy == {"version": 1, "BT": 32, "num_warps": 4, "num_stages": 3}
 
 
 @pytest.mark.parametrize("width", [128, 1024])
@@ -50,9 +44,9 @@ def test_fla_l2norm_launches_original_kernels_with_fixed_options(monkeypatch, wi
         ["_FWD", "_BWD"] if width <= 512 else ["_FWD_LARGE", "_BWD_LARGE"]
     )
     for _, _, kw in calls:
-        assert (kw["num_warps"], kw["num_stages"]) == (8 if width <= 512 else 4, 3)
+        assert (kw["num_warps"], kw["num_stages"]) == (4, 3)
         if width <= 512:
-            assert kw["BT"] == 8
+            assert kw["BT"] == 32
 
 
 def test_actual_fla_kernel_configs_must_match_across_ranks():
@@ -63,13 +57,13 @@ def test_actual_fla_kernel_configs_must_match_across_ranks():
             "name": "l2norm_fwd_kernel",
             "shape": [32, 128],
             "dtype": "torch.bfloat16",
-            "config": {"BT": 8, "num_warps": w, "num_stages": 3},
+            "config": {"BT": 32, "num_warps": w, "num_stages": 3},
         }
 
-    assert_kernel_configs_match([[record(8)], [record(8)]])
+    assert_kernel_configs_match([[record(4)], [record(4)]])
     with pytest.raises(
         AssertionError, match="FLA_AUTOTUNE_WINNER_MUST_MATCH_ACROSS_RANKS"
     ):
         assert_kernel_configs_match([[record(4)], [record(8)]])
     with pytest.raises(AssertionError, match="FLA_L2NORM_PINNED_CONFIG_REQUIRED"):
-        assert_kernel_configs_match([[record(4)], [record(4)]])
+        assert_kernel_configs_match([[record(8)], [record(8)]])
