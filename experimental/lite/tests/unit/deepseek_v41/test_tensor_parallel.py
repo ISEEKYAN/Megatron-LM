@@ -218,6 +218,7 @@ def _training(serial, parallel, restored, directory, trainable):
         with torch.no_grad():
             expected = serial.forward_step(reference, batch)['logits']
             actual = parallel.forward_step(model, batch)['logits']
+        assert actual.shape == expected.shape, 'TP_HEAD_MUST_GATHER_FULL_VOCAB'
         torch.testing.assert_close(
             actual, expected, atol=0, rtol=0, msg='TP_LOGITS_PARITY'
         )

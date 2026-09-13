@@ -609,7 +609,7 @@ class DeepseekV41Model(nn.Module):
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.
         return {
-            'logits': F.linear(hidden.float(), self.head.weight.float()),
+            'logits': self.head(hidden.float()),
             'modality_loads': tuple(tuple(entries) for entries in loads),
         }
 
