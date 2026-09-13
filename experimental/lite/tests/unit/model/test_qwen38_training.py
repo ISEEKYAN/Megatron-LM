@@ -95,6 +95,27 @@ def test_native_runtime_trains_all_decoder_branches(tmp_path):
     runtime = MegatronLiteRuntime(str(tmp_path), cfg)
     handle = runtime.build_model()
     model = unwrap_model(handle._model)
+    gdn = model.layers[0].linear_attn
+    x = torch.linspace(-3, 4, 2 * 128, device='cuda', dtype=torch.bfloat16).reshape(
+        1, 2, 128
+    )
+    gate = torch.linspace(-2, 1, x.numel(), device='cuda', dtype=x.dtype).reshape_as(x)
+    expected_norm = x.float() * torch.rsqrt(
+        x.float().square().mean(-1, keepdim=True) + config.get('rms_norm_eps', 1e-6)
+    )
+    expected_norm = (
+        expected_norm * gdn.norm.weight.float() * gate.float().sigmoid()
+    ).to(x.dtype)
+    torch.testing.assert_close(
+        gdn._apply_gated_norm(x, gate).reshape_as(x), expected_norm, rtol=0, atol=0
+    )
+    projection = gdn.in_proj(x.transpose(0, 1)).transpose(0, 1)
+    torch.testing.assert_close(
+        projection,
+        torch.nn.functional.linear(x, gdn.in_proj.linear.weight),
+        rtol=0.01,
+        atol=0.01,
+    )
     required = [
         'linear_attn.in_proj',
         'linear_attn.norm',

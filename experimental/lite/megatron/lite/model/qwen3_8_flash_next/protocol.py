@@ -113,5 +113,9 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
         raise NotImplementedError('QWEN38_HF_WEIGHT_LOADING_NOT_VALIDATED')
 
 
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    raise NotImplementedError('QWEN38_HF_EXPORT_NOT_VALIDATED_USE_NATIVE_CHECKPOINT')
+
+
 def vocab_size(model_cfg):
     return model_cfg.vocab_size
