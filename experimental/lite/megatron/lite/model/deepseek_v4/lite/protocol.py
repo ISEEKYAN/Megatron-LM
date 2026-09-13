@@ -95,11 +95,19 @@ _MODEL_FORWARD_KEYS = (
 )
 
 
-def build_model_config(source: str | Path | dict, **overrides) -> DeepseekV4Config:
+def build_model_config(
+    source: str | Path | dict,
+    *,
+    config_type=DeepseekV4Config,
+    allow_overrides=True,
+    **overrides,
+):
+    if overrides and not allow_overrides:
+        raise ValueError("Apply overrides to the explicit nested source config")
     if isinstance(source, dict):
-        cfg = DeepseekV4Config._from_hf_dict(source)
+        cfg = config_type._from_hf_dict(source)
     else:
-        cfg = DeepseekV4Config.from_hf(str(source))
+        cfg = config_type.from_hf(str(source))
     for key, value in overrides.items():
         if hasattr(cfg, key):
             setattr(cfg, key, value)
@@ -271,7 +279,9 @@ def unpack_forward_output(model: nn.Module, batch: PackedBatch, output) -> Any:
     return unpack_thd_to_nested(output, meta, contiguous=True)
 
 
-def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
+def pack_routed_experts(
+    model: nn.Module, batch: PackedBatch, routed_experts, *, contiguous_padding=False
+):
     """Pack R3 routes using DS4's contiguous CP token layout.
 
     The current rollout configuration does not run MTP, so the route layer axis
@@ -279,13 +289,23 @@ def pack_routed_experts(model: nn.Module, batch: PackedBatch, routed_experts):
     speculative decoding, this assumption must be reevaluated.
     """
 
-    return _pack_routed_experts(model, batch, routed_experts, contiguous=True)
+    return _pack_routed_experts(
+        model,
+        batch,
+        routed_experts,
+        contiguous=True,
+        contiguous_padding=contiguous_padding,
+    )
 
 
-def pack_r3_replay_mask(model: nn.Module, batch: PackedBatch) -> torch.Tensor:
+def pack_r3_replay_mask(
+    model: nn.Module, batch: PackedBatch, *, contiguous_padding=False
+) -> torch.Tensor:
     """Pack the causal R3 mask using DS4's contiguous CP token layout."""
 
-    return _pack_r3_replay_mask(model, batch, contiguous=True)
+    return _pack_r3_replay_mask(
+        model, batch, contiguous=True, contiguous_padding=contiguous_padding
+    )
 
 
 def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None:
@@ -492,24 +512,51 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     )
 
 
+def _single(chunks):
+    if len(chunks) != 1:
+        raise NotImplementedError('Single-rank export requires one chunk')
+    return chunks[0]
+
+
 def load_hf_weights(
-    chunk: nn.Module, hf_path: str, model_cfg: DeepseekV4Config, ps: ParallelState
+    chunk: nn.Module,
+    hf_path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    *,
+    loader=None,
+    model_only=False,
 ) -> None:
     if not hf_path:
         return
-    _load_hf_weights_impl(chunk, hf_path, model_cfg, ps)
+    (loader or _load_hf_weights_impl)(chunk, hf_path, *(() if model_only else (model_cfg, ps)))
 
 
 def export_hf_weights(
-    chunks: list[nn.Module], model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    *,
+    exporter=None,
+    model_only=False,
+    **kwargs,
 ):
-    yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
+    args = (_single(chunks),) if model_only else (chunks, model_cfg, ps)
+    yield from (exporter or _export_hf_weights_impl)(*args, **kwargs)
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    *,
+    saver=None,
+    model_only=False,
+    **kwargs,
 ) -> None:
-    _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
+    args = (_single(chunks), path) if model_only else (chunks, path, model_cfg, ps)
+    (saver or _save_hf_weights_impl)(*args, **kwargs)
 
 
 def vocab_size(model_cfg: DeepseekV4Config) -> int | None:

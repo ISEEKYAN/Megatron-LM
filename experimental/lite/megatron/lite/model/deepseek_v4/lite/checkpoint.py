@@ -253,8 +253,11 @@ class DeepseekV4WeightSpec:
     )
     _FP32_HF_INFIXES: tuple[str, ...] = ("hc_head_", ".hc_attn_", ".hc_ffn_")
 
-    def __init__(self, config: DeepseekV4Config):
+    def __init__(
+        self, config: DeepseekV4Config, *, name_mapper=_hf_names_for_state_key
+    ):
         self.config = config
+        self.name_mapper = name_mapper
 
     def hf_export_dtype_override(self, hf_name: str) -> torch.dtype | None:
         """Return an explicit export dtype for ``hf_name``, or ``None`` when
@@ -298,7 +301,7 @@ class DeepseekV4WeightSpec:
                 continue
             global_name = to_global_layer_name(name, layer_map)
             mapped_name = _to_global_expert_name(global_name, self.config, ps)
-            hf_names = _hf_names_for_state_key(mapped_name, self.config)
+            hf_names = self.name_mapper(mapped_name, self.config)
             if hf_names:
                 weight_map[mapped_name] = hf_names
         return weight_map
@@ -314,7 +317,7 @@ class DeepseekV4WeightSpec:
     ) -> torch.Size:
         del source_index
         if (
-            len(_hf_names_for_state_key(native_name, self.config)) == 2
+            len(self.name_mapper(native_name, self.config)) == 2
             and target_shape
             and target_shape[0] % 2 == 0
         ):
@@ -341,7 +344,7 @@ class DeepseekV4WeightSpec:
     ) -> list[tuple[str, torch.Tensor]]:
         # ``native_name`` is the global native name; experts already carry the
         # global expert id (shared exporter rewrote weight<local> -> weight<gid>).
-        hf_names = _hf_names_for_state_key(native_name, self.config)
+        hf_names = self.name_mapper(native_name, self.config)
         if not hf_names:
             return []
         if len(hf_names) == 1:

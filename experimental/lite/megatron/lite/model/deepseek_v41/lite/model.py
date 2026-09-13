@@ -5,7 +5,6 @@ Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
-from collections import namedtuple
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from functools import partial
@@ -29,7 +28,7 @@ from torch.nn import functional as F
 
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
-from .checkpoint import validate_execution
+from .checkpoint import DeepseekV4WeightSpec, _release_names, validate_execution
 from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
 from .vision import Aligner, ViT
@@ -96,11 +95,6 @@ class DeferredModule(nn.Module):
         raise NotImplementedError(
             f'{self.scope} execution is not implemented in text-only mode'
         )
-
-
-Rule = namedtuple(
-    'Rule', 'attributes role encoding shape key', defaults=(None, None, None)
-)
 
 
 # Attention state -> PP carrier; native shapes and frozen selection are preserved.
@@ -305,88 +299,87 @@ class DeepseekV41Model(nn.Module):
         )
 
     def _bind_table(self, t):
-        # Checkpoint patterns bind objects; optimizer routes independently audit
-        # actual owners and logical matrix shapes, never release-name prefixes.
-        fp8 = 'F8_E4M3'
-        heads = (t.num_attention_heads, t.head_dim, t.q_lora_rank)
-        index_heads = (t.index_n_heads, t.index_head_dim, t.q_lora_rank)
-        rules = {
-            'embed': Rule('weight', 'embedding'),
-            'norm': Rule('weight', 'norm'),
-            'head': Rule('weight', 'head'),
-            'layers.*.attn.wq_b': Rule('weight', 'wq_b', fp8, heads),
-            'layers.*.attn.indexer.wq_b': Rule('weight', 'indexer', fp8, index_heads),
-            'layers.*.attn': Rule('attn_sink', 'attention_sink'),
-            'layers.*.ffn.gate': Rule('bias bias_vl', 'router_bias'),
-            'layers.*.ffn.gate.router.gate': Rule(
-                'weight', 'router', key='{grandparent}.{a}'
+        # Match explicit owner attributes before mapping native names to release
+        # keys. Unlisted parameters must still fail the exact-coverage audit.
+        policies = {
+            ('embedding', None): 'embed.weight',
+            ('head', None): 'head.weight',
+            (
+                'norm',
+                None,
+            ): 'norm.weight layers.*.attn_norm.weight layers.*.ffn_norm.weight layers.*.attn.q_norm.weight layers.*.attn.kv_norm.weight',
+            ('wq_b', 'F8_E4M3'): 'layers.*.attn.wq_b.weight',
+            ('attention_sink', None): 'layers.*.attn.attn_sink',
+            ('router_bias', None): 'layers.*.ffn.gate.bias layers.*.ffn.gate.bias_vl',
+            ('router', None): 'layers.*.ffn.gate.router.gate.weight',
+            ('expert', 'I8'): 'layers.*.ffn.experts.*.w[123].weight',
+            ('shared_expert', 'F8_E4M3'): 'layers.*.ffn.shared_experts.w[123].weight',
+            ('engram_projection', 'F8_E4M3'): 'layers.*.engram.wkv.weight',
+            ('engram_norm', None): 'layers.*.engram.q_weight layers.*.engram.k_weight',
+            (
+                'engram_table',
+                'F8_E4M3',
+            ): 'layers.*.engram.embed.weight layers.*.engram.embed.master',
+            ('scale', 'F8_E8M0'): 'layers.*.engram.embed.scale',
+            ('image_delimiter', None): 'image_start image_end image_newline',
+            ('hyper_connection', None): ' '.join(
+                f'layers.*.{side}_mixes.{attr}'
+                for side in ('attn', 'ffn') for attr in ('fn', 'base', 'scale')
             ),
-            'layers.*.ffn.experts.*.w[123]': Rule('weight', 'expert', 'I8'),
-            'layers.*.ffn.shared_experts.w[123]': Rule('weight', 'shared_expert', fp8),
-            'layers.*.engram.wkv': Rule('weight', 'engram_projection', fp8),
-            'layers.*.engram': Rule('q_weight k_weight', 'engram_norm'),
-            'layers.*.engram.embed': Rule('scale', 'scale', 'F8_E8M0'),
-            '': Rule(
-                'image_start image_end image_newline', 'image_delimiter', key='{a}'
-            ),
+            (
+                'compressor',
+                None,
+            ): 'layers.*.attn.compressor.wkv.weight layers.*.attn.compressor.norm.weight layers.*.attn.compressor.wgate.weight',
+            (
+                'indexer',
+                None,
+            ): 'layers.*.attn.indexer.weights_proj.weight layers.*.attn.indexer.wk.weight layers.*.attn.indexer.k_norm.weight',
+            ('indexer', 'F8_E4M3'): 'layers.*.attn.indexer.wq_b.weight',
         }
-        rules.update(
-            (f'layers.*.attn.{n}', Rule('weight', n, fp8))
-            for n in ('wq_a', 'wkv', 'wo_a', 'wo_b')
+        policies.update(
+            ((name, 'F8_E4M3'), f'layers.*.attn.{name}.weight')
+            for name in ('wq_a', 'wkv', 'wo_a', 'wo_b')
         )
-        rules.update(
-            (f'layers.*.attn.{n}_norm', Rule('weight', 'norm')) for n in ('q', 'kv')
-        )
-        for role, names in (
-            ('compressor', 'wkv norm wgate'),
-            ('indexer', 'weights_proj wk k_norm'),
-        ):
-            rules.update(
-                (f'layers.*.attn.{role}.{n}', Rule('weight', role))
-                for n in names.split()
-            )
-        for side in ('attn', 'ffn'):
-            rules[f'layers.*.{side}_norm'] = Rule('weight', 'norm')
-            rules[f'layers.*.{side}_mixes'] = Rule(
-                'fn base scale', 'hyper_connection', key='{parent}.hc_' + side + '_{a}'
-            )
+        spec = DeepseekV4WeightSpec(t, name_mapper=_release_names)
         for path, owner in self.named_modules():
-            entries = [
-                rule for pattern, rule in rules.items() if fnmatchcase(path, pattern)
-            ]
+            tensors = dict(owner.named_parameters(recurse=False))
+            if isinstance(owner, ModalityRouter):
+                tensors.update(bias=owner.bias, bias_vl=owner.bias_vl)
             if isinstance(owner, EngramTable):
                 attribute = 'weight' if owner.master is None else 'master'
-                entries.append(
-                    Rule(attribute, 'engram_table', fp8, key='{module}.weight')
-                )
-            if path.split('.')[0] in ('vision', 'aligner'):
-                entries.append(
-                    Rule(
-                        ' '.join(dict(owner.named_parameters(recurse=False))),
-                        path.split('.')[0],
+                tensors = {attribute: getattr(owner, attribute), 'scale': owner.scale}
+            for attribute, tensor in tensors.items():
+                native_name = f'{path}.{attribute}' if path else attribute
+                matches = [
+                    (role, encoding)
+                    for (role, encoding), patterns in policies.items()
+                    if any(
+                        fnmatchcase(native_name, pattern)
+                        for pattern in patterns.split()
                     )
-                )
-            for attributes, role, encoding, shape, key in entries:
-                for attribute in attributes.split():
-                    tensor = getattr(owner, attribute, None)
-                    if tensor is None:
-                        continue
-                    name = (key or '{module}.{a}').format(
-                        module=path,
-                        a=attribute,
-                        parent=path.rsplit('.', 1)[0],
-                        grandparent=path.rsplit('.', 2)[0],
-                    )
-                    axes = tuple(tensor.shape) if shape is None else shape
-                    self._bind(
-                        name,
-                        owner,
-                        attribute,
-                        role,
-                        None if shape is None else shape[0],
-                        encoding,
-                        axes,
-                    )
+                ]
+                if path.split('.')[0] in ('vision', 'aligner'):
+                    matches.append((path.split('.')[0], None))
+                for role, encoding in matches:
+                    shape = None
+                    if path.endswith('.wq_b'):
+                        shape = (
+                            (t.index_n_heads, t.index_head_dim, t.q_lora_rank)
+                            if role == 'indexer'
+                            else (t.num_attention_heads, t.head_dim, t.q_lora_rank)
+                        )
+                    for name, value in spec.native_to_hf(native_name, tensor):
+                        if value is not tensor:
+                            raise ValueError('V4.1 bindings require an unfused owner')
+                        self._bind(
+                            name,
+                            owner,
+                            attribute,
+                            role,
+                            None if shape is None else shape[0],
+                            encoding,
+                            tuple(tensor.shape) if shape is None else shape,
+                        )
 
     @staticmethod
     def _archive_keys(t):
