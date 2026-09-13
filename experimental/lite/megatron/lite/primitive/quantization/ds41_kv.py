@@ -5,13 +5,13 @@ from dataclasses import dataclass
 
 import torch
 
+from .mxfp4 import e2m1_round_index
+
 
 def _quantize_nibbles(values):
     """Official PTX cvt.rn E2M1; ModelOpt's weight codec uses different ties."""
     magnitude = values.abs()
-    index = torch.zeros_like(magnitude, dtype=torch.uint8)
-    for boundary in (0.25, 0.75, 1.25, 1.75, 2.5, 3.5, 5.0):
-        index += (magnitude > boundary).to(torch.uint8)
+    index = e2m1_round_index(magnitude).to(torch.uint8)
     for boundary in (0.75, 1.75, 3.5):
         index += (magnitude == boundary).to(torch.uint8)
     return index | (values.signbit().to(torch.uint8) << 3)
@@ -57,7 +57,9 @@ def quantize_main_kv(post_rope):
     table = torch.tensor([0, 0.5, 1, 1.5, 2, 3, 4, 6], device=post_rope.device)
     decoded = table[(codes & 7).long()] * torch.where((codes & 8) != 0, -1.0, 1.0)
     decoded = decoded.reshape(blocks.shape) * scale.float().unsqueeze(-1)
-    return QuantizedValues(packed, scale, decoded.reshape(post_rope.shape).to(post_rope.dtype))
+    return QuantizedValues(
+        packed, scale, decoded.reshape(post_rope.shape).to(post_rope.dtype)
+    )
 
 
 def _fake_quant(post_rope, enabled, quantize, phase="post-training"):
