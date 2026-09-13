@@ -69,7 +69,10 @@ Communication uses the shared differentiable CP gather and DDP gradient
 averaging. This correctness path materializes full-document KV; it does not
 provide fused sparse attention's memory or throughput characteristics. CP
 modality/replay inputs and CP combined with other parallel dimensions are
-rejected. Floating tests retain the 40-layer assembly, all three CSA2 modes,
+rejected. In particular, CP>1 with EP>1 raises
+`CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED`. TP/PP/VPP/ETP and custom pipeline
+layouts raise `V4.1_UNSUPPORTED_PARALLELISM`, listing the rejected settings.
+Floating tests retain the 40-layer assembly, all three CSA2 modes,
 frozen indexers, and nonzero frozen/trainable Engram tables. The strict reference
 preserves local operator shapes and the gather backward reduction order;
 parameter contributions are checked before DDP averaging as well as after it.

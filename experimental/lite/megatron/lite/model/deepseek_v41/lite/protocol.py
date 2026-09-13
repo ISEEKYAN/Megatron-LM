@@ -61,14 +61,21 @@ def build_model(model_cfg, *, impl_cfg):
     from .model import DeepseekV41Model
 
     p = impl_cfg.parallel
-    if (
-        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'vpp'))
-        or (p.cp != 1 and p.ep != 1)
-        or p.etp not in (None, 1)
-        or p.pp_layout is not None
-    ):
+    unsupported = [key for key in ('tp', 'pp', 'vpp') if getattr(p, key) != 1]
+    if p.etp not in (None, 1):
+        unsupported.append('etp')
+    if p.pp_layout is not None:
+        unsupported.append('pp_layout')
+    if unsupported:
         raise NotImplementedError(
-            'V4.1 model construction requires single-rank execution; distributed integration remains pending'
+            f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
+            'supported: DP, EP with CP=1, or contiguous CP-only; '
+            'TP/PP/VPP/ETP and custom pipeline layouts are unsupported'
+        )
+    if p.cp != 1 and p.ep != 1:
+        raise NotImplementedError(
+            'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; '
+            'use CP-only or EP with CP=1'
         )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError("EP size must be a positive integer")
@@ -516,7 +523,7 @@ def export_hf_weights(
     *,
     export_dtype=None,
     cpu=False,
-    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ):
     yield from export_checkpoint(
         _single(chunks),
@@ -534,7 +541,7 @@ def save_hf_weights(
     *,
     export_dtype=None,
     cpu=True,
-    buffer_max_size_bytes=None
+    buffer_max_size_bytes=None,
 ):
     save_model(
         _single(chunks),
