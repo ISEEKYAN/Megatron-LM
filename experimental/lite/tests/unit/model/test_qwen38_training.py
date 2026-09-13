@@ -56,8 +56,25 @@ def test_protocol_next_token_targets_stop_at_document_boundaries():
     assert captured['labels'].tolist() == [[2, -100, -100, 5, -100]]
 
 
+@pytest.fixture
+def isolated_training_groups():
+    from megatron.core import parallel_state as mpu
+
+    was_initialized = torch.distributed.is_initialized()
+    had_model_parallel = mpu.is_initialized()
+    try:
+        yield
+    finally:
+        if not had_model_parallel:
+            mpu.destroy_model_parallel()
+        if not was_initialized and torch.distributed.is_initialized():
+            torch.distributed.destroy_process_group()
+
+
 @pytest.mark.gpu
-def test_native_runtime_trains_all_decoder_branches(tmp_path, monkeypatch):
+def test_native_runtime_trains_all_decoder_branches(
+    tmp_path, monkeypatch, isolated_training_groups
+):
     from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
     from megatron.lite.primitive.modules import gated_delta_net as gdn_primitive
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
