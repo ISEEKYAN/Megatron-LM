@@ -12,32 +12,16 @@ import torch.distributed as dist
 import torch.multiprocessing as mp
 from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
-from megatron.lite.primitive.train_step import run_microbatch_loop
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+from test_data_parallel import (
+    _check_parallel_buffers,
+    _init_parallel_worker,
+    _train_parallel_step,
+)
 
 
 def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
-    torch.set_num_threads(1)
-    torch.cuda.set_device(rank)
-    torch.manual_seed(19)
-    impl = protocol.ImplConfig(
-        device=f'cuda:{rank}',
-        dtype=torch.float32,
-        quantized=False,
-        token_map=list(range(256)),
-        trainable_engram=trainable,
-        optimizer='muon',
-        optimizer_config=OptimizerConfig(0.0001, 5, 'quintic'),
-    )
-    # Construct the serial baseline before joining the distributed world.
-    serial = protocol.build_model(config, impl_cfg=impl)
-    dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rendezvous').as_uri(),
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=120),
-    )
+    serial, impl = _init_parallel_worker(rank, config, trainable, directory)
     try:
         parallel = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(ep=2))
@@ -78,32 +62,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                 for layer in bundle.chunks[0].layers:
                     layer.ffn.gate.bias.fill_(-100)
                     layer.ffn.gate.bias[[0, 1 if step == 0 else 2]] = 100
-            batches = []
-            for other_rank in range(2):
-                ids = torch.arange(1 + step, 5 + step + other_rank * 2, device=rank)
-                batches.append(
-                    PackedBatch(ids, ids, torch.tensor([len(ids)], device=rank))
-                )
-            if step == 0:
-                with torch.no_grad():
-                    local_logits = parallel.forward_step(
-                        parallel.chunks[0], batches[rank]
-                    )['logits']
-                    serial_logits = serial.forward_step(
-                        serial.chunks[0], batches[rank]
-                    )['logits']
-                torch.testing.assert_close(local_logits, serial_logits, atol=0, rtol=0)
-            for bundle, inputs in ((serial, batches), (parallel, [batches[rank]])):
-                bundle.optimizer.zero_grad()
-                run_microbatch_loop(
-                    bundle.chunks[0],
-                    iter(inputs),
-                    len(inputs),
-                    bundle.forward_step,
-                    prepare_microbatches=bundle.extras['prepare_microbatches'],
-                )
-                if bundle.finalize_grads is not None:
-                    bundle.finalize_grads()
+            _train_parallel_step(serial, parallel, rank, step)
             _finalize_reference_expert_wgrad(records, reference, rank)
             diagnostics = {}
             serial_parameters = dict(reference.named_parameters())
@@ -160,22 +119,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                     replicas = [torch.empty_like(p) for _ in range(2)]
                     dist.all_gather(replicas, p)
                     torch.testing.assert_close(*replicas, atol=0, rtol=0, msg=name)
-            for block, reference_block in zip(
-                parallel.chunks[0].layers, serial.chunks[0].layers
-            ):
-                for name in ('bias', 'bias_vl'):
-                    torch.testing.assert_close(
-                        getattr(block.ffn.gate, name),
-                        getattr(reference_block.ffn.gate, name),
-                        atol=0,
-                        rtol=0,
-                    )
-                if block.engram is not None:
-                    table = block.engram.embed
-                    assert table.weight.device == torch.device('cuda', rank)
-                    assert table.scale.device == table.weight.device
-                    if trainable:
-                        assert table.master.device == table.weight.device
+            _check_parallel_buffers(parallel, serial, rank, trainable)
         Path(directory, f'rank-{rank}.json').write_text(json.dumps(errors))
     finally:
         dist.destroy_process_group()
