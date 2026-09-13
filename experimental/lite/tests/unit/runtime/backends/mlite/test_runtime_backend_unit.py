@@ -772,3 +772,67 @@ def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
         torch.testing.assert_close(
             gradients[0], gradients[1], rtol=0, atol=0, msg='PP versus non-PP gradient'
         )
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_runtime_replay_driver_requires_observed_routes(
+    live, capsys, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.router_replay import RouterReplay
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    from megatron.lite.primitive.parallel import ParallelState
+
+    model = SigmoidTopKRouter(
+        types.SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            routed_scaling_factor=1.0,
+            hidden_size=4,
+        ),
+        ParallelState(),
+        compute_aux_loss=False,
+    )
+    batch = PackedBatch(
+        torch.arange(3),
+        None,
+        torch.tensor([3]),
+        routed_experts=torch.tensor([[[[2, 3]], [[2, 3]], [[2, 3]]]]),
+        r3_replay_mask=torch.ones(3, dtype=torch.bool),
+    )
+
+    def forward(module, batch):
+        value = module(torch.ones(3, 4))[0] if live else module.gate.weight
+        return {'loss': value.sum()}
+
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={'forward_step': forward},
+    )
+    instances = RouterReplay.global_router_replay_instances[:]
+    try:
+        runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+        if live:
+            runtime.forward_backward(
+                handle,
+                iter([batch]),
+                None,
+                num_microbatches=1,
+                router_replay={'action': 'replay'},
+            )
+            assert 'R3_REPLAY_EVIDENCE calls=1 rows=6' in capsys.readouterr().out
+        else:
+            with pytest.raises(RuntimeError, match='R3_REPLAY_VOID'):
+                runtime.forward_backward(
+                    handle,
+                    iter([batch]),
+                    None,
+                    num_microbatches=1,
+                    router_replay={'action': 'replay'},
+                )
+    finally:
+        RouterReplay.clear_global_state()
+        RouterReplay.global_router_replay_instances[:] = instances

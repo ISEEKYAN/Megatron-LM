@@ -26,7 +26,7 @@ from megatron.lite.primitive.quantization.qat import (
 
 pytestmark = pytest.mark.mlite
 
-MODEL_NAMES = ("qwen3_5", "qwen3_moe", "deepseek_v4", "glm5", "kimi_k2")
+MODEL_NAMES = ("qwen3_5", "qwen3_moe", "deepseek_v4", "glm5", "kimi_k2", "deepseek_v41")
 
 
 class _TinyRouter(nn.Module):
@@ -297,10 +297,29 @@ def _train_config():
     )
 
 
-def _real_tiny_model(model_name: str, monkeypatch):
+def _real_tiny_model(model_name: str, monkeypatch, *, quantized=False):
     from megatron.lite.primitive.parallel import ParallelState
 
     ps = ParallelState()
+    if model_name == "deepseek_v41":
+        # Reuse the same pinned 40-layer fixture as the native DS4.1 suite.
+        fixture_path = Path(__file__).parents[1] / "deepseek_v41/conftest.py"
+        spec = importlib.util.spec_from_file_location("v41_test_config", fixture_path)
+        fixtures = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(fixtures)
+        from megatron.lite.model.deepseek_v41.lite import protocol
+
+        return protocol.build_model(
+            fixtures.model_config.__wrapped__(),
+            impl_cfg=protocol.ImplConfig(
+                device='cpu',
+                dtype=torch.float32,
+                token_map=list(range(256)),
+                quantized=quantized,
+                optimizer='muon',
+                optimizer_config=protocol.OptimizerConfig(0.001, 5, 'quintic'),
+            ),
+        ).chunks[0]
     if model_name == "qwen3_moe":
         from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
         from megatron.lite.model.qwen3_moe.lite.model import Qwen3MoEModel
@@ -428,7 +447,7 @@ def _real_tiny_model(model_name: str, monkeypatch):
     raise AssertionError(f"unsupported model: {model_name}")
 
 
-R3_SUPPORTED_MODEL_NAMES = (*MODEL_NAMES, "deepseek_v41")
+R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
 
 
 def test_mapped_model_state_has_no_optional_override(
@@ -788,14 +807,17 @@ def test_every_model_qat_none_is_bitwise_inert(
     implicit = copy.deepcopy(case.chunk)
     explicit = copy.deepcopy(case.chunk)
 
-    implicit_cfg = case.protocol.ImplConfig()
-    explicit_cfg = case.protocol.ImplConfig(qat=None)
-    implicit_stats = apply_qat_to_chunks(
-        [implicit], normalize_qat_spec(implicit_cfg.qat)
-    )
-    explicit_stats = apply_qat_to_chunks(
-        [explicit], normalize_qat_spec(explicit_cfg.qat)
-    )
+    if model_name == "deepseek_v41":
+        implicit = _real_tiny_model(model_name, monkeypatch)
+        explicit = copy.deepcopy(implicit)
+        implicit_spec, explicit_spec = None, normalize_qat_spec(None)
+        for layer in implicit.layers:
+            assert not layer.attn.config.main_qat and not layer.attn.config.index_qat
+    else:
+        implicit_spec = case.protocol.ImplConfig().qat
+        explicit_spec = case.protocol.ImplConfig(qat=None).qat
+    implicit_stats = apply_qat_to_chunks([implicit], normalize_qat_spec(implicit_spec))
+    explicit_stats = apply_qat_to_chunks([explicit], normalize_qat_spec(explicit_spec))
 
     assert implicit_stats["quantized_modules"] == 0
     assert explicit_stats["quantized_modules"] == 0
@@ -811,6 +833,24 @@ def test_every_model_qat_none_is_bitwise_inert(
 def test_every_model_qat_quantizes_gate_up_but_not_router_gate(
     model_name: str, transformer_engine_import_stub, monkeypatch
 ):
+    if model_name == "deepseek_v41":
+        transformer_engine_import_stub()
+        model = _real_tiny_model(model_name, monkeypatch, quantized=True)
+        for layer in model.layers:
+            assert not parametrize.is_parametrized(layer.ffn.gate.router.gate, 'weight')
+            assert layer.attn.config.main_qat and layer.attn.config.index_qat
+            for expert in layer.ffn.experts:
+                assert expert.w1.quantized and expert.w3.quantized
+        projection = model.layers[0].ffn.experts[0].w1
+        x = torch.linspace(-1, 1, 64).reshape(2, 32).requires_grad_()
+        actual = projection(x)
+        projection.quantized = False
+        plain = projection(x)
+        assert not torch.equal(actual, plain), 'V41_NATIVE_QAT_EXECUTED'
+        actual.sum().backward()
+        assert projection.weight.grad.dtype == torch.float32
+        assert torch.isfinite(projection.weight.grad).all()
+        return
     case = _case(
         model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=False
     )
@@ -832,6 +872,21 @@ def test_every_model_qat_expert_load_target_resolves_master_weight(
 ):
     _install_cpu_te_construction_stubs(transformer_engine_import_stub, monkeypatch)
     model = _real_tiny_model(model_name, monkeypatch)
+    if model_name == "deepseek_v41":
+        from megatron.lite.primitive.ckpt.hf_weights import _resolve_param_name
+
+        state = model.state_dict()
+        masters = dict(model.named_parameters())
+        experts = [b for b in model.parameter_bindings() if b.role == 'expert']
+        assert experts, 'V41_NATIVE_QAT_EXPERT_MASTERS'
+        for binding in experts:
+            name = next(n for n, p in masters.items() if p is binding.tensor)
+            assert _resolve_param_name(name, state) == name
+            assert binding.tensor.is_leaf and binding.tensor.dtype == torch.float32
+        for layer in model.layers:
+            if layer.attn.indexer is not None:
+                assert not any(p.requires_grad for p in layer.attn.indexer.parameters())
+        return
     stats = apply_qat_to_chunks(
         [model], QATSpec(enabled=True, format="int8", group_size=-1)
     )

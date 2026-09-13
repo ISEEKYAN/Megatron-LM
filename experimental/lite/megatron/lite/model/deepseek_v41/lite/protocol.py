@@ -24,6 +24,10 @@ from .optimizer_groups import OptimizerConfig, V41Optimizer
 from .training import VisionSchedule, VisionTrainability
 
 
+# HF checkpoints store trainable masters and byte-preserved archives.
+HF_SAVE_SUPPORTS_RESYNC = False
+
+
 @dataclass(frozen=True)
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)

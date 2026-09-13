@@ -396,3 +396,60 @@ def test_v41_export_cpu_controls_gpu_tensor_destination(tmp_path, cpu):
     for name, expected in values.items():
         assert tensors[name].dtype == torch.bfloat16
         assert torch.equal(tensors[name].cpu(), expected.bfloat16())
+
+
+def test_v41_engine_hf_save_keeps_master_checkpoint_with_resync_config(
+    tmp_path, transformer_engine_import_stub, monkeypatch
+):
+    import os
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from safetensors.torch import load_file
+
+    transformer_engine_import_stub()
+    source = LITE_ROOT / 'examples/verl/verl_mlite/engine/mlite_engine.py'
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == 'MegatronLiteEngine'
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == '_save_hf_checkpoint'
+    )
+    namespace = dict(os=os, dist=dist, Any=object)
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'),
+        namespace,
+    )
+    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
+    model, values, archive = _v41_export_model(tmp_path)
+    engine = SimpleNamespace(
+        handle=SimpleNamespace(
+            _model=model,
+            _parallel_state=None,
+            _extras={'protocol': protocol, 'model_cfg': model.config},
+        ),
+        _rank=0,
+        model_config=SimpleNamespace(),
+        engine_config=SimpleNamespace(
+            resync_format='mxfp4',
+            resync_config={'expert_dtype': 'fp4'},
+            export_dtype='bfloat16',
+        ),
+    )
+    namespace['_save_hf_checkpoint'](engine, str(tmp_path / 'checkpoint'))
+    saved = tmp_path / 'checkpoint/huggingface'
+    tensors = {
+        k: v
+        for shard in saved.glob('*.safetensors')
+        for k, v in load_file(shard).items()
+    }
+    assert tensors.keys() == values.keys() | archive.keys(), 'HF_ENGINE_COMPLETE_KEYS'
+    for name, value in values.items():
+        assert torch.equal(tensors[name], value.bfloat16()), 'HF_ENGINE_MASTER_DTYPE'
+    assert torch.equal(
+        tensors['mtp.weight'], archive['mtp.weight']
+    ), 'HF_ENGINE_ARCHIVE_BYTES'

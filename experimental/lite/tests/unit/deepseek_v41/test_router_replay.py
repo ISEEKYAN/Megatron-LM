@@ -3,6 +3,7 @@
 
 from copy import deepcopy
 from dataclasses import replace
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -13,6 +14,7 @@ from megatron.lite.primitive.modules.router_replay import (
     attach_router_replay,
 )
 from megatron.lite.runtime.contracts import PackedBatch
+from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
 
 
 @pytest.fixture
@@ -33,7 +35,7 @@ def isolated_replay_state():
 
 @pytest.mark.parametrize('masked', [False, True])
 def test_concatenated_replay_forced_rank_swap_checkpoint(
-    build_bundle, model_config, tmp_path, isolated_replay_state, masked
+    build_bundle, model_config, tmp_path, isolated_replay_state, masked, capsys
 ):
     torch.manual_seed(104)
     bundle = build_bundle(model_config)
@@ -63,9 +65,13 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
         seq_lens=torch.tensor([3, 5]),
     )
     assert attach_router_replay(model) == 40, 'ALL_LAYERS_USE_SHARED_REPLAY'
+    handle = SimpleNamespace(_model=model, _extras={'protocol': protocol})
+    driver = RouterReplayDriver(handle, 'record')
+    driver.begin()
+    recorded_forward = driver.wrap(bundle.forward_step)
     RouterReplay.set_global_router_replay_action(RouterReplayAction.RECORD)
     with torch.no_grad():
-        logits_a = bundle.forward_step(model, batch)['logits']
+        logits_a = recorded_forward(model, batch)['logits']
     recorded_a = [r.detach().clone() for r in RouterReplay.get_recorded_data()]
     expected_a = [
         torch.tensor([2, 3] if layer % 2 else [0, 1]).expand(8, 2)
@@ -83,7 +89,7 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
 
     model.load_state_dict(torch.load(path, weights_only=True))
     with torch.no_grad():
-        native_b = bundle.forward_step(model, batch)['logits']
+        native_b = recorded_forward(model, batch)['logits']
     recorded_b = [r.detach().clone() for r in RouterReplay.get_recorded_data()]
     for actual, old in zip(recorded_b, expected_a, strict=True):
         assert torch.equal(actual, (old + 2) % 4), 'CHECKPOINT_B_FORCED_RANK_SWAP'
@@ -91,6 +97,9 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
     # here is caused by the constructed expert-set swap, not a random checkpoint.
     assert not torch.allclose(native_b, logits_a), 'NATIVE_REROUTE_MUST_CHANGE_OUTPUT'
 
+    driver.end()
+    driver = RouterReplayDriver(handle, 'replay')
+    driver.begin()
     mask = torch.tensor([True, False, True, False, True, False, True, False])
     if not masked:
         mask.fill_(True)
@@ -129,13 +138,20 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
         RouterReplay.reset_replay_stats()
         RouterReplay.set_replay_data(packed_routes, packed_mask)
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-        packed_logits = bundle.forward_step(model, replay_batch)['logits']
+        packed_logits = driver.wrap(bundle.forward_step)(model, replay_batch)['logits']
         packed_hidden = normalized.pop()
         for rows, expected in zip(seen, expected_routes, strict=True):
             assert [r.shape[0] for r in rows] == [3, 5], 'VISIT_BOTH_LOGICAL_SAMPLES'
             assert torch.equal(torch.cat(rows), expected), 'PACKED_REPLAY_EXACT_EXPERTS'
         stats = RouterReplay.replay_stats()
         assert stats == dict(calls=80, rows=640, changed=int(mask.sum()) * 40 * 2)
+        evidence = capsys.readouterr().out
+        assert (
+            f'R3_REPLAY_EVIDENCE calls=80 rows=640 changed={stats["changed"]}'
+            in evidence
+        ), 'R3_REPLAY_DRIVER_COUNTS_REAL_ROUTES'
+        assert 'R3_REPLAY_VOID' not in evidence and 'R3_REPLAY_WARN' not in evidence
+        print(evidence, end='')
         if not masked:
             torch.testing.assert_close(packed_logits, logits_a, atol=0, rtol=0)
         packed_logits.square().sum().backward()
@@ -177,5 +193,6 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
                 msg=f'PACKED_VS_SERIAL_GRADIENT {name}',
             )
     finally:
+        driver.end()
         for handle in handles:
             handle.remove()
