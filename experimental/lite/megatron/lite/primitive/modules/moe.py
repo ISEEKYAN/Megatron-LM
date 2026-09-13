@@ -16,7 +16,6 @@ from __future__ import annotations
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.modules.ep_participation import check_ep_participation
 
 __all__ = ["MoEAuxLossAutoScaler", "_AllToAll"]
@@ -56,7 +55,9 @@ class _AllToAll(torch.autograd.Function):
         ctx.output_splits = output_splits
         ctx.group = group
         input_tensor = input_tensor.contiguous()
-        output = input_tensor.new_empty([sum(output_splits)] + list(input_tensor.shape[1:]))
+        output = input_tensor.new_empty(
+            [sum(output_splits)] + list(input_tensor.shape[1:])
+        )
         dist.all_to_all_single(
             output,
             input_tensor,
@@ -70,7 +71,9 @@ class _AllToAll(torch.autograd.Function):
     def backward(ctx, grad_output):
         check_ep_participation(ctx.group, f"alltoall.backward:{ctx.ep_sequence}")
         grad_output = grad_output.contiguous()
-        grad_input = grad_output.new_empty([sum(ctx.input_splits)] + list(grad_output.shape[1:]))
+        grad_input = grad_output.new_empty(
+            [sum(ctx.input_splits)] + list(grad_output.shape[1:])
+        )
         dist.all_to_all_single(
             grad_input,
             grad_output,
