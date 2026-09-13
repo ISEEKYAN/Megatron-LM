@@ -1,9 +1,9 @@
 # Qwen3.8-Flash-Next text training composition
 
-Single-rank MLite runtime training is assembled; distributed training, full HF loading, and end-to-end reference parity remain unvalidated.
+Single-rank and DP=2 MLite runtime scratch training are assembled; model parallelism, full HF loading, and end-to-end external-reference parity remain unvalidated.
 References: [HF config and checkpoint index](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/de4b8e4d43b917e7706784d8bb445c9af86a3540), [Automodel PR](https://github.com/NVIDIA-NeMo/Automodel/pull/3690) head `5cfe13b160eb7e23ac5a4868bbf611707cdf98fb`; source inspection also used Automodel `dc8f31f2c35e9e98a8721b575037a833807c7ac1`.
 Fresh source checks: Automodel main `f7ccd6f7902634af34c2f31b3294ac250dc97670` and PR head fetched 2026-09-13T11:12:06Z; MCore `nv/dev` `0cd11658f44350a141656751259cfe1f72398e9f` fetched 2026-09-13T11:11:23Z has generic GDN/HC, no dedicated Qwen3.8 model.
-The original 2000-added-line component budget is exceeded by runtime assembly and training tests; no budget acceptance is claimed. No tools or fixtures are added.
+The original 2000-added-line component budget is exceeded by runtime assembly and training tests; no budget acceptance is claimed. No reference weights or generated fixtures are bundled.
 
 | Config group | Mapping / invariant |
 |---|---|
@@ -44,4 +44,4 @@ Checkpoint index: 1658 keys = 1294 text/head + 333 vision + 31 MTP. Below, `L=mo
 
 Engram is explicitly temporary and independent of PR #212: after that PR lands on main, a separate follow-up will converge on `primitive/modules/engram_lookup.py`. Qwen uses floating rows/raw token IDs; DS4 also supports FP8/scales and tokenizer compression. Multi-owner lookup is currently rejected.
 Keep `contiguous_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=1)`, `thd_pack_meta(seq_lens, *, tp_size=1, cp_size=1, cp_group=None, contiguous=False)`, and `unpack_thd_to_nested(output, meta, *, contiguous=False)` stable. Confirm global packed slicing separately from per-document padding.
-The registered protocol uses the existing MLite runtime and distributed optimizer for single-rank scratch training. Set `load_hf_weights=False`; HF import/export and all parallel dimensions greater than one fail explicitly. The GPU test exercises GDN, QSA, MoE, HC, PLE, optimizer updates and model-state restoration; packed GDN requires FLA. No full skill acceptance is claimed.
+The registered protocol uses the existing MLite runtime and distributed optimizer for single-rank and DP scratch training. Set `load_hf_weights=False`; HF import/export and TP/EP/ETP/CP/PP greater than one fail explicitly. `tests/smoke/workflows/training/qwen38_dp_probe.py` compares DP=2 distinct documents against one rank with two microbatches: three steps and three repeated runs have bitwise-equal losses, actual FP32 reduced gradients, parameters, and replicas; scalar grad-norm reduction order can differ by one FP32 ULP. The single-GPU test exercises all decoder branches and model-state restoration; packed GDN requires FLA. No full skill acceptance is claimed.
