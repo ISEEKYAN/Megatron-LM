@@ -59,3 +59,16 @@ def parallelize_projections(model, ps):
         # Full-gradient replicas must be counted once, never SP-summed.
         parameter.tensor_model_parallel = projection_shard(name)
         parameter.sequence_parallel = False
+
+
+def finalize_replicated_experts(chunks, finalize, tp_size):
+    """EDP sums identical TP token replicas; average them once before stepping.
+
+    MCore's default expert scale assumes SP partitions the tokens. Here only
+    projections are partitioned, so replicated experts see every token on each
+    TP rank. Use the public buffer scaling API after reduction has completed.
+    """
+    finalize()
+    for chunk in chunks:
+        for buffer in chunk.expert_parallel_buffers:
+            buffer.scale_gradients(1.0 / tp_size)

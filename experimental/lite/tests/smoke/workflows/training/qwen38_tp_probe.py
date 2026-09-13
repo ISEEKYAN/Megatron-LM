@@ -181,6 +181,53 @@ def main():
         for ids in documents
     ]
     records = []
+    traces = {}
+    trace_active = [True]
+    for name, module in model.named_modules():
+        if name.endswith('.linear'):
+            continue
+        weight_name = name + (
+            '.linear.weight' if hasattr(module, 'linear') else '.weight'
+        )
+        canonical = serial_parameter_name(weight_name)
+        # Same canonical projection set on the complete serial and TP arms.
+        probe_name = (
+            canonical
+            if canonical.endswith('.linear.weight')
+            else canonical.replace('.weight', '.linear.weight')
+        )
+        if not projection_shard(probe_name):
+            continue
+
+        def before(module, inputs, key=canonical):
+            if not trace_active[0]:
+                return
+            x = inputs[0].view_as(inputs[0])
+            weight = (
+                module.linear.weight if hasattr(module, 'linear') else module.weight
+            )
+            row = {
+                'x': x.detach().cpu().clone(),
+                'weight': weight.detach().cpu().clone(),
+            }
+            traces.setdefault(key, []).append(row)
+            if x.requires_grad:
+                x.register_hook(
+                    lambda grad, row=row: row.update(dx=grad.detach().cpu().clone())
+                )
+            return (x, *inputs[1:])
+
+        def after(module, inputs, output, key=canonical):
+            if not trace_active[0]:
+                return
+            row = traces[key][-1]
+            row['y'] = output.detach().cpu().clone()
+            output.register_hook(
+                lambda grad, row=row: row.update(dy=grad.detach().cpu().clone())
+            )
+
+        module.register_forward_pre_hook(before)
+        module.register_forward_hook(after)
 
     def train_step():
         outputs = []
@@ -203,6 +250,9 @@ def main():
     for step in range(3):
         record = train_step()
         records.append(record)
+        if step == 0:
+            torch.save(traces, args.output / f'projection-traces-rank{rank}.pt')
+            trace_active[0] = False
         torch.save(record, args.output / f'step{step}-rank{rank}.pt')
         if step == 1:
             runtime.save_checkpoint(

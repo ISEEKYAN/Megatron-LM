@@ -135,6 +135,8 @@ class Qwen38Model(nn.Module):
         super().__init__()
         if any(getattr(ps, k) != 1 for k in ('etp_size', 'cp_size', 'pp_size')):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
+        if ps.tp_size > 1 and ps.ep_size > 1:
+            raise NotImplementedError('QWEN38_TP_EP_COMBINATION_NOT_VALIDATED')
         if config.tie_word_embeddings or not config.norm_topk_prob:
             raise ValueError('QWEN38_RELEASE_TIED_OR_ROUTER_CONTRACT')
         self.config, self.ps = config, ps

@@ -60,3 +60,29 @@ def test_tp_serial_key_mapping():
         serial_parameter_name('layers.0.linear_attn.in_proj.linear.weight')
         == 'layers.0.linear_attn.in_proj.linear.weight'
     )
+
+
+def test_replicated_expert_reduction_counts_each_token_once():
+    from megatron.lite.model.qwen3_8_flash_next.tp import finalize_replicated_experts
+
+    class Buffer:
+        def __init__(self):
+            self.grad_data = torch.tensor([2.0, 6.0])
+
+        def scale_gradients(self, factor):
+            self.grad_data.mul_(factor)
+
+    expert, dense = Buffer(), Buffer()
+    chunk = SimpleNamespace(expert_parallel_buffers=[expert], buffers=[dense])
+
+    def finish():
+        # EDP SUM of two TP copies of the same tokens.
+        expert.grad_data.mul_(2)
+
+    finalize_replicated_experts([chunk], finish, 2)
+    assert torch.equal(
+        expert.grad_data, torch.tensor([2.0, 6.0])
+    ), 'TP_EXPERT_DUPLICATE_TOKENS'
+    assert torch.equal(
+        dense.grad_data, torch.tensor([2.0, 6.0])
+    ), 'TP_DENSE_SCALE_UNCHANGED'

@@ -129,6 +129,14 @@ def build_model(model_cfg, *, impl_cfg):
             is_expert=is_expert_param,
             deterministic=impl_cfg.deterministic,
         )
+        if ps.tp_size > 1:
+            from functools import partial
+
+            from .tp import finalize_replicated_experts
+
+            finalize = partial(
+                finalize_replicated_experts, chunks, finalize, ps.tp_size
+            )
         register_training_hooks(chunks, optimizer)
         attach_model_sharded_state_dict(
             chunks, ps, get_placements=parameter_placements, is_expert=is_expert_param
