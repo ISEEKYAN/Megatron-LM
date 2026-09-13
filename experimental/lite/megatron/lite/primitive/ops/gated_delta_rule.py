@@ -6,12 +6,10 @@ from __future__ import annotations
 import torch
 import torch.nn.functional as F
 
-try:
-    from fla.modules.l2norm import l2norm as _fla_l2norm  # pyright: ignore[reportMissingImports]
-
-    _HAS_FLA_L2NORM = True
-except ImportError:
-    _HAS_FLA_L2NORM = False
+from megatron.lite.primitive.ops.fla_l2norm import (
+    HAS_FLA as _HAS_FLA_L2NORM,
+    fixed_l2norm as _fla_l2norm,
+)
 
 __all__ = ["l2norm", "torch_chunk_gated_delta_rule"]
 
