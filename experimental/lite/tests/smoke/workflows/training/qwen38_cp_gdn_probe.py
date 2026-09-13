@@ -26,6 +26,7 @@ def main():
     world, rank = int(os.environ['WORLD_SIZE']), int(os.environ['RANK'])
     assert world in (1, 2), 'CP_GDN_WORLD'
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
+    dist.init_process_group('nccl')
     torch.manual_seed(3852)
     ps = init_parallel(ParallelConfig(cp=world))
     assert shared._HAS_FLA, 'CP_GDN_PACKED_FLA_REQUIRED'
