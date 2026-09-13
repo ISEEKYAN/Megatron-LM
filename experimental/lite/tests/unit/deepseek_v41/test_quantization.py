@@ -104,14 +104,18 @@ def test_fp8_gemm_matches_dequantized_blockwise_reference():
     assert torch.cuda.is_available(), 'FP8 GEMM correctness requires a CUDA allocation'
     torch.manual_seed(17)
     activation = _quantize_rows(torch.randn(3, 64, device='cuda'))
-    weight = torch.randn(32, 64, device='cuda')
+    weight = torch.randn(64, 64, device='cuda')
+    # Distinct output-block scales make a one-column scale shift observable.
+    weight[32:] *= 8
     encoded_weight, weight_scale = quantize_block_fp8(
         weight, (32, 32), scale_format='e8m0'
     )
 
     actual = _fp8_gemm(activation.values, activation.scale, encoded_weight, weight_scale)
-    expected = activation.decoded.float() @ dequantize_block_fp8(
+    assert torch.all(weight_scale[0].float() != weight_scale[1].float())
+    # Double accumulation keeps this independent reference free of TF32 rounding.
+    expected = activation.decoded.double() @ dequantize_block_fp8(
         encoded_weight, weight_scale, (32, 32)
-    ).float().T
+    ).double().T
 
-    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
+    torch.testing.assert_close(actual, expected.float(), atol=2e-4, rtol=2e-4)
