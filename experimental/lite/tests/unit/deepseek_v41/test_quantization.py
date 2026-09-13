@@ -2,9 +2,15 @@
 import pytest
 import torch
 from megatron.lite.primitive.quantization.ds41_fp8 import (
+    _fp8_gemm,
+    _quantize_rows,
     dynamic_fp8_linear,
     fake_quant_swa,
     quantize_swa,
+)
+from megatron.lite.primitive.quantization.block_fp8 import (
+    dequantize_block_fp8,
+    quantize_block_fp8,
 )
 from megatron.lite.primitive.quantization.ds41_index import (
     fake_quant_index,
@@ -90,3 +96,22 @@ def test_quantization_rejects(case, message):
             dynamic_fp8_linear(torch.ones(2, 32), torch.ones(32, 32))
         else:
             quantize_main_kv(x)
+
+
+@pytest.mark.gpus(1)
+def test_fp8_gemm_matches_dequantized_blockwise_reference():
+    """Exercise the native FP8 kernel and its separately accumulated E8M0 scales."""
+    assert torch.cuda.is_available(), 'FP8 GEMM correctness requires a CUDA allocation'
+    torch.manual_seed(17)
+    activation = _quantize_rows(torch.randn(3, 64, device='cuda'))
+    weight = torch.randn(32, 64, device='cuda')
+    encoded_weight, weight_scale = quantize_block_fp8(
+        weight, (32, 32), scale_format='e8m0'
+    )
+
+    actual = _fp8_gemm(activation.values, activation.scale, encoded_weight, weight_scale)
+    expected = activation.decoded.float() @ dequantize_block_fp8(
+        encoded_weight, weight_scale, (32, 32)
+    ).float().T
+
+    torch.testing.assert_close(actual, expected, atol=2e-4, rtol=2e-4)
