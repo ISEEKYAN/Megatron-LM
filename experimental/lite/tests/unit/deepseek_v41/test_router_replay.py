@@ -138,7 +138,12 @@ def test_concatenated_replay_forced_rank_swap_checkpoint(
         RouterReplay.reset_replay_stats()
         RouterReplay.set_replay_data(packed_routes, packed_mask)
         RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
-        packed_logits = driver.wrap(bundle.forward_step)(model, replay_batch)['logits']
+        try:
+            packed_logits = driver.wrap(bundle.forward_step)(model, replay_batch)[
+                'logits'
+            ]
+        except RuntimeError as error:
+            pytest.fail(f'REPLAY_DRIVER_MUST_EXECUTE_ROUTES: {error}')
         packed_hidden = normalized.pop()
         for rows, expected in zip(seen, expected_routes, strict=True):
             assert [r.shape[0] for r in rows] == [3, 5], 'VISIT_BOTH_LOGICAL_SAMPLES'

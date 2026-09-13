@@ -440,7 +440,10 @@ def test_v41_engine_hf_save_keeps_master_checkpoint_with_resync_config(
             export_dtype='bfloat16',
         ),
     )
-    namespace['_save_hf_checkpoint'](engine, str(tmp_path / 'checkpoint'))
+    try:
+        namespace['_save_hf_checkpoint'](engine, str(tmp_path / 'checkpoint'))
+    except TypeError as error:
+        pytest.fail(f'HF_ENGINE_NATIVE_SAVE_MUST_ACCEPT_RESYNC_CONFIG: {error}')
     saved = tmp_path / 'checkpoint/huggingface'
     tensors = {
         k: v

@@ -75,4 +75,7 @@ def test_decode_rejects_scale_damage(tmp_path, damage, message):
     save_file(tensors, path)
     store = CheckpointTensorStore.load([path], expected_keys=tensors)
     with pytest.raises((ValueError, TypeError), match=message):
-        load_weight(store, name)
+        try:
+            load_weight(store, name)
+        except KeyError as error:
+            pytest.fail(f'CHECKPOINT_SCALE_GUARD_BEFORE_READ: {error}')

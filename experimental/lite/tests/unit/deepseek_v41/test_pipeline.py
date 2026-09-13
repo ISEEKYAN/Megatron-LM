@@ -12,20 +12,26 @@ from megatron.lite.runtime.contracts import PackedBatch
 @pytest.mark.parametrize(
     'case', ['range_outside_local_stage', 'output_on_nonfinal_stage']
 )
-def test_v41_pipeline_rejects(moe, model_config, case):
+def test_v41_pipeline_rejects(moe, model_config, case, monkeypatch):
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
     stage = DeepseekV41Model(
         model_config, token_map=list(range(256)), quantized=False, layer_range=(0, 20)
     )
+    def execution_after_guard(*args, **kwargs):
+        raise AssertionError('PIPELINE_GUARD_MUST_PRECEDE_EXECUTION')
+
     ids = torch.tensor([[3, 4]])
     if case == 'range_outside_local_stage':
+        monkeypatch.setattr(stage, '_validate_input_ids', execution_after_guard)
         with pytest.raises(
             ValueError, match='^Requested range is outside this pipeline stage$'
         ):
             stage.forward_pipeline_range(ids, start=0, end=21)
     else:
         payload, _ = stage.forward_pipeline_range(ids, start=0, end=20)
+        stage.norm = torch.nn.Identity()
+        monkeypatch.setattr(stage.norm, 'forward', execution_after_guard)
         with pytest.raises(
             RuntimeError, match='^Only the final pipeline stage owns the output head$'
         ):

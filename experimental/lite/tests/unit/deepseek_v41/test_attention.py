@@ -67,6 +67,11 @@ def test_ced_chain_and_gradient(official, model_config, dtype):
     finally:
         for handle in handles:
             handle.remove()
+    assert seen.keys() == {
+        'x',
+        'latent',
+        'key',
+    }, 'CED_ALL_NORMALIZATION_BOUNDARIES_EXECUTED'
     for name, expected in zip(('x', 'latent', 'key'), (x, latent, key)):
         torch.testing.assert_close(
             seen[name], expected, rtol=0, atol=0, msg='CED:' + name

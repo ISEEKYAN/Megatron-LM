@@ -158,7 +158,10 @@ def test_staged_optimizer_guards(action, prepared, message):
         else ((lambda: None,) if action == 'step' else ())
     )
     with pytest.raises((ValueError, RuntimeError), match=message):
-        getattr(opt, action)(*args)
+        try:
+            getattr(opt, action)(*args)
+        except TypeError as error:
+            pytest.fail(f'STAGED_OPTIMIZER_GUARD_BEFORE_CONSUME: {error}')
 
 
 @pytest.mark.parametrize('recompute', [False, True])
@@ -293,3 +296,15 @@ def test_step_publishes_accumulated_modality_bias(
                 msg=f'stale bias statistics reused after {"skipped" if skipped else "successful"} step',
             )
     assert changed, 'successful steps never changed load-balancing biases'
+    snapshot = biases()
+    bundle.forward_step(model, batches[0])
+    optimizer.zero_grad()
+    assert optimizer.step()[0]
+    for router, actual in biases().items():
+        torch.testing.assert_close(
+            actual,
+            snapshot[router],
+            atol=0,
+            rtol=0,
+            msg='ZERO_GRAD_DISCARDS_UNCOMMITTED_MODALITY_LOADS',
+        )

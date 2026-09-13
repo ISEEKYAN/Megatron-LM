@@ -98,3 +98,13 @@ The default save accepts the engine's precreated empty directory. Existing nonem
 checkpoints are not overwritten. With no options, the lossless archival save remains
 byte-streamed. Deployment conversion options such as `target` and `resync_config`
 are rejected by name; quantized rollout conversion is not implemented here.
+
+For native SFT, the protocol supplies the global next-token denominator; the
+Verl adapter does not apply its token-count scale a second time. An external
+loss callback owns its objective normalization, with the existing microbatch
+multiplier cancelling the runtime's microbatch averaging.
+
+HF checkpoint saves retain trainable masters and archival bytes even when the
+engine has a rollout resync format configured. The engine uses the protocol's
+HF-save capability to keep deployment conversion options out of this native
+checkpoint path. Direct unsupported export options still fail explicitly.

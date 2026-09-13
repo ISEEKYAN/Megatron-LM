@@ -30,7 +30,10 @@ from megatron.lite.primitive.quantization.ds41_kv import (
     ],
 )
 def test_group16_e4m3_vs_group32_e8m0(codec, group, dtype, scale):
-    result = codec(torch.full((2, 64), 6.25))
+    try:
+        result = codec(torch.full((2, 64), 6.25))
+    except ValueError as error:
+        pytest.fail(f'CODEC_MUST_ACCEPT_VALID_GROUPED_INPUT: {error}')
     assert result.scale.shape == (2, 64 // group)
     assert result.scale.dtype == dtype
     assert result.scale.view(torch.uint8).tolist() == [[scale] * (64 // group)] * 2
