@@ -18,6 +18,11 @@ from megatron.lite.primitive.ckpt.hf_weights import (
 )
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+from megatron.lite.primitive.parallel.matrix import (
+    gather_parameter,
+    logical_shape,
+    slice_parameter,
+)
 from safetensors import SafetensorError, safe_open
 
 _CHUNK = 8 * 1024 * 1024
@@ -279,7 +284,7 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
             dtype = _header_dtype(header['dtype'])
             if binding.role == 'scale':
                 weight = model.tensor_bindings[name[:-5] + 'weight']
-                rows, columns = weight.tensor.shape
+                rows, columns = logical_shape(weight.tensor)
                 shape = (
                     (rows, (columns + 31) // 32)
                     if weight.encoding == 'I8' or weight.role == 'engram_table'
@@ -288,7 +293,7 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
                 if dtype != 'F8_E8M0':
                     raise ValueError(f'scale dtype mismatch: {name}')
             else:
-                shape = tuple(binding.tensor.shape)
+                shape = logical_shape(binding.tensor)
                 if dtype == 'I8':
                     if binding.encoding != 'I8' or len(shape) != 2 or shape[-1] % 32:
                         raise ValueError(f'invalid packed weight: {name}')
@@ -329,7 +334,7 @@ def export_model(model):
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
             continue
-        tensor = binding.tensor.detach()
+        tensor = gather_parameter(binding.tensor, model.ps.tp_group)
         if tensor.is_meta:
             raise ValueError(f'Cannot export unmaterialized parameter: {name}')
         yield name, tensor
@@ -406,6 +411,11 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
         )
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
+    if model.ps.tp_size > 1 and model.ps.tp_rank != 0:
+        # Every TP owner participates; only rank zero publishes filesystem bytes.
+        for _ in export_model(model):
+            pass
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.v41-export-', dir=path.parent))
     try:
@@ -507,7 +517,7 @@ def load_model(model, path):
                 if name.endswith('.weight')
                 else _tensor(store, name)
             )
-            target.copy_(value.to(target.device))
+            target.copy_(slice_parameter(target, value).to(target.device))
             if table is not None:
                 table.refresh_storage()
     model.archival_store = CheckpointTensorStore(

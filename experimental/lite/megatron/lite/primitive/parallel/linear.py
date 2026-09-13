@@ -439,6 +439,41 @@ class _ReduceFromTP(torch.autograd.Function):
         return grad_output, None
 
 
+class _CopyToTP(torch.autograd.Function):
+    """Replicated input; sum the disjoint column projections' input gradients."""
+
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        return x
+
+    @staticmethod
+    def backward(ctx, grad):
+        grad = grad.contiguous().clone()
+        dist.all_reduce(grad, group=ctx.group)
+        return grad, None
+
+
+def column_parallel_forward(x, local_forward, size, group):
+    """Reuse column TP collectives around an explicit local precision provider."""
+    output = local_forward(_CopyToTP.apply(x, group))
+    return _AllGatherLastDim.apply(output, size, group)
+
+
+def shard_native_linear(module, ps):
+    """Preserve the module/owner paths while partitioning output rows once."""
+    from megatron.lite.primitive.parallel.matrix import TensorShard
+
+    if hasattr(module.weight, 'tp_shard'):
+        raise ValueError('Linear is already tensor sharded')
+    layout = TensorShard(tuple(module.weight.shape), 0, ps.tp_rank, ps.tp_size)
+    if module.fp8 and (module.out_features // ps.tp_size) % 32:
+        raise ValueError('FP8 tensor shards must preserve complete 32-row blocks')
+    module.weight.data = layout.slice(module.weight.data).clone()
+    module.weight.tp_shard = layout
+    module.tp_size, module.tp_group = ps.tp_size, ps.tp_group
+
+
 __all__ = [
     "ColumnParallelLinear",
     "RowParallelLinear",

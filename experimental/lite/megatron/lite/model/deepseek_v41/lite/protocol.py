@@ -62,7 +62,8 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'cp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('pp', 'cp', 'vpp'))
+        or (p.tp != 1 and p.ep != 1)
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
@@ -71,6 +72,13 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError("EP size must be a positive integer")
+    if type(p.tp) is not int or p.tp < 1:
+        raise ValueError('TP size must be a positive integer')
+    if p.tp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() != p.tp
+    ):
+        raise ValueError('TP requires an initialized TP-only world')
     if p.ep > 1 and (
         not torch.distributed.is_initialized()
         or torch.distributed.get_world_size() < p.ep
@@ -132,6 +140,25 @@ def build_model(model_cfg, *, impl_cfg):
             module.output_dtype = impl_cfg.dtype
     if model.engram_hash is not None:
         model.engram_hash.to(device=impl_cfg.device)
+    if ps.tp_size > 1:
+        from megatron.lite.primitive.parallel.linear import shard_native_linear
+        from megatron.lite.primitive.parallel.matrix import broadcast_module
+
+        broadcast_module(model, ps.tp_group)
+        # Object ownership selects projections; grouped wo_a and ETP=1 experts
+        # retain their full matrices. Attention receives gathered activations.
+        projections = [model.head]
+        for block in model.layers:
+            attention = block.attn
+            projections.extend(
+                getattr(attention, name) for name in ('wq_a', 'wq_b', 'wkv', 'wo_b')
+            )
+            if attention.compressor is not None:
+                projections.append(attention.compressor.wkv)
+                if hasattr(attention.compressor, 'wgate'):
+                    projections.append(attention.compressor.wgate)
+        for projection in projections:
+            shard_native_linear(projection, ps)
     optimizer = None
     if optimizing:
         for parameter in model.parameters():
