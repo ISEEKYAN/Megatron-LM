@@ -22,6 +22,33 @@ from megatron.lite.runtime.contracts import OptimizerConfig, PackedBatch
 from test_qwen38_training import tiny_training_config
 
 
+def reduced_gradients(wrapped, model):
+    # MCore fd1121b8, param_and_grad_buffer.py:657-667 stores the only valid
+    # reduce-scatter output in each bucket's rank-local contiguous shard.
+    names = {param: name for name, param in model.named_parameters()}
+    result = {}
+    for buffer in [*wrapped.buffers, *wrapped.expert_parallel_buffers]:
+        group = buffer.data_parallel_group
+        for bucket in buffer.buckets:
+            local = bucket.grad_data.chunk(dist.get_world_size(group))[
+                dist.get_rank(group)
+            ]
+            gathered = [
+                torch.empty_like(local) for _ in range(dist.get_world_size(group))
+            ]
+            dist.all_gather(gathered, local.contiguous(), group=group)
+            full = torch.cat(gathered)
+            assert full.dtype == torch.float32, 'DP_REDUCE_NOT_FP32'
+            for param, (start, end) in bucket.param_to_index.items():
+                result[names[param]] = (
+                    full[start:end].reshape(param.shape).cpu().clone()
+                )
+    assert set(result) == {
+        name for name, p in model.named_parameters() if p.requires_grad
+    }
+    return result
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--reference', type=Path, required=True)
@@ -101,6 +128,7 @@ def main():
         runtime.forward_backward(
             handle, batches, loss_fn, num_microbatches=len(batches)
         )
+        gradients = reduced_gradients(handle._model, model)
         success, norm, _ = runtime.optimizer_step(handle)
         assert success and 0 < norm < float('inf'), ('DP_OPTIMIZER_STEP', step, norm)
         if world == 2:
@@ -113,10 +141,21 @@ def main():
                 replica = param.detach().clone()
                 dist.broadcast(replica, src=0)
                 assert torch.equal(param, replica), ('DP_REPLICA_MISMATCH', step, name)
-        record = {'losses': losses, 'grad_norm': float(norm), 'state': current}
+        record = {
+            'losses': losses,
+            'grad_norm': float(norm),
+            'state': current,
+            'gradients': gradients,
+        }
         records.append(record)
         if reference is not None:
+            torch.save(record, args.output / f'step{step}-rank{rank}.pt')
             expected = reference['steps'][step]
+            grad_diffs = {
+                name: float((value - expected['gradients'][name]).abs().max())
+                for name, value in gradients.items()
+                if not torch.equal(value, expected['gradients'][name])
+            }
             diffs = {
                 name: float(
                     (value.float() - expected['state'][name].float()).abs().max()
@@ -134,12 +173,14 @@ def main():
                 'norm',
                 float(norm),
                 expected['grad_norm'],
+                'gradient_max_abs',
+                grad_diffs,
                 'parameter_max_abs',
                 diffs,
                 flush=True,
             )
             assert losses == expected['losses'], ('DP_LOSS_PARITY', step)
-            assert float(norm) == expected['grad_norm'], ('DP_GRAD_NORM_PARITY', step)
+            assert not grad_diffs, ('DP_REDUCED_GRADIENT_PARITY', step, grad_diffs)
             assert not diffs, ('DP_PARAMETER_UPDATE_PARITY', step, diffs)
     assert sum(records[-1]['losses']) < sum(
         records[0]['losses']
