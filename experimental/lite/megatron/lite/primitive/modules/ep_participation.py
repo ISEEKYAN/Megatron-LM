@@ -27,9 +27,7 @@ class _Participation:
         self.sequence, self.phase, self.failure, self.ready = 0, "", None, False
 
     def _records(self):
-        keys = (
-            self.keys if self.ready else [k for k in self.keys if self.store.check([k])]
-        )
+        keys = self.keys if self.ready else [k for k in self.keys if self.store.check([k])]
         return dict(zip(keys, map(json.loads, self.store.multi_get(keys))))
 
     def check(self, phase):
@@ -65,8 +63,7 @@ class _Participation:
                 self.failure = (
                     f"EP participation failed before {phase}: "
                     f"expected participants={len(self.ranks)} "
-                    f"actual={len(self.ranks) - len(missing)}; "
-                    + "; ".join(missing + mismatched)
+                    f"actual={len(self.ranks) - len(missing)}; " + "; ".join(missing + mismatched)
                 )
                 raise RuntimeError(self.failure)
             if not missing:
@@ -87,11 +84,7 @@ def check_ep_participation(group, phase):
     if state is None:
         # Reuse the group's namespace: no extra collective or group creation on
         # a rank-local dispatch path, so an absent rank need not run this code.
-        store = dist.PrefixStore(
-            "mlite_ep_participation", _get_process_group_store(group)
-        )
-        state = _Participation(
-            store, dist.get_process_group_ranks(group), dist.get_rank()
-        )
+        store = dist.PrefixStore("mlite_ep_participation", _get_process_group_store(group))
+        state = _Participation(store, dist.get_process_group_ranks(group), dist.get_rank())
         _participation[group] = state
     return state.check(phase)
