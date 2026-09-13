@@ -13,6 +13,40 @@ from megatron.lite.primitive.parallel.thd import thd_pack_meta
 from torch.nn import functional as F
 
 
+class ContiguousGDNHeadTransport:
+    """Adapt the shared headwise recurrence to Qwen's contiguous token owners.
+
+    Only transport changes: section permutation, parameter head slices and the
+    recurrence remain the existing GDN primitives. Real document boundaries do
+    not need to be divisible by CP; each head owner receives the complete row.
+    """
+
+    def _headwise_cp2hp(self, projected, cu_seqlens):
+        from megatron.lite.primitive.parallel.cp import (
+            all_to_all_hidden_shards,
+            build_headwise_section_perm,
+        )
+
+        size = self.ps.cp_size
+        permutation = build_headwise_section_perm(
+            self._qkvzba_sections(), size, projected.device
+        )
+        parts = projected.index_select(-1, permutation).chunk(size, -1)
+        received = all_to_all_hidden_shards(
+            [part.contiguous() for part in parts], self.ps.cp_group
+        )
+        return torch.cat(received, 1).contiguous(), cu_seqlens
+
+    def _headwise_hp2cp(self, output, cu_seqlens):
+        from megatron.lite.primitive.parallel.cp import all_to_all_hidden_shards
+
+        received = all_to_all_hidden_shards(
+            [part.contiguous() for part in output.chunk(self.ps.cp_size, 1)],
+            self.ps.cp_group,
+        )
+        return torch.cat(received, -1).contiguous()
+
+
 @dataclass(frozen=True)
 class Qwen3_8_FlashNextCPContext:
     group: object

@@ -236,3 +236,54 @@ def test_cp_guards(tag):
         assert tag in str(error), f'GUARD_{tag}: wrong failure {error!r}'
     else:
         assert False, f'GUARD_{tag}: missing rejection'
+
+
+@pytest.mark.parametrize('rank', [0, 1])
+def test_gdn_contiguous_head_transport_preserves_packed_boundaries(monkeypatch, rank):
+    """Thirteen tokens, a document straddles the rank boundary, three pad tokens."""
+    from megatron.lite.primitive.parallel import cp as primitive
+
+    sections = [4, 4, 4, 4, 2, 2]
+    full = torch.arange(16 * sum(sections)).reshape(1, 16, -1).float()
+    local = full[:, rank * 8 : (rank + 1) * 8]
+    cu = torch.tensor([0, 5, 13, 16], dtype=torch.int32)
+    owner = SimpleNamespace(ps=SimpleNamespace(cp_size=2, cp_rank=rank, cp_group='cp'))
+    owner._qkvzba_sections = lambda: sections
+    expected_heads = [
+        torch.cat([s.chunk(2, -1)[r] for s in full.split(sections, -1)], -1)
+        for r in range(2)
+    ]
+    observed = []
+
+    def forward_exchange(parts, group):
+        assert group == 'cp', 'CP_GDN_TRANSPORT_GROUP'
+        for r, part in enumerate(parts):
+            assert torch.equal(
+                part, expected_heads[r][:, rank * 8 : (rank + 1) * 8]
+            ), 'CP_GDN_LOCAL_HEAD_SLICE'
+        observed.append(True)
+        return list(expected_heads[rank].chunk(2, 1))
+
+    monkeypatch.setattr(primitive, 'all_to_all_hidden_shards', forward_exchange)
+    actual, actual_cu = cp.ContiguousGDNHeadTransport._headwise_cp2hp(owner, local, cu)
+    assert torch.equal(actual, expected_heads[rank]), 'CP_GDN_CONTIGUOUS_HEAD_ORDER'
+    assert actual_cu is cu, 'CP_GDN_REAL_DOCUMENT_BOUNDARIES'
+
+    values = full[..., :4]
+
+    def backward_exchange(parts, group):
+        for r, part in enumerate(parts):
+            assert torch.equal(
+                part, values[:, r * 8 : (r + 1) * 8, rank * 2 : (rank + 1) * 2]
+            ), 'CP_GDN_RETURN_TOKEN_OWNER'
+        observed.append(True)
+        return list(values[:, rank * 8 : (rank + 1) * 8].chunk(2, -1))
+
+    monkeypatch.setattr(primitive, 'all_to_all_hidden_shards', backward_exchange)
+    restored = cp.ContiguousGDNHeadTransport._headwise_hp2cp(
+        owner, values[..., rank * 2 : (rank + 1) * 2], cu
+    )
+    assert torch.equal(
+        restored, values[:, rank * 8 : (rank + 1) * 8]
+    ), 'CP_GDN_INVERSE_EXACT'
+    assert len(observed) == 2, 'CP_GDN_BOTH_COLLECTIVES'

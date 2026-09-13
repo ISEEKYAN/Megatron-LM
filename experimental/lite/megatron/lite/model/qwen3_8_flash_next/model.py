@@ -14,6 +14,7 @@ from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
 from torch import nn
 from torch.nn import functional as F
 
+from .cp import ContiguousGDNHeadTransport
 from .engram import (
     PRIMES,
     Qwen3_8_FlashNextEngramTableConfig,
@@ -24,7 +25,7 @@ from .math import Qwen3_8_FlashNextHyperConnection as HyperConnection
 from .qsa import Qwen3_8_FlashNextQSAAttention
 
 
-class Qwen38GatedDeltaNet(GatedDeltaNet):
+class Qwen38GatedDeltaNet(ContiguousGDNHeadTransport, GatedDeltaNet):
     def __init__(self, config, ps):
         fields = (
             'hidden_size',
@@ -36,6 +37,11 @@ class Qwen38GatedDeltaNet(GatedDeltaNet):
             'rms_norm_eps',
         )
         super().__init__(**{k: getattr(config, k) for k in fields}, ps=ps)
+        if ps.cp_size > 1 and (
+            config.linear_num_key_heads % ps.cp_size
+            or config.linear_num_value_heads % ps.cp_size
+        ):
+            raise ValueError('CP_GDN_HEAD_OWNERSHIP')
         # HC already supplies normalized inputs. Preserve the shared recurrence,
         # convolution and projection layout, with no second input RMSNorm.
         self.in_proj = ColumnParallelLinear(config.hidden_size, self.in_proj_dim, ps)
