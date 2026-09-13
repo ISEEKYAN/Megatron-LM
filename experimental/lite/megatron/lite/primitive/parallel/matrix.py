@@ -59,6 +59,8 @@ def gather_parameter(parameter, group, value=None):
     layout = getattr(parameter, 'tp_shard', None)
     if layout is None:
         return value
+    if group is None:
+        raise ValueError('Sharded parameter requires an explicit TP group')
     if tuple(value.shape) != layout.local_shape:
         raise ValueError('Tensor shard storage disagrees with its declared local shape')
     return allgather_concat(value, layout.size, group, layout.dim)

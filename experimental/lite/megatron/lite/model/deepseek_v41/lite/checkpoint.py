@@ -331,10 +331,11 @@ def export_model(model):
             'Pipeline stage export requires distributed checkpoint assembly'
         )
     model.validate_parameter_bindings()
+    ps = getattr(model, 'ps', None)
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
             continue
-        tensor = gather_parameter(binding.tensor, model.ps.tp_group)
+        tensor = gather_parameter(binding.tensor, None if ps is None else ps.tp_group)
         if tensor.is_meta:
             raise ValueError(f'Cannot export unmaterialized parameter: {name}')
         yield name, tensor
@@ -411,7 +412,8 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
         )
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
-    if model.ps.tp_size > 1 and model.ps.tp_rank != 0:
+    ps = getattr(model, 'ps', None)
+    if ps is not None and ps.tp_size > 1 and ps.tp_rank != 0:
         # Every TP owner participates; only rank zero publishes filesystem bytes.
         for _ in export_model(model):
             pass

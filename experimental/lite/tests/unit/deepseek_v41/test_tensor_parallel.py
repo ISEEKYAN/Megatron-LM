@@ -13,7 +13,7 @@ import torch.multiprocessing as mp
 
 
 def test_tp_layout_rejects_double_slice_and_nondivisible():
-    from megatron.lite.primitive.parallel.matrix import TensorShard
+    from megatron.lite.primitive.parallel.matrix import TensorShard, gather_parameter
 
     layout = TensorShard((8, 4), 0, 1, 2)
     full = torch.arange(32).reshape(8, 4)
@@ -22,6 +22,10 @@ def test_tp_layout_rejects_double_slice_and_nondivisible():
         layout.slice(full[4:])
     with pytest.raises(ValueError, match='divisible'):
         TensorShard((7, 4), 0, 0, 2)
+    shard = torch.nn.Parameter(torch.zeros(4, 4))
+    shard.tp_shard = layout
+    with pytest.raises(ValueError, match='explicit TP group'):
+        gather_parameter(shard, None)
 
 
 def test_tp_requires_initialized_world(moe, model_config):
