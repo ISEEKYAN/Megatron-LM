@@ -1,11 +1,14 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Qwen3.8 text training protocol for the existing MLite runtime."""
+
 from dataclasses import dataclass, field
+from types import SimpleNamespace
 
 import torch
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config import load_hf_config_dict
 from megatron.lite.primitive.parallel import init_parallel
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 
 from .config import Qwen3_8_FlashNextTextConfig
@@ -78,11 +81,41 @@ def _forward_step(model, batch):
             target[-1] = -100
             targets.append(target)
         labels = torch.cat(targets).reshape(1, -1)
-    return model(
+    kwargs = dict(
         input_ids=batch.input_ids.reshape(1, -1),
         labels=labels,
         cu_seqlens=cu if len(lengths) > 1 else None,
     )
+    ps = parallel_state_from_model(model)
+    if ps is not None and ps.cp_size > 1:
+        from .cp import shard_batch_for_qwen3_8_flash_next_cp
+
+        # Targets are already shifted over complete documents. Never roll a shard.
+        positions = torch.cat(
+            [torch.arange(n, device=batch.input_ids.device) for n in lengths]
+        ).reshape(1, -1)
+        cp_mesh = SimpleNamespace(
+            size=lambda: ps.cp_size,
+            get_local_rank=lambda: ps.cp_rank,
+            get_group=lambda: ps.cp_group,
+        )
+        tp_mesh = SimpleNamespace(size=lambda: ps.tp_size)
+        _, local, layout = shard_batch_for_qwen3_8_flash_next_cp(
+            cp_mesh, tp_mesh, dict(kwargs, position_ids=positions, cu_seqlens=cu)
+        )
+        context = local.pop('_qwen3_8_flash_next_cp_context')
+        physical_cu = cu
+        if int(cu[-1]) < layout.padded_seq_len:
+            physical_cu = torch.cat((cu, cu.new_tensor([layout.padded_seq_len])))
+        kwargs = dict(
+            local,
+            cp_context=context,
+            cu_seqlens=physical_cu,
+            # Loss targets and real router tokens are different populations.
+            # Router validity remains available in context.global_padding_mask.
+            loss_token_count=None if labels is None else (labels != -100).sum(),
+        )
+    return model(**kwargs)
 
 
 def unpack_forward_output(model, batch, output):
