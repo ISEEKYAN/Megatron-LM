@@ -9,6 +9,7 @@ from pathlib import Path
 
 import torch
 import torch.distributed as dist
+from torch.distributed.elastic.multiprocessing.errors import record
 
 sys.path.insert(
     0, os.environ['ARM_SRC'] + '/experimental/lite/tests/smoke/workflows/training'
@@ -26,6 +27,7 @@ from qwen38_dp_probe import reduced_gradients, tiny_training_config
 from qwen38_qsa_profile_observer import observed_attention
 
 
+@record
 def main():
     p = argparse.ArgumentParser()
     p.add_argument('--output', type=Path, required=True)
@@ -204,9 +206,22 @@ def main():
         markers = [
             e
             for e in trace
-            if e.get('name') == 'QSA_KV_INDEX_BACKWARD' and e.get('ph') == 'X'
+            if e.get('name') == 'QSA_KV_INDEX_BACKWARD'
+            and e.get('ph') == 'X'
+            and e.get('cat') == 'user_annotation'
         ]
         assert len(markers) == 4, ('QSA_INDEX_PROFILE_NATIVE_COUNTS', len(markers))
+        gpu_markers = [
+            e
+            for e in trace
+            if e.get('name') == 'QSA_KV_INDEX_BACKWARD'
+            and e.get('cat') == 'gpu_user_annotation'
+        ]
+        assert len(gpu_markers) == 4 and {
+            e['args']['External id'] for e in gpu_markers
+        } == {
+            e['args']['External id'] for e in markers
+        }, 'QSA_INDEX_PROFILE_CPU_GPU_RANGE_IDENTITY'
         attributed = []
         ids = set()
         for marker in markers:

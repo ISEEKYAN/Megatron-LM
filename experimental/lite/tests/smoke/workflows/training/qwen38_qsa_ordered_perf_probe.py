@@ -9,6 +9,7 @@ from pathlib import Path
 import torch
 import torch.distributed as dist
 from megatron.lite.model.qwen3_8_flash_next.math import sparse_attention
+from torch.distributed.elastic.multiprocessing.errors import record
 
 
 def selected_adjoints(record, left, right):
@@ -43,6 +44,7 @@ def selected_adjoints(record, left, right):
     return dict(routes=routes, selected=captured, dk=k.grad, dv=v.grad)
 
 
+@record
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--source', type=Path, required=True)
@@ -168,6 +170,7 @@ def main():
         checks=checks,
         samples_us={'partial': [], 'ordered': []},
     )
+    graphs = {}
     try:
         baseline()
         raw['partial'] = output.cpu().clone()
@@ -253,7 +256,14 @@ def main():
         (args.output / f'report-rank{rank}.json').write_text(
             json.dumps(report, indent=2) + '\n'
         )
+        print('QSA_COST_RELEASE_GRAPHS_BEGIN', rank, flush=True)
+        for graph in graphs.values():
+            graph.reset()
+        graphs.clear()
+        torch.cuda.synchronize()
+        print('QSA_COST_RELEASE_GRAPHS_DONE', rank, flush=True)
         dist.destroy_process_group()
+        print('QSA_COST_GROUP_DESTROYED', rank, flush=True)
 
 
 if __name__ == '__main__':
