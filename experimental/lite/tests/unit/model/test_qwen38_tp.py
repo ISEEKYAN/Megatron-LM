@@ -18,6 +18,9 @@ def test_tp_projection_storage_and_optimizer_scope(monkeypatch):
     model.lm_head = torch.nn.Linear(4, 8, bias=False)
     model.embed_tokens = torch.nn.Embedding(8, 4)
     model.layers = torch.nn.ModuleList([])
+    model.mlp = torch.nn.Module()
+    model.mlp.experts = torch.nn.Linear(4, 8, bias=False)
+    model.mlp.experts.weight.allreduce = False
     original = sum(p.numel() for p in model.parameters())
     tp.parallelize_projections(model, SimpleNamespace(tp_size=2, tp_rank=0))
     assert model.lm_head.linear.weight.shape == (4, 4), 'TP_STORAGE'
@@ -27,6 +30,9 @@ def test_tp_projection_storage_and_optimizer_scope(monkeypatch):
         model.embed_tokens.weight.tensor_model_parallel is False
     ), 'TP_OPTIMIZER_SCOPE'
     assert not model.embed_tokens.weight.sequence_parallel, 'TP_REPLICA_MUST_NOT_SUM'
+    # EDP optimizer shards are disjoint even though ETP=1 weights are replicated.
+    assert model.mlp.experts.weight.tensor_model_parallel, 'TP_EXPERT_NORM_SCOPE'
+    assert not model.mlp.experts.weight.sequence_parallel
 
 
 @pytest.mark.parametrize(

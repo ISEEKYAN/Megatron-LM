@@ -145,7 +145,9 @@ def main():
                 expected_local(name, reference['initial'][serial_parameter_name(name)]),
             ), ('TP_INITIAL_WEIGHTS', name)
         for name, p in model.named_parameters():
-            assert p.tensor_model_parallel == projection_shard(name), (
+            assert p.tensor_model_parallel == (
+                projection_shard(name) or '.experts.' in name
+            ), (
                 'TP_OPTIMIZER_SCOPE',
                 name,
             )

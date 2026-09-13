@@ -56,8 +56,9 @@ def parallelize_projections(model, ps):
         replacement = (column if use_te else vanilla)(din, dout, ps, gather_output=True)
         setattr(parent, key, replacement)
     for name, parameter in model.named_parameters():
-        # Full-gradient replicas must be counted once, never SP-summed.
-        parameter.tensor_model_parallel = projection_shard(name)
+        # Dense replicas count once. Expert EDP optimizer shards are disjoint
+        # across TP ranks and must all contribute to the logical gradient norm.
+        parameter.tensor_model_parallel = projection_shard(name) or '.experts.' in name
         parameter.sequence_parallel = False
 
 
