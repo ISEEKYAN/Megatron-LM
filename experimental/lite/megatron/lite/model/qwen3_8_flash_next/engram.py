@@ -1,4 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Temporary model-local floating row lookup, independent of unmerged PR #212.
+
+Converge to primitive/modules/engram_lookup.py after #212 lands on main in a
+separate change. Qwen trains floating rows with raw-ID hashing; DS4 additionally
+supports FP8/scale storage and tokenizer-compressed hashing. Single-owner lookup
+has the same additive duplicate-index gradient contract as RowLookup.gather_rows.
+"""
 from dataclasses import dataclass
 
 import torch
@@ -124,13 +131,6 @@ class Qwen3_8_FlashNextEngramTableConfig:
 class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
     def __init__(self, config, *, process_group, device, dtype):
         super().__init__()
-        try:
-            from megatron.lite.primitive.modules.engram_lookup import RowLookup
-        except ModuleNotFoundError as error:
-            if error.name != 'megatron.lite.primitive.modules.engram_lookup':
-                raise
-            RowLookup = None
-
         size = (
             1
             if process_group is None
@@ -138,9 +138,9 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         )
         rank = 0 if process_group is None else torch.distributed.get_rank(process_group)
         boundaries = [config.num_embeddings * r // size for r in range(size + 1)]
-        self.lookup = (
-            None if RowLookup is None else RowLookup(boundaries, process_group)
-        )
+        if size != 1:
+            raise NotImplementedError('PLE_MULTI_OWNER_NOT_VALIDATED')
+        self.lookup = None
         self.global_row_start, self.global_row_end = boundaries[rank : rank + 2]
         self.weight = nn.Parameter(
             torch.empty(
@@ -157,6 +157,12 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         nn.init.normal_(self.weight, std=self.initializer_range)
 
     def forward(self, global_ids):
+        if self.lookup is None and self.global_row_start == 0:
+            if global_ids.dtype != torch.int64 or bool(
+                ((global_ids < 0) | (global_ids >= self.global_row_end)).any()
+            ):
+                raise ValueError('PLE_LOCAL_ROW_IDS')
+            return self.weight[global_ids]
         gather = getattr(self.lookup, 'gather_rows', None)
         if not callable(gather):
             raise RuntimeError('ROW_LOOKUP_GATHER_ROWS_REQUIRED')

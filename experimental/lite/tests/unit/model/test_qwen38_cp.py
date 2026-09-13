@@ -98,18 +98,17 @@ def test_ple_cp_padding_matches_separate_sequences(metadata, dtype):
     assert (x.grad[:, [0, 1, 6, 11, 12, 13, 14, 15]] == 0).all(), 'PLE_PAD_GRAD'
 
 
-def test_unassembled_runtime_diagnostic():
+def test_assembled_runtime_protocol():
     from megatron.lite.model.registry import (
         get_train_runtime_module,
         resolve_runtime_model_name,
     )
 
-    for resolve, args in [
-        (get_train_runtime_module, ()),
-        (resolve_runtime_model_name, ('lite',)),
-    ]:
-        with pytest.raises(ValueError, match='not yet assembled'):
-            resolve('qwen3_8_flash_next', *args)
+    assert (
+        resolve_runtime_model_name('qwen3_8_flash_next', 'lite') == 'qwen3_8_flash_next'
+    )
+    protocol = get_train_runtime_module('qwen3_8_flash_next')
+    assert callable(protocol.build_model) and callable(protocol.build_model_config)
 
 
 @pytest.mark.parametrize('packed', [False, True])

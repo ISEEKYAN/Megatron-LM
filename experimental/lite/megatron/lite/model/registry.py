@@ -125,6 +125,7 @@ register_model(
         "qwen4_exp",
         "qwen4_exp_text",
     ],
+    impls={"lite": "megatron.lite.model.qwen3_8_flash_next.protocol"},
 )
 
 # ---------------------------------------------------------------------------
