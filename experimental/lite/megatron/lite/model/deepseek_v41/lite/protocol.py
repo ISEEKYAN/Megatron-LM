@@ -10,8 +10,6 @@ import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
-)
-from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -459,16 +457,13 @@ def vocab_size(model_cfg):
     return model_cfg.to_hf_dict()['text_config']['vocab_size']
 
 
-def pack_routed_experts(model, batch, routed_experts):
-    """Use shared THD padding followed by contiguous CP and then TP slicing."""
-    return _pack_routed_experts(
-        model, batch, routed_experts, contiguous=True, contiguous_padding=True
-    )
-
-
-def pack_r3_replay_mask(model, batch):
-    """Keep the causal replay mask in exactly the same token layout as routes."""
-    return _pack_r3_replay_mask(model, batch, contiguous=True, contiguous_padding=True)
+# Both replay inputs use V4's shared packers with V4.1's contiguous padding.
+pack_routed_experts = partial(
+    _pack_routed_experts, contiguous=True, contiguous_padding=True
+)
+pack_r3_replay_mask = partial(
+    _pack_r3_replay_mask, contiguous=True, contiguous_padding=True
+)
 
 
 def router_replay_roots(chunk):
