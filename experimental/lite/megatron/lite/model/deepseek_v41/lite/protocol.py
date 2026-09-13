@@ -62,7 +62,8 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'cp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'vpp'))
+        or (p.cp != 1 and p.ep != 1)
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
@@ -71,6 +72,13 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError("EP size must be a positive integer")
+    if type(p.cp) is not int or p.cp < 1:
+        raise ValueError('CP size must be a positive integer')
+    if p.cp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() != p.cp
+    ):
+        raise ValueError('CP requires an initialized CP-only world')
     if p.ep > 1 and (
         not torch.distributed.is_initialized()
         or torch.distributed.get_world_size() < p.ep
@@ -140,14 +148,17 @@ def build_model(model_cfg, *, impl_cfg):
                 parameter.main_grad = None
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(
-            model, impl_cfg.optimizer_config, dp_group=ps.dp_group, ps=ps
+            model,
+            impl_cfg.optimizer_config,
+            dp_group=ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group,
+            ps=ps,
         )
     if impl_cfg.external_vision_device is not None:
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
         model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
     execution_model = model
-    if ps.dp_size > 1 and optimizing:
+    if (ps.dp_size > 1 or ps.cp_size > 1) and optimizing:
         if impl_cfg.external_vision_device is not None:
             raise NotImplementedError(
                 'DP external vision requires staged gradient synchronization'
@@ -156,10 +167,11 @@ def build_model(model_cfg, *, impl_cfg):
 
         # DDP synchronizes parameter initialization. Encoded Engram buffers need
         # byte collectives because NCCL does not accept their FP8 storage dtype.
+        gradient_group = ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group
         with torch.no_grad():
             for buffer in model.buffers():
                 value = buffer.contiguous().reshape(-1).view(torch.uint8)
-                torch.distributed.broadcast(value, src=0, group=ps.dp_group)
+                torch.distributed.broadcast(value, src=0, group=gradient_group)
                 buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
         if ps.ep_size > 1:
             expert_ids = {
@@ -179,7 +191,7 @@ def build_model(model_cfg, *, impl_cfg):
                     )
         execution_model = DistributedDataParallel(
             model,
-            process_group=ps.dp_group,
+            process_group=gradient_group,
             broadcast_buffers=False,
             find_unused_parameters=True,
         )
@@ -310,15 +322,32 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
         else nullcontext()
     )
     modality = dict(batch.extras)
+    cp_context = None
+    ids = batch.input_ids[None]
+    if model.ps.cp_size > 1:
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+        if (
+            modality
+            or batch.routed_experts is not None
+            or batch.r3_replay_mask is not None
+        ):
+            raise NotImplementedError(
+                'CP text training does not yet accept modality or replay inputs'
+            )
+        cp_context = ContiguousCPSequence(
+            batch.total_tokens, model.ps.cp_rank, model.ps.cp_size, model.ps.cp_group
+        )
+        ids = cp_context.slice(ids)
     if 'token_types' in modality:
         if modality['token_types'].shape != batch.input_ids.shape:
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
     with precision:
         output = (model if execution_model is None else execution_model)(
-            batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality
+            ids, cu_seqlens=batch.cu_seqlens, cp_context=cp_context, **modality
         )
-    result = _text_output(output['logits'][0], batch)
+    result = _text_output(output['logits'][0], batch, cp_context=cp_context)
     if optimizer is not None and model.training and torch.is_grad_enabled():
         optimizer.accumulate_modality_loads(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
@@ -381,7 +410,24 @@ def _pipeline_ranges(model, batch, start, end, states):
     return outputs, result
 
 
-def _text_output(logits, batch):
+def _cp_targets(batch, cp_context):
+    mask = (
+        torch.ones_like(batch.labels, dtype=torch.float32)
+        if batch.loss_mask is None
+        else batch.loss_mask
+    )
+    labels, mask = (
+        roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
+        for value in (batch.labels, mask)
+    )
+    return (
+        cp_context.slice(labels, seq_dim=0),
+        cp_context.slice(mask, seq_dim=0),
+        mask.sum().clamp_min(1),
+    )
+
+
+def _text_output(logits, batch, *, cp_context=None):
     from megatron.lite.runtime.contracts.loss import get_loss_context
 
     context = get_loss_context()
@@ -401,17 +447,23 @@ def _text_output(logits, batch):
         )
         if mask.shape != labels.shape:
             raise ValueError('Loss mask must match packed input shape')
-        labels, mask = (
-            roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
-            for value in (labels, mask)
-        )
+        if cp_context is None:
+            labels, mask = (
+                roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
+                for value in (labels, mask)
+            )
+            denominator = mask.sum().clamp_min(1)
+        else:
+            labels, mask, denominator = _cp_targets(batch, cp_context)
         token_loss = F.cross_entropy(logits, labels, reduction='none')
-        denominator = mask.sum().clamp_min(1)
         if context is not None and context.normalization_denominator is not None:
             denominator = context.normalization_denominator
             if not math.isfinite(denominator) or denominator <= 0:
                 raise ValueError('Loss denominator must be finite and positive')
         result['loss'] = (token_loss * mask).sum() / denominator
+        if cp_context is not None:
+            # DDP averages the disjoint CP token contributions.
+            result['loss'] = result['loss'] * cp_context.size
         if context is not None:
             result['loss'] = result['loss'] * context.loss_scale
         if context is None or context.return_log_probs:
@@ -428,6 +480,13 @@ def unpack_forward_output(model, batch, output):
             key: unpack_forward_output(model, batch, value)
             for key, value in output.items()
         }
+    if model.ps.cp_size > 1 and isinstance(output, torch.Tensor) and output.ndim > 0:
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+        cp_context = ContiguousCPSequence(
+            batch.total_tokens, model.ps.cp_rank, model.ps.cp_size, model.ps.cp_group
+        )
+        output = cp_context.gather(output, seq_dim=0)
     if (
         isinstance(output, torch.Tensor)
         and output.ndim > 0

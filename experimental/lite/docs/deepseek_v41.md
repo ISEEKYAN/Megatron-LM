@@ -52,8 +52,27 @@ The two-GPU regression preserves all 40 layers with reduced dimensions in the
 floating diagnostic mode. It checks two optimizer steps, unequal token counts,
 replica equality, and comparison with a single-process global batch. This does
 not establish full-size or native quantized training support. `build_model` still
-rejects PP > 1 (and TP/CP/VPP/ETP); local pipeline range helpers are not a supported
+rejects PP > 1 (and TP/VPP/ETP); local pipeline range helpers are not a supported
 PP runtime.
+
+
+## Contiguous context parallel text training
+Use `ParallelConfig(cp=2)` in an initialized two-rank world, keeping TP, EP,
+PP and VPP at one. The protocol receives the complete packed batch, shifts
+labels and loss weights within each document, then assigns one contiguous
+interval per rank. Uneven lengths pad transport only. Each rank visits every
+document, including empty intersections, and hashes complete document history
+before selecting its Engram rows. CSA2 queries and selections are local; window
+KV, compressor groups and shared KV remain document-global.
+
+Communication uses the shared differentiable CP gather and DDP gradient
+averaging. This correctness path materializes full-document KV; it does not
+provide fused sparse attention's memory or throughput characteristics. CP
+modality/replay inputs and CP combined with other parallel dimensions are
+rejected. Floating tests retain the 40-layer assembly, all three CSA2 modes,
+frozen indexers, and nonzero frozen/trainable Engram tables. The strict reference
+preserves local operator shapes and the gather backward reduction order;
+parameter contributions are checked before DDP averaging as well as after it.
 
 
 ## Expert parallel text training
