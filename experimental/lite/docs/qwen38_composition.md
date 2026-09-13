@@ -1,9 +1,9 @@
-# Qwen3.8-Flash-Next composition design
+# Qwen3.8-Flash-Next text training composition
 
-Design only; model execution, tensor shapes/dtypes, and numerical parity are not yet validated.
+Single-rank MLite runtime training is assembled; distributed training, full HF loading, and end-to-end reference parity remain unvalidated.
 References: [HF config and checkpoint index](https://huggingface.co/Qwen/Qwen3.8-Flash-Next/tree/de4b8e4d43b917e7706784d8bb445c9af86a3540), [Automodel PR](https://github.com/NVIDIA-NeMo/Automodel/pull/3690) head `5cfe13b160eb7e23ac5a4868bbf611707cdf98fb`; source inspection also used Automodel `dc8f31f2c35e9e98a8721b575037a833807c7ac1`.
-The HF repository lists no Python modeling files; Automodel supplies the inspected modeling reference. Shared interface snapshot: `92f89751a` on `feature/deepseek-v41-c-clean`.
-Budget: model 700 + primitive extensions 600 + tests 650 + documentation 50 = 2000 added lines relative to the stack base; no tools or fixtures.
+Fresh source checks: Automodel main `f7ccd6f7902634af34c2f31b3294ac250dc97670` and PR head fetched 2026-09-13T11:12:06Z; MCore `nv/dev` `0cd11658f44350a141656751259cfe1f72398e9f` fetched 2026-09-13T11:11:23Z has generic GDN/HC, no dedicated Qwen3.8 model.
+The original 2000-added-line component budget is exceeded by runtime assembly and training tests; no budget acceptance is claimed. No tools or fixtures are added.
 
 | Config group | Mapping / invariant |
 |---|---|
@@ -21,11 +21,11 @@ Budget: model 700 + primitive extensions 600 + tests 650 + documentation 50 = 20
 | HC | Reuse pipeline expand/fold/unfold only. New grouped RMSNorm, low-rank sigmoid read, mean over streams, and `2*sigmoid` injection write; reject DS4 mixing equations. |
 | QSA | New compressed-block indexer and selected-token GQA; group keys before norm/RoPE, restart blocks per document, preserve causal tail. Reject DS4 CSA/DSA routing semantics. |
 | N-gram | New raw-ID, EOS-aware signed-int64 multiply/XOR/modulo; reject DS4 tokenizer compression and seeded multipliers. Constants: 23703573157769, 20109073645365, 8052911324071. |
-| PLE | Reuse owner routing transport only; new branch norms/projections and depthwise short convolution (width 4, dilation 3, nine-token history). |
+| PLE | Temporary model-local floating lookup; duplicate IDs accumulate gradients. New branch norms/projections and depthwise convolution (width 4, dilation 3, nine-token history). |
 | CP | Reuse contiguous slicing, THD metadata/unpacking, router replay; retain global IDs and document boundaries, local interval `[r*L,(r+1)*L)`. Per-document CP slicing is not global contiguous slicing. |
 | Storage | Use floating trainable owner rows for Qwen; reuse block-FP8 helpers only if a matching quantized storage contract is explicitly selected. Do not force DS4 FP8+E8M0 table semantics. |
 
-Checkpoint index: 1658 keys = 1294 text/head + 333 vision + 31 MTP. Below, `L=model.language_model.layers.i`; shapes follow config/reference equations, not tensor-header validation.
+Checkpoint index: 1658 keys = 1294 text/head + 333 vision + 31 MTP. Below, `L=model.language_model.layers.i`; mapping plans follow config/reference equations. Real-HF tests additionally check 7 HC native shapes, 9 GDN planned shapes, and all 35 PLE buffer integers; this is not a complete loader.
 | HF keys (suffixes grouped only when transform is identical) | Proposed native mapping |
 |---|---|
 | `model.language_model.embed_tokens.weight`, `lm_head.weight` | Token embedding/output, each [248320,2560]; preserve untied weights. |
@@ -42,6 +42,6 @@ Checkpoint index: 1658 keys = 1294 text/head + 333 vision + 31 MTP. Below, `L=mo
 | `L.ple.{key_proj,value_proj}.weight`, `{norm_key,norm_query,norm_conv}.weight`, `conv1d.weight` | Qwen PLE: key [10240,2560], value [2560,2560], norms [10240], convolution [10240,1,4]. |
 | `model.visual.*` (333), `mtp.*` (31) | Account explicitly in coverage; current MLite text composition does not establish their support. Reference adapter omits MTP; this is not evidence of complete checkpoint coverage. |
 
-Required stable shared API: `RowLookup(boundaries, group=None)` plus proposed `gather_rows(values, ids)` with symmetric pre-payload validation, autograd duplicate-index accumulation, and empty-rank participation; current `fetch(values, scales, ids, master=None)` is FP8-specific.
+Engram is explicitly temporary and independent of PR #212: after that PR lands on main, a separate follow-up will converge on `primitive/modules/engram_lookup.py`. Qwen uses floating rows/raw token IDs; DS4 also supports FP8/scales and tokenizer compression. Multi-owner lookup is currently rejected.
 Keep `contiguous_slice_for_cp(tensor, cp_rank, cp_size, seq_dim=1)`, `thd_pack_meta(seq_lens, *, tp_size=1, cp_size=1, cp_group=None, contiguous=False)`, and `unpack_thd_to_nested(output, meta, *, contiguous=False)` stable. Confirm global packed slicing separately from per-document padding.
-Selection is provisional: floating lookup, boundary transport, QSA/HC/PLE, and full weight coverage still require implementation and independent forward/backward validation. No skill completion or acceptance pass is claimed.
+The registered protocol uses the existing MLite runtime and distributed optimizer for single-rank scratch training. Set `load_hf_weights=False`; HF import/export and all parallel dimensions greater than one fail explicitly. The GPU test exercises GDN, QSA, MoE, HC, PLE, optimizer updates and model-state restoration; packed GDN requires FLA. No full skill acceptance is claimed.
