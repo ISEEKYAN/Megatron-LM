@@ -16,6 +16,12 @@ import torch.distributed as dist
 sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'unit' / 'model'))
 from test_qwen38_training import tiny_training_config
 from qwen38_dp_probe import reduced_gradients
+from qwen38_tp_reference import (
+    assert_dgrad_reference,
+    bf16_ordered_sum,
+    independent_partials,
+    explained_difference,
+)
 from megatron.lite.model.qwen3_8_flash_next.tp import (
     projection_shard,
     serial_parameter_name,
@@ -40,9 +46,17 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--reference', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--bf16-model', action='store_true')
+    parser.add_argument('--serial-reference', type=Path)
     args = parser.parse_args()
     world, rank = int(os.environ['WORLD_SIZE']), int(os.environ['RANK'])
     assert world in (1, 2), 'TP_WORLD'
+    assert not args.bf16_model or world == 1, 'TP_MODEL_SINGLE_PROCESS'
+    serial = (
+        torch.load(args.serial_reference, weights_only=True)
+        if args.serial_reference
+        else None
+    )
     torch.cuda.set_device(int(os.environ['LOCAL_RANK']))
     torch.manual_seed(1234)
     run_id = os.environ['QWEN_TP_RUN_ID']
@@ -124,6 +138,21 @@ def main():
         }
 
     initial = state()
+    if serial is not None:
+        assert serial['world'] == 1 and not serial.get(
+            'bf16_model', False
+        ), 'TP_SERIAL_FULL_MATRIX'
+        assert (
+            serial['run_id'] == run_id and serial['config'] == config
+        ), 'TP_SERIAL_SCOPE'
+        for name, value in initial.items():
+            assert compare(
+                value,
+                expected_local(name, serial['initial'][serial_parameter_name(name)]),
+            ), ('TP_SERIAL_INITIAL', name)
+        if world > 1:
+            assert reference['bf16_model'], 'TP_BF16_MODEL_REFERENCE_REQUIRED'
+    assert not args.bf16_model or serial is not None, 'TP_MODEL_SERIAL_REQUIRED'
     storage = {
         name: dict(
             shape=list(p.shape),
@@ -147,10 +176,7 @@ def main():
         for name, p in model.named_parameters():
             assert p.tensor_model_parallel == (
                 projection_shard(name) or '.experts.' in name
-            ), (
-                'TP_OPTIMIZER_SCOPE',
-                name,
-            )
+            ), ('TP_OPTIMIZER_SCOPE', name)
             assert not p.sequence_parallel, ('TP_REPLICA_GRADIENT_SCOPE', name)
         print('TP_STORAGE', rank, local_numel, reference['local_numel'], flush=True)
 
@@ -212,7 +238,7 @@ def main():
             continue
 
         def before(module, inputs, key=canonical):
-            if not trace_active[0]:
+            if not trace_active[0] and not args.bf16_model:
                 return
             x = inputs[0].view_as(inputs[0])
             weight = (
@@ -224,19 +250,33 @@ def main():
             }
             traces.setdefault(key, []).append(row)
             if x.requires_grad:
-                x.register_hook(
-                    lambda grad, row=row: row.update(dx=grad.detach().cpu().clone())
-                )
+
+                def input_gradient(grad, row=row):
+                    if args.bf16_model:
+                        grad = row['modeled_dx'].to(grad.device)
+                    row['dx'] = grad.detach().cpu().clone()
+                    return grad
+
+                x.register_hook(input_gradient)
             return (x, *inputs[1:])
 
         def after(module, inputs, output, key=canonical):
-            if not trace_active[0]:
+            if not trace_active[0] and not args.bf16_model:
                 return
             row = traces[key][-1]
             row['y'] = output.detach().cpu().clone()
 
             def output_gradient(grad):
                 row['dy'] = grad.detach().cpu().clone()
+                if args.bf16_model:
+                    full_weight = (
+                        module.linear.weight
+                        if hasattr(module, 'linear')
+                        else module.weight
+                    )
+                    parts = independent_partials(grad.detach(), full_weight.detach())
+                    row['modeled_dx'] = bf16_ordered_sum(parts).cpu()
+                    row['model_partials'] = [part.cpu() for part in parts]
                 if key == 'lm_head.weight':
                     if world == 1:
                         # Diagnostic slices of the independent full-matrix run.
@@ -295,6 +335,12 @@ def main():
                     assert torch.equal(
                         row['post_reduce'], row['dx']
                     ), 'TP_HEAD_POST_REDUCE_DX'
+                    if serial is not None:
+                        modeled_dx = bf16_ordered_sum(target['serial_partials'])
+                        serial_dx = serial['head_partials'][microbatch]['dx']
+                        assert_dgrad_reference(row['dx'], modeled_dx, serial_dx)
+                if serial is not None:
+                    print('TP_DGRAD_BF16_MODEL_SERIAL_EXPLAINED_OK', rank, flush=True)
                 print('TP_HEAD_PRE_REDUCE_PARTIALS_BITWISE_OK', rank, flush=True)
         torch.save(record, args.output / f'step{step}-rank{rank}.pt')
         if step == 1:
@@ -323,6 +369,7 @@ def main():
     result = dict(
         run_id=run_id,
         world=world,
+        bf16_model=args.bf16_model,
         config=config,
         head_partials=traces['lm_head.weight'],
         initial=initial,
@@ -346,6 +393,11 @@ def main():
         for step, (record, target) in enumerate(
             zip(records, reference['steps'], strict=True)
         ):
+            serial_step = serial['steps'][step] if serial is not None else None
+            if serial_step is not None:
+                assert explained_difference(
+                    record['grad_norm'], target['grad_norm'], serial_step['grad_norm']
+                ), ('TP_NORM_SERIAL_EXPLAINED', step)
             if record['grad_norm'] != target['grad_norm']:
                 mismatches.append(
                     (
@@ -359,6 +411,10 @@ def main():
                 zip(record['outputs'], target['outputs'], strict=True)
             ):
                 for name, value in output.items():
+                    if serial_step is not None:
+                        assert explained_difference(
+                            value, expected[name], serial_step['outputs'][i][name]
+                        ), ('TP_OUTPUT_SERIAL_EXPLAINED', step, i, name)
                     if not compare(value, expected[name]):
                         mismatches.append(
                             (
@@ -378,6 +434,16 @@ def main():
                     expected = expected_local(
                         name, target[field][serial_parameter_name(name)]
                     )
+                    if serial_step is not None:
+                        full_serial = expected_local(
+                            name, serial_step[field][serial_parameter_name(name)]
+                        )
+                        assert explained_difference(value, expected, full_serial), (
+                            'TP_STATE_SERIAL_EXPLAINED',
+                            step,
+                            field,
+                            name,
+                        )
                     if not compare(value, expected):
                         mismatches.append(
                             (
