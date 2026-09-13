@@ -266,3 +266,34 @@ def test_fp64_oracle_rejects_corrupted_actual_signals(mutation, tag):
         gradients[name][0, 0] += 1e-7
     with pytest.raises(AssertionError, match=tag):
         check_wgrad_oracle(calls, gradients, reference, 0, 2)
+
+
+def test_environment_survives_restricted_reference_loading(monkeypatch, tmp_path):
+    import os
+    from types import ModuleType
+
+    from qwen38_ep_probe import environment
+
+    te = ModuleType('transformer_engine')
+    te.__version__ = '2.15.0+42b84005'
+    gdn = ModuleType('megatron.lite.primitive.modules.gated_delta_net')
+    gdn._HAS_FLA = False
+    monkeypatch.setitem(sys.modules, 'transformer_engine', te)
+    monkeypatch.setitem(sys.modules, gdn.__name__, gdn)
+    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda: 'NVIDIA H100 80GB HBM3')
+    monkeypatch.setattr(torch.cuda, 'get_device_capability', lambda: (9, 0))
+    for key in os.environ:
+        if key.startswith(('NVTE_', 'MEGATRON_LITE_', 'MLITE_', 'FLA_', 'CUBLAS_')):
+            monkeypatch.delenv(key)
+    for key, value in {
+        'CUBLAS_VERSION': '13.4.1.1',
+        'NVTE_FLASH_ATTN': '1',
+        'NVTE_FUSED_ATTN': '0',
+        'NVTE_UNFUSED_ATTN': '0',
+    }.items():
+        monkeypatch.setenv(key, value)
+    observed = environment()
+    artifact = tmp_path / 'reference.pt'
+    torch.save({'scope': {'environment': observed}}, artifact)
+    restored = torch.load(artifact, weights_only=True)
+    assert restored['scope']['environment'] == observed

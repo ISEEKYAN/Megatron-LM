@@ -59,7 +59,7 @@ def environment():
     from megatron.lite.primitive.modules import gated_delta_net
 
     result = dict(
-        torch=torch.__version__,
+        torch=str(torch.__version__),
         cuda=torch.version.cuda,
         te=transformer_engine.__version__,
         cudnn=torch.backends.cudnn.version(),
