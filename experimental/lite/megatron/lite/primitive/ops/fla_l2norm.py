@@ -3,7 +3,9 @@
 
 The policy is code-versioned, not benchmark-selected or environment-dependent.
 Changing it changes numerical execution and requires a new policy version.
-Other FLA operators are outside this adapter's scope.
+Policy v2 selects the measured stable BT8/w8 small-feature configuration.
+The large-feature branch retains four warps. Other FLA operators are outside
+this adapter's scope.
 """
 
 from __future__ import annotations
@@ -33,7 +35,13 @@ except ImportError:
 
 def kernel_policy() -> dict[str, int]:
     """Persist this alongside a validation run/checkpoint's implementation revision."""
-    return {"version": 1, "BT": 32, "num_warps": 4, "num_stages": 3}
+    return {
+        "version": 2,
+        "BT": 8,
+        "num_warps": 8,
+        "num_stages": 3,
+        "large_num_warps": 4,
+    }
 
 
 def assert_kernel_configs_match(per_rank: list[list[dict]]) -> None:
@@ -60,7 +68,7 @@ def assert_kernel_configs_match(per_rank: list[list[dict]]) -> None:
     for key, config in seen.items():
         expected = {"num_warps": 4, "num_stages": 3}
         if key[0] in ("l2norm_fwd_kernel", "l2norm_bwd_kernel"):
-            expected["BT"] = 32
+            expected.update(BT=8, num_warps=8)
         assert config == expected, ("FLA_L2NORM_PINNED_CONFIG_REQUIRED", key, config)
 
 
@@ -79,7 +87,7 @@ class _FixedL2Norm(torch.autograd.Function):
         y = torch.empty_like(flat)
         rstd = torch.empty((rows,), dtype=torch.float32, device=x.device)
         if width <= 512:
-            _FWD[((rows + 31) // 32,)](
+            _FWD[((rows + 7) // 8,)](
                 x=flat,
                 y=y,
                 rstd=rstd,
@@ -88,8 +96,8 @@ class _FixedL2Norm(torch.autograd.Function):
                 D=width,
                 BD=block,
                 NB=(rows + 65535) // 65536,
-                BT=32,
-                num_warps=4,
+                BT=8,
+                num_warps=8,
                 num_stages=3,
             )
         else:
@@ -115,7 +123,7 @@ class _FixedL2Norm(torch.autograd.Function):
         rows, width = y.shape
         dx = torch.empty_like(y)
         if width <= 512:
-            _BWD[((rows + 31) // 32,)](
+            _BWD[((rows + 7) // 8,)](
                 y=y,
                 rstd=rstd,
                 dy=dy,
@@ -125,8 +133,8 @@ class _FixedL2Norm(torch.autograd.Function):
                 D=width,
                 BD=ctx.block,
                 NB=(rows + 65535) // 65536,
-                BT=32,
-                num_warps=4,
+                BT=8,
+                num_warps=8,
                 num_stages=3,
             )
         else:
