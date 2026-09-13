@@ -280,6 +280,14 @@ def _1f1b_schedule(
     def _run_backward(inp_t, hid_t, loss_t, grad_t):
         # Match Core backward_step: the output, not local loss presence, gates backward.
         output = loss_t if ps.pp_is_last and loss_t is not None else hid_t
+        if output is None:
+            # The oldest output was just popped from the backward queue.
+            microbatch = len(outputs) - len(output_hiddens) - 1
+            raise RuntimeError(
+                f"pipeline_missing_backward_output: rank={dist.get_rank()} "
+                f"stage={ps.pp_rank} microbatch={microbatch}; "
+                "expected loss or hidden_states for backward"
+            )
         if output.requires_grad:
             torch.autograd.backward(output, grad_t)
         return inp_t.grad if inp_t is not None else None
@@ -886,6 +894,12 @@ def _interleaved_1f1b_schedule(
                 if _dbg:
                     print(f"[VPP r{rank}] mb={mb_id} bwd stage={stage_id}", flush=True)
                 output = loss if is_last_stage and loss is not None else out_t
+                if output is None:
+                    raise RuntimeError(
+                        f"pipeline_missing_backward_output: rank={rank} "
+                        f"stage={stage_id} microbatch={mb_id}; "
+                        "expected loss or hidden_states for backward"
+                    )
                 if output.requires_grad:
                     torch.autograd.backward(output, grad)
                 if not is_first_stage:

@@ -99,6 +99,55 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8, terminal="loss"):
 VARLEN = [5, 9, 3, 7]  # deliberately non-uniform, ascending & descending mix
 
 
+@pytest.mark.parametrize("interleaved", [False, True], ids=["1f1b", "interleaved"])
+@pytest.mark.parametrize("missing_mb", [0, 1])
+def test_missing_backward_output_is_named(monkeypatch, interleaved, missing_mb):
+    ps = _make_ps(2, 1)
+    ps.pp_cpu_group = None
+    models = [_MockModel(2) for _ in range(2 if interleaved else 1)]
+    shape = (3, 1, 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 7)
+
+    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, *args, **kwargs):
+        return (
+            torch.ones(shape, requires_grad=True) if recv_fwd else None,
+            torch.ones(shape) if recv_bwd else None,
+        )
+
+    monkeypatch.setattr(pl, "_send_recv_pipeline", fake_srp)
+
+    def forward_step_fn(model, mb):
+        if model is models[-1] and mb == missing_mb:
+            return {}  # Last stage supplies neither loss nor hidden_states.
+        hidden = model._input_tensor * model.weight.sum()
+        return (
+            {"loss": hidden.sum()} if model is models[-1] else {"hidden_states": hidden}
+        )
+
+    schedule = pl._interleaved_1f1b_schedule if interleaved else pl._1f1b_schedule
+    try:
+        schedule(
+            forward_step_fn,
+            models if interleaved else models[0],
+            iter(range(2)),
+            2,
+            SimpleNamespace(),
+            ps,
+            shape,
+        )
+    except Exception as exc:
+        assert isinstance(
+            exc, RuntimeError
+        ), "missing_backward_output_must_raise_named_runtime_error"
+        expected_stage = 3 if interleaved else 1
+        assert str(exc) == (
+            f"pipeline_missing_backward_output: rank=7 stage={expected_stage} "
+            f"microbatch={missing_mb}; expected loss or hidden_states for backward"
+        ), "missing_backward_output_must_identify_rank_stage_microbatch"
+    else:
+        pytest.fail("missing_backward_output_must_not_silently_skip")
+
+
 @pytest.mark.parametrize("pp_rank", [1, 2])
 def test_middle_stage_recv_shapes_match_each_microbatch(pp_rank):
     # PP4 interior stage: every fwd AND bwd recv sized for its own micro-batch.
