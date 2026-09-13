@@ -188,13 +188,27 @@ def main():
             exact('QSA_ORDERED_REPEAT_BITWISE', output, raw['ordered'])
         print('QSA_ORDERED_CORRECTNESS', rank, json.dumps(checks), flush=True)
         graphs = {}
+        # Autograd schedules a backward node on its forward stream. Build the
+        # retained IndexBackward graphs on the same non-default capture stream.
+        graph_stream = torch.cuda.Stream()
+        graph_stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(graph_stream):
+            for record in local_records:
+                for key in ('k', 'v'):
+                    leaf = record['leaves'][key].detach().clone().requires_grad_()
+                    record['leaves'][key] = leaf
+                    record['indexed'][key] = leaf[
+                        record['indices'][0], record['indices'][1]
+                    ]
+        torch.cuda.synchronize()
         for name, function in [('partial', baseline), ('ordered', ordered)]:
-            for _ in range(64):
-                function()
+            with torch.cuda.stream(graph_stream):
+                for _ in range(64):
+                    function()
             torch.cuda.synchronize()
             dist.barrier()
             graph = torch.cuda.CUDAGraph()
-            with torch.cuda.graph(graph):
+            with torch.cuda.graph(graph, stream=graph_stream):
                 for _ in range(args.calls):
                     function()
             graphs[name] = graph
