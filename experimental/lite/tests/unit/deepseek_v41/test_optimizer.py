@@ -163,7 +163,7 @@ def test_staged_optimizer_guards(action, prepared, message):
 
 @pytest.mark.parametrize('recompute', [False, True])
 def test_step_publishes_accumulated_modality_bias(
-    moe, model_config, monkeypatch, recompute
+    build_bundle, model_config, monkeypatch, recompute
 ):
     from megatron.lite.model.deepseek_v41.lite import image_data, protocol
     from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
@@ -171,17 +171,11 @@ def test_step_publishes_accumulated_modality_bias(
     from torch.utils.checkpoint import checkpoint, set_checkpoint_early_stop
 
     torch.manual_seed(43)
-    bundle = protocol.build_model(
+    bundle = build_bundle(
         model_config,
-        impl_cfg=protocol.ImplConfig(
-            device='cpu',
-            dtype=torch.float32,
-            quantized=False,
-            token_map=list(range(256)),
-            bias_rate=0.125,
-            optimizer='muon',
-            optimizer_config=OptimizerConfig(0.0, 1, 'quintic'),
-        ),
+        bias_rate=0.125,
+        optimizer='muon',
+        optimizer_config=OptimizerConfig(0.0, 1, 'quintic'),
     )
     model, optimizer = bundle.chunks[0], bundle.optimizer
     routers = [block.ffn.gate for block in model.layers]

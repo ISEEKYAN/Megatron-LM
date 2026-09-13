@@ -32,17 +32,9 @@ def test_v41_pipeline_rejects(moe, model_config, case):
             stage.finish_pipeline(payload)
 
 
-def test_v41_packed_pipeline_matches_monolithic(moe, model_config):
+def test_v41_packed_pipeline_matches_monolithic(build_bundle, model_config):
     torch.manual_seed(17)
-    bundle = protocol.build_model(
-        model_config,
-        impl_cfg=protocol.ImplConfig(
-            device='cpu',
-            dtype=torch.float32,
-            quantized=False,
-            token_map=list(range(256)),
-        ),
-    )
+    bundle = build_bundle(model_config)
     model = bundle.chunks[0]
     ids = torch.arange(3, 19)
     batch = PackedBatch(ids, ids.roll(-1), torch.tensor([5, 8, 3]), torch.ones(16))

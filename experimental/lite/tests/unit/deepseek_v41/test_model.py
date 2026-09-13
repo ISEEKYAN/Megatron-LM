@@ -15,27 +15,18 @@ from megatron.lite.runtime.contracts import PackedBatch
 
 
 @pytest.mark.parametrize('trainable_engram', [False, True])
-def test_staged_training_and_restart(moe, model_config, trainable_engram):
+def test_staged_training_and_restart(build_bundle, model_config, trainable_engram):
     mask = protocol.VisionTrainability(True, True, True, True)
 
     def build(external):
-        return protocol.build_model(
+        return build_bundle(
             model_config,
-            impl_cfg=protocol.ImplConfig(
-                device='cpu',
-                dtype=torch.float32,
-                quantized=False,
-                token_map=list(range(256)),
-                trainable_engram=trainable_engram,
-                vision_trainability=mask,
-                external_vision_device='cpu' if external else None,
-                optimizer='muon',
-                optimizer_config=OptimizerConfig(
-                    0.001,
-                    5,
-                    'quintic',
-                    vision_policy=VisionOptimizerConfig(0.5, 1.0, 0.0),
-                ),
+            trainable_engram=trainable_engram,
+            vision_trainability=mask,
+            external_vision_device='cpu' if external else None,
+            optimizer='muon',
+            optimizer_config=OptimizerConfig(
+                0.001, 5, 'quintic', vision_policy=VisionOptimizerConfig(0.5, 1.0, 0.0)
             ),
         )
 

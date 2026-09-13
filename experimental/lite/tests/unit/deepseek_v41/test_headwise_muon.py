@@ -127,25 +127,20 @@ def test_always_vanilla_is_rejected_by_independent_head_assertion(
 
 
 @pytest.mark.parametrize('role', ['wq_b', 'wq_a', 'wkv'])
-def test_live_main_attention_groups_keep_shared_matrices(moe, model_config, role):
+def test_live_main_attention_groups_keep_shared_matrices(
+    build_bundle, model_config, role
+):
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-    from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
 
     release = model_config.to_hf_dict()
     # Keep all 64 query heads and 40 layers; shrink matrix widths only.
     release['text_config'].update(num_attention_heads=64, q_lora_rank=64)
-    bundle = protocol.build_model(
+    bundle = build_bundle(
         DeepseekV41Config(release),
-        impl_cfg=protocol.ImplConfig(
-            device='cpu',
-            dtype=torch.float32,
-            quantized=False,
-            token_map=list(range(256)),
-            text_only=True,
-            optimizer='muon',
-            optimizer_config=OptimizerConfig(0.03, 5, 'quintic'),
-        ),
+        text_only=True,
+        optimizer='muon',
+        optimizer_config=OptimizerConfig(0.03, 5, 'quintic'),
     )
     model = bundle.chunks[0]
     backend = next(

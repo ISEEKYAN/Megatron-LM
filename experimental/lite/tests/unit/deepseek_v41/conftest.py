@@ -61,7 +61,8 @@ def moe(transformer_engine_import_stub):
 def model_config():
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 
-    release = json.loads('''
+    release = json.loads(
+        '''
     {"model_type": "deepseek_v41", "text_config": {"vocab_size": 256, "hidden_size": 32, "num_hidden_layers": 40,
      "num_attention_heads": 2, "num_key_value_heads": 1, "head_dim": 32,
      "qk_rope_head_dim": 4, "q_lora_rank": 32, "o_lora_rank": 4, "o_groups": 2,
@@ -87,6 +88,26 @@ def model_config():
      "quantization_config": {"quant_method": "fp8", "activation_scheme": "dynamic",
                              "weight_block_size": [32,32], "scale_fmt": "ue8m0",
                              "expert_dtype": "fp4"}}
-    ''')
+    '''
+    )
     release['text_config']['compress_ratios'] = [0, 0] + [2] * 18 + [1] * 20 + [0] * 3
     return DeepseekV41Config(release)
+
+
+@pytest.fixture
+def build_bundle(moe):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    def build(config, **kwargs):
+        return protocol.build_model(
+            config,
+            impl_cfg=protocol.ImplConfig(
+                device='cpu',
+                dtype=torch.float32,
+                quantized=False,
+                token_map=list(range(256)),
+                **kwargs,
+            ),
+        )
+
+    return build

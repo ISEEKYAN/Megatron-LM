@@ -33,18 +33,10 @@ def isolated_replay_state():
 
 @pytest.mark.parametrize('masked', [False, True])
 def test_concatenated_replay_forced_rank_swap_checkpoint(
-    moe, model_config, tmp_path, isolated_replay_state, masked
+    build_bundle, model_config, tmp_path, isolated_replay_state, masked
 ):
     torch.manual_seed(104)
-    bundle = protocol.build_model(
-        model_config,
-        impl_cfg=protocol.ImplConfig(
-            device='cpu',
-            dtype=torch.float32,
-            quantized=False,
-            token_map=list(range(256)),
-        ),
-    )
+    bundle = build_bundle(model_config)
     model = bundle.chunks[0]
     # Zero logits make selection depend ONLY on these strict, known bias ranks.
     # Alternate per layer, so exchanging recorded layer columns is observable.
