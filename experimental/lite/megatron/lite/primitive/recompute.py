@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 from collections.abc import Callable
-from functools import partial
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
+from torch.utils._pytree import tree_flatten, tree_unflatten
 
 # ── CheckpointWithoutOutput ───────────────────────────────────────────────────
 # Zero-copy C++ extension: makes dst's UntypedStorage point to src's data.
@@ -306,7 +306,11 @@ class CheckpointFunction(torch.autograd.Function):
 
 
 def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> None:
-    """Wrap a module's forward with reentrant activation checkpointing."""
+    """Wrap forward, exposing positional and keyword tensor leaves to autograd.
+
+    Keyword tensors now receive gradients through the checkpoint boundary; older
+    versions captured them in a closure and could silently disconnect training.
+    """
     original_forward = module.forward
     _routers = [m for m in module.modules() if hasattr(m, "expert_bias")]
 
@@ -327,8 +331,20 @@ def wrap_checkpoint(module: nn.Module, *, preserve_rng_state: bool = True) -> No
         else:
             _fwd = original_forward
 
-        # Differentiable tensors must be positional; capture only metadata here.
-        return CheckpointFunction.apply(partial(_fwd, **kwargs), preserve_rng_state, *args)
+        leaves, spec = tree_flatten((args, kwargs))
+        indices = [i for i, value in enumerate(leaves) if isinstance(value, torch.Tensor)]
+        tensors = tuple(leaves[i] for i in indices)
+        for i in indices:
+            leaves[i] = None  # Capture metadata only; tensors live in save_for_backward.
+
+        def run_function(*inputs):
+            values = leaves.copy()
+            for i, value in zip(indices, inputs, strict=True):
+                values[i] = value
+            positional, keyword = tree_unflatten(values, spec)
+            return _fwd(*positional, **keyword)
+
+        return CheckpointFunction.apply(run_function, preserve_rng_state, *tensors)
 
     module.forward = _checkpointed_forward
 
