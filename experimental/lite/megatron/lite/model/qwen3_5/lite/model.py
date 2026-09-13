@@ -201,7 +201,10 @@ class MoELayer(nn.Module):
             router_dtype=router_dtype,
         )
         self.experts = Experts(
-            config, ps, fp8=fp8, moe_act_recompute=moe_act_recompute,
+            config,
+            ps,
+            fp8=fp8,
+            moe_act_recompute=moe_act_recompute,
             fuse_wgrad_accumulation=fuse_wgrad_accumulation,
         )
         self.dispatcher = TokenDispatcher(
