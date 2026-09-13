@@ -62,12 +62,19 @@ def build_model(model_cfg, *, impl_cfg):
 
     p = impl_cfg.parallel
     if (
-        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'ep', 'cp', 'vpp'))
+        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'cp', 'vpp'))
         or p.etp not in (None, 1)
         or p.pp_layout is not None
     ):
         raise NotImplementedError(
             'V4.1 model construction requires single-rank execution; distributed integration remains pending'
+        )
+    if p.ep > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() < p.ep
+    ):
+        raise ValueError(
+            "EP requires an initialized distributed world of at least ep ranks"
         )
     ps = ParallelState()
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
@@ -87,6 +94,7 @@ def build_model(model_cfg, *, impl_cfg):
     with torch.device(impl_cfg.device):
         model = DeepseekV41Model(
             model_cfg,
+            parallel_state=ps,
             token_map=impl_cfg.token_map,
             quantized=impl_cfg.quantized,
             trainable_engram=impl_cfg.trainable_engram,
@@ -129,7 +137,9 @@ def build_model(model_cfg, *, impl_cfg):
                 parameter.data = parameter.data.float()
                 parameter.main_grad = None
         model.residual_dtype = impl_cfg.dtype
-        optimizer = V41Optimizer(model, impl_cfg.optimizer_config, dp_group=ps.dp_group)
+        optimizer = V41Optimizer(
+            model, impl_cfg.optimizer_config, dp_group=ps.dp_group, ps=ps
+        )
     if impl_cfg.external_vision_device is not None:
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
@@ -149,6 +159,22 @@ def build_model(model_cfg, *, impl_cfg):
                 value = buffer.contiguous().reshape(-1).view(torch.uint8)
                 torch.distributed.broadcast(value, src=0, group=ps.dp_group)
                 buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
+        if ps.ep_size > 1:
+            expert_ids = {
+                id(b.tensor) for b in model.parameter_bindings() if b.role == "expert"
+            }
+            model._ddp_params_and_buffers_to_ignore = [
+                name
+                for name, parameter in model.named_parameters()
+                if id(parameter) in expert_ids
+            ]
+            for parameter in model.parameters():
+                if id(parameter) in expert_ids:
+                    torch.distributed.broadcast(
+                        parameter.data,
+                        src=torch.distributed.get_global_rank(ps.ep_dp_group, 0),
+                        group=ps.ep_dp_group,
+                    )
         execution_model = DistributedDataParallel(
             model,
             process_group=ps.dp_group,
@@ -159,6 +185,9 @@ def build_model(model_cfg, *, impl_cfg):
         [model],
         ps,
         optimizer=optimizer,
+        finalize_grads=(
+            optimizer.finalize_expert_grads if optimizing and ps.ep_size > 1 else None
+        ),
         forward_step=partial(
             _forward_step, optimizer=optimizer, execution_model=execution_model
         ),

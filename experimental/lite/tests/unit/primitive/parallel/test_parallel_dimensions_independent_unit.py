@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+from contextlib import contextmanager
 from types import SimpleNamespace
 
 import pytest
@@ -161,6 +162,10 @@ def test_alltoall_dispatch_sums_scores_for_duplicate_experts(
     transformer_engine_import_stub()
     from megatron.lite.primitive.modules import dispatcher as dispatcher_module
 
+    # This is a local routing arithmetic test; distributed participation is
+    # covered by the real eight-process EP tests.
+    monkeypatch.setattr(dispatcher_module, "check_ep_participation", lambda group, phase: None)
+
     def fake_all_gather(output, local_counts, group):
         del group
         output.zero_()
@@ -216,3 +221,213 @@ def test_deepep_dispatch_finish_sums_scores_for_duplicate_experts(
     torch.testing.assert_close(dispatched_probs, torch.tensor([0.6, 0.5, 0.5, 0.4]))
     dispatched_probs.sum().backward()
     torch.testing.assert_close(recv_probs.grad, torch.ones_like(recv_probs))
+
+
+def _peers(count=4):
+    from megatron.lite.primitive.modules import ep_participation
+
+    store = torch.distributed.HashStore()
+    ranks = list(range(count))
+    return [ep_participation._Participation(store, ranks, rank) for rank in ranks]
+
+
+def _arrive(*calls):
+    """Peers enter their rendezvous concurrently, as real ranks do."""
+    from concurrent.futures import ThreadPoolExecutor
+
+    with ThreadPoolExecutor(max_workers=len(calls)) as pool:
+        return [f.result() for f in [pool.submit(p.check, phase) for p, phase in calls]]
+
+
+@pytest.fixture
+def _fast_rendezvous(monkeypatch):
+    monkeypatch.setattr(
+        "megatron.lite.primitive.modules.ep_participation._TIMEOUT", 0.2, raising=False
+    )
+
+
+def test_ep_participation_names_the_absent_peer(_fast_rendezvous):
+    peers = _peers()
+    assert _arrive(*[(p, "dispatch") for p in peers]) == [1] * len(peers)
+    with pytest.raises(RuntimeError, match="EP participation") as excinfo:
+        _arrive(*[(p, "dispatch") for p in peers[:-1]])
+    assert "rank 3 expected=2 actual=1" in str(excinfo.value)
+    assert "expected participants=4 actual=3" in str(excinfo.value)
+
+
+def test_ep_participation_rejects_same_shaped_work_at_the_wrong_phase(_fast_rendezvous):
+    peers = _peers()
+    with pytest.raises(RuntimeError, match="EP participation"):
+        _arrive((peers[0], "backward"), *[(p, "forward") for p in peers[1:]])
+
+
+@pytest.fixture
+def deepep_participation_stub(monkeypatch, transformer_engine_import_stub):
+    """CPU DeepEP stand-in: tests guard wiring, not CUDA transport correctness."""
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules import dispatcher as module
+    from megatron.lite.primitive.modules import ep_participation
+
+    calls, phases = [], []
+    group = object()
+    missing = ep_participation._Participation(torch.distributed.HashStore(), [0, 1], 0)
+    monkeypatch.setattr(ep_participation, "_TIMEOUT", 0.02)
+    control = SimpleNamespace(fail=None)
+
+    def check(actual_group, phase):
+        assert actual_group is group, "deepep_guard_must_use_buffer_group"
+        calls.append(phase)
+        phases.append(phase)
+        if phase == control.fail:
+            return missing.check(phase)
+        return len(phases)
+
+    class Buffer:
+        def get_dispatch_layout(self, indices, **kwargs):
+            calls.append("layout")
+            return None, None, None, None, None
+
+        def dispatch(self, hidden, **kwargs):
+            calls.append("dispatch")
+            return (
+                hidden.clone(),
+                kwargs.get("topk_idx"),
+                kwargs.get("topk_weights"),
+                [hidden.shape[0]],
+                "handle",
+                None,
+            )
+
+        def combine(self, hidden, handle, **kwargs):
+            calls.append("combine")
+            return hidden.clone(), kwargs.get("topk_weights"), None
+
+    monkeypatch.setattr(module, "deep_ep", object())
+    monkeypatch.setattr(module, "EventHandle", None)
+    monkeypatch.setattr(module, "EventOverlap", None)
+    monkeypatch.setattr(module, "check_ep_participation", check)
+    monkeypatch.setattr(module, "_build_deepep_buffer", lambda actual, size: Buffer())
+    dispatcher = module.TokenDispatcher(
+        2,
+        2,
+        ParallelState(ep_size=2, ep_group=object(), tp_ep_group=group),
+        moe_permute_fusion=False,
+    )
+    assert dispatcher.use_deepep, "deepep_test_must_not_fall_back_to_alltoall"
+    return dispatcher, calls, control
+
+
+@pytest.mark.parametrize("tokens", [0, 2])
+def test_deepep_participation_forward_backward_pairing(deepep_participation_stub, tokens):
+    dispatcher, calls, _ = deepep_participation_stub
+    hidden = torch.ones(tokens, 2, requires_grad=True)
+    scores = torch.ones(tokens, 1, requires_grad=True)
+    indices = torch.zeros(tokens, 1, dtype=torch.long)
+    dispatched, _, probs = dispatcher.dispatch(hidden, scores, indices)
+    result = dispatcher.combine(dispatched * probs.unsqueeze(-1))
+    result.sum().backward()
+    assert calls == [
+        "deepep.dispatch",
+        "layout",
+        "dispatch",
+        "deepep.combine",
+        "combine",
+        "deepep.combine.backward:2",
+        "dispatch",
+        "deepep.dispatch.backward:1",
+        "combine",
+    ], "deepep_each_collective_must_follow_paired_guard_even_for_empty_tokens"
+    torch.testing.assert_close(hidden.grad, torch.ones_like(hidden))
+    torch.testing.assert_close(scores.grad, torch.full_like(scores, 2))
+
+
+@pytest.mark.parametrize("entry", ["grad", "no_grad", "no_requires_grad", "submit"])
+@pytest.mark.parametrize("phase", ["deepep.dispatch", "deepep.combine"])
+def test_deepep_missing_forward_peer_fails_before_transport(
+    deepep_participation_stub, entry, phase
+):
+    dispatcher, calls, control = deepep_participation_stub
+    hidden = torch.ones(2, 2, requires_grad=True)
+    scores = torch.ones(2, 1, requires_grad=True)
+    indices = torch.zeros(2, 1, dtype=torch.long)
+    with torch.set_grad_enabled(entry in {"grad", "no_requires_grad"}):
+        if entry == "no_requires_grad":
+            hidden, scores = hidden.detach(), scores.detach()
+        if phase == "deepep.combine":
+            hidden, _, _ = dispatcher.dispatch(hidden, scores, indices)
+        control.fail = phase
+        calls.clear()
+        with _deepep_missing_peer_error(phase):
+            if phase == "deepep.dispatch":
+                if entry == "submit":
+                    dispatcher.submit_deepep_dispatch(hidden, scores, indices)
+                else:
+                    dispatcher.dispatch(hidden, scores, indices)
+            elif entry == "submit":
+                dispatcher.submit_deepep_combine(hidden)
+            else:
+                dispatcher.combine(hidden)
+        assert calls == [phase], "deepep_missing_peer_must_fail_before_transport"
+
+
+@pytest.mark.parametrize("phase", ["deepep.combine.backward:2", "deepep.dispatch.backward:1"])
+def test_deepep_missing_backward_peer_fails_before_transport(deepep_participation_stub, phase):
+    dispatcher, calls, control = deepep_participation_stub
+    hidden = torch.ones(2, 2, requires_grad=True)
+    dispatched, _, _ = dispatcher.dispatch(
+        hidden, torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.long)
+    )
+    result = dispatcher.combine(dispatched)
+    control.fail = phase
+    calls.clear()
+    with _deepep_missing_peer_error(phase):
+        result.sum().backward()
+    expected = (
+        [phase]
+        if "combine.backward" in phase
+        else [
+            "deepep.combine.backward:2",
+            "dispatch",
+            phase,
+        ]
+    )
+    assert calls == expected, "deepep_missing_peer_must_fail_before_transport"
+
+
+@contextmanager
+def _deepep_missing_peer_error(phase):
+    import time
+
+    started = time.monotonic()
+    try:
+        yield
+    except RuntimeError as error:
+        assert f"EP participation failed before {phase}:" in str(error)
+        assert "rank 1 expected=1 actual=0" in str(error)
+    else:
+        pytest.fail("deepep_missing_peer_must_raise_named_runtime_error")
+    assert time.monotonic() - started < 10, "deepep_missing_peer_must_fail_within_10s"
+
+
+@pytest.mark.parametrize("entry", ["no_grad", "submit"])
+def test_deepep_no_grad_participation(deepep_participation_stub, entry):
+    dispatcher, calls, _ = deepep_participation_stub
+    hidden = torch.ones(2, 2)
+    scores, indices = torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.long)
+    with torch.no_grad():
+        if entry == "submit":
+            dispatched, _, _ = dispatcher.finish_deepep_dispatch(
+                dispatcher.submit_deepep_dispatch(hidden, scores, indices)
+            )
+            result = dispatcher.finish_deepep_combine(dispatcher.submit_deepep_combine(dispatched))
+        else:
+            dispatched, _, _ = dispatcher.dispatch(hidden, scores, indices)
+            result = dispatcher.combine(dispatched)
+    assert calls == [
+        "deepep.dispatch",
+        "layout",
+        "dispatch",
+        "deepep.combine",
+        "combine",
+    ], "deepep_no_grad_collectives_must_follow_guard"
+    torch.testing.assert_close(result, hidden)

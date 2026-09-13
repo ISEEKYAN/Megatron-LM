@@ -272,7 +272,7 @@ class V41Optimizer(MixedOptimizer):
     owned by the parallel integration rather than silently approximated here.
     """
 
-    def __init__(self, model, config, *, dp_group=None):
+    def __init__(self, model, config, *, dp_group=None, ps=None):
         if not isinstance(config, OptimizerConfig):
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
         if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
@@ -282,6 +282,13 @@ class V41Optimizer(MixedOptimizer):
         )
         self.model = model
         self.dp_group = dp_group
+        self.ps = ps
+        self.expert_parameters = [
+            b.tensor
+            for b in model.parameter_bindings()
+            if b.role == "expert" and b.tensor.requires_grad
+        ]
+        self.expert_ids = {id(p) for p in self.expert_parameters}
         self.routers = [block.ffn.gate for block in model.layers]
         self._modality_loads = [None] * len(self.routers)
         tables = [
@@ -290,6 +297,51 @@ class V41Optimizer(MixedOptimizer):
             if b.engram is not None and b.engram.embed.master is not None
         ]
         super().__init__(groups, config, tables)
+
+    @torch.no_grad()
+    def finalize_expert_grads(self):
+        """Expert gradients already sum source tokens within EP dispatch.
+
+        Sum only matching expert replicas, then divide by the dense DP size
+        used to scale the loss. Never average different experts together.
+        """
+        import torch.distributed as dist
+
+        ps = self.ps
+        for p in self.expert_parameters:
+            grad = p.main_grad if p.main_grad is not None else p.grad
+            active = torch.tensor(int(grad is not None), device=p.device)
+            dist.all_reduce(active, group=ps.ep_dp_group)
+            if not active.item():
+                continue
+            if grad is None:
+                grad = torch.zeros_like(p)
+            dist.all_reduce(grad, group=ps.ep_dp_group)
+            grad.div_(ps.dp_size)
+            p.grad = p.main_grad = grad
+
+    def _grad_norm(self, parameters, gradients):
+        if self.ps is None or self.ps.ep_size == 1:
+            return super()._grad_norm(parameters, gradients)
+        # Dense gradients are replicated. Count each dense owner once and
+        # sum the disjoint expert shards across EP, not expert-DP replicas.
+        dense = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
+        expert = torch.zeros_like(dense)
+        for p, grad in zip(parameters, gradients, strict=True):
+            if grad is not None:
+                target = expert if id(p) in self.expert_ids else dense
+                target.add_(grad.double().square().sum())
+        torch.distributed.all_reduce(expert, group=self.ps.ep_group)
+        return (dense + expert).sqrt()
+
+    def _all_finite(self, valid):
+        if self.ps is None or self.ps.ep_size == 1:
+            return valid
+        flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
+        torch.distributed.all_reduce(
+            flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
+        )
+        return bool(flag.item())
 
     def accumulate_modality_loads(self, loads):
         """One forward snapshot: global layer order, then packed sample order."""

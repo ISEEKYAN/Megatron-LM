@@ -2,8 +2,8 @@
 """EP must preserve the global token objective and complete optimizer updates."""
 
 import json
-from datetime import timedelta
 from dataclasses import replace
+from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -46,14 +46,18 @@ def _ep_worker(rank, config, trainable, directory):
         model = parallel.chunks[0]
         reference = serial.chunks[0]
         local_state = model.state_dict()
-        model.load_state_dict({k: v for k, v in reference.state_dict().items() if k in local_state})
+        model.load_state_dict(
+            {k: v for k, v in reference.state_dict().items() if k in local_state}
+        )
         for bundle in (serial, parallel):
             for layer in bundle.chunks[0].layers:
                 # Both sources route to experts 0/1: rank 1 receives zero tokens.
                 layer.ffn.gate.bias[:2] = 100
         for layer in model.layers:
             owned = [i for i, e in enumerate(layer.ffn.experts) if e is not None]
-            assert owned == list(range(rank * 2, rank * 2 + 2)), 'global expert ownership'
+            assert owned == list(
+                range(rank * 2, rank * 2 + 2)
+            ), 'global expert ownership'
         errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
         for step in range(2):
             batches = []
@@ -138,11 +142,24 @@ def test_ep_matches_global_batch(model_config, trainable, tmp_path):
         )
 
 
-def test_ep_requires_distributed_world(model_config):
+def test_ep_requires_distributed_world(moe, model_config):
     with pytest.raises((ValueError, RuntimeError), match='EP.*initialized|EP.*world'):
         protocol.build_model(
             model_config,
             impl_cfg=protocol.ImplConfig(
                 device='meta', quantized=False, parallel=ParallelConfig(ep=2)
+            ),
+        )
+
+
+@pytest.mark.parametrize('dimension', ['tp', 'pp', 'cp', 'vpp', 'etp'])
+def test_ep_does_not_unlock_other_dimensions(moe, model_config, dimension):
+    with pytest.raises(NotImplementedError, match='distributed integration'):
+        protocol.build_model(
+            model_config,
+            impl_cfg=protocol.ImplConfig(
+                device='meta',
+                quantized=False,
+                parallel=ParallelConfig(ep=2, **{dimension: 2}),
             ),
         )

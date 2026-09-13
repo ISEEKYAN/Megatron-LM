@@ -21,6 +21,8 @@ from megatron.lite.primitive.modules.engram_lookup import (
 )
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
 from megatron.lite.primitive.modules.router_replay import PackedRouterReplay
+from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 from torch import nn
 from torch.nn import functional as F
@@ -122,13 +124,17 @@ class DeepseekV41Model(nn.Module):
         bias_rate=0.001,
         enable_dspark_execution=False,
         layer_range=None,
+        parallel_state=None,
     ):
         super().__init__()
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
+        self.ps = parallel_state or ParallelState()
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
+        local_experts = ensure_divisible(t.n_routed_experts, self.ps.ep_size)
+        expert_start = self.ps.ep_rank * local_experts
         self.hc_mult = copies
         self.vision_schedule = None
         self.register_buffer(
@@ -169,13 +175,17 @@ class DeepseekV41Model(nn.Module):
                 bias_rate=bias_rate,
             )
             experts = [
-                self._expert(t, quantized, shared=False)
-                for _ in range(t.n_routed_experts)
+                (
+                    self._expert(t, quantized, shared=False)
+                    if expert_start <= i < expert_start + local_experts
+                    else None
+                )
+                for i in range(t.n_routed_experts)
             ]
             shared = (
                 self._expert(t, quantized, shared=True) if t.n_shared_experts else None
             )
-            ffn = DeepseekV41MoE(router, experts, shared)
+            ffn = DeepseekV41MoE(router, experts, shared, ps=self.ps)
             block = DeepseekV41Block(
                 dim,
                 copies,

@@ -8,6 +8,7 @@ import os
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 
+from megatron.lite.primitive.modules.ep_participation import check_ep_participation
 from megatron.lite.primitive.modules.moe import _AllToAll
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
@@ -68,7 +69,10 @@ class _DeepEPDispatch(torch.autograd.Function):
         num_experts: int,
         async_finish: bool,
         allocate_on_comm_stream: bool,
+        group,
     ):
+        ctx.group = group
+        ctx.ep_sequence = check_ep_participation(group, "deepep.dispatch")
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -118,6 +122,7 @@ class _DeepEPDispatch(torch.autograd.Function):
         ctx, grad_recv_hidden, grad_recv_indices, grad_recv_probs, grad_recv_per_expert, grad_handle
     ):
         del grad_recv_indices, grad_recv_per_expert, grad_handle
+        check_ep_participation(ctx.group, f"deepep.dispatch.backward:{ctx.ep_sequence}")
         previous_event = (
             EventOverlap(EventHandle())
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
@@ -134,7 +139,7 @@ class _DeepEPDispatch(torch.autograd.Function):
         )
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return None, grad_hidden, None, grad_topk_scores, None, None, None
+        return None, grad_hidden, None, grad_topk_scores, None, None, None, None
 
 
 class _DeepEPCombine(torch.autograd.Function):
@@ -146,7 +151,10 @@ class _DeepEPCombine(torch.autograd.Function):
         handle,
         async_finish: bool,
         allocate_on_comm_stream: bool,
+        group,
     ):
+        ctx.group = group
+        ctx.ep_sequence = check_ep_participation(group, "deepep.combine")
         previous_event = (
             EventOverlap(EventHandle())
             if async_finish and EventHandle is not None and EventOverlap is not None
@@ -169,6 +177,7 @@ class _DeepEPCombine(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad_output):
+        check_ep_participation(ctx.group, f"deepep.combine.backward:{ctx.ep_sequence}")
         previous_event = (
             EventOverlap(EventHandle())
             if ctx.async_finish and EventHandle is not None and EventOverlap is not None
@@ -183,7 +192,7 @@ class _DeepEPCombine(torch.autograd.Function):
         )
         if ctx.async_finish:
             after_event.current_stream_wait()
-        return None, grad_rank_grouped, None, None, None
+        return None, grad_rank_grouped, None, None, None, None
 
 
 class TokenDispatcher:
@@ -250,6 +259,7 @@ class TokenDispatcher:
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_combine requires DeepEP combine.")
+        check_ep_participation(self.ps.tp_ep_group, "deepep.combine")
         rank_grouped = unpermute(
             expert_output,
             self._row_id_map,
@@ -324,6 +334,7 @@ class TokenDispatcher:
         return result
 
     def _dispatch_alltoall(self, hidden_states, topk_scores, topk_indices):
+        check_ep_participation(self.ps.ep_group, "dispatch.metadata")
         t, h = hidden_states.shape
         e = self.num_experts
 
@@ -423,6 +434,7 @@ class TokenDispatcher:
     ):
         if not self.use_deepep:
             raise RuntimeError("submit_deepep_dispatch requires DeepEP dispatch.")
+        check_ep_participation(self.ps.tp_ep_group, "deepep.dispatch")
         previous_event = (
             EventOverlap(EventHandle())
             if EventHandle is not None and EventOverlap is not None
@@ -550,6 +562,7 @@ class TokenDispatcher:
                 self.num_experts,
                 False,
                 False,
+                self.ps.tp_ep_group,
             )
             self._handle = handle
             self._deepep_event = None
@@ -574,8 +587,11 @@ class TokenDispatcher:
             fused=self.moe_permute_fusion,
         )
         if torch.is_grad_enabled():
-            combined = _DeepEPCombine.apply(self.buffer, rank_grouped, self._handle, False, False)
+            combined = _DeepEPCombine.apply(
+                self.buffer, rank_grouped, self._handle, False, False, self.ps.tp_ep_group
+            )
         else:
+            check_ep_participation(self.ps.tp_ep_group, "deepep.combine")
             combined = self.buffer.combine(rank_grouped, self._handle)
         if isinstance(combined, tuple):
             combined = combined[0]

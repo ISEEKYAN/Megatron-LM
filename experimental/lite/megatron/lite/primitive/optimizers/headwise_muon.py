@@ -69,7 +69,9 @@ class StagedMatrixOptimizer(torch.optim.Optimizer):
             or momentum.shape != shape
             or not torch.isfinite(momentum).all()
         ):
-            raise ValueError(f'{self._label} checkpoint requires matching finite FP32 momentum')
+            raise ValueError(
+                f'{self._label} checkpoint requires matching finite FP32 momentum'
+            )
 
 
 class HeadwiseMuon(StagedMatrixOptimizer):
@@ -86,7 +88,9 @@ class HeadwiseMuon(StagedMatrixOptimizer):
         momentum=0.95,
         update_rms=0.18,
     ):
-        from emerging_optimizers.orthogonalized_optimizers.muon_utils import newton_schulz
+        from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
+            newton_schulz,
+        )
 
         if type(ns_steps) is not int or ns_steps < 1:
             raise ValueError('ns_steps must be a positive integer')
@@ -112,7 +116,9 @@ class HeadwiseMuon(StagedMatrixOptimizer):
         for group in self.param_groups:
             shape = group.get('matrix_shape')
             if not _matrix_shape(shape):
-                raise ValueError('An explicit positive logical matrix shape is required')
+                raise ValueError(
+                    'An explicit positive logical matrix shape is required'
+                )
             partitions = group.get('matrix_partitions')
             if partitions is not None and (
                 not isinstance(partitions, (list, tuple))
@@ -120,7 +126,9 @@ class HeadwiseMuon(StagedMatrixOptimizer):
                 or not all(_matrix_shape(part) for part in partitions)
                 or sum(math.prod(part) for part in partitions) != math.prod(shape)
             ):
-                raise ValueError('Logical partitions must cover the physical matrix exactly')
+                raise ValueError(
+                    'Logical partitions must cover the physical matrix exactly'
+                )
             for key in ('lr', 'weight_decay', 'momentum', 'update_rms'):
                 if not math.isfinite(group[key]) or group[key] < 0:
                     raise ValueError(f'Invalid Muon {key}')
@@ -151,18 +159,28 @@ class HeadwiseMuon(StagedMatrixOptimizer):
                 grad = getattr(p, 'main_grad', p.grad)
                 if grad is None:
                     continue
-                if grad.dtype != torch.float32 or grad.shape != p.shape or grad.is_sparse:
-                    raise ValueError('Muon requires matching dense native FP32 gradients')
+                if (
+                    grad.dtype != torch.float32
+                    or grad.shape != p.shape
+                    or grad.is_sparse
+                ):
+                    raise ValueError(
+                        'Muon requires matching dense native FP32 gradients'
+                    )
                 if not torch.isfinite(grad).all():
                     return False
-                previous = self.state.get(p, {}).get('momentum_buffer', torch.zeros_like(p))
+                previous = self.state.get(p, {}).get(
+                    'momentum_buffer', torch.zeros_like(p)
+                )
                 beta = group['momentum']
                 momentum = beta * previous + (1 - beta) * grad
                 nesterov = beta * momentum + (1 - beta) * grad
                 from emerging_optimizers.utils import fp32_matmul_precision
 
                 shapes = group.get('matrix_partitions') or (group['matrix_shape'],)
-                chunks = nesterov.flatten().split([math.prod(shape) for shape in shapes])
+                chunks = nesterov.flatten().split(
+                    [math.prod(shape) for shape in shapes]
+                )
                 logical = [chunk.reshape(shape) for chunk, shape in zip(chunks, shapes)]
                 matrices = [
                     matrix
@@ -175,14 +193,21 @@ class HeadwiseMuon(StagedMatrixOptimizer):
                 ), fp32_matmul_precision('highest'):
                     for matrix in matrices:
                         update = self._orthogonalize(
-                            matrix, group['ns_steps'], coefficient_type=group['coefficient_type']
+                            matrix,
+                            group['ns_steps'],
+                            coefficient_type=group['coefficient_type'],
                         )
                         rms = update.square().mean().sqrt()
-                        directions.append(update * (group['update_rms'] / rms.clamp_min(1e-30)))
+                        directions.append(
+                            update * (group['update_rms'] / rms.clamp_min(1e-30))
+                        )
                 update = torch.cat([direction.flatten() for direction in directions])
                 candidate = p * (1 - group['lr'] * group['weight_decay'])
                 candidate = candidate - group['lr'] * update.reshape_as(p)
-                if not torch.isfinite(candidate).all() or not torch.isfinite(momentum).all():
+                if (
+                    not torch.isfinite(candidate).all()
+                    or not torch.isfinite(momentum).all()
+                ):
                     return False
                 prepared.append((p, candidate, momentum))
         self._prepared = prepared
@@ -215,13 +240,17 @@ class MixedOptimizer:
     def __init__(self, groups, config, tables=()):
         from .sinkhorn import Sinkhorn
 
-        if not groups or any(p.dtype != torch.float32 for g in groups for p in g['params']):
+        if not groups or any(
+            p.dtype != torch.float32 for g in groups for p in g['params']
+        ):
             raise ValueError('V4.1 optimizer requires native FP32 parameter masters')
         for group in groups:
             for p in group['params']:
                 if not hasattr(p, '_v41_main_grad_hook'):
                     p.main_grad = p.grad
-                    p._v41_main_grad_hook = p.register_post_accumulate_grad_hook(_publish_main_grad)
+                    p._v41_main_grad_hook = p.register_post_accumulate_grad_hook(
+                        _publish_main_grad
+                    )
         self.config = config
         self.optimizers = []
         for algorithm, optimizer in (
@@ -234,7 +263,8 @@ class MixedOptimizer:
                 kwargs = {}
                 if algorithm == 'muon':
                     kwargs = dict(
-                        ns_steps=config.ns_steps, coefficient_type=config.coefficient_type
+                        ns_steps=config.ns_steps,
+                        coefficient_type=config.coefficient_type,
                     )
                 elif algorithm == 'adamw':
                     kwargs = dict(betas=(0.9, 0.95), eps=1e-20, foreach=False)
@@ -254,25 +284,35 @@ class MixedOptimizer:
         for p in _parameters(self):
             p.main_grad = p.grad
 
+    def _grad_norm(self, parameters, gradients):
+        active = [g for g in gradients if g is not None]
+        return (
+            torch.stack([g.double().square().sum() for g in active]).sum().sqrt()
+            if active
+            else torch.tensor(0.0)
+        )
+
+    def _all_finite(self, valid):
+        return valid
+
     @torch.no_grad()
     def step(self):
         self._validate_trainability()
         parameters = _parameters(self)
         gradients = [
-            p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad for p in parameters
+            p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
+            for p in parameters
         ]
         active = [g for g in gradients if g is not None]
         if any(g.dtype != torch.float32 or g.is_sparse for g in active):
             raise ValueError('Expected native dense FP32 main_grad')
-        norm = (
-            torch.stack([g.double().square().sum() for g in active]).sum().sqrt()
-            if active
-            else torch.tensor(0.0)
-        )
-        if not torch.isfinite(norm):
+        norm = self._grad_norm(parameters, gradients)
+        if not self._all_finite(bool(torch.isfinite(norm))):
             return False, float(norm), None
         coefficient = (
-            min(1.0, self.config.clip_grad / (float(norm) + 1e-6)) if self.config.clip_grad else 1.0
+            min(1.0, self.config.clip_grad / (float(norm) + 1e-6))
+            if self.config.clip_grad
+            else 1.0
         )
         # Reversible gradient views permit retry on failed publication.
         original = [(p, p.grad, getattr(p, 'main_grad', None)) for p in parameters]
@@ -288,28 +328,36 @@ class MixedOptimizer:
                         q.grad = p.grad
                     candidate.step()
                     candidates.update((id(p), q) for p, q in _pairs(backend, candidate))
-                    if any(
-                        not torch.isfinite(v).all()
-                        for s in candidate.state.values()
-                        for v in s.values()
-                        if isinstance(v, torch.Tensor)
+                    if not self._all_finite(
+                        not any(
+                            not torch.isfinite(v).all()
+                            for s in candidate.state.values()
+                            for v in s.values()
+                            if isinstance(v, torch.Tensor)
+                        )
                     ):
                         return False, float(norm), None
                     staged_adam.append((backend, candidate))
                 else:
-                    if not backend.prepare_step():
+                    if not self._all_finite(backend.prepare_step()):
                         return False, float(norm), None
-                    candidates.update((id(p), value) for p, value in backend.candidates())
-            if any(not torch.isfinite(p).all() for p in candidates.values()):
+                    candidates.update(
+                        (id(p), value) for p, value in backend.candidates()
+                    )
+            if not self._all_finite(
+                not any(not torch.isfinite(p).all() for p in candidates.values())
+            ):
                 return False, float(norm), None
             storage = []
             for table in self.tables:
                 weight, scale = quantize_block_fp8(
                     candidates[id(table.master)], (1, 32), scale_format='e8m0'
                 )
-                if (
-                    not torch.isfinite(weight.float()).all()
-                    or not torch.isfinite(scale.float()).all()
+                if not self._all_finite(
+                    bool(
+                        torch.isfinite(weight.float()).all()
+                        and torch.isfinite(scale.float()).all()
+                    )
                 ):
                     return False, float(norm), None
                 storage.append((table, weight, scale))
