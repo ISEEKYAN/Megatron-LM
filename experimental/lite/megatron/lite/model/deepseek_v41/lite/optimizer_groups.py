@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Object-based V4.1 routing and single-rank transactional optimizer assembly.
+"""Object-based V4.1 routing and replicated transactional optimizer assembly.
 
 Release keys are audit labels, never dispatch inputs. Unknown active objects
 fail closed. Vision execution/its explicit trainability mask belong to the
@@ -29,7 +29,9 @@ class VisionOptimizerConfig:
 
     def __post_init__(self):
         if any(not math.isfinite(value) or value < 0 for value in vars(self).values()):
-            raise ValueError('Visual optimizer policy requires finite nonnegative values')
+            raise ValueError(
+                'Visual optimizer policy requires finite nonnegative values'
+            )
 
 
 @dataclass(frozen=True)
@@ -45,7 +47,17 @@ class OptimizerConfig:
 # Roles are validated against an independently enumerated object inventory below.
 _RULES = {
     **dict.fromkeys(
-        ('wq_a', 'wq_b', 'wkv', 'wo_a', 'wo_b', 'router', 'expert', 'shared_expert', 'compressor'),
+        (
+            'wq_a',
+            'wq_b',
+            'wkv',
+            'wo_a',
+            'wo_b',
+            'router',
+            'expert',
+            'shared_expert',
+            'compressor',
+        ),
         ('muon', 0.1, 0.1, 1),
     ),
     'embedding': ('sinkhorn', 0, 0, 1),
@@ -72,7 +84,9 @@ def parameter_groups(model, *, lr, vision_policy=None):
         raise ValueError('Unexpected parameter alias in module tree')
     groups, seen = [], set()
 
-    def add(p, role, *, shape=None, heads=None, partitions=None, vector=False, **policy):
+    def add(
+        p, role, *, shape=None, heads=None, partitions=None, vector=False, **policy
+    ):
         if id(p) in seen:
             raise ValueError('Duplicate optimizer owner')
         seen.add(id(p))
@@ -88,7 +102,9 @@ def parameter_groups(model, *, lr, vision_policy=None):
         if vector:
             algorithm = 'adamw'
         if algorithm in ('muon', 'sinkhorn') and p.ndim != 2:
-            raise ValueError('Matrix optimizer requires the declared two-dimensional owner')
+            raise ValueError(
+                'Matrix optimizer requires the declared two-dimensional owner'
+            )
         if shape is not None and math.prod(shape) != p.numel():
             raise ValueError('Logical matrix shape disagrees with actual owner')
         if (
@@ -124,7 +140,13 @@ def parameter_groups(model, *, lr, vision_policy=None):
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
             route(a, role + '.weight', role)
-        route(a, 'wq_b.weight', 'wq_b', shape=(c.heads, c.head_dim, c.q_rank), heads=c.heads)
+        route(
+            a,
+            'wq_b.weight',
+            'wq_b',
+            shape=(c.heads, c.head_dim, c.q_rank),
+            heads=c.heads,
+        )
         for owner, paths, role in (
             (a, 'q_norm.weight kv_norm.weight', 'norm'),
             (a, 'attn_sink', 'attention_sink'),
@@ -166,7 +188,9 @@ def parameter_groups(model, *, lr, vision_policy=None):
     vision = model.vision
     if hasattr(vision, 'patch_embed'):
         encoder_active = any(
-            p.requires_grad for m in (vision.patch_embed, vision.blocks) for p in m.parameters()
+            p.requires_grad
+            for m in (vision.patch_embed, vision.blocks)
+            for p in m.parameters()
         )
         vectors = (model.image_start, model.image_end, model.image_newline)
         if (encoder_active or any(p.requires_grad for p in vectors)) and not isinstance(
@@ -179,24 +203,40 @@ def parameter_groups(model, *, lr, vision_policy=None):
 
         def visual_linear(module, role, *, multiplier=1, partitions=None):
             shape = (module.out_features, module.in_features)
-            if math.prod(shape) != module.weight.numel() or tuple(module.weight.shape) != shape:
+            if (
+                math.prod(shape) != module.weight.numel()
+                or tuple(module.weight.shape) != shape
+            ):
                 raise ValueError('Visual linear shape disagrees with physical owner')
             if module.bias is not None and tuple(module.bias.shape) != (shape[0],):
                 raise ValueError('Visual bias shape disagrees with physical owner')
             if partitions is not None and (
-                any(any(type(d) is not int or d < 1 for d in part) for part in partitions)
+                any(
+                    any(type(d) is not int or d < 1 for d in part)
+                    for part in partitions
+                )
                 or sum(math.prod(part) for part in partitions) != module.weight.numel()
                 or any(part[-1] != shape[-1] for part in partitions)
             ):
                 raise ValueError('Logical partitions disagree with visual matrix shape')
-            add(module.weight, role, shape=shape, multiplier=multiplier, partitions=partitions)
+            add(
+                module.weight,
+                role,
+                shape=shape,
+                multiplier=multiplier,
+                partitions=partitions,
+            )
             if module.bias is not None:
                 add(module.bias, role, multiplier=multiplier, decay=0, vector=True)
 
         visual_linear(vision.patch_embed.proj, 'vision', multiplier=multiplier)
         for block in vision.blocks:
             a, dim = block.attn, block.attn.wqkv.in_features
-            partitions = ((a.n_heads, a.head_dim, dim), (a.n_heads, a.head_dim, dim), (dim, dim))
+            partitions = (
+                (a.n_heads, a.head_dim, dim),
+                (a.n_heads, a.head_dim, dim),
+                (dim, dim),
+            )
             for module, parts in (
                 (a.wqkv, partitions),
                 (a.wo, None),
@@ -232,13 +272,16 @@ class V41Optimizer(MixedOptimizer):
     owned by the parallel integration rather than silently approximated here.
     """
 
-    def __init__(self, model, config):
+    def __init__(self, model, config, *, dp_group=None):
         if not isinstance(config, OptimizerConfig):
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
         if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
             raise ValueError('Invalid gradient clipping threshold')
-        groups = parameter_groups(model, lr=config.lr, vision_policy=config.vision_policy)
+        groups = parameter_groups(
+            model, lr=config.lr, vision_policy=config.vision_policy
+        )
         self.model = model
+        self.dp_group = dp_group
         self.routers = [block.ffn.gate for block in model.layers]
         self._modality_loads = [None] * len(self.routers)
         tables = [
@@ -279,6 +322,11 @@ class V41Optimizer(MixedOptimizer):
         if result[0]:
             for router, stats in zip(self.routers, self._modality_loads, strict=True):
                 if stats is not None:
+                    if self.dp_group is not None:
+                        torch.distributed.all_reduce(stats.counts, group=self.dp_group)
+                        torch.distributed.all_reduce(
+                            stats.total_tokens, group=self.dp_group
+                        )
                     router.update_bias(stats)
         # Successful publication and overflow skips both finish this window.
         # Exceptions from the transactional backend retain statistics for retry.
@@ -296,6 +344,10 @@ class V41Optimizer(MixedOptimizer):
 
         if not isinstance(mask, VisionTrainability):
             raise TypeError('Expected explicit visual trainability mask')
+        if self.dp_group is not None:
+            raise NotImplementedError(
+                'Rebuild the DP bundle when changing vision trainability'
+            )
         self._validate_trainability()
         if any(
             p.grad is not None or getattr(p, 'main_grad', None) is not None
@@ -305,7 +357,7 @@ class V41Optimizer(MixedOptimizer):
         previous = self.model.vision_trainability
         try:
             mask.apply(self.model)
-            candidate = type(self)(self.model, self.config)
+            candidate = type(self)(self.model, self.config, dp_group=self.dp_group)
         except Exception:
             previous.apply(self.model)
             raise
@@ -329,4 +381,6 @@ class V41Optimizer(MixedOptimizer):
         expected = {id(p) for p in self.model.parameters() if p.requires_grad}
         actual = {id(p) for g in self.param_groups for p in g['params']}
         if actual != expected:
-            raise ValueError('Trainability changed; rebuild optimizer groups before training')
+            raise ValueError(
+                'Trainability changed; rebuild optimizer groups before training'
+            )

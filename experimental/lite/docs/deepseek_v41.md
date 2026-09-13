@@ -41,8 +41,19 @@ print(sum(p.numel() for p in bundle.chunks[0].parameters()))
 ```
 Meta construction inspects assembly; execution needs a tokenizer-derived Engram
 map and materialized weights. Select post-training trainability explicitly.
-Single-rank execution is supported. `build_model` rejects PP > 1 (and TP/EP/CP/VPP)
-at construction time; local pipeline range helpers are not a supported PP runtime.
+Pure data parallel text training uses PyTorch DDP with the explicit V4.1 Muon
+optimizer. SFT normalization counts valid tokens across all replicas; successful
+steps update routing biases from their combined load statistics. Engram storage
+stays on the model device in both frozen and trainable modes. Changing vision
+trainability requires rebuilding the DP bundle; external staged vision is not
+yet supported with DP.
+
+The two-GPU regression preserves all 40 layers with reduced dimensions in the
+floating diagnostic mode. It checks two optimizer steps, unequal token counts,
+replica equality, and comparison with a single-process global batch. This does
+not establish full-size or native quantized training support. `build_model` still
+rejects PP > 1 (and TP/EP/CP/VPP); local pipeline range helpers are not a supported
+PP runtime.
 
 
 ## Weight export

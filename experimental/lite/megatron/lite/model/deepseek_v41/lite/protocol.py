@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Text protocol with single-rank construction; distributed integration is pending."""
+"""Text protocol with replicated data parallel training and explicit optimizer policy."""
 
 import math
 from contextlib import nullcontext
@@ -19,7 +19,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
     allgather_concat,
 )
-from megatron.lite.primitive.parallel.state import ParallelState
+from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
@@ -71,9 +71,7 @@ def build_model(model_cfg, *, impl_cfg):
         )
     ps = ParallelState()
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
-        raise NotImplementedError(
-            'Data parallel construction requires the distributed integration'
-        )
+        ps = init_parallel(replace(p, etp=1))
     if impl_cfg.optimizer not in (None, 'muon'):
         raise ValueError('V4.1 optimizer must be explicitly selected as muon')
     if impl_cfg.optimizer is None and impl_cfg.optimizer_config is not None:
@@ -131,27 +129,50 @@ def build_model(model_cfg, *, impl_cfg):
                 parameter.data = parameter.data.float()
                 parameter.main_grad = None
         model.residual_dtype = impl_cfg.dtype
-        optimizer = V41Optimizer(model, impl_cfg.optimizer_config)
+        optimizer = V41Optimizer(model, impl_cfg.optimizer_config, dp_group=ps.dp_group)
     if impl_cfg.external_vision_device is not None:
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
         model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
+    execution_model = model
+    if ps.dp_size > 1 and optimizing:
+        if impl_cfg.external_vision_device is not None:
+            raise NotImplementedError(
+                'DP external vision requires staged gradient synchronization'
+            )
+        from torch.nn.parallel import DistributedDataParallel
+
+        # DDP synchronizes parameter initialization. Encoded Engram buffers need
+        # byte collectives because NCCL does not accept their FP8 storage dtype.
+        with torch.no_grad():
+            for buffer in model.buffers():
+                value = buffer.contiguous().reshape(-1).view(torch.uint8)
+                torch.distributed.broadcast(value, src=0, group=ps.dp_group)
+                buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
+        execution_model = DistributedDataParallel(
+            model,
+            process_group=ps.dp_group,
+            broadcast_buffers=False,
+            find_unused_parameters=True,
+        )
     return ModelBundle(
         [model],
         ps,
         optimizer=optimizer,
-        forward_step=partial(_forward_step, optimizer=optimizer),
+        forward_step=partial(
+            _forward_step, optimizer=optimizer, execution_model=execution_model
+        ),
         extras={
             'model_cfg': model_cfg,
             'vision_schedule': model.vision_schedule,
-            'prepare_microbatches': prepare_microbatches,
+            'prepare_microbatches': partial(prepare_microbatches, dp_group=ps.dp_group),
             'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
         },
     )
 
 
-def prepare_microbatches(data_iter, count):
+def prepare_microbatches(data_iter, count, *, dp_group=None):
     """Use one valid-token denominator for all SFT microbatches (O16)."""
     from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
 
@@ -179,7 +200,15 @@ def prepare_microbatches(data_iter, count):
         shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
         total += float(shifted_mask.sum())
     # The generic runtime divides every microbatch by count after this loss.
-    denominator = max(total, 1.0) / count
+    dp_size = 1
+    if dp_group is not None:
+        tokens = torch.tensor(
+            total, dtype=torch.float64, device=items[0][0].input_ids.device
+        )
+        torch.distributed.all_reduce(tokens, group=dp_group)
+        total = float(tokens)
+        dp_size = torch.distributed.get_world_size(dp_group)
+    denominator = max(total, 1.0) / (count * dp_size)
     return [
         (
             batch,
@@ -227,19 +256,21 @@ def _validate_text_batch(batch, *, multimodal=False):
         raise ValueError('Only sequence-local positions are supported')
 
 
-def _forward_step(model, batch, *, optimizer=None):
+def _forward_step(model, batch, *, optimizer=None, execution_model=None):
     schedule = model.vision_schedule
     if schedule is not None and schedule.stage != 'idle':
         raise RuntimeError('Previous microbatch requires completed vision backward')
     try:
-        return _forward_step_impl(model, batch, optimizer=optimizer)
+        return _forward_step_impl(
+            model, batch, optimizer=optimizer, execution_model=execution_model
+        )
     except Exception:
         if schedule is not None:
             schedule.abort()
         raise
 
 
-def _forward_step_impl(model, batch, *, optimizer=None):
+def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
     _validate_text_batch(batch, multimodal=True)
     _validate_replay(model, batch)
     precision = (
@@ -253,7 +284,9 @@ def _forward_step_impl(model, batch, *, optimizer=None):
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
     with precision:
-        output = model(batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality)
+        output = (model if execution_model is None else execution_model)(
+            batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality
+        )
     result = _text_output(output['logits'][0], batch)
     if optimizer is not None and model.training and torch.is_grad_enabled():
         optimizer.accumulate_modality_loads(output['modality_loads'])
