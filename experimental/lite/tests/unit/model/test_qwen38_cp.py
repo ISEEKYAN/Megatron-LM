@@ -348,3 +348,75 @@ def test_qsa_cp_queries_are_local_and_documents_are_isolated(monkeypatch, rank):
         8,
         8,
     ], 'CP_QSA_QUERY_STORAGE_LOCAL'
+
+
+def test_ple_cp_bf16_convolution_uses_native_accumulation(monkeypatch):
+    from megatron.lite.model.qwen3_8_flash_next.engram import (
+        Qwen3_8_FlashNextNGramEmbedding,
+        Qwen3_8_FlashNextPLELayer,
+    )
+
+    torch.manual_seed(3852)
+    embedding = Qwen3_8_FlashNextNGramEmbedding(
+        lambda ids: (ids.remainder(31).float() / 31).unsqueeze(-1)
+    )
+    module = Qwen3_8_FlashNextPLELayer(
+        embedding, hidden_size=4, hc_count=4, ple_embed_dim=16, dtype=torch.bfloat16
+    )
+    with torch.no_grad():
+        module.conv1d.weight.normal_(mean=0, std=0.1)
+    ids = torch.arange(1, 14).reshape(1, -1)
+    cu = torch.tensor([0, 5, 13])
+    x = torch.randn(1, 16, 16, dtype=torch.bfloat16)
+    serial_inputs = []
+    module.conv1d.register_forward_pre_hook(
+        lambda m, args: serial_inputs.append(args[0].detach().clone())
+    )
+    expected = module(x[:, :13], ids, cu_seqlens=cu)
+    local_normalized = []
+    original = cp.qwen3_8_flash_next_cp_left_halo
+
+    def capture(tensor, context, *, history):
+        local_normalized.append(tensor.detach().clone())
+        return original(tensor, context, history=history)
+
+    monkeypatch.setattr(cp, 'qwen3_8_flash_next_cp_left_halo', capture)
+    _, batch, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(
+        mesh(0, 1), None, {'input_ids': ids, 'cu_seqlens': cu}
+    )
+    actual = module(
+        x, batch['input_ids'], cp_context=batch['_qwen3_8_flash_next_cp_context']
+    )
+    serial_normalized = torch.cat(
+        [part[:, :, 9:].transpose(1, 2) for part in serial_inputs], 1
+    )
+    assert torch.equal(
+        local_normalized[0][:, :13], serial_normalized
+    ), 'CP_PLE_PRE_CONV_BITWISE'
+    assert torch.equal(actual[:, :13], expected), 'CP_PLE_NATIVE_CONV_BITWISE'
+    normalized = local_normalized[0]
+
+    def halo(tensor, context, *, history):
+        start = context.local_sequence_start
+        assert torch.equal(
+            tensor, normalized[:, start : context.local_sequence_end]
+        ), 'CP_PLE_PRE_HALO_BITWISE'
+        return torch.nn.functional.pad(
+            normalized[:, max(0, start - history) : start],
+            (0, 0, max(0, history - start), 0),
+        )
+
+    monkeypatch.setattr(cp, 'qwen3_8_flash_next_cp_left_halo', halo)
+    for rank in (0, 1):
+        _, batch, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(
+            mesh(rank, 2), None, {'input_ids': ids, 'cu_seqlens': cu}
+        )
+        part = module(
+            x[:, rank * 8 : (rank + 1) * 8],
+            batch['input_ids'],
+            cp_context=batch['_qwen3_8_flash_next_cp_context'],
+        )
+        stop = min(8, 13 - rank * 8)
+        assert torch.equal(
+            part[:, :stop], expected[:, rank * 8 : rank * 8 + stop]
+        ), 'CP_PLE_CROSS_DOCUMENT_HALO_BITWISE'

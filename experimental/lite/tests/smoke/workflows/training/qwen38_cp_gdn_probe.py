@@ -62,22 +62,43 @@ def main():
     dy = full_dy.chunk(world, 0)[rank].clone()
     traces = {}
 
+    def watch(name, value):
+        traces[name] = value.detach().cpu().clone()
+        if value.requires_grad:
+
+            def gradient(grad):
+                traces[name + '_grad'] = grad.detach().cpu().clone()
+
+            value.register_hook(gradient)
+
     def capture(name):
         def hook(module, inputs, output):
-            traces[name] = output.detach().cpu().clone()
+            watch(name + '_input', inputs[0])
+            watch(name, output)
 
         return hook
 
     model.in_proj.register_forward_hook(capture('projected'))
+    model.o_proj.register_forward_hook(capture('output_projection'))
     original_rule = model._gated_delta_rule
 
     def rule(q, k, v, *a, **kw):
-        traces['recurrence_q'] = q.detach().cpu().clone()
+        for name, value in zip(('q', 'k', 'v', 'g', 'beta'), (q, k, v, *a)):
+            watch('recurrence_' + name, value)
         out = original_rule(q, k, v, *a, **kw)
-        traces['recurrence_output'] = out[0].detach().cpu().clone()
+        watch('recurrence_output', out[0])
         return out
 
     model._gated_delta_rule = rule
+    original_conv = model._causal_conv1d
+
+    def convolution(qkv, *a, **kw):
+        watch('convolution_input', qkv)
+        out = original_conv(qkv, *a, **kw)
+        watch('convolution_output', out)
+        return out
+
+    model._causal_conv1d = convolution
     calls = []
     original_exchange = dist.all_to_all_single
 

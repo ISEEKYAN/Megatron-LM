@@ -265,16 +265,21 @@ class Qwen3_8_FlashNextPLELayer(nn.Module):
                 starts = torch.maximum(
                     starts, cu[torch.bucketize(positions, cu[1:], right=True)]
                 )
-            convolution = normalized.new_zeros(hidden_states.shape)
+            windows = []
             for i in range(self.conv1d.kernel_size[0]):
                 valid = (positions - history + 3 * i >= starts).unsqueeze(-1)
-                convolution = (
-                    convolution
-                    + normalized[:, 3 * i : 3 * i + hidden_states.shape[1]]
-                    * self.conv1d.weight[:, 0, i]
-                    * valid
+                windows.append(
+                    normalized[:, 3 * i : 3 * i + hidden_states.shape[1]] * valid
                 )
-            convolution = F.silu(convolution)
+            # The halo selects the same dilated taps as the serial convolution.
+            # Preserve its native accumulation: BF16 tap-by-tap multiply/add
+            # rounds before the sum, unlike the original conv1d operation.
+            windows = torch.stack(windows, -1).reshape(
+                -1, hidden_states.shape[-1], self.conv1d.kernel_size[0]
+            )
+            convolution = F.silu(
+                F.conv1d(windows, self.conv1d.weight, groups=hidden_states.shape[-1])
+            ).reshape_as(hidden_states)
         elif cu_seqlens is not None:
             convolution = torch.cat(
                 [
