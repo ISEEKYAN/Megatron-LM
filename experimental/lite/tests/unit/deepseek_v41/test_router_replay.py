@@ -13,8 +13,8 @@ from megatron.lite.primitive.modules.router_replay import (
     RouterReplayAction,
     attach_router_replay,
 )
-from megatron.lite.runtime.contracts import PackedBatch
 from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+from megatron.lite.runtime.contracts import PackedBatch
 
 
 @pytest.fixture

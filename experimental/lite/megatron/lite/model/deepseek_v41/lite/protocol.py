@@ -10,6 +10,8 @@ import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
 from megatron.lite.model.protocol_utils import (
     pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
     pack_routed_experts as _pack_routed_experts,
 )
 from megatron.lite.primitive.bundle import ModelBundle
@@ -22,7 +24,6 @@ from torch.nn import functional as F
 from .checkpoint import export_checkpoint, load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
 from .training import VisionSchedule, VisionTrainability
-
 
 # HF checkpoints store trainable masters and byte-preserved archives.
 HF_SAVE_SUPPORTS_RESYNC = False

@@ -402,6 +402,7 @@ def test_v41_engine_hf_save_keeps_master_checkpoint_with_resync_config(
     tmp_path, transformer_engine_import_stub, monkeypatch
 ):
     import os
+
     import torch.distributed as dist
     from megatron.lite.model.deepseek_v41.lite import protocol
     from safetensors.torch import load_file

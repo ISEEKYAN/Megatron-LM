@@ -779,11 +779,10 @@ def test_runtime_replay_driver_requires_observed_routes(
     live, capsys, transformer_engine_import_stub
 ):
     transformer_engine_import_stub()
-    from megatron.lite.primitive.modules.router_replay import RouterReplay
     from megatron.lite.primitive.modules.router import SigmoidTopKRouter
-    from megatron.lite.runtime.contracts import PackedBatch
-
+    from megatron.lite.primitive.modules.router_replay import RouterReplay
     from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
 
     model = SigmoidTopKRouter(
         types.SimpleNamespace(

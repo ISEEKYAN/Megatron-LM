@@ -18,6 +18,7 @@ def test_v41_pipeline_rejects(moe, model_config, case, monkeypatch):
     stage = DeepseekV41Model(
         model_config, token_map=list(range(256)), quantized=False, layer_range=(0, 20)
     )
+
     def execution_after_guard(*args, **kwargs):
         raise AssertionError('PIPELINE_GUARD_MUST_PRECEDE_EXECUTION')
 

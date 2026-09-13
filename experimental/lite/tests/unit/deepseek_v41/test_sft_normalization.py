@@ -101,9 +101,10 @@ def test_verl_runtime_sft_uses_one_global_token_denominator(count, policy):
     # Execute the engine's actual adapter without importing optional VERL/CUDA
     # dependencies; only the TensorDict transport is replaced by this CPU seam.
     import ast
-    from pathlib import Path
-    from types import SimpleNamespace, MethodType
     import weakref
+    from pathlib import Path
+    from types import MethodType, SimpleNamespace
+
     from megatron.lite.primitive.train_step import run_microbatch_loop
 
     source = (

@@ -1,16 +1,16 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import pytest
 import torch
+from megatron.lite.primitive.quantization.block_fp8 import (
+    dequantize_block_fp8,
+    quantize_block_fp8,
+)
 from megatron.lite.primitive.quantization.ds41_fp8 import (
     _fp8_gemm,
     _quantize_rows,
     dynamic_fp8_linear,
     fake_quant_swa,
     quantize_swa,
-)
-from megatron.lite.primitive.quantization.block_fp8 import (
-    dequantize_block_fp8,
-    quantize_block_fp8,
 )
 from megatron.lite.primitive.quantization.ds41_index import (
     fake_quant_index,
@@ -116,11 +116,14 @@ def test_fp8_gemm_matches_dequantized_blockwise_reference():
         weight, (32, 32), scale_format='e8m0'
     )
 
-    actual = _fp8_gemm(activation.values, activation.scale, encoded_weight, weight_scale)
+    actual = _fp8_gemm(
+        activation.values, activation.scale, encoded_weight, weight_scale
+    )
     assert torch.all(weight_scale[0].float() != weight_scale[1].float())
     # Double accumulation keeps this independent reference free of TF32 rounding.
-    expected = activation.decoded.double() @ dequantize_block_fp8(
-        encoded_weight, weight_scale, (32, 32)
-    ).double().T
+    expected = (
+        activation.decoded.double()
+        @ dequantize_block_fp8(encoded_weight, weight_scale, (32, 32)).double().T
+    )
 
     torch.testing.assert_close(actual, expected.float(), atol=2e-4, rtol=2e-4)
