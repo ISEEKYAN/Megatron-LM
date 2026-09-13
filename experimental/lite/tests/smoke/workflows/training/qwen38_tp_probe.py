@@ -21,6 +21,7 @@ from qwen38_tp_reference import (
     bf16_ordered_sum,
     independent_partials,
     explained_difference,
+    ordered_norm_reference,
 )
 from megatron.lite.model.qwen3_8_flash_next.tp import (
     projection_shard,
@@ -319,6 +320,16 @@ def main():
     for step in range(3):
         record = train_step()
         records.append(record)
+        if serial is not None and world > 1:
+            matched_norm, norm_trace = ordered_norm_reference(
+                handle._optimizer,
+                model,
+                reference['steps'][step]['gradients'],
+                rank,
+                world,
+            )
+            record['matched_norm'] = matched_norm
+            record['norm_trace'] = norm_trace
         if step == 0:
             torch.save(traces, args.output / f'projection-traces-rank{rank}.pt')
             trace_active[0] = False
@@ -394,11 +405,18 @@ def main():
             zip(records, reference['steps'], strict=True)
         ):
             serial_step = serial['steps'][step] if serial is not None else None
+            target_norm = record.get('matched_norm', target['grad_norm'])
+            assert record['grad_norm'] == target_norm, (
+                'TP_NORM_ORDERED_MODEL',
+                step,
+                record['grad_norm'],
+                target_norm,
+            )
             if serial_step is not None:
                 assert explained_difference(
-                    record['grad_norm'], target['grad_norm'], serial_step['grad_norm']
+                    record['grad_norm'], target_norm, serial_step['grad_norm']
                 ), ('TP_NORM_SERIAL_EXPLAINED', step)
-            if record['grad_norm'] != target['grad_norm']:
+            if record['grad_norm'] != target_norm:
                 mismatches.append(
                     (
                         'TP_OPTIMIZER_LOGICAL_SCOPE',
