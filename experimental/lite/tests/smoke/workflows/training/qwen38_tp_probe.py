@@ -154,6 +154,7 @@ def main():
 
     # Count actual collectives on the TP group only, only during fwd/bwd.
     calls, shapes, active = {}, {}, [False]
+    head_pending = []
     for operation in (
         'all_reduce',
         'all_gather',
@@ -169,6 +170,15 @@ def main():
                 tensors = [x for x in a if isinstance(x, torch.Tensor)]
                 if tensors:
                     shapes.setdefault(_op, set()).add(tuple(tensors[-1].shape))
+            if _op == 'all_reduce' and head_pending:
+                row = head_pending.pop()
+                assert group is ps.tp_group and not kw.get(
+                    'async_op', False
+                ), 'TP_HEAD_REDUCE_SCOPE'
+                row['pre_reduce'] = a[0].detach().cpu().clone()
+                result = _fn(*a, **kw)
+                row['post_reduce'] = a[0].detach().cpu().clone()
+                return result
             return _fn(*a, **kw)
 
         setattr(dist, operation, counted)
@@ -222,9 +232,26 @@ def main():
                 return
             row = traces[key][-1]
             row['y'] = output.detach().cpu().clone()
-            output.register_hook(
-                lambda grad, row=row: row.update(dy=grad.detach().cpu().clone())
-            )
+
+            def output_gradient(grad):
+                row['dy'] = grad.detach().cpu().clone()
+                if key == 'lm_head.weight':
+                    if world == 1:
+                        # Diagnostic slices of the independent full-matrix run.
+                        # They are not used by its forward/backward or optimizer.
+                        weight = module.weight.detach()
+                        row['serial_partials'] = [
+                            part.contiguous()
+                            .matmul(weight.chunk(2, 0)[owner])
+                            .cpu()
+                            .clone()
+                            for owner, part in enumerate(grad.detach().chunk(2, -1))
+                        ]
+                    else:
+                        assert not head_pending, 'TP_HEAD_REDUCE_PENDING'
+                        head_pending.append(row)
+
+            output.register_hook(output_gradient)
 
         module.register_forward_pre_hook(before)
         module.register_forward_hook(after)
@@ -253,6 +280,20 @@ def main():
         if step == 0:
             torch.save(traces, args.output / f'projection-traces-rank{rank}.pt')
             trace_active[0] = False
+            if reference is not None:
+                for microbatch, row in enumerate(traces['lm_head.weight']):
+                    target = reference['head_partials'][microbatch]
+                    assert torch.equal(row['dy'], target['dy']), 'TP_HEAD_PARTIAL_DY'
+                    assert torch.equal(
+                        row['weight'], target['weight'].chunk(2, 0)[rank]
+                    ), 'TP_HEAD_PARTIAL_WEIGHT'
+                    assert torch.equal(
+                        row['pre_reduce'], target['serial_partials'][rank]
+                    ), ('TP_HEAD_PRE_REDUCE_PARTIAL', rank, microbatch)
+                    assert torch.equal(
+                        row['post_reduce'], row['dx']
+                    ), 'TP_HEAD_POST_REDUCE_DX'
+                print('TP_HEAD_PRE_REDUCE_PARTIALS_BITWISE_OK', rank, flush=True)
         torch.save(record, args.output / f'step{step}-rank{rank}.pt')
         if step == 1:
             runtime.save_checkpoint(
@@ -281,6 +322,7 @@ def main():
         run_id=run_id,
         world=world,
         config=config,
+        head_partials=traces['lm_head.weight'],
         initial=initial,
         steps=records,
         storage=storage,
