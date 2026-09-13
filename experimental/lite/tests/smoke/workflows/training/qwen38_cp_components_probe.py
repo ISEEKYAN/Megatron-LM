@@ -7,7 +7,9 @@ adjoints. Full raw tensors are retained, including unscored padding outputs.
 import argparse
 import os
 import sys
+from contextlib import contextmanager, nullcontext
 from pathlib import Path
+from unittest.mock import patch
 
 import torch
 import torch.distributed as dist
@@ -21,10 +23,62 @@ from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 from test_qwen38_training import tiny_training_config
 
 
+@contextmanager
+def capture_qsa_boundaries(module, records):
+    """Observe native operands and adjoints without replacing arithmetic."""
+    from megatron.lite.model.qwen3_8_flash_next import cp, qsa
+
+    def save_tensor(record, name, tensor):
+        record[name] = tensor.detach().cpu().clone()
+        if tensor.requires_grad:
+
+            def save_grad(grad):
+                record[name + '_grad'] = grad.detach().cpu().clone()
+
+            tensor.register_hook(save_grad)
+
+    def observe(name, function):
+        def call(*args, **kwargs):
+            record = dict(kind=name)
+            records.append(record)
+            for i, value in enumerate(args):
+                if isinstance(value, torch.Tensor):
+                    save_tensor(record, f'input{i}', value)
+            output = function(*args, **kwargs)
+            save_tensor(record, 'output', output)
+            return output
+
+        return call
+
+    hooks = []
+    for name in ('q_proj', 'k_proj', 'v_proj', 'o_proj'):
+
+        def projection_hook(module, inputs, output, name=name):
+            record = dict(kind=name)
+            records.append(record)
+            record['input0'] = inputs[0].detach().cpu().clone()
+            save_tensor(record, 'output', output)
+
+        hooks.append(getattr(module, name).register_forward_hook(projection_hook))
+    try:
+        with patch.object(
+            qsa, 'sparse_attention', observe('attention', qsa.sparse_attention)
+        ), patch.object(
+            cp,
+            'qwen3_8_flash_next_cp_all_gather',
+            observe('gather', cp.qwen3_8_flash_next_cp_all_gather),
+        ):
+            yield
+    finally:
+        for hook in hooks:
+            hook.remove()
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--reference', type=Path, required=True)
     parser.add_argument('--output', type=Path, required=True)
+    parser.add_argument('--capture-boundaries', action='store_true')
     args = parser.parse_args()
     world, rank = int(os.environ['WORLD_SIZE']), int(os.environ['RANK'])
     assert world in (1, 2)
@@ -128,7 +182,15 @@ def main():
                 },
             )
 
-        actual = run()
+        records = []
+        capture = (
+            capture_qsa_boundaries(module, records)
+            if args.capture_boundaries and name == 'QSA'
+            else nullcontext()
+        )
+        with capture:
+            actual = run()
+        actual['boundaries'] = records
         if world == 1:
             repeated = run()
             for field in ('y', 'dx'):
