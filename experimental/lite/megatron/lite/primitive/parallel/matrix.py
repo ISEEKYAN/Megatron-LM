@@ -11,7 +11,6 @@ from dataclasses import dataclass
 
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
 
 
@@ -30,7 +29,9 @@ class TensorShard:
 
     def slice(self, full):
         if tuple(full.shape) != self.shape:
-            raise ValueError('Tensor shard requires the full logical shape; double slicing is invalid')
+            raise ValueError(
+                'Tensor shard requires the full logical shape; double slicing is invalid'
+            )
         width = self.shape[self.dim] // self.size
         return full.narrow(self.dim, self.rank * width, width).contiguous()
 
@@ -84,7 +85,9 @@ def full_matrix_parameters(parameters, group, *, publish=False):
                 continue
             data, grad, main = p.data, p.grad, getattr(p, 'main_grad', None)
             full = gather_parameter(p, group)
-            active = torch.tensor(int(main is not None or grad is not None), device=p.device)
+            active = torch.tensor(
+                int(main is not None or grad is not None), device=p.device
+            )
             dist.all_reduce(active, group=group)
             gradient = main if main is not None else grad
             if active.item():

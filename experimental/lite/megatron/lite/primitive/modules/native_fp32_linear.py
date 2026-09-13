@@ -46,7 +46,9 @@ class Linear(torch.nn.Linear):
         if getattr(self, 'tp_size', 1) > 1:
             from megatron.lite.primitive.parallel.linear import column_parallel_forward
 
-            return column_parallel_forward(x, self._local_forward, self.tp_size, self.tp_group)
+            return column_parallel_forward(
+                x, self._local_forward, self.tp_size, self.tp_group
+            )
         return self._local_forward(x)
 
     def _local_forward(self, x):

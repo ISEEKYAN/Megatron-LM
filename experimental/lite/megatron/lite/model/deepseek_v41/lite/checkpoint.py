@@ -16,13 +16,13 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _resolve_export_dtype,
     stream_export_to_shards,
 )
-from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
-from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 from megatron.lite.primitive.parallel.matrix import (
     gather_parameter,
     logical_shape,
     slice_parameter,
 )
+from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
+from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 from safetensors import SafetensorError, safe_open
 
 _CHUNK = 8 * 1024 * 1024
