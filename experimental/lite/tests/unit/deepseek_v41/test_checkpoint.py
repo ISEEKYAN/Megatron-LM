@@ -57,7 +57,7 @@ def test_decode_archive_and_reload(tmp_path, kind):
         ('stale', 'unexpected scale'),
     ],
 )
-def test_decode_rejects_scale_damage(tmp_path, damage, message):
+def test_decode_rejects_scale_damage(tmp_path, damage, message, monkeypatch):
     name = 'layers.0.ffn.experts.0.w1.weight'
     tensors = {name: torch.zeros(2, 16, dtype=torch.int8)}
     if damage != 'missing':
@@ -74,8 +74,23 @@ def test_decode_rejects_scale_damage(tmp_path, damage, message):
     path = tmp_path / 'bad'
     save_file(tensors, path)
     store = CheckpointTensorStore.load([path], expected_keys=tensors)
+    reads = []
+    if damage == 'missing':
+        from megatron.lite.model.deepseek_v41.lite import checkpoint
+
+        read_tensor = checkpoint._tensor
+
+        def checked_read(source, key):
+            reads.append(key)
+            # The missing-scale guard must reject before this tensor-read boundary.
+            assert key in source.entries, 'CHECKPOINT_SCALE_GUARD_PRECEDES_READ'
+            return read_tensor(source, key)
+
+        monkeypatch.setattr(checkpoint, '_tensor', checked_read)
     with pytest.raises((ValueError, TypeError), match=message):
         try:
             load_weight(store, name)
         except KeyError as error:
             pytest.fail(f'CHECKPOINT_SCALE_GUARD_BEFORE_READ: {error}')
+    if damage == 'missing':
+        assert reads == [name], 'CHECKPOINT_MISSING_SCALE_NEVER_READ'

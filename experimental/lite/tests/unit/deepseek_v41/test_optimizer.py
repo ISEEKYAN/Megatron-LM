@@ -147,7 +147,7 @@ def test_algorithm1_momentum_fresh_n_and_resume(restore):
         ('step', False, 'Sinkhorn requires explicit accumulated gradients'),
     ],
 )
-def test_staged_optimizer_guards(action, prepared, message):
+def test_staged_optimizer_guards(action, prepared, message, monkeypatch):
     opt = Sinkhorn([torch.nn.Parameter(torch.ones(2, 2))], lr=0.1)
     saved = opt.state_dict()
     if prepared:
@@ -157,11 +157,26 @@ def test_staged_optimizer_guards(action, prepared, message):
         if action == 'load_state_dict'
         else ((lambda: None,) if action == 'step' else ())
     )
+    reads = []
+    if action in ('candidates', 'commit_step'):
+        original_get = type(opt).__getattribute__
+
+        def read_prepared(self, name):
+            value = original_get(self, name)
+            if self is opt and name == '_prepared':
+                reads.append(value)
+                # The first read checks the guard; a second read consumes candidates.
+                assert len(reads) == 1, 'STAGED_GUARD_PRECEDES_CANDIDATE_READ'
+            return value
+
+        monkeypatch.setattr(type(opt), '__getattribute__', read_prepared)
     with pytest.raises((ValueError, RuntimeError), match=message):
         try:
             getattr(opt, action)(*args)
         except TypeError as error:
             pytest.fail(f'STAGED_OPTIMIZER_GUARD_BEFORE_CONSUME: {error}')
+    if action in ('candidates', 'commit_step'):
+        assert reads == [None], 'STAGED_UNPREPARED_GUARD_EXECUTED'
 
 
 @pytest.mark.parametrize('recompute', [False, True])

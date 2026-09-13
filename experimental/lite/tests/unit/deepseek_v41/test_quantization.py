@@ -29,7 +29,22 @@ from megatron.lite.primitive.quantization.ds41_kv import (
         (quantize_index, 32, torch.float8_e8m0fnu, 128),
     ],
 )
-def test_group16_e4m3_vs_group32_e8m0(codec, group, dtype, scale):
+def test_group16_e4m3_vs_group32_e8m0(codec, group, dtype, scale, monkeypatch):
+    from megatron.lite.primitive.quantization import ds41_index
+
+    decoded_calls = []
+    decode = ds41_index.dequantize_mxfp4
+
+    def checked_decode(packed, scales):
+        decoded_calls.append((packed.shape, scales.shape))
+        # This boundary follows grouping and scale creation, before decoding can fail.
+        assert scales.shape == (
+            *packed.shape[:-1],
+            packed.shape[-1] * 2 // 32,
+        ), 'INDEX_SCALE_ONE_PER_32_VALUES'
+        return decode(packed, scales)
+
+    monkeypatch.setattr(ds41_index, 'dequantize_mxfp4', checked_decode)
     try:
         result = codec(torch.full((2, 64), 6.25))
     except ValueError as error:
@@ -49,6 +64,8 @@ def test_group16_e4m3_vs_group32_e8m0(codec, group, dtype, scale):
         [0x20, 0x42, 0x64, 0x76, 0xA8, 0xCA, 0xEC, 0xFE] * 2
     ]
     assert torch.equal(before, values) and not encoded.scale.requires_grad
+    if codec is quantize_index:
+        assert len(decoded_calls) == 3, 'INDEX_SCALE_BOUNDARY_EXECUTED'
 
 
 @pytest.mark.parametrize(

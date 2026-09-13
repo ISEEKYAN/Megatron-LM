@@ -441,10 +441,23 @@ def test_v41_engine_hf_save_keeps_master_checkpoint_with_resync_config(
             export_dtype='bfloat16',
         ),
     )
+    save_calls = []
+    save_weights = protocol.save_hf_weights
+
+    def checked_save(*args, **kwargs):
+        save_calls.append(dict(kwargs))
+        # Observe the actual engine call after its resync-kwargs branch executes.
+        assert (
+            not {'target', 'resync_config'} & kwargs.keys()
+        ), 'HF_NATIVE_SAVE_EXCLUDES_DEPLOYMENT_OPTIONS'
+        return save_weights(*args, **kwargs)
+
+    monkeypatch.setattr(protocol, 'save_hf_weights', checked_save)
     try:
         namespace['_save_hf_checkpoint'](engine, str(tmp_path / 'checkpoint'))
     except TypeError as error:
         pytest.fail(f'HF_ENGINE_NATIVE_SAVE_MUST_ACCEPT_RESYNC_CONFIG: {error}')
+    assert len(save_calls) == 1, 'HF_NATIVE_SAVE_BOUNDARY_EXECUTED'
     saved = tmp_path / 'checkpoint/huggingface'
     tensors = {
         k: v
