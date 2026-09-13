@@ -45,10 +45,10 @@ def parameter_placements(name):
     # Match the existing Qwen3.5 GroupedLinear owner layout. weightN denotes
     # a local expert: these checkpoints currently require the same EP size.
     return [
-        Shard(0) if projection_shard(name) else Replicate(),
+        Replicate(),
         Replicate(),
         Shard(0) if is_expert_param(name) else Replicate(),
-        Replicate(),
+        Shard(0) if projection_shard(name) else Replicate(),
     ]
 
 

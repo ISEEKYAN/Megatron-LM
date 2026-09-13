@@ -45,7 +45,7 @@ def test_tp_checkpoint_shard_axis(name):
     from megatron.lite.model.qwen3_8_flash_next.protocol import parameter_placements
     from torch.distributed.tensor import Shard
 
-    assert parameter_placements(name)[0] == Shard(0), 'TP_CHECKPOINT_AXIS'
+    assert parameter_placements(name)[3] == Shard(0), 'TP_CHECKPOINT_AXIS'
 
 
 def test_tp_serial_key_mapping():
