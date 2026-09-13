@@ -522,20 +522,26 @@ class MegatronLiteRuntime(RuntimeBase):
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
-            first_item = next(data_iter)
-            first_batch, _loss_context = split_loss_context(first_item)
-            data_iter = chain([first_item], data_iter)
-            model_cfg = handle._extras.get("model_cfg")
-            # Nominal inter-stage shape for the fixed-shape VPP path. The 1F1B and
-            # forward-only schedules ignore this and use Megatron dynamic shape
-            # exchange (the sender transmits its real per-micro-batch size), so THD
-            # variable-length packing no longer needs a locally-derived shape.
-            tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
-
-            model_chunks = handle._extras.get("model_chunks", [handle._model])
-            pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
-            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             try:
+                prepare = handle._extras.get("prepare_microbatches")
+                # Match the non-PP SFT policy before shape inspection and scheduling.
+                if prepare is not None and loss_fn is None and not forward_only:
+                    data_iter = iter(prepare(data_iter, num_microbatches))
+                first_item = next(data_iter)
+                first_batch, _loss_context = split_loss_context(first_item)
+                data_iter = chain([first_item], data_iter)
+                model_cfg = handle._extras.get("model_cfg")
+                # Nominal inter-stage shape for the fixed-shape VPP path. The 1F1B and
+                # forward-only schedules ignore this and use Megatron dynamic shape
+                # exchange (the sender transmits its real per-micro-batch size), so THD
+                # variable-length packing no longer needs a locally-derived shape.
+                tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
+
+                model_chunks = handle._extras.get("model_chunks", [handle._model])
+                pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
+                pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(
+                    forward_step, loss_fn
+                )
                 outputs = forward_backward_pipelining(
                     pipeline_forward_step,
                     pipeline_chunks,

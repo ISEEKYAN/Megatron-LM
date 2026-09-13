@@ -663,3 +663,112 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
+
+
+@pytest.mark.parametrize('mode', ['sft', 'external_loss', 'forward_only'])
+def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
+    from megatron.lite.primitive.parallel import pipeline
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    batches = [
+        PackedBatch(torch.arange(n), torch.arange(n), torch.tensor([n])) for n in (2, 5)
+    ]
+    context = LossContext(source_batch='original', loss_scale=0.5)
+    outputs, gradients = [], []
+    for pp_size in (1, 2):
+        model = nn.Linear(1, 1, bias=False)
+        nn.init.ones_(model.weight)
+        prepared_calls, contexts, consumed = [], [], []
+
+        def prepare(data_iter, count):
+            prepared_calls.append(count)
+            from dataclasses import replace
+
+            items = [next(data_iter) for _ in range(count)]
+            return [
+                (batch, replace(ctx, normalization_denominator=3.5))
+                for batch, ctx in items
+            ]
+
+        def forward(module, batch):
+            ctx = get_loss_context()
+            contexts.append(ctx)
+            consumed.append(batch)
+            denominator = ctx.normalization_denominator or batch.total_tokens
+            return {
+                'loss': module.weight.sum()
+                * batch.total_tokens
+                / denominator
+                * ctx.loss_scale
+            }
+
+        def schedule(forward_fn, chunks, data_iter, config, ps, **kwargs):
+            # Exercise the real runtime PP dispatch/callbacks without CUDA transport.
+            result = []
+            for _ in range(config.num_microbatches):
+                item = next(data_iter)
+                out = forward_fn(chunks[0], item)
+                loss = out['loss']
+                if kwargs['loss_fn'] is not None:
+                    loss, _ = kwargs['loss_fn'](out, item)
+                if not kwargs['forward_only']:
+                    (loss / config.num_microbatches).backward()
+                result.append(out)
+            return result
+
+        handle = ModelHandle(
+            model=model,
+            parallel_state=types.SimpleNamespace(
+                pp_size=pp_size, pp_group=None, pp_global_ranks=None
+            ),
+            _extras={
+                'forward_step': forward,
+                'prepare_microbatches': prepare,
+                'model_cfg': types.SimpleNamespace(hidden_size=1),
+            },
+        )
+        # Only the PP result broadcast payload requests CUDA in this CPU dispatch test.
+        original_tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            if kwargs.get('device') == 'cuda':
+                kwargs['device'] = 'cpu'
+            return original_tensor(*args, **kwargs)
+
+        data = iter([(batch, context) for batch in batches] + [('untouched', context)])
+        with patch.object(
+            pipeline, 'forward_backward_pipelining', schedule
+        ), patch.object(torch, 'tensor', cpu_tensor):
+            result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+                handle,
+                data,
+                (
+                    (lambda out, batch, ctx: (out['loss'], {}))
+                    if mode == 'external_loss'
+                    else None
+                ),
+                num_microbatches=2,
+                forward_only=mode == 'forward_only',
+            )
+        assert prepared_calls == (
+            [2] if mode == 'sft' else []
+        ), 'PP must prepare SFT exactly once like non-PP'
+        assert all(
+            a is b for a, b in zip(consumed, batches)
+        ), 'prepared order and first item preserved'
+        assert next(data)[0] == 'untouched', 'prepare consumes exactly num_microbatches'
+        assert all(
+            ctx.source_batch == 'original' and ctx.loss_scale == 0.5 for ctx in contexts
+        )
+        assert [ctx.normalization_denominator for ctx in contexts] == (
+            [3.5] * 2 if mode == 'sft' else [None] * 2
+        )
+        outputs.append(result.model_output.loss)
+        gradients.append(model.weight.grad)
+    torch.testing.assert_close(
+        outputs[0], outputs[1], rtol=0, atol=0, msg='PP versus non-PP loss'
+    )
+    if mode != 'forward_only':
+        torch.testing.assert_close(
+            gradients[0], gradients[1], rtol=0, atol=0, msg='PP versus non-PP gradient'
+        )

@@ -173,10 +173,11 @@ def prepare_microbatches(data_iter, count):
             or (mask < 0).any()
         ):
             raise ValueError('Expected finite nonnegative token loss weights')
-        offset = 0
-        for length in batch.seq_lens.tolist():
-            total += float(mask[offset + 1 : offset + length].sum())
-            offset += length
+        # Count exactly the weights consumed by _text_output's next-token CE.
+        # The packed shift zeros each sequence tail (there is no next label),
+        # so the original first-token weight does not contribute.
+        shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
+        total += float(shifted_mask.sum())
     # The generic runtime divides every microbatch by count after this loss.
     denominator = max(total, 1.0) / count
     return [
