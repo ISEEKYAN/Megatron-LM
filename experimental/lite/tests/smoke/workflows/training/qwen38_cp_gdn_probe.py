@@ -32,6 +32,7 @@ def main():
     assert shared._HAS_FLA, 'CP_GDN_PACKED_FLA_REQUIRED'
     cfg = Qwen3_8_FlashNextTextConfig.from_hf_dict(
         dict(
+            model_type='qwen4_exp_text',
             hidden_size=128,
             linear_num_key_heads=2,
             linear_num_value_heads=2,

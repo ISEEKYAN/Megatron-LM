@@ -287,3 +287,64 @@ def test_gdn_contiguous_head_transport_preserves_packed_boundaries(monkeypatch, 
         restored, values[:, rank * 8 : (rank + 1) * 8]
     ), 'CP_GDN_INVERSE_EXACT'
     assert len(observed) == 2, 'CP_GDN_BOTH_COLLECTIVES'
+
+
+@pytest.mark.parametrize('rank', [0, 1])
+def test_qsa_cp_queries_are_local_and_documents_are_isolated(monkeypatch, rank):
+    from megatron.lite.model.qwen3_8_flash_next.qsa import Qwen3_8_FlashNextQSAAttention
+
+    cfg = SimpleNamespace(
+        hidden_size=8,
+        num_attention_heads=2,
+        num_key_value_heads=1,
+        head_dim=4,
+        indexer_n_heads=2,
+        indexer_head_dim=4,
+        rms_norm_eps=1e-6,
+        indexer_compress_ratio=4,
+        indexer_budget=4,
+    )
+    torch.manual_seed(38)
+    module = Qwen3_8_FlashNextQSAAttention(cfg).to(torch.bfloat16)
+    x = torch.randn(1, 16, 8, dtype=torch.bfloat16)
+    angles = torch.zeros(1, 16, 1, 4, dtype=torch.bfloat16)
+    cu = torch.tensor([0, 5, 13, 16])
+    expected = module(x, angles, cu_seqlens=cu)
+    projected = module.indexer.index_qk_proj(x).reshape(1, 16, 3, 4)
+    key = module._norm(module.k_proj(x).reshape(1, 16, 1, 4), module.k_norm)
+    value = module.v_proj(x).reshape(1, 16, 1, 4)
+    gathered = iter([projected, key, value, angles])
+    seen = []
+
+    def gather(local, context, **kwargs):
+        full = next(gathered)
+        assert torch.equal(
+            local, full[:, rank * 8 : (rank + 1) * 8]
+        ), 'CP_QSA_PRE_GATHER_LOCAL'
+        seen.append(local.shape[1])
+        return full
+
+    monkeypatch.setattr(cp, 'qwen3_8_flash_next_cp_all_gather', gather)
+    _, batch, _ = cp.shard_batch_for_qwen3_8_flash_next_cp(
+        mesh(rank, 2),
+        None,
+        {'input_ids': torch.arange(13).reshape(1, 13), 'cu_seqlens': cu[:-1]},
+    )
+    projection_lengths = []
+    module.q_proj.register_forward_pre_hook(
+        lambda m, args: projection_lengths.append(args[0].shape[1])
+    )
+    actual = module(
+        x[:, rank * 8 : (rank + 1) * 8],
+        angles[:, rank * 8 : (rank + 1) * 8],
+        cp_context=batch['_qwen3_8_flash_next_cp_context'],
+    )
+    assert torch.equal(
+        actual, expected[:, rank * 8 : (rank + 1) * 8]
+    ), 'CP_QSA_DOCUMENT_FORWARD_BITWISE'
+    assert projection_lengths == [8] and seen == [
+        8,
+        8,
+        8,
+        8,
+    ], 'CP_QSA_QUERY_STORAGE_LOCAL'

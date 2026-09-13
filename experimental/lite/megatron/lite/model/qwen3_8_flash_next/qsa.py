@@ -49,7 +49,7 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
             * (1 + weight.weight.float())
         ).to(x.dtype)
 
-    def forward(self, x, angles, *, lengths=None, cu_seqlens=None):
+    def forward(self, x, angles, *, lengths=None, cu_seqlens=None, cp_context=None):
         """Angles are expanded rotary angles [B,S,1,R]; documents reset RoPE externally."""
         if (
             x.ndim != 3
@@ -62,6 +62,10 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
             <= min(self.config.head_dim, self.config.indexer_head_dim)
         ):
             raise ValueError('QSA_INPUT_ANGLES')
+        if cp_context is not None:
+            if lengths is not None or cu_seqlens is not None or x.shape[0] != 1:
+                raise ValueError('CP_QSA_CONTEXT_METADATA')
+            return self._forward_cp(x, angles, cp_context)
         if cu_seqlens is not None:
             if (
                 lengths is not None
@@ -124,3 +128,79 @@ class Qwen3_8_FlashNextQSAAttention(nn.Module):
             * gate.sigmoid()
         )
         return self.o_proj(output.flatten(-2))
+
+    def _forward_cp(self, x, angles, context):
+        from .cp import qwen3_8_flash_next_cp_all_gather as gather
+
+        c = self.config
+        b, s, _ = x.shape
+        if s != context.local_sequence_length:
+            raise ValueError('CP_QSA_LOCAL_SEQUENCE')
+        with torch.no_grad():
+            projected = self.indexer.index_qk_proj(x).reshape(
+                b, s, c.indexer_n_heads + 1, c.indexer_head_dim
+            )
+            iq = _apply_rotary_pos_emb_bshd(
+                self._norm(projected[:, :, :-1], self.indexer.q_layernorm), angles
+            )
+            global_index = gather(projected, context, differentiable=False)
+        q, gate = (
+            self.q_proj(x)
+            .reshape(b, s, c.num_attention_heads, 2 * c.head_dim)
+            .chunk(2, -1)
+        )
+        q = _apply_rotary_pos_emb_bshd(self._norm(q, self.q_norm), angles)
+        k = self.k_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim)
+        k = gather(
+            _apply_rotary_pos_emb_bshd(self._norm(k, self.k_norm), angles), context
+        )
+        v = gather(
+            self.v_proj(x).reshape(b, s, c.num_key_value_heads, c.head_dim), context
+        )
+        global_angles = gather(angles, context, differentiable=False)
+        cu = context.global_cu_seqlens
+        boundaries = [0] if cu is None else cu.tolist()
+        if boundaries[-1] < context.global_sequence_length:
+            boundaries.append(context.global_sequence_length)
+        start, end = context.local_sequence_start, context.local_sequence_end
+        pieces = []
+        for a, z in zip(boundaries, boundaries[1:]):
+            left, right = max(a, start), min(z, end)
+            if left >= right:
+                continue
+            local = slice(left - start, right - start)
+            with torch.no_grad():
+                blocks = (z - a) // c.indexer_compress_ratio
+                stop = a + blocks * c.indexer_compress_ratio
+                raw = global_index[:, a:stop, -1:]
+                pooled = (
+                    raw.reshape(
+                        b, blocks, c.indexer_compress_ratio, 1, c.indexer_head_dim
+                    )
+                    .float()
+                    .mean(2)
+                    .to(x.dtype)
+                )
+                ik = _apply_rotary_pos_emb_bshd(
+                    self._norm(pooled, self.indexer.k_layernorm),
+                    global_angles[:, a : stop : c.indexer_compress_ratio],
+                )
+                routes = qsa_routes(
+                    iq[:, local],
+                    ik,
+                    torch.full((b,), right - a, device=x.device, dtype=torch.long),
+                    token_budget=c.indexer_budget,
+                    compress_ratio=c.indexer_compress_ratio,
+                    offset=left - a,
+                )
+            pieces.append(
+                sparse_attention(
+                    q[:, local],
+                    k[:, a:z],
+                    v[:, a:z],
+                    routes[..., : min(z - a, routes.shape[-1])],
+                )
+            )
+        # Keep the same differentiable collectives on ranks with disjoint docs.
+        output = torch.cat(pieces, 1) + (k[:, :0].sum() + v[:, :0].sum())
+        return self.o_proj((output * gate.sigmoid()).flatten(-2))
