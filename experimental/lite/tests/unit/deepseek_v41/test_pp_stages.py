@@ -116,7 +116,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
             model.zero_grad(set_to_none=True)
 
 
-@pytest.mark.parametrize('cut', [15, 19, 21, 0, 40])
+@pytest.mark.parametrize('cut', [15, 19, 21, 25, 0, 40])
 def test_pp2_rejects_untransported_csa2_state(model_config, cut):
     with pytest.raises(NotImplementedError, match='^V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED:'):
         protocol.build_model(
