@@ -105,7 +105,25 @@ def compare(actual, expected):
 
 
 def inject_mutation(model, mutation, rank):
-    """Change only the tested arm's real computation, never the reference."""
+    """Intervene only after healthy activation; sentinel follows the intervention."""
+    trace = model._cp_ep_mutation_trace = []
+
+    def remove_gradient(grad, tag):
+        before = grad.detach().cpu().clone()
+        assert before.count_nonzero() > 0, 'CP_EP_MUTATION_GRADIENT_MUST_BE_NONZERO'
+        changed = torch.zeros_like(grad)
+        # This sentinel is after the actual replacement, not before a guard.
+        trace.append(
+            dict(
+                tag=tag,
+                reached=True,
+                before=before,
+                after=changed.detach().cpu().clone(),
+            )
+        )
+        print(tag, rank, int(before.count_nonzero()), flush=True)
+        return changed
+
     if mutation == 'halo_adjoint':
         from megatron.lite.model.qwen3_8_flash_next import cp
 
@@ -113,15 +131,20 @@ def inject_mutation(model, mutation, rank):
 
         def drop_later_consumer(*args, **kwargs):
             output = original(*args, **kwargs)
-            # Keep zero-adjoint collective participation on every rank.
-            return output.detach() + output[:, :0].sum() if rank == 1 else output
+            if rank == 1:
+                output.register_hook(
+                    lambda grad: remove_gradient(grad, 'CP_EP_HALO_MUTATION_REACHED')
+                )
+            return output
 
         cp.qwen3_8_flash_next_cp_left_halo = drop_later_consumer
     elif mutation == 'owner_adjoint':
 
         def drop_lookup_grad(module, args, output):
             if rank == 1:
-                output.register_hook(lambda grad: torch.zeros_like(grad))
+                output.register_hook(
+                    lambda grad: remove_gradient(grad, 'CP_EP_OWNER_MUTATION_REACHED')
+                )
 
         for layer in model.layers:
             if layer.ple is not None:
@@ -132,7 +155,16 @@ def inject_mutation(model, mutation, rank):
 
         def include_padding(module, args, kwargs):
             kwargs = dict(kwargs)
+            before = kwargs['token_mask'].detach().cpu().clone()
             kwargs['token_mask'] = torch.ones_like(kwargs['token_mask'])
+            trace.append(
+                dict(
+                    tag='CP_EP_ROUTER_MUTATION_REACHED',
+                    reached=True,
+                    before=before,
+                    after=kwargs['token_mask'].detach().cpu().clone(),
+                )
+            )
             return args, kwargs
 
         for layer in model.layers:
@@ -141,7 +173,34 @@ def inject_mutation(model, mutation, rank):
             )
 
 
-def mutation_record(mutation, rank, checks):
+def activation_proof(path, model, initial, rank):
+    """Measured healthy proof is a fault-activation gate, never a parity reference."""
+    assert path is not None, 'CP_EP_HEALTHY_ACTIVATION_PROOF_REQUIRED'
+    first = torch.load(
+        path / f'step0-rank{rank}.pt', map_location='cpu', weights_only=False
+    )
+    later = torch.load(path / 'step1-rank1.pt', map_location='cpu', weights_only=False)
+    assert all(first['checks'].values()) and all(
+        later['checks'].values()
+    ), 'CP_EP_HEALTHY_PROOF_NOT_PASSED'
+    assert not compare(initial, first['initial']), 'CP_EP_MUTATION_SAME_INITIAL_STATE'
+    assert not compare(
+        snapshot(model), first['state']
+    ), 'CP_EP_MUTATION_SAME_HEALTHY_UPDATE'
+    grad = later['halo_trace'][0]['1']['halo']['output_grad']
+    assert grad.count_nonzero() > 0, 'CP_EP_HEALTHY_HALO_GRADIENT_MUST_BE_NONZERO'
+    assert all(
+        later['halo_activity']['conv_before_nonzero'].values()
+    ), 'CP_EP_HEALTHY_CONV_UPDATE_REQUIRED'
+    assert all(
+        first['halo_activity']['conv_grad_nonzero'].values()
+    ), 'CP_EP_HEALTHY_CONV_GRADIENT_REQUIRED'
+    print(
+        'CP_EP_HEALTHY_ACTIVATION_PROVED', rank, int(grad.count_nonzero()), flush=True
+    )
+
+
+def mutation_record(mutation, rank, checks, trace):
     non_targets = [
         'CP_MODEL_ORDERED_FORWARD',
         'CP_MODEL_ORDERED_LOSS',
@@ -150,13 +209,31 @@ def mutation_record(mutation, rank, checks):
     ]
     if mutation == 'owner_adjoint':
         non_targets.append('CP_EP_NON_TABLE_GRAD')
+    local = [
+        dict(
+            tag=row['tag'],
+            reached=row['reached'],
+            before_nonzero=int(row['before'].count_nonzero()),
+            after_nonzero=int(row['after'].count_nonzero()),
+            changed=int((row['before'] != row['after']).count_nonzero()),
+        )
+        for row in trace
+    ]
+    sentinels = [None, None]
+    dist.all_gather_object(sentinels, local)
+    reached = any(
+        row['reached'] and row['changed'] > 0 for rows in sentinels for row in rows
+    )
     failures = [tag for tag, passed in checks.items() if not passed]
     return dict(
         mutation=mutation,
         rank=rank,
         failures=failures,
+        sentinels=sentinels,
+        activation_proved=True,
         non_target_passed={tag: checks[tag] for tag in non_targets},
         detected='CP_MODEL_ORDERED_REDUCED_GRAD' in failures
+        and reached
         and all(checks[tag] for tag in non_targets),
     )
 
@@ -274,6 +351,7 @@ def main():
     parser.add_argument(
         '--mutation', choices=['halo_adjoint', 'owner_adjoint', 'router_population']
     )
+    parser.add_argument('--activation-proof', type=Path)
     args = parser.parse_args()
     rank = int(os.environ['RANK'])
     assert int(os.environ['WORLD_SIZE']) == 2, 'CP_PARITY_TWO_RANKS'
@@ -290,12 +368,15 @@ def main():
     model.load_state_dict(initial)
     handle._optimizer.reload_model_params()
     virtual = build_virtual(reference)
-    inject_mutation(model, args.mutation, rank)
     reference_geometry = buffer_geometry(rh, reference)
     tested_geometry = buffer_geometry(handle, model)
     assert reference_geometry == tested_geometry, 'CP_EP_DDP_BUCKET_GEOMETRY'
     records = []
     for step in range(3):
+        active_mutation = args.mutation if step == 1 else None
+        if active_mutation:
+            activation_proof(args.activation_proof, model, initial, rank)
+            inject_mutation(model, active_mutation, rank)
         states = reference_states(reference)
         for r, m in enumerate(virtual):
             m.load_state_dict(states[r])
@@ -392,6 +473,7 @@ def main():
             and not compare(saved['state'], saved['reference_state']),
             'CP_MODEL_ORDERED_NORM': norm == expected_norm,
         }
+        checks['CP_EP_NON_TABLE_GRAD'] = checks.pop('CP_EP_NON_TABLE_GRAD')
         halo = saved['halo_trace'][0][str(rank)]['halo']
         activity = dict(
             rank=rank,
@@ -407,13 +489,14 @@ def main():
         )
         saved['halo_activity'] = activity
         print('CP_EP_HALO_ACTIVITY', json.dumps(activity), flush=True)
-        if args.mutation is None:
+        if active_mutation is None:
             active = all(activity['conv_grad_nonzero'].values()) and (
                 rank == 0 or step == 0 or activity['halo_grad_nonzero'] > 0
             )
             flags = [None, None]
             dist.all_gather_object(flags, active)
             checks['CP_EP_HALO_TRAINING_ACTIVE'] = all(flags)
+        saved['mutation_trace'] = getattr(model, '_cp_ep_mutation_trace', [])
         saved['checks'] = checks
         args.output.mkdir(parents=True, exist_ok=True)
         torch.save(saved, args.output / f'step{step}-rank{rank}.pt')
@@ -424,8 +507,10 @@ def main():
             compare(saved['local_gradients'], local_references[rank]),
             flush=True,
         )
-        if args.mutation:
-            rejection = mutation_record(args.mutation, rank, checks)
+        if active_mutation:
+            rejection = mutation_record(
+                active_mutation, rank, checks, saved['mutation_trace']
+            )
             (args.output / f'mutation-rank{rank}.json').write_text(
                 json.dumps(rejection, indent=2)
             )
@@ -437,7 +522,7 @@ def main():
             assert rejection['detected'], ('CP_MODEL_MUTATION_INVALID', rejection)
         for tag, passed in checks.items():
             assert passed, (tag, rank, step)
-        assert args.mutation is None, 'CP_MODEL_MUTATION_SURVIVED'
+        assert active_mutation is None, 'CP_MODEL_MUTATION_SURVIVED'
         records.append(saved)
         if step == 1:
             runtime.save_checkpoint(
