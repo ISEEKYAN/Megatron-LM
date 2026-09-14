@@ -26,6 +26,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
         quantized=False,
         token_map=list(range(256)),
         trainable_engram=trainable,
+        shard_engram=False,  # Keep the serial-reference parameter/bucket layout.
         optimizer='muon',
         optimizer_config=OptimizerConfig(0.0001, 5, 'quintic'),
     )

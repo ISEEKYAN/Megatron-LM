@@ -40,7 +40,7 @@ class ImplConfig:
     quantized: bool = True
     token_map: list[int] | None = None
     trainable_engram: bool = False
-    shard_engram: bool = False
+    shard_engram: bool = True
     text_only: bool = True
     vision_trainability: VisionTrainability | None = None
     external_vision_device: str | None = None
