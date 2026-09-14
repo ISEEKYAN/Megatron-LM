@@ -120,7 +120,7 @@ def test_pipeline_build_rejects_unsupported_parallelism(moe, model_config, pp):
 
 @pytest.mark.parametrize('pp', [1, 2, 4])
 @pytest.mark.parametrize('vision', ['local', 'external', 'external_frozen'])
-def test_pipeline_text_only_build_contract(moe, model_config, pp, vision):
+def test_pipeline_build_reports_current_support(moe, model_config, pp, vision):
     external = vision != 'local'
     enabled = vision != 'external_frozen'
     impl_cfg = protocol.ImplConfig(
@@ -146,10 +146,13 @@ def test_pipeline_text_only_build_contract(moe, model_config, pp, vision):
     try:
         protocol.build_model(model_config, impl_cfg=impl_cfg)
     except NotImplementedError as error:
+        # PP itself is not enabled yet. Model-side PP integration must update
+        # this expectation when it removes pp from the unsupported axes.
         assert str(error) == (
-            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
-            'use PP=1 for multimodal training'
-        ), 'PP_MULTIMODAL_BUILD_CONTRACT'
+            'V4.1_UNSUPPORTED_PARALLELISM: pp; '
+            'supported: DP, EP with CP=1, or contiguous CP-only; '
+            'TP/PP/VPP/ETP and custom pipeline layouts are unsupported'
+        ), 'PP_UNSUPPORTED_MUST_PRECEDE_TEXT_ONLY_CONTRACT'
     else:
         pytest.fail('PP_MULTIMODAL_BUILD_MUST_REJECT')
 

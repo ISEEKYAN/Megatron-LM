@@ -59,18 +59,6 @@ def build_model_config(source, **overrides):
 
 def build_model(model_cfg, *, impl_cfg):
     p = impl_cfg.parallel
-    # An external vision schedule can publish a segmented backward callback
-    # even with text_only=True or a frozen vision mask. Reject before model
-    # allocation or process-group initialization; PP keeps a runtime backstop.
-    if p.pp > 1 and (
-        not impl_cfg.text_only or impl_cfg.external_vision_device is not None
-    ):
-        raise NotImplementedError(
-            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
-            'use PP=1 for multimodal training'
-        )
-    from .model import DeepseekV41Model
-
     unsupported = [key for key in ('tp', 'pp', 'vpp') if getattr(p, key) != 1]
     if p.etp not in (None, 1):
         unsupported.append('etp')
@@ -82,6 +70,18 @@ def build_model(model_cfg, *, impl_cfg):
             'supported: DP, EP with CP=1, or contiguous CP-only; '
             'TP/PP/VPP/ETP and custom pipeline layouts are unsupported'
         )
+    # Check current parallel support first: the text-only contract applies
+    # once model-side PP is enabled. An external schedule can publish a backward
+    # callback even with text_only=True or a frozen vision mask.
+    if p.pp > 1 and (
+        not impl_cfg.text_only or impl_cfg.external_vision_device is not None
+    ):
+        raise NotImplementedError(
+            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
+            'use PP=1 for multimodal training'
+        )
+    from .model import DeepseekV41Model
+
     if p.cp != 1 and p.ep != 1:
         raise NotImplementedError(
             'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; '
