@@ -180,8 +180,6 @@ def build_model(model_cfg, *, impl_cfg):
             deterministic=impl_cfg.deterministic,
         )
         if ps.tp_size > 1:
-            from functools import partial
-
             from .tp import finalize_replicated_experts
 
             finalize = partial(

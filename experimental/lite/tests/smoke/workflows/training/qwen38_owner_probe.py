@@ -90,16 +90,6 @@ def one_step(runtime, handle, model, ids, dy, mutation=None):
     runtime.zero_grad(handle)
     t = table(model)
     output = t(ids)
-    if mutation == 'return_order':
-        output = output.flip(0)
-    if mutation == 'skip_contribution' and dist.get_rank() == 1:
-
-        def skip(grad):
-            grad = grad.clone()
-            grad[0] = 0
-            return grad
-
-        output.register_hook(skip)
     output.backward(dy)
     before = t.weight.main_grad.detach().clone()
     handle._extras['finalize_grads']()
@@ -113,6 +103,20 @@ def one_step(runtime, handle, model, ids, dy, mutation=None):
         success=success,
         norm=norm,
     )
+
+
+def install_mutation(model, mutation):
+    # Only the tested product module is changed; the full reference never calls it.
+    if mutation == 'return_order':
+        table(model).register_forward_hook(lambda m, args, output: output.flip(0))
+    elif mutation == 'skip_contribution' and dist.get_rank() == 1:
+        def drop(m, args, output):
+            def skip(grad):
+                grad = grad.clone()
+                grad[0] = 0
+                return grad
+            output.register_hook(skip)
+        table(model).register_forward_hook(drop)
 
 
 @record
@@ -147,6 +151,7 @@ def main():
     model.load_state_dict(reference.state_dict())
     handle._optimizer.reload_model_params()
     t = table(model)
+    install_mutation(model, args.mutation)
     b = next(
         b
         for b in [*handle._model.buffers, *handle._model.expert_parallel_buffers]
