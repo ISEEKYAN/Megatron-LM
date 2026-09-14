@@ -17,6 +17,8 @@ from megatron.lite.primitive.modules.engram_lookup import (
     Engram,
     EngramTable,
     NgramHash,
+    RowLookup,
+    ShardedEngramTable,
     hash_multipliers,
     prime_buckets,
 )
@@ -136,6 +138,7 @@ class DeepseekV41Model(nn.Module):
         token_map=None,
         quantized=True,
         trainable_engram=False,
+        shard_engram=False,
         gate_temperature=1.0,
         bias_rate=0.001,
         enable_dspark_execution=False,
@@ -146,6 +149,9 @@ class DeepseekV41Model(nn.Module):
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         self.ps = parallel_state or ParallelState()
+        self.engram_group = (
+            self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
+        )
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
@@ -247,10 +253,20 @@ class DeepseekV41Model(nn.Module):
                 if not start <= layer_id < end:
                     continue
                 rows, width = t.engram_num_embeddings[offset], t.engram_head_dim
-                table = EngramTable(
+                table_type, options = EngramTable, {}
+                if self.engram_group is not None:
+                    boundaries = [
+                        rows * i // self.ps.dp_cp_size
+                        for i in range(self.ps.dp_cp_size + 1)
+                    ]
+                    lookup = RowLookup(boundaries, self.engram_group)
+                    rows = boundaries[lookup.rank + 1] - boundaries[lookup.rank]
+                    table_type, options = ShardedEngramTable, {'lookup': lookup}
+                table = table_type(
                     torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
                     torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
                     trainable=trainable_engram,
+                    **options,
                 )
                 projection = Linear(
                     (t.engram_max_ngram_size - 1) * t.engram_n_heads * width,
@@ -609,6 +625,18 @@ class DeepseekV41Model(nn.Module):
     ):
         if self.local_layer_range != (0, len(self.layers)):
             raise RuntimeError('A local pipeline stage requires the range protocol')
+        if self.engram_group is not None:
+            # Each packed document visits both lookup collectives. Reject a
+            # mismatched schedule before any rank enters the first lookup.
+            count = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+            counts = torch.tensor([count, -count], device=input_ids.device)
+            torch.distributed.all_reduce(
+                counts, op=torch.distributed.ReduceOp.MAX, group=self.engram_group
+            )
+            if counts[0] != -counts[1]:
+                raise ValueError(
+                    'Sharded Engram requires equal packed document counts across ranks'
+                )
         if cp_context is None:
             self._validate_input_ids(input_ids)
         elif (

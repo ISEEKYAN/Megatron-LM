@@ -297,6 +297,39 @@ class V41Optimizer(MixedOptimizer):
             if b.engram is not None and b.engram.embed.master is not None
         ]
         super().__init__(groups, config, tables)
+        self.engram_parameters = (
+            [table.master for table in tables] if model.engram_group is not None else []
+        )
+        self.engram_ids = {id(p) for p in self.engram_parameters}
+        if self.engram_parameters:
+            from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
+
+            # Reuse the distributed logical-row algorithm; local Sinkhorn would
+            # change rho_mean, column norms and hence every shard's update.
+            backend = next(o for o in self.optimizers if isinstance(o, Sinkhorn))
+            sharded = [
+                g for g in backend.param_groups if id(g['params'][0]) in self.engram_ids
+            ]
+            backend.param_groups = [
+                g
+                for g in backend.param_groups
+                if id(g['params'][0]) not in self.engram_ids
+            ]
+            self.optimizers.append(
+                Sinkhorn(sharded, lr=config.lr, row_group=model.engram_group)
+            )
+
+    @torch.no_grad()
+    def finalize_grads(self):
+        if self.ps.ep_size > 1:
+            self.finalize_expert_grads()
+        # Lookup backward sums requests from all data/context ranks. Dense DDP
+        # averages the same objective; apply that normalization exactly once.
+        for p in self.engram_parameters:
+            grad = p.main_grad if p.main_grad is not None else p.grad
+            if grad is not None:
+                grad.div_(self.ps.dp_cp_size)
+                p.grad = p.main_grad = grad
 
     @torch.no_grad()
     def finalize_expert_grads(self):
@@ -321,21 +354,31 @@ class V41Optimizer(MixedOptimizer):
             p.grad = p.main_grad = grad
 
     def _grad_norm(self, parameters, gradients):
-        if self.ps is None or self.ps.ep_size == 1:
+        if self.ps is None or (self.ps.ep_size == 1 and not self.engram_parameters):
             return super()._grad_norm(parameters, gradients)
         # Dense gradients are replicated. Count each dense owner once and
         # sum the disjoint expert shards across EP, not expert-DP replicas.
         dense = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
         expert = torch.zeros_like(dense)
+        engram = torch.zeros_like(dense)
         for p, grad in zip(parameters, gradients, strict=True):
             if grad is not None:
-                target = expert if id(p) in self.expert_ids else dense
+                target = (
+                    engram
+                    if id(p) in self.engram_ids
+                    else expert if id(p) in self.expert_ids else dense
+                )
                 target.add_(grad.double().square().sum())
-        torch.distributed.all_reduce(expert, group=self.ps.ep_group)
-        return (dense + expert).sqrt()
+        if self.ps.ep_size > 1:
+            torch.distributed.all_reduce(expert, group=self.ps.ep_group)
+        if self.engram_parameters:
+            torch.distributed.all_reduce(engram, group=self.model.engram_group)
+        return (dense + expert + engram).sqrt()
 
     def _all_finite(self, valid):
-        if self.ps is None or self.ps.ep_size == 1:
+        if self.ps is None or (
+            self.ps.ep_size == 1 and self.model.engram_group is None
+        ):
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
         torch.distributed.all_reduce(

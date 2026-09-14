@@ -39,6 +39,7 @@ class ImplConfig:
     quantized: bool = True
     token_map: list[int] | None = None
     trainable_engram: bool = False
+    shard_engram: bool = False
     text_only: bool = True
     vision_trainability: VisionTrainability | None = None
     external_vision_device: str | None = None
@@ -125,6 +126,7 @@ def build_model(model_cfg, *, impl_cfg):
             token_map=impl_cfg.token_map,
             quantized=impl_cfg.quantized,
             trainable_engram=impl_cfg.trainable_engram,
+            shard_engram=impl_cfg.shard_engram,
             gate_temperature=impl_cfg.gate_temperature,
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
@@ -185,8 +187,32 @@ def build_model(model_cfg, *, impl_cfg):
         # DDP synchronizes parameter initialization. Encoded Engram buffers need
         # byte collectives because NCCL does not accept their FP8 storage dtype.
         gradient_group = ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group
+        sharded = (
+            {
+                id(tensor)
+                for block in model.layers
+                if block.engram is not None
+                for tensor in block.engram.embed.buffers()
+            }
+            if model.engram_group is not None
+            else set()
+        )
+        sharded.update(
+            id(block.engram.embed.master)
+            for block in model.layers
+            if model.engram_group is not None
+            and block.engram is not None
+            and block.engram.embed.master is not None
+        )
+        model._ddp_params_and_buffers_to_ignore = [
+            name
+            for name, tensor in (*model.named_parameters(), *model.named_buffers())
+            if id(tensor) in sharded
+        ]
         with torch.no_grad():
             for buffer in model.buffers():
+                if id(buffer) in sharded:
+                    continue
                 value = buffer.contiguous().reshape(-1).view(torch.uint8)
                 torch.distributed.broadcast(value, src=0, group=gradient_group)
                 buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
@@ -194,7 +220,7 @@ def build_model(model_cfg, *, impl_cfg):
             expert_ids = {
                 id(b.tensor) for b in model.parameter_bindings() if b.role == "expert"
             }
-            model._ddp_params_and_buffers_to_ignore = [
+            model._ddp_params_and_buffers_to_ignore += [
                 name
                 for name, parameter in model.named_parameters()
                 if id(parameter) in expert_ids
@@ -217,7 +243,9 @@ def build_model(model_cfg, *, impl_cfg):
         ps,
         optimizer=optimizer,
         finalize_grads=(
-            optimizer.finalize_expert_grads if optimizing and ps.ep_size > 1 else None
+            optimizer.finalize_grads
+            if optimizing and (ps.ep_size > 1 or model.engram_group is not None)
+            else None
         ),
         forward_step=partial(
             _forward_step, optimizer=optimizer, execution_model=execution_model
