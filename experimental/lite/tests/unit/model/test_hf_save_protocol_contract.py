@@ -179,6 +179,7 @@ def test_hf_save_checkpoint_warns_on_unused_export_kwargs(
 
 def _v41_export_model(tmp_path):
     from megatron.lite.model.deepseek_v41.lite.checkpoint import CheckpointTensorStore
+    from megatron.lite.primitive.parallel.state import ParallelState
     from safetensors.torch import save_file
 
     archive_path = tmp_path / "archive.safetensors"
@@ -190,6 +191,7 @@ def _v41_export_model(tmp_path):
         "model.norm": torch.arange(8, dtype=torch.float32) / 3,
     }
     model = SimpleNamespace(
+        ps=ParallelState(),
         local_layer_range=(0, 1),
         layers=[None],
         tensor_bindings={
