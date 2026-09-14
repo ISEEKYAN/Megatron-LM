@@ -2,6 +2,7 @@
 """Qwen3.8 text training protocol for the existing MLite runtime."""
 
 from dataclasses import dataclass, field
+from functools import partial
 from types import SimpleNamespace
 
 import torch
@@ -23,6 +24,8 @@ class ImplConfig:
     ngram_primes: tuple[int, ...] | None = None
     router_aux_loss_coef: float | None = None
     deterministic: bool = True
+    # Explicit checkpoint layout change. Owners use EP; replicas use expert-DP.
+    ple_owner_sharding: bool = False
 
 
 def build_model_config(source, **overrides):
@@ -36,11 +39,14 @@ def build_model_config(source, **overrides):
     return Qwen3_8_FlashNextTextConfig.from_hf_dict(config)
 
 
-def is_expert_param(name):
-    return '.experts.' in name
+def is_expert_param(name, *, ple_owner_sharding=False):
+    return '.experts.' in name or (
+        ple_owner_sharding
+        and name.endswith('.ple.ple_embedding.ngram_embedding.weight')
+    )
 
 
-def parameter_placements(name):
+def parameter_placements(name, *, ple_owner_sharding=False):
     from torch.distributed.tensor import Replicate, Shard
 
     from .tp import projection_shard
@@ -50,7 +56,11 @@ def parameter_placements(name):
     return [
         Replicate(),
         Replicate(),
-        Shard(0) if is_expert_param(name) else Replicate(),
+        (
+            Shard(0)
+            if is_expert_param(name, ple_owner_sharding=ple_owner_sharding)
+            else Replicate()
+        ),
         Shard(0) if projection_shard(name) else Replicate(),
     ]
 
@@ -140,11 +150,18 @@ def build_model(model_cfg, *, impl_cfg):
             model_cfg,
             ps,
             ngram_primes=impl_cfg.ngram_primes,
+            ple_owner_sharding=impl_cfg.ple_owner_sharding,
             fuse_wgrad_accumulation=impl_cfg.optimizer == 'dist_opt',
         )
         .to(torch.bfloat16)
         .cuda()
     ]
+    expert_classifier = partial(
+        is_expert_param, ple_owner_sharding=impl_cfg.ple_owner_sharding
+    )
+    placements = partial(
+        parameter_placements, ple_owner_sharding=impl_cfg.ple_owner_sharding
+    )
     optimizer, finalize = None, None
     if impl_cfg.optimizer == 'dist_opt':
         from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
@@ -159,7 +176,7 @@ def build_model(model_cfg, *, impl_cfg):
             impl_cfg=impl_cfg,
             ps=ps,
             model_name='qwen3_8_flash_next',
-            is_expert=is_expert_param,
+            is_expert=expert_classifier,
             deterministic=impl_cfg.deterministic,
         )
         if ps.tp_size > 1:
@@ -172,7 +189,7 @@ def build_model(model_cfg, *, impl_cfg):
             )
         register_training_hooks(chunks, optimizer)
         attach_model_sharded_state_dict(
-            chunks, ps, get_placements=parameter_placements, is_expert=is_expert_param
+            chunks, ps, get_placements=placements, is_expert=expert_classifier
         )
     elif impl_cfg.optimizer is not None:
         raise ValueError(f'Unsupported Qwen3.8 optimizer: {impl_cfg.optimizer}')

@@ -6,6 +6,7 @@ separate change. Qwen trains floating rows with raw-ID hashing; DS4 additionally
 supports FP8/scale storage and tokenizer-compressed hashing. Single-owner lookup
 has the same additive duplicate-index gradient contract as RowLookup.gather_rows.
 """
+
 from dataclasses import dataclass
 
 import torch
@@ -138,9 +139,11 @@ class Qwen3_8_FlashNextOwnerShardedEmbedding(nn.Module):
         )
         rank = 0 if process_group is None else torch.distributed.get_rank(process_group)
         boundaries = [config.num_embeddings * r // size for r in range(size + 1)]
-        if size != 1:
-            raise NotImplementedError('PLE_MULTI_OWNER_NOT_VALIDATED')
         self.lookup = None
+        if size > 1:
+            from .owner import OwnerRowLookup
+
+            self.lookup = OwnerRowLookup(config.num_embeddings, process_group)
         self.global_row_start, self.global_row_end = boundaries[rank : rank + 2]
         self.weight = nn.Parameter(
             torch.empty(

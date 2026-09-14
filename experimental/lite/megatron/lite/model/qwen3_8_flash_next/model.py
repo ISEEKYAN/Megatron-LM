@@ -4,6 +4,7 @@
 Layer order and GDN normalization follow NVIDIA-NeMo/Automodel #3690,
 5cfe13b160eb7e23ac5a4868bbf611707cdf98fb (fetched 2026-09-13).
 """
+
 from copy import copy
 
 import torch
@@ -61,7 +62,14 @@ class Qwen38GatedDeltaNet(ContiguousGDNHeadTransport, GatedDeltaNet):
 
 class Qwen38Layer(nn.Module):
     def __init__(
-        self, config, ps, layer_idx, *, ngram_primes=None, fuse_wgrad_accumulation=False
+        self,
+        config,
+        ps,
+        layer_idx,
+        *,
+        ngram_primes=None,
+        fuse_wgrad_accumulation=False,
+        ple_owner_sharding=False
     ):
         super().__init__()
         c = config
@@ -98,7 +106,7 @@ class Qwen38Layer(nn.Module):
             table = Qwen3_8_FlashNextEngramTableConfig(
                 rows, c.ple_embed_dim // 16
             ).build(
-                process_group=None,
+                process_group=ps.ep_group if ple_owner_sharding else None,
                 device=torch.cuda.current_device(),
                 dtype=torch.bfloat16,
             )
@@ -160,7 +168,15 @@ class Qwen38Layer(nn.Module):
 
 
 class Qwen38Model(nn.Module):
-    def __init__(self, config, ps, *, ngram_primes=None, fuse_wgrad_accumulation=False):
+    def __init__(
+        self,
+        config,
+        ps,
+        *,
+        ngram_primes=None,
+        fuse_wgrad_accumulation=False,
+        ple_owner_sharding=False
+    ):
         super().__init__()
         if any(getattr(ps, k) != 1 for k in ('etp_size', 'pp_size')):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
@@ -173,6 +189,10 @@ class Qwen38Model(nn.Module):
             raise NotImplementedError('QWEN38_TP_EP_COMBINATION_NOT_VALIDATED')
         if config.tie_word_embeddings or not config.norm_topk_prob:
             raise ValueError('QWEN38_RELEASE_TIED_OR_ROUTER_CONTRACT')
+        if ple_owner_sharding and (
+            ps.ep_size < 2 or ps.ep_group is None or ps.tp_size != 1 or ps.cp_size != 1
+        ):
+            raise ValueError('PLE_OWNER_REQUIRES_EP_WITH_TP_CP_ONE')
         self.config, self.ps = config, ps
         # Replicated consumers see complete projection outputs. Preserve EP/EDP
         # groups; dense projections below own the actual TP group.
@@ -186,6 +206,7 @@ class Qwen38Model(nn.Module):
                     consumer_ps,
                     i,
                     ngram_primes=ngram_primes,
+                    ple_owner_sharding=ple_owner_sharding,
                     fuse_wgrad_accumulation=fuse_wgrad_accumulation,
                 )
                 for i in range(config.num_hidden_layers)
