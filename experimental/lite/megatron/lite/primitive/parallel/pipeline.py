@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
@@ -45,7 +44,7 @@ def forward_backward_pipelining(
         forward_step_fn: Callable(model, batch) -> output_dict with "loss" and "hidden_states"
         model_chunks: local model chunks. ``len>1`` enables interleaved VPP.
         data_iter: iterator yielding micro-batches
-        config: training config
+        config: training config; optional pipeline_dtype defaults to BF16
         ps: parallel state
         tensor_shape: nominal inter-stage hidden shape [S, B, H]. Used only by the
             interleaved VPP schedule (fixed-shape); the 1F1B and forward-only
@@ -553,7 +552,9 @@ def _send_recv_pipeline(
         pipeline_dtype = _PIPELINE_TENSOR_DTYPE
     for buffer in (fwd_recv_buf, bwd_recv_buf):
         if buffer is not None and buffer.dtype != pipeline_dtype:
-            raise ValueError("Pipeline receive buffer dtype differs from pipeline_dtype")
+            raise ValueError(
+                "Pipeline receive buffer dtype differs from pipeline_dtype"
+            )
     _dbg = int(os.environ.get("MEGATRON_LITE_PP_DEBUG", "0"))
     rank = dist.get_rank()
 
@@ -584,12 +585,16 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
         if dynamic_shape:
-            fwd_buf = torch.empty(recv_fwd_shape, dtype=pipeline_dtype, device=_pipeline_device())
+            fwd_buf = torch.empty(
+                recv_fwd_shape, dtype=pipeline_dtype, device=_pipeline_device()
+            )
         else:
             fwd_buf = (
                 fwd_recv_buf
                 if fwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=pipeline_dtype, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=pipeline_dtype, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
@@ -597,12 +602,16 @@ def _send_recv_pipeline(
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
         if dynamic_shape:
-            bwd_buf = torch.empty(recv_bwd_shape, dtype=pipeline_dtype, device=_pipeline_device())
+            bwd_buf = torch.empty(
+                recv_bwd_shape, dtype=pipeline_dtype, device=_pipeline_device()
+            )
         else:
             bwd_buf = (
                 bwd_recv_buf
                 if bwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=pipeline_dtype, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=pipeline_dtype, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 
@@ -876,7 +885,9 @@ def _interleaved_1f1b_schedule(
                     tensor_shape,
                     batch_p2p=False,
                     clone_recv=True,
-                    pipeline_dtype=getattr(config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE),
+                    pipeline_dtype=getattr(
+                        config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE
+                    ),
                 )
                 if recv_next:
                     pending_activation = fwd_buf
@@ -926,7 +937,9 @@ def _interleaved_1f1b_schedule(
                     tensor_shape,
                     batch_p2p=False,
                     clone_recv=True,
-                    pipeline_dtype=getattr(config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE),
+                    pipeline_dtype=getattr(
+                        config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE
+                    ),
                 )
                 if recv_prev:
                     pending_grad = bwd_buf

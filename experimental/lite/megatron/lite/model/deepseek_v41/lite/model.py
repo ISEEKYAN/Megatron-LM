@@ -617,7 +617,9 @@ class DeepseekV41Model(nn.Module):
     def set_input_tensor(self, input_tensor):
         """Receive the FP32 paired HC carrier through the shared PP interface."""
         if self.local_layer_range[0] != 20:
-            raise RuntimeError('V4.1_PP_INPUT_STAGE: only the layer-20 stage accepts input')
+            raise RuntimeError(
+                'V4.1_PP_INPUT_STAGE: only the layer-20 stage accepts input'
+            )
         if self._input_tensor is not None:
             raise RuntimeError('V4.1_PP_INPUT_PENDING: previous input was not consumed')
         self._input_tensor = input_tensor
@@ -633,9 +635,13 @@ class DeepseekV41Model(nn.Module):
     ):
         local_start, local_end = self.local_layer_range
         if (local_start, local_end) not in ((0, 40), (0, 20), (20, 40)):
-            raise RuntimeError('V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol')
+            raise RuntimeError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol'
+            )
         if self.ps.pp_size > 1 and (images is not None or token_types is not None):
-            raise NotImplementedError('V4.1_PP_TEXT_ONLY: use PP=1 for multimodal training')
+            raise NotImplementedError(
+                'V4.1_PP_TEXT_ONLY: use PP=1 for multimodal training'
+            )
         if self.engram_group is not None:
             # Each packed document visits both lookup collectives. Reject a
             # mismatched schedule before any rank enters the first lookup.
@@ -664,9 +670,14 @@ class DeepseekV41Model(nn.Module):
         if local_start == 20:
             carrier, self._input_tensor = self._input_tensor, None
             width = self.config.to_hf_dict()['text_config']['hidden_size']
-            if (carrier is None or carrier.dtype != torch.float32
-                    or carrier.shape != (*input_ids.shape, self.hc_mult * (width + 1))):
-                raise ValueError('V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix')
+            if (
+                carrier is None
+                or carrier.dtype != torch.float32
+                or carrier.shape != (*input_ids.shape, self.hc_mult * (width + 1))
+            ):
+                raise ValueError(
+                    'V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix'
+                )
             pair = carrier.reshape(*input_ids.shape, self.hc_mult, width + 1)
             hidden = pair[..., :-1].to(self.pipeline_residual_dtype).contiguous()
             pre = pair[..., -1].contiguous()
@@ -718,9 +729,11 @@ class DeepseekV41Model(nn.Module):
         if local_end == 20:
             # CED at layer 19 is this same pair. Layer 20 regenerates KV/index state.
             # FP32 transport preserves both native pre_mix and its backward gradient.
-            return {'hidden_states': torch.cat(
-                (hidden.float(), pre.unsqueeze(-1)), dim=-1
-            ).flatten(2)}
+            return {
+                'hidden_states': torch.cat(
+                    (hidden.float(), pre.unsqueeze(-1)), dim=-1
+                ).flatten(2)
+            }
         hidden = self.norm(contract_hc(hidden, pre))
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.

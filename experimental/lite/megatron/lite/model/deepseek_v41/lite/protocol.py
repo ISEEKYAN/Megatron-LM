@@ -98,9 +98,13 @@ def build_model(model_cfg, *, impl_cfg):
                 'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model '
                 'forward/backward; distributed optimizer training is not validated'
             )
-        if (not torch.distributed.is_initialized()
-                or torch.distributed.get_world_size() != 2):
-            raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() != 2
+        ):
+            raise ValueError(
+                'V4.1_PP_WORLD: PP2 requires an initialized two-rank world'
+            )
     from .model import DeepseekV41Model
 
     if p.cp != 1 and p.ep != 1:
@@ -145,9 +149,9 @@ def build_model(model_cfg, *, impl_cfg):
 
         cut = impl_cfg.pipeline_split_layer
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
-        layout = build_pipeline_chunk_layout(count, replace(
-            ps, pp_layout=f'Et*{cut}|t*{count - cut}L'
-        ))
+        layout = build_pipeline_chunk_layout(
+            count, replace(ps, pp_layout=f'Et*{cut}|t*{count - cut}L')
+        )
         layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
     with torch.device(impl_cfg.device):
         model = DeepseekV41Model(

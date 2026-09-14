@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Nested release configuration and explicit single-rank attention bindings."""
 
-from copy import deepcopy
 import json
+from copy import deepcopy
 from pathlib import Path
 
 

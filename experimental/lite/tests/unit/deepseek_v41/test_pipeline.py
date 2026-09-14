@@ -147,7 +147,9 @@ def test_pipeline_build_reports_current_support(moe, model_config, pp, vision):
         protocol.build_model(model_config, impl_cfg=impl_cfg)
     except NotImplementedError as error:
         if pp == 2:
-            assert str(error).startswith('V4.1_PP_TEXT_ONLY:'), 'PP_MULTIMODAL_BUILD_CONTRACT'
+            assert str(error).startswith(
+                'V4.1_PP_TEXT_ONLY:'
+            ), 'PP_MULTIMODAL_BUILD_CONTRACT'
             return
         assert str(error) == (
             'V4.1_UNSUPPORTED_PARALLELISM: pp; '

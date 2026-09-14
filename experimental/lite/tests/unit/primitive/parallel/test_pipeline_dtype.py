@@ -32,17 +32,36 @@ def test_pipeline_wire_dtype(dtype, dynamic, batched):
         return [op.op(op.tensor, op.peer, op.group) for op in ops]
 
     ps = SimpleNamespace(pp_group=None, pp_next_rank=1, pp_prev_rank=1)
-    with patch.object(pl.dist, 'get_rank', return_value=0), \
-         patch.object(pl.dist, 'P2POp', side_effect=lambda op, tensor, peer, group: SimpleNamespace(op=op, tensor=tensor, peer=peer, group=group)), \
-         patch.object(pl.dist, 'isend', side_effect=send), \
-         patch.object(pl.dist, 'irecv', side_effect=receive), \
-         patch.object(pl.dist, 'batch_isend_irecv', side_effect=batch), \
-         patch.object(pl, '_pipeline_device', return_value=torch.device('cpu')), \
-         patch.object(pl, '_communicate_shapes', return_value=(value.shape, value.shape)):
-        fwd, bwd = pl._send_recv_pipeline(value, value, True, True, ps, value.shape,
-            batch_p2p=batched, dynamic_shape=dynamic, pipeline_dtype=dtype)
+    with patch.object(pl.dist, 'get_rank', return_value=0), patch.object(
+        pl.dist,
+        'P2POp',
+        side_effect=lambda op, tensor, peer, group: SimpleNamespace(
+            op=op, tensor=tensor, peer=peer, group=group
+        ),
+    ), patch.object(pl.dist, 'isend', side_effect=send), patch.object(
+        pl.dist, 'irecv', side_effect=receive
+    ), patch.object(
+        pl.dist, 'batch_isend_irecv', side_effect=batch
+    ), patch.object(
+        pl, '_pipeline_device', return_value=torch.device('cpu')
+    ), patch.object(
+        pl, '_communicate_shapes', return_value=(value.shape, value.shape)
+    ):
+        fwd, bwd = pl._send_recv_pipeline(
+            value,
+            value,
+            True,
+            True,
+            ps,
+            value.shape,
+            batch_p2p=batched,
+            dynamic_shape=dynamic,
+            pipeline_dtype=dtype,
+        )
     assert len(sent) == 2, 'PP_BIDIRECTIONAL_SEND'
     for actual in [*sent, fwd, bwd]:
         assert actual.dtype == expected_dtype, 'PP_WIRE_DTYPE'
-        torch.testing.assert_close(actual, expected, atol=0, rtol=0, msg='PP_WIRE_EXACT')
+        torch.testing.assert_close(
+            actual, expected, atol=0, rtol=0, msg='PP_WIRE_EXACT'
+        )
     assert fwd.requires_grad
