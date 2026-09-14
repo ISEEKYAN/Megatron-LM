@@ -22,6 +22,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    prepare_microbatches: Callable | None = None,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -45,8 +46,18 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+            Return the sum of detached microbatch losses divided by their count,
+            matching backward scaling. Other outputs retain the last microbatch.
+        prepare_microbatches: Prepare the native loss denominator in both training
+            and validation; this hook must not depend on gradients. External
+            ``loss_fn`` callbacks own normalization and bypass this hook. For
+            V4.1 SFT, preparation makes averaging equivalent to a token-weighted
+            objective; averaging unprepared local token means would be incorrect.
     """
+    if prepare_microbatches is not None and loss_fn is None:
+        data_iter = iter(prepare_microbatches(data_iter, num_microbatches))
     last_out = None
+    validation_loss = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
@@ -63,15 +74,33 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                (loss / num_microbatches).backward()
+                backward_output(out, loss / num_microbatches)
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+            backward_output(out, out["loss"] / num_microbatches)
+        if forward_only and out.get("loss") is not None:
+            contribution = out["loss"].detach() / num_microbatches
+            validation_loss = (
+                contribution
+                if validation_loss is None
+                else validation_loss + contribution
+            )
         last_out = out
+    if last_out is not None and validation_loss is not None:
+        last_out["loss"] = validation_loss
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
+
+
+def backward_output(output, loss):
+    """Allow a model to finish staged backward after the scaled runtime loss."""
+    callback = output.get("backward")
+    if callback is None:
+        loss.backward()
+    else:
+        callback(loss)
 
 
 def compute_and_clip_grad_norm(

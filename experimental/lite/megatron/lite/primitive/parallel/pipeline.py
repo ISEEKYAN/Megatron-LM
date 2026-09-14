@@ -9,7 +9,6 @@ from typing import TYPE_CHECKING
 
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
@@ -45,7 +44,7 @@ def forward_backward_pipelining(
         forward_step_fn: Callable(model, batch) -> output_dict with "loss" and "hidden_states"
         model_chunks: local model chunks. ``len>1`` enables interleaved VPP.
         data_iter: iterator yielding micro-batches
-        config: training config
+        config: training config; optional pipeline_dtype defaults to BF16
         ps: parallel state
         tensor_shape: nominal inter-stage hidden shape [S, B, H]. Used only by the
             interleaved VPP schedule (fixed-shape); the 1F1B and forward-only
@@ -92,6 +91,7 @@ def forward_backward_pipelining(
             num_microbatches,
             ps,
             tensor_shape,
+            pipeline_dtype=getattr(config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE),
             pre_forward_hook=pre_forward_hook,
             loss_fn=loss_fn,
         )
@@ -202,7 +202,9 @@ def _no_pipeline(
         else:
             loss = output["loss"]
         loss = loss / num_microbatches
-        loss.backward()
+        from megatron.lite.primitive.train_step import backward_output
+
+        backward_output(output, loss)
         outputs.append(_compact_pipeline_output(output))
     return outputs
 
@@ -311,6 +313,7 @@ def _1f1b_schedule(
             ps,
             tensor_shape,
             dynamic_shape=True,
+            pipeline_dtype=getattr(config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE),
         )
 
     # ── Warmup: pure forward passes ──
@@ -549,6 +552,7 @@ def _send_recv_pipeline(
     batch_p2p: bool = True,
     clone_recv: bool = False,
     dynamic_shape: bool = False,
+    pipeline_dtype: torch.dtype | None = None,
 ) -> tuple[torch.Tensor | None, torch.Tensor | None]:
     """P2P communication between pipeline stages.
 
@@ -558,6 +562,13 @@ def _send_recv_pipeline(
     is what makes THD variable-length PP correct — each micro-batch is a different
     shape and no local derivation is needed.
     """
+    if pipeline_dtype is None:
+        pipeline_dtype = _PIPELINE_TENSOR_DTYPE
+    for buffer in (fwd_recv_buf, bwd_recv_buf):
+        if buffer is not None and buffer.dtype != pipeline_dtype:
+            raise ValueError(
+                "Pipeline receive buffer dtype differs from pipeline_dtype"
+            )
     _dbg = int(os.environ.get("MEGATRON_LITE_PP_DEBUG", "0"))
     rank = dist.get_rank()
 
@@ -584,29 +595,37 @@ def _send_recv_pipeline(
         )
 
     if send_fwd is not None:
-        t = send_fwd.to(_PIPELINE_TENSOR_DTYPE)
+        t = send_fwd.to(pipeline_dtype)
         ops.append(dist.P2POp(dist.isend, t, ps.pp_next_rank, p2p_group))
     if recv_fwd:
         if dynamic_shape:
-            fwd_buf = torch.empty(recv_fwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            fwd_buf = torch.empty(
+                recv_fwd_shape, dtype=pipeline_dtype, device=_pipeline_device()
+            )
         else:
             fwd_buf = (
                 fwd_recv_buf
                 if fwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=pipeline_dtype, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, fwd_buf, ps.pp_prev_rank, p2p_group))
     if send_bwd is not None:
-        t = send_bwd.to(_PIPELINE_TENSOR_DTYPE)
+        t = send_bwd.to(pipeline_dtype)
         ops.append(dist.P2POp(dist.isend, t, ps.pp_prev_rank, p2p_group))
     if recv_bwd:
         if dynamic_shape:
-            bwd_buf = torch.empty(recv_bwd_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+            bwd_buf = torch.empty(
+                recv_bwd_shape, dtype=pipeline_dtype, device=_pipeline_device()
+            )
         else:
             bwd_buf = (
                 bwd_recv_buf
                 if bwd_recv_buf is not None
-                else torch.empty(tensor_shape, dtype=_PIPELINE_TENSOR_DTYPE, device=_pipeline_device())
+                else torch.empty(
+                    tensor_shape, dtype=pipeline_dtype, device=_pipeline_device()
+                )
             )
         ops.append(dist.P2POp(dist.irecv, bwd_buf, ps.pp_next_rank, p2p_group))
 
@@ -629,13 +648,13 @@ def _send_recv_pipeline(
             direct_tensors = []
             reqs = []
             if send_fwd is not None:
-                t = send_fwd.to(_PIPELINE_TENSOR_DTYPE)
+                t = send_fwd.to(pipeline_dtype)
                 direct_tensors.append(t)
                 reqs.append(dist.isend(t, ps.pp_next_rank, group=p2p_group))
             if recv_fwd:
                 reqs.append(dist.irecv(fwd_buf, ps.pp_prev_rank, group=p2p_group))
             if send_bwd is not None:
-                t = send_bwd.to(_PIPELINE_TENSOR_DTYPE)
+                t = send_bwd.to(pipeline_dtype)
                 direct_tensors.append(t)
                 reqs.append(dist.isend(t, ps.pp_prev_rank, group=p2p_group))
             if recv_bwd:
@@ -698,6 +717,7 @@ def _forward_only_pipeline_schedule(
     ps: ParallelState,
     tensor_shape: tuple[int, ...],
     *,
+    pipeline_dtype: torch.dtype | None = None,
     pre_forward_hook=None,
     loss_fn=None,
 ):
@@ -758,6 +778,7 @@ def _forward_only_pipeline_schedule(
                     batch_p2p=False,
                     clone_recv=True,
                     dynamic_shape=True,
+                    pipeline_dtype=pipeline_dtype,
                 )
                 if recv_next:
                     pending_activation = fwd_buf
@@ -886,6 +907,9 @@ def _interleaved_1f1b_schedule(
                     tensor_shape,
                     batch_p2p=False,
                     clone_recv=True,
+                    pipeline_dtype=getattr(
+                        config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE
+                    ),
                 )
                 if recv_next:
                     pending_activation = fwd_buf
@@ -939,6 +963,9 @@ def _interleaved_1f1b_schedule(
                     tensor_shape,
                     batch_p2p=False,
                     clone_recv=True,
+                    pipeline_dtype=getattr(
+                        config, "pipeline_dtype", _PIPELINE_TENSOR_DTYPE
+                    ),
                 )
                 if recv_prev:
                     pending_grad = bwd_buf
