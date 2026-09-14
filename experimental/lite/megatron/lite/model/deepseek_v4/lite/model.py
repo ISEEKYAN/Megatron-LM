@@ -230,7 +230,6 @@ class DeepseekV4MTPLayer(DeepseekV4Layer):
 
     def forward(
         self,
-        *,
         input_ids: torch.Tensor,
         hidden_states: torch.Tensor,
         position_ids: torch.Tensor,
@@ -563,11 +562,7 @@ class DeepseekV4Model(nn.Module):
         outputs: list[torch.Tensor] = []
         for mtp_layer in self.mtp:
             mtp_input_ids, _ = _roll_mtp_left(mtp_input_ids, packed_seq_params=packed_seq_params, dims=-1)
-            source = mtp_layer(
-                input_ids=mtp_input_ids,
-                hidden_states=source,
-                position_ids=position_ids,
-            )
+            source = mtp_layer(mtp_input_ids, source, position_ids)
             outputs.append(mtp_layer.contract(source))
         return outputs
 
