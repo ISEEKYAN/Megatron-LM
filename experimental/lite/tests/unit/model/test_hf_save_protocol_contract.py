@@ -273,6 +273,108 @@ def test_v41_online_export_engine_kwargs(
     )
 
 
+@pytest.mark.parametrize('resync_format', [None, 'mxfp4'])
+@pytest.mark.parametrize('resync_config', [{}, {'expert_dtype': 'fp4'}])
+@pytest.mark.parametrize(
+    'capability', [False, True, None], ids=['v41', 'supported', 'legacy']
+)
+def test_v41_engine_online_export_resync_contract(
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+    resync_format,
+    resync_config,
+    capability,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
+    # Execute the production engine method without importing optional VERL.
+    source = LITE_ROOT / 'examples/verl/verl_mlite/engine/mlite_engine.py'
+    cls = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == 'MegatronLiteEngine'
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == 'get_per_tensor_param'
+    )
+    namespace = {}
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'),
+        namespace,
+    )
+    model, values, archive = _v41_export_model(tmp_path)
+    export_calls = []
+    export_weights = protocol.export_hf_weights
+
+    def checked_export(*args, **kwargs):
+        # This sentinel is after the engine gate and actual runtime dispatch.
+        export_calls.append(dict(kwargs))
+        expected = {
+            'buffer_max_size_bytes': 2 * 1024**3,
+            'cpu': False,
+            'export_dtype': 'bfloat16',
+        }
+        if capability is not False and resync_format is not None:
+            expected['target'] = resync_format
+            if resync_config:
+                expected['resync_config'] = resync_config
+        assert kwargs == expected, 'ONLINE_EXPORT_RESYNC_CAPABILITY_BOUNDARY'
+        if capability is False:
+            yield from export_weights(*args, **kwargs)
+        else:
+            # Supported/legacy protocol controls prove dispatch, not conversion.
+            yield 'control.weight', torch.tensor(7)
+
+    if capability is None:
+        monkeypatch.delattr(protocol, 'HF_SAVE_SUPPORTS_RESYNC')
+    else:
+        monkeypatch.setattr(protocol, 'HF_SAVE_SUPPORTS_RESYNC', capability)
+    monkeypatch.setattr(protocol, 'export_hf_weights', checked_export)
+    engine = SimpleNamespace(
+        _require_initialized=lambda: None,
+        is_param_offload_enabled=False,
+        _initial_sync_cache_cleared=True,
+        _resolve_model_name=lambda: 'deepseek_v41',
+        runtime=MegatronLiteRuntime.__new__(MegatronLiteRuntime),
+        handle=SimpleNamespace(
+            _model=model,
+            _parallel_state=None,
+            _extras={'protocol': protocol, 'model_cfg': model.config},
+        ),
+        engine_config=SimpleNamespace(
+            resync_format=resync_format,
+            resync_config=resync_config,
+            export_dtype='bfloat16',
+            qat={},
+        ),
+    )
+    weights, metadata = namespace['get_per_tensor_param'](engine)
+    tensors = dict(weights)  # Consume the lazy generator through checkpoint export.
+    assert len(export_calls) == 1, 'ONLINE_EXPORT_RUNTIME_BOUNDARY_EXECUTED'
+    assert metadata is None, 'ONLINE_EXPORT_METADATA'
+    if capability is not False:
+        assert set(tensors) == {'control.weight'}, 'ONLINE_EXPORT_CONTROL_KEYS'
+        assert tensors['control.weight'].item() == 7, 'ONLINE_EXPORT_CONTROL_VALUE'
+        return
+    assert (
+        tensors.keys() == values.keys() | archive.keys()
+    ), 'ONLINE_EXPORT_COMPLETE_KEYS'
+    for name, value in values.items():
+        assert tensors[name].dtype == torch.bfloat16, 'ONLINE_EXPORT_MASTER_DTYPE'
+        assert torch.equal(
+            tensors[name], value.bfloat16()
+        ), 'ONLINE_EXPORT_MASTER_VALUE'
+        assert value.dtype == torch.float32, 'ONLINE_EXPORT_MASTER_UNMODIFIED'
+    assert torch.equal(
+        tensors['mtp.weight'].view(torch.uint8), archive['mtp.weight'].view(torch.uint8)
+    ), 'ONLINE_EXPORT_ARCHIVE_BYTES'
+
+
 @pytest.mark.parametrize(
     "option,value",
     [

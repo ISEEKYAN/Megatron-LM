@@ -125,10 +125,12 @@ Verl adapter does not apply its token-count scale a second time. An external
 loss callback owns its objective normalization, with the existing microbatch
 multiplier cancelling the runtime's microbatch averaging.
 
-HF checkpoint saves retain trainable masters and archival bytes even when the
-engine has a rollout resync format configured. The engine uses the protocol's
-HF-save capability to keep deployment conversion options out of this native
-checkpoint path. Direct unsupported export options still fail explicitly.
+HF checkpoint saves and online weight exports retain trainable masters and
+archival bytes even when the engine has a rollout resync format configured.
+Both engine paths use the protocol's `HF_SAVE_SUPPORTS_RESYNC=False` capability
+to omit deployment conversion options and emit native HF weights. This does
+not implement quantized rollout conversion; consumers must accept native weights.
+Direct unsupported export keywords still raise `TypeError` naming the keyword.
 
 ## Validation loss and release caveats
 
@@ -154,20 +156,31 @@ Known limitations retained for this release:
   `1 / num_microbatches`, assuming CP=1. It does not apply the CP group-size
   multiplier. CP text-path checks do not establish correctness of nonzero
   auxiliary losses under CP>1; that combination remains unvalidated.
-- **HF-RESYNC:** the reviewed fixed protocol signature rejected deployment
-  keywords with `TypeError`. The integrated native-export wrapper now forwards
-  them to named option validation (`ValueError`); deployment resync remains
-  unsupported. Native HF checkpoint save is separate and preserves masters.
-- **PP replay and optimizer:** PP>1 record mode raises `NotImplementedError`;
-  the PP2 assembly rejects distributed optimizer configuration.
-- **Replay evidence:** zero changed routes produces a warning. Record mode has
-  no replay-equivalent execution probes, and the runtime unit seam does not
-  establish an end-to-end R3 integration assertion. Replay with no observed
-  routes is rejected by `R3_REPLAY_VOID`.
-- **Workflow coverage:** skill routing and model-composition guidance remain
-  incomplete (there is no model-compose leaf). Existing workflow checks are not
-  end-to-end acceptance; cross-model R3 tests use `_TinyChunk` and do not prove
-  execution through every full model assembly.
+- **hf-resync-unsupported:** deployment resync conversion remains unsupported.
+  Online export and HF save omit `target` / `resync_config` for V4.1; direct
+  unsupported export keywords raise `TypeError`, not a conversion result.
+- **online-export-contract-test-gap:** the previous engine-to-export coverage
+  gap is addressed by `test_v41_engine_online_export_resync_contract`. It consumes
+  native weights through the runtime and real V4.1 exporter with configured
+  resync, plus supported/legacy capability controls. It is a CPU contract test,
+  not an end-to-end rollout synchronization or quantized-consumer acceptance.
+- **R3-WARN-0 / R3-EV-003:** `changed=0` is a warning, not an error; replay
+  evidence is logged once per driver, not once per step.
+- **R3-EV-001 / R3-EV-002:** cross-model contracts use `_TinyChunk` and do not
+  establish full-model execution liveness. Record mode has no `VOID` gate;
+  replay with no observed routes is rejected by `R3_REPLAY_VOID`. Review found
+  these checks neither fabricated nor unconditionally passing; their scope
+  remains narrower than full-model integration.
+- **CP/PP-REPLAY-GATE / CP-EP-EXCL:** unsupported CP/PP replay paths and CP+EP
+  combinations fail fast, rather than silently misrouting. PP>1 record mode
+  raises `NotImplementedError`; PP2 also rejects distributed optimizer config.
+- **ds41-no-compose-skill / ds41-doc-skill-gap:** model-composition and
+  documentation skill coverage remains incomplete. Workflow checks do not
+  establish end-to-end model acceptance.
+- **mhc-pytorch-path / hasattr-gates:** mHC retains the pure PyTorch path;
+  optional protocol behavior uses capability/attribute gates with compatibility
+  defaults. These are integration limitations, not fused-kernel performance or
+  exhaustive capability-validation claims.
 
 ## Resident Engram row owners
 

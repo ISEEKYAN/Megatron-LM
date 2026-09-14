@@ -389,7 +389,9 @@ class MegatronLiteEngine(BaseEngine):
             buffer_max_size_bytes=2 * 1024**3,
             cpu=False,
         )
-        if self.engine_config.resync_format is not None:
+        if self.engine_config.resync_format is not None and getattr(
+            self.handle._extras.get("protocol"), "HF_SAVE_SUPPORTS_RESYNC", True
+        ):
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
