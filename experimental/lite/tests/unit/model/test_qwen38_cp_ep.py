@@ -134,3 +134,28 @@ def _halo_worker(rank, store):
 
 def test_cp_ep_real_owner_lookup_and_halo_adjoint(tmp_path):
     mp.spawn(_halo_worker, args=(str(tmp_path / 'store'),), nprocs=2, join=True)
+
+
+def test_model_wires_cp_ep_with_owner_flag(transformer_engine_import_stub, monkeypatch):
+    transformer_engine_import_stub()
+    from megatron.lite.model.qwen3_8_flash_next import model as module
+    from megatron.lite.model.qwen3_8_flash_next.protocol import build_model_config
+    from test_qwen38_training import tiny_training_config
+
+    built = []
+
+    def layer(config, ps, layer_idx, **kwargs):
+        built.append((ps.cp_size, ps.ep_size, kwargs['ple_owner_sharding']))
+        return torch.nn.Identity()
+
+    monkeypatch.setattr(module, 'Qwen38Layer', layer)
+    groups = {'cp': [0, 1], 'ep': [0, 1], 'dense': [0, 1], 'expert': [0]}
+    with patch.object(dist, 'get_process_group_ranks', side_effect=groups.__getitem__):
+        module.Qwen38Model(
+            build_model_config(tiny_training_config()), state(), ple_owner_sharding=True
+        )
+        assert built == [(2, 2, True), (2, 2, True)], 'CP_EP_MODEL_OWNER_WIRING'
+        with pytest.raises(
+            NotImplementedError, match='QWEN38_CP_COMBINATION_NOT_VALIDATED'
+        ):
+            module.Qwen38Model(build_model_config(tiny_training_config()), state())

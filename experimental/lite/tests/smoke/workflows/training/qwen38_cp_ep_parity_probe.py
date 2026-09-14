@@ -106,21 +106,29 @@ def compare(actual, expected):
 
 def inject_mutation(model, mutation, rank):
     """Change only the tested arm's real computation, never the reference."""
-    if mutation in ('boundary_target', 'loss_population'):
+    if mutation == 'halo_adjoint':
+        from megatron.lite.model.qwen3_8_flash_next import cp
 
-        def alter(module, args, kwargs):
-            kwargs = dict(kwargs)
-            if mutation == 'boundary_target' and rank == 0:
-                # Incorrect shard-local EOS at global query 7 inside document 5..13.
-                kwargs['labels'] = kwargs['labels'].clone()
-                kwargs['labels'][0, -1] = -100
-            elif mutation == 'loss_population':
-                # Router population (13) is not the valid shifted-target count (10).
-                kwargs['loss_token_count'] = kwargs['loss_token_count'].new_tensor(13)
-            return args, kwargs
+        original = cp.qwen3_8_flash_next_cp_left_halo
 
-        model.register_forward_pre_hook(alter, with_kwargs=True)
-    elif mutation == 'router_padding':
+        def drop_later_consumer(*args, **kwargs):
+            output = original(*args, **kwargs)
+            # Keep zero-adjoint collective participation on every rank.
+            return output.detach() + output[:, :0].sum() if rank == 1 else output
+
+        cp.qwen3_8_flash_next_cp_left_halo = drop_later_consumer
+    elif mutation == 'owner_adjoint':
+
+        def drop_lookup_grad(module, args, output):
+            if rank == 1:
+                output.register_hook(lambda grad: torch.zeros_like(grad))
+
+        for layer in model.layers:
+            if layer.ple is not None:
+                layer.ple.ple_embedding.ngram_embedding.register_forward_hook(
+                    drop_lookup_grad
+                )
+    elif mutation == 'router_population':
 
         def include_padding(module, args, kwargs):
             kwargs = dict(kwargs)
@@ -134,9 +142,14 @@ def inject_mutation(model, mutation, rank):
 
 
 def mutation_record(mutation, rank, checks):
-    non_targets = ['CP_MODEL_ORDERED_FORWARD', 'CP_MODEL_EXECUTION_CONTRACT']
-    if mutation == 'router_padding' or (mutation == 'boundary_target' and rank == 1):
-        non_targets.append('CP_MODEL_ORDERED_LOSS')
+    non_targets = [
+        'CP_MODEL_ORDERED_FORWARD',
+        'CP_MODEL_ORDERED_LOSS',
+        'CP_MODEL_EXECUTION_CONTRACT',
+        'CP_EP_DDP_BUCKET_GEOMETRY',
+    ]
+    if mutation == 'owner_adjoint':
+        non_targets.append('CP_EP_NON_TABLE_GRAD')
     failures = [tag for tag, passed in checks.items() if not passed]
     return dict(
         mutation=mutation,
@@ -178,11 +191,15 @@ def train_actual(runtime, handle, model, batch, rank):
     runtime.zero_grad(handle)
     observer = FLAKernelObserver()
     original_exchange = dist.all_to_all_single
-    exchanges = []
+    exchanges, ep_exchanges = [], []
 
     def exchange(*args, **kwargs):
         if kwargs.get('group') is model.ps.cp_group:
             exchanges.append(
+                [list(x.shape) for x in args if isinstance(x, torch.Tensor)]
+            )
+        if kwargs.get('group') is model.ps.ep_group:
+            ep_exchanges.append(
                 [list(x.shape) for x in args if isinstance(x, torch.Tensor)]
             )
         return original_exchange(*args, **kwargs)
@@ -212,10 +229,15 @@ def train_actual(runtime, handle, model, batch, rank):
         actual_fla_kernels=observer.records,
         kernel_policy=kernel_policy(),
         cp_exchanges=exchanges,
+        ep_exchanges=ep_exchanges,
     )
-    saved['execution_contract'] = len(exchanges) == 4 and all(
-        values['input'].shape[0 if name.endswith('linear_attn') else 1] == 8
-        for name, values in saved['tested_trace'][str(rank)].items()
+    saved['execution_contract'] = (
+        len(exchanges) == 4
+        and len(ep_exchanges) == 15
+        and all(
+            values['input'].shape[0 if name.endswith('linear_attn') else 1] == 8
+            for name, values in saved['tested_trace'][str(rank)].items()
+        )
     )
     actual_gradients = reduced_gradients(handle._model, model)
     success, norm, _ = runtime.optimizer_step(handle)
@@ -230,7 +252,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--output', type=Path, required=True)
     parser.add_argument(
-        '--mutation', choices=['boundary_target', 'loss_population', 'router_padding']
+        '--mutation', choices=['halo_adjoint', 'owner_adjoint', 'router_population']
     )
     args = parser.parse_args()
     rank = int(os.environ['RANK'])
@@ -300,9 +322,39 @@ def main():
             norm=norm,
             reference_norm=expected_norm,
         )
+        table_suffix = 'ple_embedding.ngram_embedding.weight'
+        local_parameters = all(
+            p.main_grad.dtype == torch.float32
+            and p.main_grad.numel() == p.numel()
+            and p.shape[0] == 384
+            and not p.allreduce
+            for n, p in model.named_parameters()
+            if n.endswith(table_suffix)
+        ) and all(layer.mlp.experts.num_local_experts == 2 for layer in model.layers)
+        gradient_groups = all(
+            row['scale'] == 0.5
+            and row['dtype'] == 'torch.float32'
+            and row['group']
+            == (
+                [rank]
+                if any(
+                    '.experts.' in n or n.endswith(table_suffix)
+                    for n in row['parameters']
+                )
+                else [0, 1]
+            )
+            for row in tested_geometry
+        )
         checks = {
             'CP_MODEL_EXECUTION_CONTRACT': saved['execution_contract'],
             'CP_EP_DDP_BUCKET_GEOMETRY': reference_geometry == tested_geometry,
+            'CP_EP_LOCAL_PARAMETERS': local_parameters,
+            'CP_EP_NATIVE_GRAD_GROUPS': gradient_groups,
+            'CP_EP_NON_TABLE_GRAD': all(
+                torch.equal(v, expected_gradients[n])
+                for n, v in actual_gradients.items()
+                if not n.endswith('ple_embedding.ngram_embedding.weight')
+            ),
             'CP_MODEL_ORDERED_FORWARD': torch.equal(
                 saved['outputs']['logits'], saved['reference_logits']
             ),
