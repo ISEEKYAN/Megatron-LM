@@ -193,6 +193,7 @@ def qsa(modules, inputs, angles, cu):
 
 
 def moe(modules, inputs, mask):
+    from megatron.lite.model.qwen3_5.lite.model import SharedExpert
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.router import _ordered_topk_from_routing_map
     from megatron.lite.primitive.utils.moe import (
@@ -202,12 +203,17 @@ def moe(modules, inputs, mask):
         topk_routing_with_score_function,
     )
 
-    routing = []
-    for m, x in zip(modules, inputs):
+    routing, shared = [], []
+    # Match production's single common view: all three adjoints meet here.
+    flat = [x.reshape(-1, x.size(-1)) for x in inputs]
+    stream = SharedExpert._get_stream()
+    for m, x in zip(modules, flat):
+        assert not m.preserve_3d_graph, 'CP_REFERENCE_MOE_GRAPH'
+        stream.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(stream):
+            shared.append(m.shared_expert(x))
         r = m.router
-        logits = router_gating_linear(
-            x.reshape(-1, x.shape[-1]), r.gate.weight, None, r.router_dtype
-        )
+        logits = router_gating_linear(x, r.gate.weight, None, r.router_dtype)
         probs, mapping = topk_routing_with_score_function(
             logits,
             r.topk,
@@ -237,16 +243,36 @@ def moe(modules, inputs, mask):
             * 2
         )
         scores = MoEAuxLossAutoScaler.apply(scores, loss)
-        original = r.forward
-        try:
-            r.forward = lambda x, scores=scores, indices=indices: (scores, indices)
-            outputs.append(m(x))
-        finally:
-            r.forward = original
+        dispatched, tpe, probabilities = m.dispatcher.dispatch(
+            flat[rank], scores, indices
+        )
+        m.dispatcher.wait_dispatch_event()
+        expert = m.experts(
+            dispatched,
+            tpe,
+            probabilities,
+            tokens_per_expert_list=getattr(m.dispatcher, '_local_tpe_list', None),
+        )
+        routed = m.dispatcher.combine(expert)
+        torch.cuda.current_stream().wait_stream(stream)
+        output = routed.view_as(x)
+        output += shared[rank].view_as(x)
+        outputs.append(output.to(x.dtype))
     return outputs
 
 
-def forward(models, batch):
+def capture(trace, rank, name, field, tensor):
+    if trace is None:
+        return
+    row = trace.setdefault(str(rank), {}).setdefault(name, {})
+    row[field] = tensor.detach().cpu().clone()
+    if tensor.requires_grad:
+        tensor.register_hook(
+            lambda grad: row.update({field + '_grad': grad.detach().cpu().clone()})
+        )
+
+
+def forward(models, batch, trace=None):
     """Fixed CP2 proxy: 13 real rows, aligned to 16, documents [0,5,13]."""
     assert batch.seq_lens.tolist() == [5, 8], 'CP_REFERENCE_DOCUMENTS'
     ids = F.pad(batch.input_ids.reshape(1, -1), (0, 3))
@@ -269,23 +295,36 @@ def forward(models, batch):
     for i in range(c.num_hidden_layers):
         layers = [m.layers[i] for m in models]
         if layers[0].ple is not None:
+            for r, value in enumerate(hidden):
+                capture(trace, r, f'layers.{i}.ple', 'input', value)
             extra = ple([b.ple for b in layers], hidden, ids, mask, cu)
+            for r, value in enumerate(extra):
+                capture(trace, r, f'layers.{i}.ple', 'output', value)
             hidden = [x + y for x, y in zip(hidden, extra)]
         mixed = [b.attn_hyper_connection.mix(x) for b, x in zip(layers, hidden)]
         branches = [x[0] for x in mixed]
         fn = gdn if layers[0].linear_attn is not None else qsa
+        name = f'layers.{i}.' + ('linear_attn' if fn is gdn else 'self_attn')
+        for r, value in enumerate(branches):
+            capture(trace, r, name, 'input', value)
         arguments = (cu,) if fn is gdn else (angles, cu)
         branch = fn(
             [b.linear_attn if fn is gdn else b.self_attn for b in layers],
             branches,
-            *arguments
+            *arguments,
         )
+        for r, value in enumerate(branch):
+            capture(trace, r, name, 'output', value)
         hidden = [
             b.attn_hyper_connection.combine(y, pair[1])
             for b, y, pair in zip(layers, branch, mixed)
         ]
         mixed = [b.mlp_hyper_connection.mix(x) for b, x in zip(layers, hidden)]
+        for r, pair in enumerate(mixed):
+            capture(trace, r, f'layers.{i}.mlp', 'input', pair[0])
         branch = moe([b.mlp for b in layers], [x[0] for x in mixed], mask)
+        for r, value in enumerate(branch):
+            capture(trace, r, f'layers.{i}.mlp', 'output', value)
         hidden = [
             b.mlp_hyper_connection.combine(y, pair[1])
             for b, y, pair in zip(layers, branch, mixed)

@@ -142,3 +142,92 @@ def test_cp_model_uses_global_loss_population(
     )
     assert torch.equal(result['loss'], expected), 'CP_MODEL_GLOBAL_LOSS_DDP_SCALE'
     assert model.layers[0].context.size == 2, 'CP_MODEL_LAYER_CONTEXT'
+
+
+def test_cp_reference_moe_reuses_one_view(monkeypatch, transformer_engine_import_stub):
+    transformer_engine_import_stub()
+    import importlib.util
+    from contextlib import nullcontext
+    from pathlib import Path
+
+    from megatron.lite.model.qwen3_5.lite.model import SharedExpert
+    from megatron.lite.primitive.utils import moe as utils
+
+    path = Path(__file__).parents[2] / 'smoke/workflows/training/qwen38_cp_reference.py'
+    spec = importlib.util.spec_from_file_location('cp_reference_under_test', path)
+    ref = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(ref)
+    stream = SimpleNamespace(wait_stream=lambda _: None)
+    monkeypatch.setattr(SharedExpert, '_get_stream', lambda: stream)
+    monkeypatch.setattr(torch.cuda, 'current_stream', lambda: stream)
+    monkeypatch.setattr(torch.cuda, 'stream', lambda _: nullcontext())
+    seen = {}
+    events = []
+
+    class Shared(nn.Module):
+        def __init__(self, rank):
+            super().__init__()
+            self.rank = rank
+
+        def forward(self, x):
+            seen[self.rank] = x
+            events.append(('shared', self.rank))
+            return x * 0.1
+
+    class Dispatch:
+        def __init__(self, rank):
+            self.rank = rank
+
+        def dispatch(self, x, scores, indices):
+            assert x is seen[self.rank], 'CP_REFERENCE_COMMON_MOE_VIEW'
+            return x, None, scores
+
+        def wait_dispatch_event(self):
+            pass
+
+        def combine(self, x):
+            return x
+
+    class Expert(nn.Module):
+        def forward(self, x, *args, **kwargs):
+            return x * 0.3
+
+    modules = []
+    for rank in range(2):
+        r = SimpleNamespace(
+            gate=nn.Linear(128, 4, bias=False),
+            router_dtype=torch.float32,
+            topk=2,
+            use_pre_softmax=False,
+            num_experts=4,
+            aux_loss_coeff=0.001,
+        )
+        modules.append(
+            SimpleNamespace(
+                router=r,
+                shared_expert=Shared(rank),
+                dispatcher=Dispatch(rank),
+                experts=Expert(),
+                preserve_3d_graph=False,
+            )
+        )
+
+    def gate(x, weight, bias, dtype):
+        rank = next(i for i, m in enumerate(modules) if m.router.gate.weight is weight)
+        assert (
+            rank in seen and x is seen[rank]
+        ), 'CP_REFERENCE_SHARED_BEFORE_ROUTER_SAME_VIEW'
+        events.append(('gate', rank))
+        return F.linear(x.float(), weight.float())
+
+    from torch.nn import functional as F
+
+    monkeypatch.setattr(utils, 'router_gating_linear', gate)
+    xs = [torch.randn(1, 8, 128, requires_grad=True) for _ in range(2)]
+    outputs = ref.moe(modules, xs, torch.tensor([[True] * 13 + [False] * 3]))
+    assert len(outputs) == 2 and events == [
+        ('shared', 0),
+        ('gate', 0),
+        ('shared', 1),
+        ('gate', 1),
+    ]

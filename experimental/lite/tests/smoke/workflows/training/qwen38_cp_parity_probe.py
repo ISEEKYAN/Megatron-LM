@@ -86,7 +86,8 @@ def main():
 
         MoEAuxLossAutoScaler.set_loss_scale(torch.tensor(1.0, device='cuda'))
         batch = batch_for_step(step)
-        predicted, losses = ordered_forward(virtual, batch)
+        reference_trace = {}
+        predicted, losses = ordered_forward(virtual, batch, reference_trace)
         sum(losses).backward()
         local_references = [gradients(m) for m in virtual]
         # A separate native CP optimizer consumes independently computed local
@@ -98,7 +99,21 @@ def main():
         rh._extras['finalize_grads']()
         expected_gradients = reduced_gradients(rh._model, reference)
         expected_success, expected_norm, _ = rr.optimizer_step(rh)
-        saved = {}
+        saved = {'reference_trace': reference_trace, 'tested_trace': {}}
+        hooks = []
+        for name, child in model.named_modules():
+            if name and any(
+                name.endswith(part)
+                for part in ('linear_attn', 'self_attn', 'ple', 'mlp')
+            ):
+
+                def observe(module, args, output, name=name):
+                    from qwen38_cp_reference import capture
+
+                    capture(saved['tested_trace'], rank, name, 'input', args[0])
+                    capture(saved['tested_trace'], rank, name, 'output', output)
+
+                hooks.append(child.register_forward_hook(observe))
         original_finalize = handle._extras['finalize_grads']
 
         def finalize():
@@ -115,6 +130,8 @@ def main():
         runtime.forward_backward(handle, [batch], objective, num_microbatches=1)
         actual_gradients = reduced_gradients(handle._model, model)
         success, norm, _ = runtime.optimizer_step(handle)
+        for hook in hooks:
+            hook.remove()
         saved.update(
             initial=initial,
             local_references=local_references,
