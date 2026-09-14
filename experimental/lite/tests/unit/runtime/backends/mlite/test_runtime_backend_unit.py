@@ -838,7 +838,8 @@ def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
                 out['loss'], out['metrics'] = kwargs['loss_fn'](out, item)
             if not kwargs['forward_only']:
                 out['backward'](out['loss'] / config.num_microbatches)
-            outputs.append(out)
+            # The real PP schedule publishes Python scalar losses, not tensors.
+            outputs.append(pipeline._compact_pipeline_output(out))
         return outputs
 
     handle = ModelHandle(

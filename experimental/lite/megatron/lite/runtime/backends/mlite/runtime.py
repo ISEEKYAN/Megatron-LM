@@ -582,7 +582,12 @@ class MegatronLiteRuntime(RuntimeBase):
                 out = dict(
                     out,
                     loss=sum(
-                        item["loss"].detach() / num_microbatches
+                        (
+                            item["loss"].detach()
+                            if isinstance(item["loss"], torch.Tensor)
+                            else item["loss"]
+                        )
+                        / num_microbatches
                         for item in outputs
                         if item.get("loss") is not None
                     ),
