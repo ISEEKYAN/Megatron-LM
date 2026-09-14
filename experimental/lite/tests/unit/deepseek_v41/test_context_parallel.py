@@ -67,7 +67,7 @@ def test_cp_requires_initialized_world(moe, model_config):
         )
 
 
-@pytest.mark.parametrize('key', ['tp', 'pp', 'vpp'])
+@pytest.mark.parametrize('key', ['tp', 'vpp'])
 def test_cp_preserves_unsupported_parallel_rejection(moe, model_config, key):
     from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.runtime.contracts import ParallelConfig

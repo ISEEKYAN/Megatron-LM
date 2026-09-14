@@ -172,6 +172,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError('Invalid local pipeline stage interval')
         self.local_layer_range = (start, end)
+        self._input_tensor = None
         self.tensor_bindings = {}
         self.archival_bindings = {}
         self.archival_store = None
@@ -531,8 +532,7 @@ class DeepseekV41Model(nn.Module):
             hidden,
             pre,
             input_ids,
-            0,
-            len(self.layers),
+            *self.local_layer_range,
             AttentionState(),
             (None, None),
             image_mask,
@@ -614,6 +614,14 @@ class DeepseekV41Model(nn.Module):
         hidden = self.norm(contract_hc(payload.h, payload.p))
         return F.linear(hidden.float(), self.head.weight.float())
 
+    def set_input_tensor(self, input_tensor):
+        """Receive the FP32 paired HC carrier through the shared PP interface."""
+        if self.local_layer_range[0] != 20:
+            raise RuntimeError('V4.1_PP_INPUT_STAGE: only the layer-20 stage accepts input')
+        if self._input_tensor is not None:
+            raise RuntimeError('V4.1_PP_INPUT_PENDING: previous input was not consumed')
+        self._input_tensor = input_tensor
+
     def forward(
         self,
         input_ids,
@@ -623,8 +631,11 @@ class DeepseekV41Model(nn.Module):
         token_types=None,
         cp_context=None,
     ):
-        if self.local_layer_range != (0, len(self.layers)):
-            raise RuntimeError('A local pipeline stage requires the range protocol')
+        local_start, local_end = self.local_layer_range
+        if (local_start, local_end) not in ((0, 40), (0, 20), (20, 40)):
+            raise RuntimeError('V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol')
+        if self.ps.pp_size > 1 and (images is not None or token_types is not None):
+            raise NotImplementedError('V4.1_PP_TEXT_ONLY: use PP=1 for multimodal training')
         if self.engram_group is not None:
             # Each packed document visits both lookup collectives. Reject a
             # mismatched schedule before any rank enters the first lookup.
@@ -650,6 +661,21 @@ class DeepseekV41Model(nn.Module):
             raise ValueError(
                 'CP model requires protocol-owned contiguous input metadata'
             )
+        if local_start == 20:
+            carrier, self._input_tensor = self._input_tensor, None
+            width = self.config.to_hf_dict()['text_config']['hidden_size']
+            if (carrier is None or carrier.dtype != torch.float32
+                    or carrier.shape != (*input_ids.shape, self.hc_mult * (width + 1))):
+                raise ValueError('V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix')
+            pair = carrier.reshape(*input_ids.shape, self.hc_mult, width + 1)
+            hidden = pair[..., :-1].to(self.pipeline_residual_dtype).contiguous()
+            pre = pair[..., -1].contiguous()
+            sequence = self._sequence
+            if cu_seqlens is not None:
+                sequence = partial(packed_forward, sequence, cu_seqlens=cu_seqlens)
+            hidden, pre = sequence(hidden, pre, input_ids=input_ids)
+            hidden = self.norm(contract_hc(hidden, pre))
+            return {'logits': F.linear(hidden.float(), self.head.weight.float())}
         embeddings = self.embed(input_ids)
         if hasattr(self, 'residual_dtype'):
             embeddings = embeddings.to(self.residual_dtype)
@@ -689,6 +715,12 @@ class DeepseekV41Model(nn.Module):
                 packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
             )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
+        if local_end == 20:
+            # CED at layer 19 is this same pair. Layer 20 regenerates KV/index state.
+            # FP32 transport preserves both native pre_mix and its backward gradient.
+            return {'hidden_states': torch.cat(
+                (hidden.float(), pre.unsqueeze(-1)), dim=-1
+            ).flatten(2)}
         hidden = self.norm(contract_hc(hidden, pre))
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.

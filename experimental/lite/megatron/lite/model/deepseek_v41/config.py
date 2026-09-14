@@ -81,6 +81,11 @@ class DeepseekV41Config:
     def _from_hf_dict(cls, hf):
         return cls(hf)
 
+    @property
+    def hidden_size(self):
+        """Residual width consumed by the shared runtime pipeline shape contract."""
+        return self._release['text_config']['hidden_size']
+
     def to_hf_dict(self):
         return deepcopy(self._release)
 

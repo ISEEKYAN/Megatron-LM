@@ -46,6 +46,7 @@ class ImplConfig:
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
+    pipeline_split_layer: int = 20
 
 
 def build_model_config(source, **overrides):
@@ -60,7 +61,9 @@ def build_model_config(source, **overrides):
 
 def build_model(model_cfg, *, impl_cfg):
     p = impl_cfg.parallel
-    unsupported = [key for key in ('tp', 'pp', 'vpp') if getattr(p, key) != 1]
+    unsupported = [key for key in ('tp', 'vpp') if getattr(p, key) != 1]
+    if p.pp not in (1, 2):
+        unsupported.append('pp')
     if p.etp not in (None, 1):
         unsupported.append('etp')
     if p.pp_layout is not None:
@@ -68,11 +71,10 @@ def build_model(model_cfg, *, impl_cfg):
     if unsupported:
         raise NotImplementedError(
             f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
-            'supported: DP, EP with CP=1, or contiguous CP-only; '
-            'TP/PP/VPP/ETP and custom pipeline layouts are unsupported'
+            'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
+            'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
-    # Check current parallel support first: the text-only contract applies
-    # once model-side PP is enabled. An external schedule can publish a backward
+    # An external schedule can publish a backward
     # callback even with text_only=True or a frozen vision mask.
     if p.pp > 1 and (
         not impl_cfg.text_only or impl_cfg.external_vision_device is not None
@@ -81,6 +83,24 @@ def build_model(model_cfg, *, impl_cfg):
             'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
             'use PP=1 for multimodal training'
         )
+    if p.pp > 1:
+        if impl_cfg.pipeline_split_layer != 20:
+            raise NotImplementedError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; '
+                'other cuts require transporting CSA2 owner state'
+            )
+        if p.ep != 1 or p.cp != 1:
+            raise NotImplementedError(
+                'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
+            )
+        if impl_cfg.optimizer is not None:
+            raise NotImplementedError(
+                'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model '
+                'forward/backward; distributed optimizer training is not validated'
+            )
+        if (not torch.distributed.is_initialized()
+                or torch.distributed.get_world_size() != 2):
+            raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
     from .model import DeepseekV41Model
 
     if p.cp != 1 and p.ep != 1:
@@ -119,10 +139,21 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
+    layer_range = None
+    if p.pp > 1:
+        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+
+        cut = impl_cfg.pipeline_split_layer
+        count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+        layout = build_pipeline_chunk_layout(count, replace(
+            ps, pp_layout=f'Et*{cut}|t*{count - cut}L'
+        ))
+        layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
     with torch.device(impl_cfg.device):
         model = DeepseekV41Model(
             model_cfg,
             parallel_state=ps,
+            layer_range=layer_range,
             token_map=impl_cfg.token_map,
             quantized=impl_cfg.quantized,
             trainable_engram=impl_cfg.trainable_engram,
@@ -131,6 +162,7 @@ def build_model(model_cfg, *, impl_cfg):
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
         )
+    model.pipeline_residual_dtype = impl_cfg.dtype
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
     from .attention import Linear
@@ -252,6 +284,7 @@ def build_model(model_cfg, *, impl_cfg):
         ),
         extras={
             'model_cfg': model_cfg,
+            **({'pipeline_dtype': torch.float32} if p.pp > 1 else {}),
             'vision_schedule': model.vision_schedule,
             'prepare_microbatches': partial(prepare_microbatches, dp_group=ps.dp_group),
             'optimizer_backend': 'none' if optimizer is None else 'v41',
@@ -359,7 +392,10 @@ def _forward_step(model, batch, *, optimizer=None, execution_model=None):
 
 
 def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
-    _validate_text_batch(batch, multimodal=True)
+    if model.ps.pp_size > 1:
+        _validate_pipeline_batch(batch)
+    else:
+        _validate_text_batch(batch, multimodal=True)
     _validate_replay(model, batch)
     precision = (
         torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
@@ -392,7 +428,11 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
         output = (model if execution_model is None else execution_model)(
             ids, cu_seqlens=batch.cu_seqlens, cp_context=cp_context, **modality
         )
-    result = _text_output(output['logits'][0], batch, cp_context=cp_context)
+    result = (
+        {'hidden_states': output['hidden_states']}
+        if 'hidden_states' in output
+        else _text_output(output['logits'][0], batch, cp_context=cp_context)
+    )
     if optimizer is not None and model.training and torch.is_grad_enabled():
         optimizer.accumulate_modality_loads(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':

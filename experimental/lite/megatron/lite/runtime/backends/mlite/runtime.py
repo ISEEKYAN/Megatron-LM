@@ -546,7 +546,10 @@ class MegatronLiteRuntime(RuntimeBase):
                     pipeline_forward_step,
                     pipeline_chunks,
                     data_iter,
-                    SimpleNamespace(num_microbatches=num_microbatches),
+                    SimpleNamespace(
+                        num_microbatches=num_microbatches,
+                        pipeline_dtype=handle._extras.get("pipeline_dtype", torch.bfloat16),
+                    ),
                     ps,
                     tensor_shape=tensor_shape,
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
