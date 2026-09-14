@@ -23,7 +23,7 @@ def test_cp_router_counts_real_tokens_and_scales_aux(
     )
     mask = torch.tensor([True] * 5 + [False] * 3)
     captured = {}
-    original = module.switch_load_balancing_loss_func
+    original = module.moe_ops.switch_load_balancing_loss_func
 
     def loss(probs, counts, total, *args, **kwargs):
         captured.update(
@@ -35,7 +35,7 @@ def test_cp_router_counts_real_tokens_and_scales_aux(
         captured['local'] = values.clone()
         values.add_(torch.tensor([4, 4, 4, 4, 8]))
 
-    monkeypatch.setattr(module, 'switch_load_balancing_loss_func', loss)
+    monkeypatch.setattr(module.moe_ops, 'switch_load_balancing_loss_func', loss)
     monkeypatch.setattr(module.dist, 'all_reduce', reduce)
     torch.manual_seed(95)
     x = torch.randn(8, 128, requires_grad=True)
