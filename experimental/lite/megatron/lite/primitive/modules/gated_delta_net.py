@@ -38,7 +38,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.jit import jit_fuser
+from megatron.lite.primitive.kernels.jit import dynamic_jit_fuser, jit_fuser
 from megatron.lite.primitive.ops.gated_delta_rule import (
     l2norm,
     torch_chunk_gated_delta_rule,
@@ -670,8 +670,11 @@ class GatedDeltaNet(nn.Module):
         return l2norm(x)
 
     @staticmethod
-    @jit_fuser
+    @dynamic_jit_fuser
     def _compute_g_and_beta(A_log, dt_bias, alpha, beta):
+        # Start with symbolic lengths: automatic static-to-dynamic recompilation
+        # can change FP32 FMA contraction in dA's reduction and cross a BF16
+        # rounding boundary for identical inputs after a different length runs.
         g = -A_log.exp() * F.softplus(alpha.float() + dt_bias)
         return g, beta.sigmoid()
 

@@ -5,13 +5,8 @@ from __future__ import annotations
 
 import torch
 import torch.nn.functional as F
-
-try:
-    from fla.modules.l2norm import l2norm as _fla_l2norm  # pyright: ignore[reportMissingImports]
-
-    _HAS_FLA_L2NORM = True
-except ImportError:
-    _HAS_FLA_L2NORM = False
+from megatron.lite.primitive.ops.fla_l2norm import HAS_FLA as _HAS_FLA_L2NORM
+from megatron.lite.primitive.ops.fla_l2norm import fixed_l2norm as _fla_l2norm
 
 __all__ = ["l2norm", "torch_chunk_gated_delta_rule"]
 
@@ -39,7 +34,8 @@ def torch_chunk_gated_delta_rule(
         query = l2norm(query)
         key = l2norm(key)
     query, key, value, beta, g = [
-        x.transpose(1, 2).contiguous().to(torch.float32) for x in (query, key, value, beta, g)
+        x.transpose(1, 2).contiguous().to(torch.float32)
+        for x in (query, key, value, beta, g)
     ]
 
     batch_size, num_heads, sequence_length, key_dim = key.shape
@@ -63,7 +59,8 @@ def torch_chunk_gated_delta_rule(
     g = g.reshape(g.shape[0], g.shape[1], -1, chunk_size)
 
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=0
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=0,
     )
     g = g.cumsum(dim=-1)
     decay_mask = ((g.unsqueeze(-1) - g.unsqueeze(-2)).tril().exp().float()).tril()
@@ -83,7 +80,8 @@ def torch_chunk_gated_delta_rule(
     )
     core_attn_out = torch.zeros_like(value)
     mask = torch.triu(
-        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device), diagonal=1
+        torch.ones(chunk_size, chunk_size, dtype=torch.bool, device=query.device),
+        diagonal=1,
     )
 
     for i in range(0, total_sequence_length // chunk_size):
@@ -95,7 +93,10 @@ def torch_chunk_gated_delta_rule(
         core_attn_out[:, :, i] = attn_inter + attn @ v_new
         last_recurrent_state = (
             last_recurrent_state * g[:, :, i, -1, None, None].exp()
-            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(-1, -2) @ v_new
+            + (k_i * (g[:, :, i, -1, None] - g[:, :, i]).exp()[..., None]).transpose(
+                -1, -2
+            )
+            @ v_new
         )
 
     if not output_final_state:
