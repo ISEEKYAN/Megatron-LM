@@ -181,7 +181,11 @@ class Qwen38Model(nn.Module):
         if any(getattr(ps, k) != 1 for k in ('etp_size', 'pp_size')):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
         if ps.cp_size > 1:
-            if ps.tp_size != 1 or ps.ep_size != 1 or ps.dp_size != 1:
+            if ps.ep_size > 1:
+                from .cp_ep import validate_cp_ep_contract
+
+                validate_cp_ep_contract(ps, ple_owner_sharding=ple_owner_sharding)
+            elif ps.tp_size != 1 or ps.dp_size != 1:
                 raise NotImplementedError('QWEN38_CP_COMBINATION_NOT_VALIDATED')
             if ps.cp_group is None:
                 raise ValueError('QWEN38_CP_GROUP_REQUIRED')
@@ -190,7 +194,7 @@ class Qwen38Model(nn.Module):
         if config.tie_word_embeddings or not config.norm_topk_prob:
             raise ValueError('QWEN38_RELEASE_TIED_OR_ROUTER_CONTRACT')
         if ple_owner_sharding and (
-            ps.ep_size < 2 or ps.ep_group is None or ps.tp_size != 1 or ps.cp_size != 1
+            ps.ep_size < 2 or ps.ep_group is None or ps.tp_size != 1
         ):
             raise ValueError('PLE_OWNER_REQUIRES_EP_WITH_TP_CP_ONE')
         self.config, self.ps = config, ps

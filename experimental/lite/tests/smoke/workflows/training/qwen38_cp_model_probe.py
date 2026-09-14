@@ -27,7 +27,7 @@ def configuration():
     return config
 
 
-def build(directory, cp):
+def build(directory, cp, *, ep=1, ple_owner_sharding=False):
     directory.mkdir(parents=True, exist_ok=True)
     (directory / 'config.json').write_text(json.dumps(configuration()))
     cfg = MegatronLiteConfig(
@@ -35,8 +35,8 @@ def build(directory, cp):
         hf_path=str(directory),
         load_hf_weights=False,
         optimizer=OptimizerConfig(lr=0.003),
-        parallel=ParallelConfig(cp=cp, etp=1),
-        impl_cfg={'ngram_primes': PRIMES},
+        parallel=ParallelConfig(cp=cp, ep=ep, etp=1),
+        impl_cfg={'ngram_primes': PRIMES, 'ple_owner_sharding': ple_owner_sharding},
     )
     runtime = MegatronLiteRuntime(str(directory), cfg)
     handle = runtime.build_model()

@@ -73,14 +73,22 @@ def gdn(modules, inputs, cu):
     ]
 
 
-def ple(modules, inputs, ids, real_mask, cu):
+def ple(modules, inputs, ids, real_mask, cu, lookup=None):
     values, normalized = [], []
+    hashes = modules[0].ple_embedding.hash_ids(
+        ids.masked_fill(~real_mask, modules[0].ple_embedding.eos_token_id), cu
+    )
+    requested = None if lookup is None else lookup(modules, hashes)
     for r, (m, x) in enumerate(zip(modules, inputs)):
         hashes = m.ple_embedding.hash_ids(
             ids.masked_fill(~real_mask, m.ple_embedding.eos_token_id), cu
         )
         embeddings = (
-            m.ple_embedding.ngram_embedding(hashes[:, r * 8 : (r + 1) * 8])
+            (
+                m.ple_embedding.ngram_embedding(hashes[:, r * 8 : (r + 1) * 8])
+                if requested is None
+                else requested[r]
+            )
             .flatten(-2)
             .to(m.key_proj.weight.dtype)
         )
@@ -192,7 +200,7 @@ def qsa(modules, inputs, angles, cu):
     ]
 
 
-def moe(modules, inputs, mask):
+def moe(modules, inputs, mask, expert_forward=None):
     from megatron.lite.model.qwen3_5.lite.model import SharedExpert
     from megatron.lite.primitive.modules.moe import MoEAuxLossAutoScaler
     from megatron.lite.primitive.modules.router import _ordered_topk_from_routing_map
@@ -231,7 +239,7 @@ def moe(modules, inputs, mask):
         for r, item in enumerate(routing)
     ]
     total = counts[0] + counts[1]
-    outputs = []
+    outputs, routed_scores = [], []
     for rank, (m, x, item) in enumerate(zip(modules, inputs, routing)):
         scores, indices, _, aux = item
         r = m.router
@@ -243,22 +251,34 @@ def moe(modules, inputs, mask):
             * 2
         )
         scores = MoEAuxLossAutoScaler.apply(scores, loss)
-        dispatched, tpe, probabilities = m.dispatcher.dispatch(
-            flat[rank], scores, indices
-        )
-        m.dispatcher.wait_dispatch_event()
-        expert = m.experts(
-            dispatched,
-            tpe,
-            probabilities,
-            tokens_per_expert_list=getattr(m.dispatcher, '_local_tpe_list', None),
-        )
-        routed = m.dispatcher.combine(expert)
+        routed_scores.append((scores, indices))
+    combined = (
+        None if expert_forward is None else expert_forward(modules, flat, routed_scores)
+    )
+    for rank, (m, x) in enumerate(zip(modules, inputs)):
+        scores, indices = routed_scores[rank]
+        if combined is not None:
+            routed = combined[rank]
+        else:
+            routed = local_experts(m, flat[rank], scores, indices)
         torch.cuda.current_stream().wait_stream(stream)
         output = routed.view_as(x)
         output += shared[rank].view_as(x)
         outputs.append(output.to(x.dtype))
     return outputs
+
+
+def local_experts(m, x, scores, indices):
+    dispatched, tpe, probabilities = m.dispatcher.dispatch(x, scores, indices)
+    m.dispatcher.wait_dispatch_event()
+    expert = m.experts(
+        dispatched,
+        tpe,
+        probabilities,
+        tokens_per_expert_list=getattr(m.dispatcher, '_local_tpe_list', None),
+    )
+    routed = m.dispatcher.combine(expert)
+    return routed
 
 
 def capture(trace, rank, name, field, tensor):
@@ -272,7 +292,7 @@ def capture(trace, rank, name, field, tensor):
         )
 
 
-def forward(models, batch, trace=None):
+def forward(models, batch, trace=None, *, lookup=None, expert_forward=None):
     """Fixed CP2 proxy: 13 real rows, aligned to 16, documents [0,5,13]."""
     assert batch.seq_lens.tolist() == [5, 8], 'CP_REFERENCE_DOCUMENTS'
     ids = F.pad(batch.input_ids.reshape(1, -1), (0, 3))
@@ -297,7 +317,7 @@ def forward(models, batch, trace=None):
         if layers[0].ple is not None:
             for r, value in enumerate(hidden):
                 capture(trace, r, f'layers.{i}.ple', 'input', value)
-            extra = ple([b.ple for b in layers], hidden, ids, mask, cu)
+            extra = ple([b.ple for b in layers], hidden, ids, mask, cu, lookup=lookup)
             for r, value in enumerate(extra):
                 capture(trace, r, f'layers.{i}.ple', 'output', value)
             hidden = [x + y for x, y in zip(hidden, extra)]
@@ -322,7 +342,12 @@ def forward(models, batch, trace=None):
         mixed = [b.mlp_hyper_connection.mix(x) for b, x in zip(layers, hidden)]
         for r, pair in enumerate(mixed):
             capture(trace, r, f'layers.{i}.mlp', 'input', pair[0])
-        branch = moe([b.mlp for b in layers], [x[0] for x in mixed], mask)
+        branch = moe(
+            [b.mlp for b in layers],
+            [x[0] for x in mixed],
+            mask,
+            expert_forward=expert_forward,
+        )
         for r, value in enumerate(branch):
             capture(trace, r, f'layers.{i}.mlp', 'output', value)
         hidden = [
