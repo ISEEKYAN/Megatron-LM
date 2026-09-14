@@ -4,8 +4,71 @@ import torch
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
-@pytest.mark.parametrize('trainable', [False, True])
-@pytest.mark.parametrize('rank', [0, 1, 2])
+def test_trainer_scheduler_preserves_model_lr_and_decay_policy():
+    import ast
+    import math
+    from pathlib import Path
+    from types import SimpleNamespace
+
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "examples/verl/verl_mlite/engine/mlite_engine.py"
+    )
+    node = next(
+        n
+        for n in ast.parse(path.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == "_MegatronLiteLRScheduler"
+    )
+    namespace = {"Any": object, "math": math}
+    exec(compile(ast.Module([node], type_ignores=[]), str(path), "exec"), namespace)
+    groups = [{"lr_mult": 5, "wd_mult": 0, "weight_decay": 0}, {"weight_decay": 0.1}]
+    scheduler = namespace["_MegatronLiteLRScheduler"](
+        SimpleNamespace(param_groups=groups),
+        init_lr=0,
+        max_lr=1e-4,
+        min_lr=1e-4,
+        lr_warmup_steps=0,
+        lr_decay_steps=50,
+        lr_decay_style="constant",
+        start_wd=0.1,
+        end_wd=0.1,
+        wd_incr_steps=50,
+        wd_incr_style="constant",
+        wsd_decay_steps=None,
+        lr_wsd_decay_style="constant",
+    )
+    scheduler.step()
+    assert groups[0]["lr"] == 5e-4 and groups[0]["weight_decay"] == 0
+    assert groups[1]["lr"] == 1e-4 and groups[1]["weight_decay"] == 0.1
+
+
+def test_runtime_accepts_serialized_v41_optimizer_config():
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+    from megatron.lite.runtime.backends.mlite.runtime import _build_impl_cfg
+
+    config = _build_impl_cfg(
+        protocol,
+        MegatronLiteConfig(
+            impl_cfg={
+                "shard_engram": True,
+                "dtype": "float32",
+                "optimizer": "muon",
+                "optimizer_config": {
+                    "lr": 1e-4,
+                    "ns_steps": 5,
+                    "coefficient_type": "quintic",
+                },
+            }
+        ),
+    )
+    assert config.dtype is torch.float32
+    assert config.optimizer_config == protocol.OptimizerConfig(1e-4, 5, "quintic")
+    assert config.shard_engram
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+@pytest.mark.parametrize("rank", [0, 1, 2])
 def test_model_allocates_only_owned_engram_rows(
     moe, model_config, monkeypatch, rank, trainable
 ):
@@ -13,10 +76,10 @@ def test_model_allocates_only_owned_engram_rows(
     from megatron.lite.primitive.modules.engram_lookup import ShardedEngramTable
 
     group = object()
-    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda g: 3)
-    monkeypatch.setattr(torch.distributed, 'get_rank', lambda g: rank)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda g: 3)
+    monkeypatch.setattr(torch.distributed, "get_rank", lambda g: rank)
     ps = ParallelState(dp_cp_group=group, dp_cp_size=3, dp_cp_rank=rank)
-    with torch.device('meta'):
+    with torch.device("meta"):
         model = DeepseekV41Model(
             model_config,
             parallel_state=ps,
@@ -51,9 +114,10 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
 
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
+    torch.manual_seed(19)
     dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rdzv').as_uri(),
+        "nccl",
+        init_method=(Path(directory) / "rdzv").as_uri(),
         rank=rank,
         world_size=world,
         timeout=timedelta(seconds=120),
@@ -61,13 +125,13 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
     try:
         impl = protocol.ImplConfig(
             parallel=ParallelConfig(ep=ep, cp=cp),
-            device=f'cuda:{rank}',
+            device=f"cuda:{rank}",
             dtype=torch.float32,
             quantized=False,
             token_map=list(range(256)),
             trainable_engram=trainable,
-            optimizer='muon',
-            optimizer_config=OptimizerConfig(1e-4, 5, 'quintic'),
+            optimizer="muon",
+            optimizer_config=OptimizerConfig(1e-4, 5, "quintic"),
         )
         reference = protocol.build_model(config, impl_cfg=impl)
         actual = protocol.build_model(config, impl_cfg=replace(impl, shard_engram=True))
@@ -90,8 +154,8 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
         state = full.state_dict()
         for name, value in local.state_dict().items():
             source = state[name]
-            if '.engram.embed.' in name:
-                layer_id = int(name.split('.')[1])
+            if ".engram.embed." in name:
+                layer_id = int(name.split(".")[1])
                 lookup = local.layers[layer_id].engram.embed.lookup
                 source = source[lookup.boundaries[rank] : lookup.boundaries[rank + 1]]
             value.copy_(source)
@@ -104,7 +168,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             for bundle in (reference, actual):
                 bundle.optimizer.zero_grad()
                 result = bundle.forward_step(bundle.chunks[0], batch)
-                logits.append(result['logits'].detach())
+                logits.append(result["logits"].detach())
                 # Use the production normalization and gradient finalization.
                 bundle.optimizer.zero_grad()
                 run_microbatch_loop(
@@ -112,38 +176,46 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                     iter([batch]),
                     1,
                     bundle.forward_step,
-                    prepare_microbatches=bundle.extras['prepare_microbatches'],
+                    prepare_microbatches=bundle.extras["prepare_microbatches"],
                 )
                 if bundle.finalize_grads is not None:
                     bundle.finalize_grads()
-            torch.testing.assert_close(*logits, atol=1e-5, rtol=1e-5)
+            print(
+                f"SHARD_STEP rank={rank} step={step} logits_max_abs={float((logits[0] - logits[1]).abs().max())}",
+                flush=True,
+            )
+            torch.testing.assert_close(*logits, atol=0, rtol=0)
             expected = dict(full.named_parameters())
             for name, p in local.named_parameters():
                 q = expected[name]
                 assert (p.grad is None) == (q.grad is None), name
                 if p.grad is not None:
                     grad = q.grad
-                    if '.engram.embed.master' in name:
+                    if ".engram.embed.master" in name:
                         lookup = local.layers[
-                            int(name.split('.')[1])
+                            int(name.split(".")[1])
                         ].engram.embed.lookup
                         grad = grad[
                             lookup.boundaries[rank] : lookup.boundaries[rank + 1]
                         ]
                     torch.testing.assert_close(
-                        p.grad, grad, atol=2e-6, rtol=2e-4, msg=name
+                        p.grad, grad, atol=0, rtol=0, msg=name
                     )
             ref_step, actual_step = reference.optimizer.step(), actual.optimizer.step()
             assert ref_step[0] and actual_step[0]
-            assert actual_step[1] == pytest.approx(ref_step[1], rel=2e-5)
+            assert actual_step[1] == ref_step[1]
+            print(
+                f"SHARD_NORM rank={rank} step={step} reference={ref_step[1]} sharded={actual_step[1]}",
+                flush=True,
+            )
             for name, p in local.named_parameters():
                 q = expected[name]
-                if '.engram.embed.master' in name:
-                    lookup = local.layers[int(name.split('.')[1])].engram.embed.lookup
+                if ".engram.embed.master" in name:
+                    lookup = local.layers[int(name.split(".")[1])].engram.embed.lookup
                     q = q[lookup.boundaries[rank] : lookup.boundaries[rank + 1]]
-                torch.testing.assert_close(p, q, atol=2e-6, rtol=2e-4, msg=name)
+                torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
         print(
-            f'SHARDED_ENGRAM_OK rank={rank} world={world} ep={ep} cp={cp} trainable={trainable}',
+            f"SHARDED_ENGRAM_OK rank={rank} world={world} ep={ep} cp={cp} trainable={trainable}",
             flush=True,
         )
         from megatron.lite.model.deepseek_v41.lite.checkpoint import export_model
@@ -159,7 +231,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             target = ref_export.pop(name)
             if value.element_size() == 1:
                 value, target = value.view(torch.uint8), target.view(torch.uint8)
-            torch.testing.assert_close(value, target, atol=2e-6, rtol=2e-4, msg=name)
+            torch.testing.assert_close(value, target, atol=0, rtol=0, msg=name)
         assert not ref_export
         snapshot = {name: value.clone() for name, value in local.state_dict().items()}
         save_training_checkpoint(local, actual.optimizer, 2, directory, use_dcp=False)
@@ -177,14 +249,14 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 atol=0,
                 rtol=0,
             )
-        print(f'SHARDED_CHECKPOINT_EXPORT_OK rank={rank}', flush=True)
+        print(f"SHARDED_CHECKPOINT_EXPORT_OK rank={rank}", flush=True)
     finally:
         dist.destroy_process_group()
 
 
 @pytest.mark.gpus(4)
-@pytest.mark.parametrize('world,ep,cp', [(2, 1, 1), (4, 2, 1), (2, 1, 2)])
-@pytest.mark.parametrize('trainable', [False, True])
+@pytest.mark.parametrize("world,ep,cp", [(2, 1, 1), (4, 2, 1), (2, 1, 2)])
+@pytest.mark.parametrize("trainable", [False, True])
 def test_sharded_model_matches_replicated_training(
     model_config, tmp_path, trainable, world, ep, cp
 ):

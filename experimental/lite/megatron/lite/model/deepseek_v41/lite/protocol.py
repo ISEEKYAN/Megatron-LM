@@ -2,6 +2,7 @@
 """Text protocol with replicated data parallel training and explicit optimizer policy."""
 
 import math
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -47,6 +48,18 @@ class ImplConfig:
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
     pipeline_split_layer: int = 20
+
+    def __post_init__(self):
+        # Runtime/VERL configurations arrive as serialized mappings.
+        if isinstance(self.optimizer_config, Mapping):
+            object.__setattr__(
+                self, "optimizer_config", OptimizerConfig(**self.optimizer_config)
+            )
+        if isinstance(self.dtype, str):
+            dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+            if self.dtype not in dtypes:
+                raise ValueError("V4.1 residual dtype must be BF16 or FP32")
+            object.__setattr__(self, "dtype", dtypes[self.dtype])
 
 
 def build_model_config(source, **overrides):

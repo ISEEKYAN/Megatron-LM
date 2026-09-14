@@ -539,7 +539,7 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
 
 
 @torch.no_grad()
-def load_model(model, path):
+def load_model(model, path, *, allow_missing_mtp=False):
     """Bind every header before loading any live tensor, retaining archive bytes."""
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
@@ -562,7 +562,9 @@ def load_model(model, path):
         dict(name=name, dtype=e.dtype, shape=e.shape)
         for name, e in store.entries.items()
     ]
-    bindings = bind_checkpoint(model, records, store=store)
+    bindings = bind_checkpoint(
+        model, records, store=store, allow_missing_mtp=allow_missing_mtp
+    )
     for name, binding in bindings.items():
         if binding.role in ('archival', 'scale'):
             continue
