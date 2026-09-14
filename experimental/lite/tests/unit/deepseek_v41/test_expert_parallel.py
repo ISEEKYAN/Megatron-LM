@@ -207,11 +207,10 @@ def test_ep_requires_distributed_world(moe, model_config):
 
 @pytest.mark.parametrize('dimension', ['tp', 'pp', 'cp', 'vpp', 'etp'])
 def test_ep_does_not_unlock_other_dimensions(moe, model_config, dimension):
-    message = (
-        'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED'
-        if dimension == 'cp'
-        else f'V4.1_UNSUPPORTED_PARALLELISM: {dimension};'
-    )
+    message = {
+        'cp': 'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED',
+        'pp': 'V4.1_PP_COMBINATION_UNSUPPORTED',
+    }.get(dimension, f'V4.1_UNSUPPORTED_PARALLELISM: {dimension};')
     with pytest.raises(NotImplementedError, match=message):
         protocol.build_model(
             model_config,
