@@ -42,7 +42,7 @@ class _MockModel(torch.nn.Module):
         self._input_tensor = t
 
 
-def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
+def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8, terminal="loss"):
     """Run the real _1f1b_schedule for one rank with _send_recv_pipeline mocked to
     play the peer (recv tensor of the peer-sent shape, in transfer order); records
     recv shapes to prove each recv maps to the right mb."""
@@ -80,7 +80,8 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
         hidden_t = base * m.weight.sum()
         out = {"hidden_states": hidden_t}
         if ps.pp_is_last:
-            out["loss"] = hidden_t.float().sum()
+            out["loss" if terminal == "loss" else "hidden_states"] = (
+                hidden_t.detach() if terminal == "detached" else hidden_t).float().sum()
         return out
 
     batches = [{"S": s} for s in seq_lens]
@@ -91,10 +92,122 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
             num_mb, SimpleNamespace(num_microbatches=num_mb), ps, fwd_shapes[0])
     finally:
         pl._send_recv_pipeline = orig_srp
+    assert (model.weight.grad is None) == (terminal == "detached")
     return recorded_fwd, recorded_bwd, fwd_shapes
 
 
 VARLEN = [5, 9, 3, 7]  # deliberately non-uniform, ascending & descending mix
+
+
+@pytest.mark.parametrize("interleaved", [False, True], ids=["1f1b", "interleaved"])
+@pytest.mark.parametrize("missing_mb", [0, 1])
+def test_missing_backward_output_is_named(monkeypatch, interleaved, missing_mb):
+    ps = _make_ps(2, 1)
+    ps.pp_cpu_group = None
+    models = [_MockModel(2) for _ in range(2 if interleaved else 1)]
+    shape = (3, 1, 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 7)
+
+    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, *args, **kwargs):
+        return (
+            torch.ones(shape, requires_grad=True) if recv_fwd else None,
+            torch.ones(shape) if recv_bwd else None,
+        )
+
+    monkeypatch.setattr(pl, "_send_recv_pipeline", fake_srp)
+
+    def forward_step_fn(model, mb):
+        if model is models[-1] and mb == missing_mb:
+            return {}  # Last stage supplies neither loss nor hidden_states.
+        hidden = model._input_tensor * model.weight.sum()
+        return (
+            {"loss": hidden.sum()} if model is models[-1] else {"hidden_states": hidden}
+        )
+
+    schedule = pl._interleaved_1f1b_schedule if interleaved else pl._1f1b_schedule
+    try:
+        schedule(
+            forward_step_fn,
+            models if interleaved else models[0],
+            iter(range(2)),
+            2,
+            SimpleNamespace(),
+            ps,
+            shape,
+        )
+    except Exception as exc:
+        assert isinstance(
+            exc, RuntimeError
+        ), "missing_backward_output_must_raise_named_runtime_error"
+        expected_stage = 3 if interleaved else 1
+        assert str(exc) == (
+            f"pipeline_missing_backward_output: rank=7 stage={expected_stage} "
+            f"microbatch={missing_mb}; expected loss or hidden_states for backward"
+        ), "missing_backward_output_must_identify_rank_stage_microbatch"
+    else:
+        pytest.fail("missing_backward_output_must_not_silently_skip")
+
+
+@pytest.mark.parametrize("interleaved", [False, True], ids=["1f1b", "interleaved"])
+@pytest.mark.parametrize("stage", [0, 1, 3], ids=["first", "middle", "last"])
+@pytest.mark.parametrize("callback_mb", [0, 1])
+@pytest.mark.parametrize("detached", [False, True])
+def test_backward_callback_is_named(monkeypatch, interleaved, stage, callback_mb, detached):
+    # Exercise real schedules; only peer transport is replaced. A loss-only
+    # callback cannot consume the upstream activation gradient of a PP stage.
+    pp_size = 2 if interleaved else 4
+    ps = _make_ps(pp_size, stage % pp_size)
+    ps.pp_cpu_group = None
+    models = [_MockModel(2) for _ in range(2 if interleaved else 1)]
+    shape = (3, 1, 2)
+    monkeypatch.setattr(dist, "get_rank", lambda: 7)
+
+    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, *args, **kwargs):
+        return (
+            torch.ones(shape, requires_grad=True) if recv_fwd else None,
+            torch.ones(shape) if recv_bwd else None,
+        )
+
+    monkeypatch.setattr(pl, "_send_recv_pipeline", fake_srp)
+    callback_calls = []
+
+    def forward_step_fn(model, mb):
+        chunk = models.index(model)
+        current_stage = chunk * pp_size + ps.pp_rank
+        inp = torch.ones(shape) if current_stage == 0 else model._input_tensor
+        hidden = inp * model.weight.sum()
+        out = {"loss": hidden.sum()} if current_stage == 3 else {"hidden_states": hidden}
+        if current_stage == stage and mb == callback_mb:
+            if detached:
+                out = {key: value.detach() for key, value in out.items()}
+
+            def backward(loss):
+                callback_calls.append(mb)
+                loss.backward()
+
+            out["backward"] = backward
+        return out
+
+    schedule = pl._interleaved_1f1b_schedule if interleaved else pl._1f1b_schedule
+    try:
+        schedule(
+            forward_step_fn,
+            models if interleaved else models[0],
+            iter(range(4)),
+            4,
+            SimpleNamespace(),
+            ps,
+            shape,
+        )
+    except Exception as exc:
+        assert isinstance(exc, RuntimeError), "backward_callback_must_raise_named_runtime_error"
+        assert str(exc) == (
+            f"pipeline_unsupported_backward_callback: rank=7 stage={stage} "
+            f"microbatch={callback_mb}; output['backward'] is unsupported in PP training"
+        ), "backward_callback_must_identify_rank_stage_microbatch"
+    else:
+        pytest.fail("backward_callback_must_not_be_silently_discarded")
+    assert callback_calls == [], "rejected_backward_callback_must_not_run"
 
 
 @pytest.mark.parametrize("pp_rank", [1, 2])
@@ -104,8 +217,9 @@ def test_middle_stage_recv_shapes_match_each_microbatch(pp_rank):
     assert rf == fs and rb == fs, (rf, rb, fs)
 
 
-def test_last_stage_recv_shapes_match_each_microbatch():
-    rf, rb, fs = _run_schedule(4, 3, VARLEN)  # last: every fwd input, no bwd recv
+@pytest.mark.parametrize("terminal", ["loss", "no_loss", "detached"])
+def test_last_stage_recv_shapes_match_each_microbatch(terminal):
+    rf, rb, fs = _run_schedule(4, 3, VARLEN, terminal=terminal)  # last: every fwd input, no bwd recv
     assert rf == fs and rb == [], (rf, rb, fs)
 
 
