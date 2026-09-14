@@ -58,6 +58,48 @@ def compare(actual, expected):
     }
 
 
+def train_actual(runtime, handle, model, batch, rank):
+    saved = {'tested_trace': {}}
+    hooks = []
+    for name, child in model.named_modules():
+        if name and any(
+            name.endswith(part) for part in ('linear_attn', 'self_attn', 'ple', 'mlp')
+        ):
+
+            def observe(module, args, output, name=name):
+                from qwen38_cp_reference import capture
+
+                capture(saved['tested_trace'], rank, name, 'input', args[0])
+                capture(saved['tested_trace'], rank, name, 'output', output)
+
+            hooks.append(child.register_forward_hook(observe))
+    original_finalize = handle._extras['finalize_grads']
+
+    def finalize():
+        saved['local_gradients'] = gradients(model)
+        original_finalize()
+
+    handle._extras['finalize_grads'] = finalize
+
+    def objective(output, batch):
+        saved['outputs'] = {k: v.detach().cpu().clone() for k, v in output.items()}
+        return output['loss'], {}
+
+    runtime.zero_grad(handle)
+    try:
+        runtime.forward_backward(handle, [batch], objective, num_microbatches=1)
+    finally:
+        handle._extras['finalize_grads'] = original_finalize
+        for hook in hooks:
+            hook.remove()
+    actual_gradients = reduced_gradients(handle._model, model)
+    success, norm, _ = runtime.optimizer_step(handle)
+    saved.update(
+        gradients=actual_gradients, success=success, norm=norm, state=snapshot(model)
+    )
+    return saved
+
+
 @record
 def main():
     parser = argparse.ArgumentParser()
@@ -74,7 +116,8 @@ def main():
     model.load_state_dict(initial)
     handle._optimizer.reload_model_params()
     virtual = build_virtual(reference)
-    for step in range(1):
+    records = []
+    for step in range(3):
         for m in virtual:
             m.load_state_dict(reference.state_dict())
             for p in m.parameters():
@@ -99,39 +142,13 @@ def main():
         rh._extras['finalize_grads']()
         expected_gradients = reduced_gradients(rh._model, reference)
         expected_success, expected_norm, _ = rr.optimizer_step(rh)
-        saved = {'reference_trace': reference_trace, 'tested_trace': {}}
-        hooks = []
-        for name, child in model.named_modules():
-            if name and any(
-                name.endswith(part)
-                for part in ('linear_attn', 'self_attn', 'ple', 'mlp')
-            ):
-
-                def observe(module, args, output, name=name):
-                    from qwen38_cp_reference import capture
-
-                    capture(saved['tested_trace'], rank, name, 'input', args[0])
-                    capture(saved['tested_trace'], rank, name, 'output', output)
-
-                hooks.append(child.register_forward_hook(observe))
-        original_finalize = handle._extras['finalize_grads']
-
-        def finalize():
-            saved['local_gradients'] = gradients(model)
-            original_finalize()
-
-        handle._extras['finalize_grads'] = finalize
-
-        def objective(output, batch):
-            saved['outputs'] = {k: v.detach().cpu().clone() for k, v in output.items()}
-            return output['loss'], {}
-
-        runtime.zero_grad(handle)
-        runtime.forward_backward(handle, [batch], objective, num_microbatches=1)
-        actual_gradients = reduced_gradients(handle._model, model)
-        success, norm, _ = runtime.optimizer_step(handle)
-        for hook in hooks:
-            hook.remove()
+        saved = train_actual(runtime, handle, model, batch, rank)
+        saved['reference_trace'] = reference_trace
+        actual_gradients, success, norm = (
+            saved['gradients'],
+            saved['success'],
+            saved['norm'],
+        )
         saved.update(
             initial=initial,
             local_references=local_references,
@@ -174,6 +191,34 @@ def main():
         )
         for tag, passed in checks.items():
             assert passed, (tag, rank, step)
+        records.append(saved)
+        if step == 1:
+            runtime.save_checkpoint(
+                handle, str(args.output / 'checkpoint'), step=2, save_rng=False
+            )
+    restored = runtime.load_checkpoint(
+        handle, str(args.output / 'checkpoint'), load_rng=False
+    )
+    checkpoint_checks = {
+        'CP_MODEL_CHECKPOINT_STEP': restored == 2,
+        'CP_MODEL_CHECKPOINT_RESTORE': not compare(
+            snapshot(model), records[1]['state']
+        ),
+    }
+    continued = train_actual(runtime, handle, model, batch_for_step(2), rank)
+    for field in ('state', 'gradients', 'local_gradients', 'outputs'):
+        checkpoint_checks['CP_MODEL_CHECKPOINT_CONTINUATION_' + field.upper()] = (
+            not compare(continued[field], records[2][field])
+        )
+    checkpoint_checks['CP_MODEL_CHECKPOINT_NORM'] = (
+        continued['norm'] == records[2]['norm']
+    )
+    checkpoint_checks['CP_MODEL_CHECKPOINT_SUCCESS'] = continued['success']
+    continued['checks'] = checkpoint_checks
+    torch.save(continued, args.output / f'continued-rank{rank}.pt')
+    print('CP_MODEL_CHECKPOINT_CHECKS', rank, checkpoint_checks, flush=True)
+    for tag, passed in checkpoint_checks.items():
+        assert passed, (tag, rank)
     from megatron.core import parallel_state as mpu
 
     mpu.destroy_model_parallel()
