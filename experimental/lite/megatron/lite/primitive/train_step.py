@@ -82,7 +82,9 @@ def run_microbatch_loop(
         if forward_only and out.get("loss") is not None:
             contribution = out["loss"].detach() / num_microbatches
             validation_loss = (
-                contribution if validation_loss is None else validation_loss + contribution
+                contribution
+                if validation_loss is None
+                else validation_loss + contribution
             )
         last_out = out
     if last_out is not None and validation_loss is not None:

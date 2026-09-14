@@ -788,7 +788,9 @@ def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
     # Two and six predicted tokens with respective per-token losses one and three.
     # The independently weighted reference is (2 * 1 + 6 * 3) / 8 = 2.5,
     # not the mean of local means (2) or the last local mean (3).
-    batches = [PackedBatch(torch.ones(n), torch.ones(n), torch.tensor([n])) for n in (3, 7)]
+    batches = [
+        PackedBatch(torch.ones(n), torch.ones(n), torch.tensor([n])) for n in (3, 7)
+    ]
     if count == 1:
         batches = [PackedBatch(torch.ones(10), torch.ones(10), torch.tensor([3, 7]))]
     numerators = iter([20.0] if count == 1 else [2.0, 18.0])
@@ -820,7 +822,11 @@ def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
 
     def external(out, batch, ctx):
         # The VERL adapter multiplies a caller-normalized contribution by N.
-        loss = out['numerator'] * count / 8 if policy == 'external' else out['numerator'] * 0
+        loss = (
+            out['numerator'] * count / 8
+            if policy == 'external'
+            else out['numerator'] * 0
+        )
         return loss, {'tokens': batch.total_tokens}
 
     def schedule(forward_fn, chunks, data_iter, config, ps, **kwargs):
@@ -837,7 +843,9 @@ def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
 
     handle = ModelHandle(
         model=model,
-        parallel_state=types.SimpleNamespace(pp_size=pp_size, pp_group=None, pp_global_ranks=None),
+        parallel_state=types.SimpleNamespace(
+            pp_size=pp_size, pp_group=None, pp_global_ranks=None
+        ),
         _extras={
             'forward_step': forward,
             'prepare_microbatches': prepare,
@@ -865,14 +873,20 @@ def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
     # Post-return sentinel: aggregation was reached after all model calls.
     assert consumed == batches, 'FWD_ONLY_ALL_MICROBATCHES_EXECUTED'
     assert next(items) == ('tail', None), 'FWD_ONLY_NO_EXTRA_MICROBATCH_CONSUMED'
-    assert prepared == ([count] if policy == 'native' else []), 'FWD_ONLY_PREPARE_POLICY'
+    assert prepared == (
+        [count] if policy == 'native' else []
+    ), 'FWD_ONLY_PREPARE_POLICY'
     assert len(backward_calls) == (0 if forward_only else count), 'FWD_ONLY_NO_BACKWARD'
     expected = torch.tensor(0.0 if policy == 'inference' else 2.5)
     if forward_only:
-        assert torch.equal(result.model_output.loss, expected), 'FWD_ONLY_MICROBATCH_AGGREGATE'
+        assert torch.equal(
+            result.model_output.loss, expected
+        ), 'FWD_ONLY_MICROBATCH_AGGREGATE'
         assert model.weight.grad is None, 'FWD_ONLY_NO_PARAMETER_GRADIENT'
     else:
-        assert torch.equal(model.weight.grad.squeeze(), expected), 'TRAIN_MICROBATCH_GRADIENT'
+        assert torch.equal(
+            model.weight.grad.squeeze(), expected
+        ), 'TRAIN_MICROBATCH_GRADIENT'
     if policy != 'native':
         assert result.metrics == {
             'tokens': [b.total_tokens for b in batches]
