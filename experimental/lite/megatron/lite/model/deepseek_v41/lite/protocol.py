@@ -58,9 +58,19 @@ def build_model_config(source, **overrides):
 
 
 def build_model(model_cfg, *, impl_cfg):
+    p = impl_cfg.parallel
+    # An external vision schedule can publish a segmented backward callback
+    # even with text_only=True or a frozen vision mask. Reject before model
+    # allocation or process-group initialization; PP keeps a runtime backstop.
+    if p.pp > 1 and (
+        not impl_cfg.text_only or impl_cfg.external_vision_device is not None
+    ):
+        raise NotImplementedError(
+            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
+            'use PP=1 for multimodal training'
+        )
     from .model import DeepseekV41Model
 
-    p = impl_cfg.parallel
     unsupported = [key for key in ('tp', 'pp', 'vpp') if getattr(p, key) != 1]
     if p.etp not in (None, 1):
         unsupported.append('etp')

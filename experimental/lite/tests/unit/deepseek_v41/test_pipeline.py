@@ -118,6 +118,42 @@ def test_pipeline_build_rejects_unsupported_parallelism(moe, model_config, pp):
     assert 'supports PP only' not in str(error.value)
 
 
+@pytest.mark.parametrize('pp', [1, 2, 4])
+@pytest.mark.parametrize('vision', ['local', 'external', 'external_frozen'])
+def test_pipeline_text_only_build_contract(moe, model_config, pp, vision):
+    external = vision != 'local'
+    enabled = vision != 'external_frozen'
+    impl_cfg = protocol.ImplConfig(
+        parallel=protocol.ParallelConfig(pp=pp),
+        device='cpu',
+        dtype=torch.float32,
+        quantized=False,
+        token_map=list(range(256)),
+        # An external schedule overrides the text-only default even with a
+        # frozen vision mask: configuration must reject it before allocation.
+        text_only=external,
+        external_vision_device='cpu' if external else None,
+        vision_trainability=(
+            protocol.VisionTrainability(enabled, enabled, enabled, enabled)
+            if external
+            else None
+        ),
+    )
+    if pp == 1:
+        bundle = protocol.build_model(model_config, impl_cfg=impl_cfg)
+        assert (bundle.extras['vision_schedule'] is not None) == external
+        return
+    try:
+        protocol.build_model(model_config, impl_cfg=impl_cfg)
+    except NotImplementedError as error:
+        assert str(error) == (
+            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
+            'use PP=1 for multimodal training'
+        ), 'PP_MULTIMODAL_BUILD_CONTRACT'
+    else:
+        pytest.fail('PP_MULTIMODAL_BUILD_MUST_REJECT')
+
+
 @pytest.mark.parametrize(
     'settings, rejected',
     [
