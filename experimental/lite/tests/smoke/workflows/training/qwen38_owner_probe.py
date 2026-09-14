@@ -110,12 +110,15 @@ def install_mutation(model, mutation):
     if mutation == 'return_order':
         table(model).register_forward_hook(lambda m, args, output: output.flip(0))
     elif mutation == 'skip_contribution' and dist.get_rank() == 1:
+
         def drop(m, args, output):
             def skip(grad):
                 grad = grad.clone()
                 grad[0] = 0
                 return grad
+
             output.register_hook(skip)
+
         table(model).register_forward_hook(drop)
 
 
