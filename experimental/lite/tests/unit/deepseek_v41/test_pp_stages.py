@@ -215,7 +215,11 @@ def _pp_worker(rank, config, dtype, trainable, directory):
                 serial.forward_step(reference, batch)['logits'] for batch in batches
             ]
             runtime.forward_backward(
-                handle, iter(batches), num_microbatches=2, forward_only=True
+                handle,
+                iter(batches),
+                loss_fn=None,
+                num_microbatches=2,
+                forward_only=True,
             )
         if ps.pp_is_last:
             for actual, expected in zip(seen_logits, expected_logits, strict=True):
@@ -239,7 +243,9 @@ def _pp_worker(rank, config, dtype, trainable, directory):
             reference_forward,
             prepare_microbatches=serial.extras['prepare_microbatches'],
         )
-        runtime.forward_backward(handle, iter(batches), num_microbatches=2)
+        runtime.forward_backward(
+            handle, iter(batches), loss_fn=None, num_microbatches=2
+        )
         assert counts == {'forward': 2, 'backward': 2}, 'PP_NO_IMAGE_PARTICIPATION'
         if ps.pp_is_last:
             for actual, expected in zip(seen_loss, reference_losses, strict=True):
