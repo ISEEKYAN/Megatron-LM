@@ -228,7 +228,9 @@ class MoELayer(nn.Module):
         )
         self.preserve_3d_graph = bool(preserve_3d_graph)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self, x: torch.Tensor, *, token_mask=None, token_group=None, aux_loss_scale=1.0
+    ) -> torch.Tensor:
         input_shape = x.shape
         x_2d = x.reshape(-1, x.size(-1))
         shared_input = x_2d.view(input_shape) if self.preserve_3d_graph else x_2d
@@ -241,7 +243,15 @@ class MoELayer(nn.Module):
             side_stream.wait_stream(torch.cuda.current_stream())
             with torch.cuda.stream(side_stream):
                 shared_out = self.shared_expert(shared_input)
-        scores, indices = self.router(router_input)
+        if token_mask is None:
+            scores, indices = self.router(router_input)
+        else:
+            scores, indices = self.router(
+                router_input,
+                token_mask=token_mask,
+                token_group=token_group,
+                aux_loss_scale=aux_loss_scale,
+            )
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(
             x_2d, scores, indices
         )

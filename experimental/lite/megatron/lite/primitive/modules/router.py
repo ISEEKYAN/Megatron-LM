@@ -92,7 +92,9 @@ class TopKRouter(nn.Module):
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
 
-    def forward(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+    def forward(
+        self, x: torch.Tensor, *, token_mask=None, token_group=None, aux_loss_scale=1.0
+    ) -> tuple[torch.Tensor, torch.Tensor]:
         router_dtype = self.router_dtype or x.dtype
         logits = router_gating_linear(x, self.gate.weight, None, router_dtype)
         logits = logits.view(-1, self.num_experts)
@@ -144,11 +146,28 @@ class TopKRouter(nn.Module):
             routing_map, aux_scores = compute_routing_scores_for_aux_loss(
                 logits, self.topk, score_function="softmax", fused=self.moe_router_fusion
             )
-            tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
-            total_num_tokens = num_tokens
-            if self._aux_loss_group is not None:
-                dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+            if token_mask is not None:
+                if token_mask.shape != (num_tokens,) or token_mask.dtype != torch.bool:
+                    raise ValueError('ROUTER_REAL_TOKEN_MASK')
+                if self._aux_loss_group is not None:
+                    raise ValueError('ROUTER_CP_TP_AUX_GROUP_UNSUPPORTED')
+                counts = (routing_map & token_mask[:, None]).sum(0).to(torch.int64)
+                statistics = torch.cat((counts, token_mask.sum().reshape(1)))
+                if token_group is not None:
+                    dist.all_reduce(statistics, group=token_group)
+                tokens_per_expert, total_num_tokens = statistics[:-1], int(
+                    statistics[-1]
+                )
+                aux_scores = aux_scores * token_mask[:, None]
+                total_num_tokens = max(total_num_tokens, 1)
+            else:
+                tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+                total_num_tokens = num_tokens
+                if self._aux_loss_group is not None:
+                    dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
+                    total_num_tokens = num_tokens * dist.get_world_size(
+                        group=self._aux_loss_group
+                    )
             aux_loss = switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -158,6 +177,8 @@ class TopKRouter(nn.Module):
                 self.aux_loss_coeff,
                 fused=False,
             )
+            if aux_loss_scale != 1.0:
+                aux_loss = aux_loss * aux_loss_scale
             topk_scores = MoEAuxLossAutoScaler.apply(topk_scores, aux_loss)
 
         return topk_scores, topk_indices

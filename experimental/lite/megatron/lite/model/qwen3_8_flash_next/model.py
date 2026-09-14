@@ -114,9 +114,14 @@ class Qwen38Layer(nn.Module):
                 conv_kernel_size=c.ple_conv_kernel_size,
             )
 
-    def forward(self, hidden, input_ids, angles, cu_seqlens=None):
+    def forward(self, hidden, input_ids, angles, cu_seqlens=None, *, cp_context=None):
         if self.ple is not None:
-            hidden = hidden + self.ple(hidden, input_ids, cu_seqlens=cu_seqlens)
+            hidden = hidden + self.ple(
+                hidden,
+                input_ids,
+                cu_seqlens=cu_seqlens if cp_context is None else None,
+                cp_context=cp_context,
+            )
         branch, residual = self.attn_hyper_connection.mix(hidden)
         if self.linear_attn is not None:
             packed = (
@@ -130,17 +135,40 @@ class Qwen38Layer(nn.Module):
                 branch.transpose(0, 1), packed_seq_params=packed
             ).transpose(0, 1)
         else:
-            branch = self.self_attn(branch, angles, cu_seqlens=cu_seqlens)
+            branch = self.self_attn(
+                branch,
+                angles,
+                cu_seqlens=cu_seqlens if cp_context is None else None,
+                cp_context=cp_context,
+            )
         hidden = self.attn_hyper_connection.combine(branch, residual)
         branch, residual = self.mlp_hyper_connection.mix(hidden)
-        return self.mlp_hyper_connection.combine(self.mlp(branch), residual)
+        kwargs = {}
+        if cp_context is not None:
+            context = cp_context
+            kwargs = dict(
+                token_mask=(
+                    ~context.global_padding_mask[
+                        :, context.local_sequence_start : context.local_sequence_end
+                    ]
+                ).reshape(-1),
+                token_group=context.group,
+                # Native DDP averages both dense and expert gradients over DP×CP.
+                aux_loss_scale=context.size,
+            )
+        return self.mlp_hyper_connection.combine(self.mlp(branch, **kwargs), residual)
 
 
 class Qwen38Model(nn.Module):
     def __init__(self, config, ps, *, ngram_primes=None, fuse_wgrad_accumulation=False):
         super().__init__()
-        if any(getattr(ps, k) != 1 for k in ('etp_size', 'cp_size', 'pp_size')):
+        if any(getattr(ps, k) != 1 for k in ('etp_size', 'pp_size')):
             raise NotImplementedError('QWEN38_MODEL_PARALLEL_NOT_VALIDATED')
+        if ps.cp_size > 1:
+            if ps.tp_size != 1 or ps.ep_size != 1 or ps.dp_size != 1:
+                raise NotImplementedError('QWEN38_CP_COMBINATION_NOT_VALIDATED')
+            if ps.cp_group is None:
+                raise ValueError('QWEN38_CP_GROUP_REQUIRED')
         if ps.tp_size > 1 and ps.ep_size > 1:
             raise NotImplementedError('QWEN38_TP_EP_COMBINATION_NOT_VALIDATED')
         if config.tie_word_embeddings or not config.norm_topk_prob:
@@ -176,8 +204,29 @@ class Qwen38Model(nn.Module):
 
             parallelize_projections(self, ps)
 
-    def forward(self, input_ids, *, labels=None, cu_seqlens=None, position_ids=None):
+    def forward(
+        self,
+        input_ids,
+        *,
+        labels=None,
+        cu_seqlens=None,
+        position_ids=None,
+        cp_context=None,
+        loss_token_count=None
+    ):
         c = self.config
+        if self.ps.cp_size > 1:
+            if (
+                cp_context is None
+                or cp_context.size != self.ps.cp_size
+                or cp_context.rank != self.ps.cp_rank
+                or input_ids.shape[1] != cp_context.local_sequence_length
+                or cu_seqlens is None
+                or position_ids is None
+            ):
+                raise ValueError('QWEN38_CP_FORWARD_METADATA')
+            if labels is not None and loss_token_count is None:
+                raise ValueError('QWEN38_CP_LOSS_POPULATION')
         if position_ids is None:
             position_ids = torch.arange(
                 input_ids.shape[1], device=input_ids.device
@@ -198,7 +247,12 @@ class Qwen38Model(nn.Module):
         angles = torch.cat((half_angles, half_angles), -1).unsqueeze(-2)
         hidden = self.embed_tokens(input_ids).repeat(1, 1, c.hc_count)
         for layer in self.layers:
-            hidden = layer(hidden, input_ids, angles, cu_seqlens)
+            if cp_context is None:
+                hidden = layer(hidden, input_ids, angles, cu_seqlens)
+            else:
+                hidden = layer(
+                    hidden, input_ids, angles, cu_seqlens, cp_context=cp_context
+                )
         hidden, _ = self.hyper_connection_mixer.mix(hidden)
         logits = self.lm_head(hidden)
         output = {'logits': logits, 'hidden_states': hidden}
@@ -207,7 +261,9 @@ class Qwen38Model(nn.Module):
                 logits.float().flatten(0, 1), labels.flatten(), reduction='none'
             ).reshape_as(labels)
             valid = labels != -100
-            output.update(
-                loss=losses.sum() / valid.sum().clamp_min(1), log_probs=-losses
-            )
+            denominator = valid.sum() if loss_token_count is None else loss_token_count
+            loss = losses.sum() / denominator.clamp_min(1)
+            if cp_context is not None:
+                loss = loss * cp_context.size
+            output.update(loss=loss, log_probs=-losses)
         return output
