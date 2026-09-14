@@ -123,8 +123,6 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 matrix_partitions=partitions,
                 lr=lr * policy.get('multiplier', multiplier),
                 weight_decay=policy.get('decay', decay),
-                lr_mult=policy.get('multiplier', multiplier),
-                wd_mult=policy.get('decay', decay) / 0.1,
             )
         )
 
