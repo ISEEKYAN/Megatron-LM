@@ -103,11 +103,10 @@ def test_contiguous_override_and_legacy_default(rank):
         )
 
 
-@pytest.mark.parametrize('pp', [2, 4])
+@pytest.mark.parametrize('pp', [3, 4])
 def test_pipeline_build_rejects_unsupported_parallelism(moe, model_config, pp):
     with pytest.raises(
-        NotImplementedError,
-        match='^V4.1 model construction requires single-rank execution; distributed integration remains pending$',
+        NotImplementedError, match='^V4.1_UNSUPPORTED_PARALLELISM: pp;'
     ) as error:
         protocol.build_model(
             model_config,
@@ -116,3 +115,99 @@ def test_pipeline_build_rejects_unsupported_parallelism(moe, model_config, pp):
             ),
         )
     assert 'supports PP only' not in str(error.value)
+
+
+@pytest.mark.parametrize('pp', [1, 2, 4])
+@pytest.mark.parametrize('vision', ['local', 'external', 'external_frozen'])
+def test_pipeline_build_reports_current_support(moe, model_config, pp, vision):
+    external = vision != 'local'
+    enabled = vision != 'external_frozen'
+    impl_cfg = protocol.ImplConfig(
+        parallel=protocol.ParallelConfig(pp=pp),
+        device='cpu',
+        dtype=torch.float32,
+        quantized=False,
+        token_map=list(range(256)),
+        # An external schedule overrides the text-only default even with a
+        # frozen vision mask: configuration must reject it before allocation.
+        text_only=external,
+        external_vision_device='cpu' if external else None,
+        vision_trainability=(
+            protocol.VisionTrainability(enabled, enabled, enabled, enabled)
+            if external
+            else None
+        ),
+    )
+    if pp == 1:
+        bundle = protocol.build_model(model_config, impl_cfg=impl_cfg)
+        assert (bundle.extras['vision_schedule'] is not None) == external
+        return
+    try:
+        protocol.build_model(model_config, impl_cfg=impl_cfg)
+    except NotImplementedError as error:
+        if pp == 2:
+            assert str(error).startswith(
+                'V4.1_PP_TEXT_ONLY:'
+            ), 'PP_MULTIMODAL_BUILD_CONTRACT'
+            return
+        assert str(error) == (
+            'V4.1_UNSUPPORTED_PARALLELISM: pp; '
+            'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
+            'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
+        ), 'PP_UNSUPPORTED_MUST_PRECEDE_TEXT_ONLY_CONTRACT'
+    else:
+        pytest.fail('PP_MULTIMODAL_BUILD_MUST_REJECT')
+
+
+@pytest.mark.parametrize(
+    'settings, rejected',
+    [
+        ({}, None),
+        ({'ep': 2}, None),
+        ({'cp': 2}, None),
+        ({'tp': 2}, 'tp'),
+        ({'pp': 2}, None),
+        ({'pp': 4}, 'pp'),
+        ({'vpp': 2}, 'vpp'),
+        ({'etp': 2}, 'etp'),
+        ({'pp_layout': 'Et|L'}, 'pp_layout'),
+        ({'tp': 2, 'pp': 2, 'etp': 2}, 'tp, etp'),
+        ({'cp': 2, 'ep': 2}, 'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED'),
+    ],
+)
+def test_parallel_guard_message_consistency(
+    moe, model_config, monkeypatch, settings, rejected
+):
+    # Stop after the guard: accepted cases must reach parallel-state construction.
+    # Expected support and rejected axes above are independent of production metadata.
+    def reached_parallel_state():
+        raise RuntimeError('GUARD_ACCEPTED')
+
+    monkeypatch.setattr(protocol, 'ParallelState', reached_parallel_state)
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+    try:
+        protocol.build_model(
+            model_config,
+            impl_cfg=protocol.ImplConfig(
+                device='meta', parallel=protocol.ParallelConfig(**settings)
+            ),
+        )
+    except (NotImplementedError, RuntimeError) as error:
+        actual = str(error)
+    else:
+        actual = 'NO_GUARD_RESULT'
+    if rejected is None:
+        expected = 'GUARD_ACCEPTED'
+    elif rejected == 'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED':
+        expected = (
+            'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; '
+            'use CP-only or EP with CP=1'
+        )
+    else:
+        expected = (
+            f'V4.1_UNSUPPORTED_PARALLELISM: {rejected}; '
+            'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
+            'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
+        )
+    assert actual == expected, 'PARALLEL_GUARD_MESSAGE_CONSISTENCY'

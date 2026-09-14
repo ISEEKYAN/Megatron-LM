@@ -17,7 +17,6 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.distributed as dist
-
 from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
 from megatron.lite.primitive.parallel import pipeline as pl
 
@@ -53,9 +52,22 @@ def _run_schedule(pp_size, pp_rank, seq_lens, hidden=8):
     recorded_fwd, recorded_bwd = [], []
     fwd_q, bwd_q = list(fwd_shapes), list(fwd_shapes)  # both arrive in mb order
 
-    def fake_srp(send_fwd, send_bwd, recv_fwd, recv_bwd, ps_, tensor_shape,
-                 *, fwd_recv_buf=None, bwd_recv_buf=None, batch_p2p=True,
-                 clone_recv=False, dynamic_shape=False):
+    def fake_srp(
+        send_fwd,
+        send_bwd,
+        recv_fwd,
+        recv_bwd,
+        ps_,
+        tensor_shape,
+        *,
+        fwd_recv_buf=None,
+        bwd_recv_buf=None,
+        batch_p2p=True,
+        clone_recv=False,
+        dynamic_shape=False,
+        pipeline_dtype=None,
+    ):
+        assert pipeline_dtype == torch.bfloat16, "PP_DEFAULT_DTYPE_UNCHANGED"
         assert dynamic_shape, "1F1B schedule must use dynamic shape exchange"
         assert fwd_recv_buf is None and bwd_recv_buf is None, "dynamic recv must not pre-size"
         fwd_out = bwd_out = None

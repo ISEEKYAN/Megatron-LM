@@ -13,12 +13,20 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
+from megatron.lite.runtime.contracts.data import (
+    ForwardResult,
+    ModelOutputs,
+    PackedBatch,
+)
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    get_loss_context,
+    split_loss_context,
+    use_loss_context,
+)
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -318,7 +326,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
-        from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
+        from megatron.lite.model.registry import (
+            TRAIN_RUNTIME_MODULES,
+            resolve_runtime_model_name,
+        )
 
         try:
             runtime_key = resolve_runtime_model_name(rt_cfg.model_name, rt_cfg.impl)
@@ -497,7 +508,9 @@ class MegatronLiteRuntime(RuntimeBase):
         router_replay: Any = None,
     ) -> ForwardResult:
         from megatron.lite.primitive.train_step import run_microbatch_loop
-        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+        from megatron.lite.runtime.backends.mlite.router_replay import (
+            RouterReplayDriver,
+        )
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -520,7 +533,9 @@ class MegatronLiteRuntime(RuntimeBase):
             from types import SimpleNamespace
 
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+            from megatron.lite.primitive.parallel.pipeline import (
+                forward_backward_pipelining,
+            )
 
             try:
                 prepare = handle._extras.get("prepare_microbatches")
@@ -546,7 +561,12 @@ class MegatronLiteRuntime(RuntimeBase):
                     pipeline_forward_step,
                     pipeline_chunks,
                     data_iter,
-                    SimpleNamespace(num_microbatches=num_microbatches),
+                    SimpleNamespace(
+                        num_microbatches=num_microbatches,
+                        pipeline_dtype=handle._extras.get(
+                            "pipeline_dtype", torch.bfloat16
+                        ),
+                    ),
                     ps,
                     tensor_shape=tensor_shape,
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
@@ -695,7 +715,10 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+    from megatron.lite.primitive.protocols import (
+        default_expert_classifier,
+        default_placement_fn,
+    )
 
     proto = handle._extras.get("protocol")
     return (

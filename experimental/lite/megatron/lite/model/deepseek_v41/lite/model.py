@@ -6,6 +6,7 @@ The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
 from collections import namedtuple
+from contextlib import nullcontext
 from dataclasses import dataclass
 from fnmatch import fnmatchcase
 from functools import partial
@@ -16,6 +17,8 @@ from megatron.lite.primitive.modules.engram_lookup import (
     Engram,
     EngramTable,
     NgramHash,
+    RowLookup,
+    ShardedEngramTable,
     hash_multipliers,
     prime_buckets,
 )
@@ -36,14 +39,21 @@ from .vision import Aligner, ViT
 
 
 def packed_forward(
-    sequence_forward, hidden, pre_mix, cu_seqlens, *, input_ids=None, image_mask=None
+    sequence_forward,
+    hidden,
+    pre_mix,
+    cu_seqlens,
+    *,
+    input_ids=None,
+    image_mask=None,
+    cp_context=None,
 ):
     """Run a pure sequence callable over each logical sample, preserving its graph.
 
     The callable returns (hidden, next_pre_mix), creates a fresh AttentionState
     per invocation, and keeps bias/statistic publication outside forward. RNG is
     consumed in sequence order, exactly as for independent calls. This is a
-    correctness path, not fused packed attention or distributed CP transport.
+    correctness path; CP transport and document ownership belong to the primitive.
     """
     if hidden.ndim != 4 or hidden.shape[0] != 1 or pre_mix.shape != hidden.shape[:-1]:
         raise ValueError("Expected packed hidden [1,T,HC,D] and pre_mix [1,T,HC]")
@@ -51,20 +61,28 @@ def packed_forward(
         if tensor is not None and tensor.shape != hidden.shape[:2]:
             raise ValueError("Token inputs must match packed [1,T] dimensions")
     outputs, mixes = [], []
-    replay = PackedRouterReplay(hidden.shape[1])
-    for begin, end in packed_sequence_ranges(cu_seqlens, hidden.shape[1]):
+    replay = PackedRouterReplay(hidden.shape[1]) if cp_context is None else None
+    total = hidden.shape[1] if cp_context is None else cp_context.total_length
+    offset = 0
+    for begin, end in packed_sequence_ranges(cu_seqlens, total):
         kwargs = {}
+        if cp_context is not None:
+            document = cp_context.document(begin, end)
+            kwargs['cp_context'] = document
+            begin, end = offset, offset + document.local_length
+            offset = end
         if input_ids is not None:
             kwargs['input_ids'] = input_ids[:, begin:end]
         if image_mask is not None:
             kwargs['image_mask'] = image_mask[:, begin:end]
-        with replay.sequence(begin, end):
+        with replay.sequence(begin, end) if replay is not None else nullcontext():
             h, p = sequence_forward(
                 hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
             )
         outputs.append(h)
         mixes.append(p)
-    replay.finish()
+    if replay is not None:
+        replay.finish()
     return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
 
 
@@ -120,6 +138,7 @@ class DeepseekV41Model(nn.Module):
         token_map=None,
         quantized=True,
         trainable_engram=False,
+        shard_engram=False,
         gate_temperature=1.0,
         bias_rate=0.001,
         enable_dspark_execution=False,
@@ -130,6 +149,9 @@ class DeepseekV41Model(nn.Module):
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         self.ps = parallel_state or ParallelState()
+        self.engram_group = (
+            self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
+        )
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
@@ -150,6 +172,7 @@ class DeepseekV41Model(nn.Module):
         ):
             raise ValueError('Invalid local pipeline stage interval')
         self.local_layer_range = (start, end)
+        self._input_tensor = None
         self.tensor_bindings = {}
         self.archival_bindings = {}
         self.archival_store = None
@@ -231,10 +254,20 @@ class DeepseekV41Model(nn.Module):
                 if not start <= layer_id < end:
                     continue
                 rows, width = t.engram_num_embeddings[offset], t.engram_head_dim
-                table = EngramTable(
+                table_type, options = EngramTable, {}
+                if self.engram_group is not None:
+                    boundaries = [
+                        rows * i // self.ps.dp_cp_size
+                        for i in range(self.ps.dp_cp_size + 1)
+                    ]
+                    lookup = RowLookup(boundaries, self.engram_group)
+                    rows = boundaries[lookup.rank + 1] - boundaries[lookup.rank]
+                    table_type, options = ShardedEngramTable, {'lookup': lookup}
+                table = table_type(
                     torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
                     torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
                     trainable=trainable_engram,
+                    **options,
                 )
                 projection = Linear(
                     (t.engram_max_ngram_size - 1) * t.engram_n_heads * width,
@@ -445,6 +478,7 @@ class DeepseekV41Model(nn.Module):
         ced,
         image_mask=None,
         modality_loads=None,
+        cp_context=None,
     ):
         token_mask = None if image_mask is None else ~image_mask
         hashes = None
@@ -453,7 +487,15 @@ class DeepseekV41Model(nn.Module):
                 raise ValueError(
                     'Engram execution requires an explicit tokenizer token_map'
                 )
-            hashes = self.engram_hash(input_ids, token_mask)
+            hash_inputs = (
+                input_ids if cp_context is None else cp_context.gather(input_ids)
+            )
+            hash_mask = token_mask
+            if cp_context is not None and token_mask is not None:
+                hash_mask = cp_context.gather(token_mask)
+            hashes = self.engram_hash(hash_inputs, hash_mask)
+            if cp_context is not None:
+                hashes = cp_context.slice(hashes)
         for index in range(start, end):
             layer = self.layers[index]
             if layer.engram is not None:
@@ -464,6 +506,7 @@ class DeepseekV41Model(nn.Module):
                 hidden,
                 pre,
                 state,
+                attention_kwargs={'cp_context': cp_context},
                 ffn_kwargs={
                     'image_mask': image_mask,
                     'load_sink': (
@@ -476,18 +519,25 @@ class DeepseekV41Model(nn.Module):
         return hidden, pre, state, ced
 
     def _sequence(
-        self, hidden, pre, *, input_ids, image_mask=None, modality_loads=None
+        self,
+        hidden,
+        pre,
+        *,
+        input_ids,
+        image_mask=None,
+        modality_loads=None,
+        cp_context=None,
     ):
         return self._layers(
             hidden,
             pre,
             input_ids,
-            0,
-            len(self.layers),
+            *self.local_layer_range,
             AttentionState(),
             (None, None),
             image_mask,
             modality_loads,
+            cp_context,
         )[:2]
 
     @staticmethod
@@ -564,10 +614,79 @@ class DeepseekV41Model(nn.Module):
         hidden = self.norm(contract_hc(payload.h, payload.p))
         return F.linear(hidden.float(), self.head.weight.float())
 
-    def forward(self, input_ids, *, cu_seqlens=None, images=None, token_types=None):
-        if self.local_layer_range != (0, len(self.layers)):
-            raise RuntimeError('A local pipeline stage requires the range protocol')
-        self._validate_input_ids(input_ids)
+    def set_input_tensor(self, input_tensor):
+        """Receive the FP32 paired HC carrier through the shared PP interface."""
+        if self.local_layer_range[0] != 20:
+            raise RuntimeError(
+                'V4.1_PP_INPUT_STAGE: only the layer-20 stage accepts input'
+            )
+        if self._input_tensor is not None:
+            raise RuntimeError('V4.1_PP_INPUT_PENDING: previous input was not consumed')
+        self._input_tensor = input_tensor
+
+    def forward(
+        self,
+        input_ids,
+        *,
+        cu_seqlens=None,
+        images=None,
+        token_types=None,
+        cp_context=None,
+    ):
+        local_start, local_end = self.local_layer_range
+        if (local_start, local_end) not in ((0, 40), (0, 20), (20, 40)):
+            raise RuntimeError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol'
+            )
+        if self.ps.pp_size > 1 and (images is not None or token_types is not None):
+            raise NotImplementedError(
+                'V4.1_PP_TEXT_ONLY: use PP=1 for multimodal training'
+            )
+        if self.engram_group is not None:
+            # Each packed document visits both lookup collectives. Reject a
+            # mismatched schedule before any rank enters the first lookup.
+            count = 1 if cu_seqlens is None else cu_seqlens.numel() - 1
+            counts = torch.tensor([count, -count], device=input_ids.device)
+            torch.distributed.all_reduce(
+                counts, op=torch.distributed.ReduceOp.MAX, group=self.engram_group
+            )
+            if counts[0] != -counts[1]:
+                raise ValueError(
+                    'Sharded Engram requires equal packed document counts across ranks'
+                )
+        if cp_context is None:
+            self._validate_input_ids(input_ids)
+        elif (
+            input_ids.shape != (1, cp_context.local_length)
+            or input_ids.dtype != torch.int64
+        ):
+            raise ValueError('CP input must match the local contiguous interval')
+        if cp_context is not None and cu_seqlens is None:
+            raise ValueError('CP requires explicit packed document boundaries')
+        if self.ps.cp_size > 1 and cp_context is None:
+            raise ValueError(
+                'CP model requires protocol-owned contiguous input metadata'
+            )
+        if local_start == 20:
+            carrier, self._input_tensor = self._input_tensor, None
+            width = self.config.to_hf_dict()['text_config']['hidden_size']
+            if (
+                carrier is None
+                or carrier.dtype != torch.float32
+                or carrier.shape != (*input_ids.shape, self.hc_mult * (width + 1))
+            ):
+                raise ValueError(
+                    'V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix'
+                )
+            pair = carrier.reshape(*input_ids.shape, self.hc_mult, width + 1)
+            hidden = pair[..., :-1].to(self.pipeline_residual_dtype).contiguous()
+            pre = pair[..., -1].contiguous()
+            sequence = self._sequence
+            if cu_seqlens is not None:
+                sequence = partial(packed_forward, sequence, cu_seqlens=cu_seqlens)
+            hidden, pre = sequence(hidden, pre, input_ids=input_ids)
+            hidden = self.norm(contract_hc(hidden, pre))
+            return {'logits': F.linear(hidden.float(), self.head.weight.float())}
         embeddings = self.embed(input_ids)
         if hasattr(self, 'residual_dtype'):
             embeddings = embeddings.to(self.residual_dtype)
@@ -603,8 +722,18 @@ class DeepseekV41Model(nn.Module):
         loads = [[] for _ in self.layers]
         sequence = partial(self._sequence, modality_loads=loads)
         if cu_seqlens is not None:
-            sequence = partial(packed_forward, sequence, cu_seqlens=cu_seqlens)
+            sequence = partial(
+                packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
+            )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
+        if local_end == 20:
+            # CED at layer 19 is this same pair. Layer 20 regenerates KV/index state.
+            # FP32 transport preserves both native pre_mix and its backward gradient.
+            return {
+                'hidden_states': torch.cat(
+                    (hidden.float(), pre.unsqueeze(-1)), dim=-1
+                ).flatten(2)
+            }
         hidden = self.norm(contract_hc(hidden, pre))
         # Freeze membership before backward: recompute may revisit a sink, but
         # its statistics must not be submitted as another training microbatch.

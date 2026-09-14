@@ -16,6 +16,7 @@ from megatron.lite.primitive.ckpt.hf_weights import (
     _resolve_export_dtype,
     stream_export_to_shards,
 )
+from megatron.lite.primitive.modules.engram_lookup import ShardedEngramTable
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 from safetensors import SafetensorError, safe_open
@@ -252,6 +253,16 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
     if len(names) != len(set(names)):
         raise ValueError('duplicate checkpoint keys')
     available = {**model.tensor_bindings, **model.archival_bindings}
+    local_names = set(available)
+    if model.ps.ep_size > 1:
+        experts = model.config.to_hf_dict()['text_config']['n_routed_experts']
+        for name, binding in list(available.items()):
+            if '.ffn.experts.' in name:
+                prefix, tail = name.split('.ffn.experts.')
+                suffix = tail.split('.', 1)[1]
+                for index in range(experts):
+                    key = f'{prefix}.ffn.experts.{index}.{suffix}'
+                    available.setdefault(key, replace(binding, release_key=key))
     expected = set(available)
     # The C reduced fixture intentionally excludes the complete inactive MTP tree.
     if allow_missing_mtp and not any(name.startswith('mtp.') for name in names):
@@ -259,7 +270,8 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
     # Plain numerical exports have no quantization scale siblings.
     for name, header in headers.items():
         if (
-            name in model.tensor_bindings
+            name in available
+            and available[name].role != 'archival'
             and name.endswith('.weight')
             and _header_dtype(header['dtype']) in ('F32', 'BF16', 'F16')
         ):
@@ -278,8 +290,8 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
         if header is not None and binding.role != 'archival':
             dtype = _header_dtype(header['dtype'])
             if binding.role == 'scale':
-                weight = model.tensor_bindings[name[:-5] + 'weight']
-                rows, columns = weight.tensor.shape
+                weight = available[name[:-5] + 'weight']
+                rows, columns = _logical_shape(weight)
                 shape = (
                     (rows, (columns + 31) // 32)
                     if weight.encoding == 'I8' or weight.role == 'engram_table'
@@ -288,7 +300,7 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
                 if dtype != 'F8_E8M0':
                     raise ValueError(f'scale dtype mismatch: {name}')
             else:
-                shape = tuple(binding.tensor.shape)
+                shape = _logical_shape(binding)
                 if dtype == 'I8':
                     if binding.encoding != 'I8' or len(shape) != 2 or shape[-1] % 32:
                         raise ValueError(f'invalid packed weight: {name}')
@@ -302,7 +314,8 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
                 raise ValueError(
                     f'checkpoint shape mismatch: {name}: {header["shape"]} != {shape}'
                 )
-        result[name] = replace(binding, header=header, store=store)
+        if name in local_names:
+            result[name] = replace(binding, header=header, store=store)
     model.validate_parameter_bindings()
     model.checkpoint_bindings = result
     return result
@@ -310,6 +323,36 @@ def bind_checkpoint(model, records, *, store=None, allow_missing_mtp=False):
 
 def _header_dtype(dtype):
     return {str(value): key for key, value in _TORCH_DTYPES.items()}.get(dtype, dtype)
+
+
+def _logical_shape(binding):
+    shape = tuple(binding.tensor.shape)
+    if isinstance(binding.owner, ShardedEngramTable):
+        shape = (binding.owner.lookup.boundaries[-1], *shape[1:])
+    return shape
+
+
+def _export_rows(table, tensor):
+    if not isinstance(table, ShardedEngramTable):
+        return tensor
+    lookup = table.lookup
+    sizes = [b - a for a, b in zip(lookup.boundaries, lookup.boundaries[1:])]
+    # NCCL transports encoded FP8 storage as bytes. Padding is transport only.
+    value = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    padded = value.new_zeros(max(sizes), value.shape[1])
+    padded[: value.shape[0]].copy_(value)
+    chunks = [torch.empty_like(padded) for _ in sizes]
+    torch.distributed.all_gather(chunks, padded, group=lookup.group)
+    return torch.cat([chunk[:size] for chunk, size in zip(chunks, sizes)]).view(
+        tensor.dtype
+    )
+
+
+def _local_rows(table, tensor):
+    if not isinstance(table, ShardedEngramTable):
+        return tensor
+    lookup = table.lookup
+    return tensor[lookup.boundaries[lookup.rank] : lookup.boundaries[lookup.rank + 1]]
 
 
 def export_model(model):
@@ -329,12 +372,41 @@ def export_model(model):
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
             continue
+        if model.ps.ep_size > 1 and binding.role == 'expert':
+            continue
         tensor = binding.tensor.detach()
         if tensor.is_meta:
             raise ValueError(f'Cannot export unmaterialized parameter: {name}')
-        yield name, tensor
+        yield name, _export_rows(binding.owner, tensor)
         if isinstance(binding.owner, EngramTable) and binding.owner.master is None:
-            yield name[:-6] + 'scale', binding.owner.scale.detach()
+            yield name[:-6] + 'scale', _export_rows(
+                binding.owner, binding.owner.scale.detach()
+            )
+    if model.ps.ep_size > 1:
+        import torch.distributed as dist
+
+        local = {
+            name: b.tensor.detach()
+            for name, b in model.tensor_bindings.items()
+            if b.role == 'expert'
+        }
+        metadata = [
+            (name, tuple(t.shape), t.dtype, dist.get_rank())
+            for name, t in local.items()
+        ]
+        gathered = [None] * model.ps.ep_size
+        dist.all_gather_object(gathered, metadata, group=model.ps.ep_group)
+        device = next(model.parameters()).device
+        for name, shape, dtype, source in sorted(
+            record for records in gathered for record in records
+        ):
+            value = (
+                local[name].contiguous()
+                if name in local
+                else torch.empty(shape, dtype=dtype, device=device)
+            )
+            dist.broadcast(value, src=source, group=model.ps.ep_group)
+            yield name, value
 
 
 def export_checkpoint(
@@ -406,6 +478,11 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
         )
     if archive.entries.keys() - model.archival_bindings.keys():
         raise ValueError('Unknown archival keys')
+    if model.ps.dp_cp_size > 1 and torch.distributed.get_rank() != 0:
+        # All ranks participate in row/expert export; only rank zero publishes.
+        for _ in export_model(model):
+            pass
+        return
     path.parent.mkdir(parents=True, exist_ok=True)
     staging = Path(tempfile.mkdtemp(prefix='.v41-export-', dir=path.parent))
     try:
@@ -462,7 +539,7 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
 
 
 @torch.no_grad()
-def load_model(model, path):
+def load_model(model, path, *, allow_missing_mtp=False):
     """Bind every header before loading any live tensor, retaining archive bytes."""
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
@@ -485,7 +562,9 @@ def load_model(model, path):
         dict(name=name, dtype=e.dtype, shape=e.shape)
         for name, e in store.entries.items()
     ]
-    bindings = bind_checkpoint(model, records, store=store)
+    bindings = bind_checkpoint(
+        model, records, store=store, allow_missing_mtp=allow_missing_mtp
+    )
     for name, binding in bindings.items():
         if binding.role in ('archival', 'scale'):
             continue
@@ -500,20 +579,22 @@ def load_model(model, path):
                 (name, table.weight),
                 (name[:-6] + 'scale', table.scale),
             ):
-                destination.copy_(_tensor(store, key).to(destination.device))
+                destination.copy_(
+                    _local_rows(table, _tensor(store, key)).to(destination.device)
+                )
         else:
             value = (
                 load_weight(store, name, output_dtype=target.dtype)
                 if name.endswith('.weight')
                 else _tensor(store, name)
             )
-            target.copy_(value.to(target.device))
+            target.copy_(_local_rows(table, value).to(target.device))
             if table is not None:
                 table.refresh_storage()
     model.archival_store = CheckpointTensorStore(
         {
             name: e
             for name, e in store.entries.items()
-            if bindings[name].role == 'archival'
+            if name in model.archival_bindings
         }
     )

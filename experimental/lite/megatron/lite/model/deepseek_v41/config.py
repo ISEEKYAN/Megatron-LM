@@ -1,8 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Nested release configuration and explicit single-rank attention bindings."""
 
-from copy import deepcopy
 import json
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -80,6 +80,11 @@ class DeepseekV41Config:
     @classmethod
     def _from_hf_dict(cls, hf):
         return cls(hf)
+
+    @property
+    def hidden_size(self):
+        """Residual width consumed by the shared runtime pipeline shape contract."""
+        return self._release['text_config']['hidden_size']
 
     def to_hf_dict(self):
         return deepcopy(self._release)

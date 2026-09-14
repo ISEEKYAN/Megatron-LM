@@ -2,6 +2,7 @@
 """Text protocol with replicated data parallel training and explicit optimizer policy."""
 
 import math
+from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
@@ -39,12 +40,26 @@ class ImplConfig:
     quantized: bool = True
     token_map: list[int] | None = None
     trainable_engram: bool = False
+    shard_engram: bool = False
     text_only: bool = True
     vision_trainability: VisionTrainability | None = None
     external_vision_device: str | None = None
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
+    pipeline_split_layer: int = 20
+
+    def __post_init__(self):
+        # Runtime/VERL configurations arrive as serialized mappings.
+        if isinstance(self.optimizer_config, Mapping):
+            object.__setattr__(
+                self, "optimizer_config", OptimizerConfig(**self.optimizer_config)
+            )
+        if isinstance(self.dtype, str):
+            dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
+            if self.dtype not in dtypes:
+                raise ValueError("V4.1 residual dtype must be BF16 or FP32")
+            object.__setattr__(self, "dtype", dtypes[self.dtype])
 
 
 def build_model_config(source, **overrides):
@@ -58,19 +73,67 @@ def build_model_config(source, **overrides):
 
 
 def build_model(model_cfg, *, impl_cfg):
-    from .model import DeepseekV41Model
-
     p = impl_cfg.parallel
-    if (
-        any(getattr(p, key) != 1 for key in ('tp', 'pp', 'cp', 'vpp'))
-        or p.etp not in (None, 1)
-        or p.pp_layout is not None
+    unsupported = [key for key in ('tp', 'vpp') if getattr(p, key) != 1]
+    if p.pp not in (1, 2):
+        unsupported.append('pp')
+    if p.etp not in (None, 1):
+        unsupported.append('etp')
+    if p.pp_layout is not None:
+        unsupported.append('pp_layout')
+    if unsupported:
+        raise NotImplementedError(
+            f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
+            'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
+            'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
+        )
+    # An external schedule can publish a backward
+    # callback even with text_only=True or a frozen vision mask.
+    if p.pp > 1 and (
+        not impl_cfg.text_only or impl_cfg.external_vision_device is not None
     ):
         raise NotImplementedError(
-            'V4.1 model construction requires single-rank execution; distributed integration remains pending'
+            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
+            'use PP=1 for multimodal training'
+        )
+    if p.pp > 1:
+        if impl_cfg.pipeline_split_layer != 20:
+            raise NotImplementedError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; '
+                'other cuts require transporting CSA2 owner state'
+            )
+        if p.ep != 1 or p.cp != 1:
+            raise NotImplementedError(
+                'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
+            )
+        if impl_cfg.optimizer is not None:
+            raise NotImplementedError(
+                'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model '
+                'forward/backward; distributed optimizer training is not validated'
+            )
+        if (
+            not torch.distributed.is_initialized()
+            or torch.distributed.get_world_size() != 2
+        ):
+            raise ValueError(
+                'V4.1_PP_WORLD: PP2 requires an initialized two-rank world'
+            )
+    from .model import DeepseekV41Model
+
+    if p.cp != 1 and p.ep != 1:
+        raise NotImplementedError(
+            'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; '
+            'use CP-only or EP with CP=1'
         )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError("EP size must be a positive integer")
+    if type(p.cp) is not int or p.cp < 1:
+        raise ValueError('CP size must be a positive integer')
+    if p.cp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() != p.cp
+    ):
+        raise ValueError('CP requires an initialized CP-only world')
     if p.ep > 1 and (
         not torch.distributed.is_initialized()
         or torch.distributed.get_world_size() < p.ep
@@ -93,17 +156,30 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
+    layer_range = None
+    if p.pp > 1:
+        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+
+        cut = impl_cfg.pipeline_split_layer
+        count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+        layout = build_pipeline_chunk_layout(
+            count, replace(ps, pp_layout=f'Et*{cut}|t*{count - cut}L')
+        )
+        layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
     with torch.device(impl_cfg.device):
         model = DeepseekV41Model(
             model_cfg,
             parallel_state=ps,
+            layer_range=layer_range,
             token_map=impl_cfg.token_map,
             quantized=impl_cfg.quantized,
             trainable_engram=impl_cfg.trainable_engram,
+            shard_engram=impl_cfg.shard_engram,
             gate_temperature=impl_cfg.gate_temperature,
             bias_rate=impl_cfg.bias_rate,
             enable_dspark_execution=impl_cfg.enable_dspark_execution,
         )
+    model.pipeline_residual_dtype = impl_cfg.dtype
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
     from .attention import Linear
@@ -140,14 +216,17 @@ def build_model(model_cfg, *, impl_cfg):
                 parameter.main_grad = None
         model.residual_dtype = impl_cfg.dtype
         optimizer = V41Optimizer(
-            model, impl_cfg.optimizer_config, dp_group=ps.dp_group, ps=ps
+            model,
+            impl_cfg.optimizer_config,
+            dp_group=ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group,
+            ps=ps,
         )
     if impl_cfg.external_vision_device is not None:
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
         model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
     execution_model = model
-    if ps.dp_size > 1 and optimizing:
+    if (ps.dp_size > 1 or ps.cp_size > 1) and optimizing:
         if impl_cfg.external_vision_device is not None:
             raise NotImplementedError(
                 'DP external vision requires staged gradient synchronization'
@@ -156,16 +235,41 @@ def build_model(model_cfg, *, impl_cfg):
 
         # DDP synchronizes parameter initialization. Encoded Engram buffers need
         # byte collectives because NCCL does not accept their FP8 storage dtype.
+        gradient_group = ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group
+        sharded = (
+            {
+                id(tensor)
+                for block in model.layers
+                if block.engram is not None
+                for tensor in block.engram.embed.buffers()
+            }
+            if model.engram_group is not None
+            else set()
+        )
+        sharded.update(
+            id(block.engram.embed.master)
+            for block in model.layers
+            if model.engram_group is not None
+            and block.engram is not None
+            and block.engram.embed.master is not None
+        )
+        model._ddp_params_and_buffers_to_ignore = [
+            name
+            for name, tensor in (*model.named_parameters(), *model.named_buffers())
+            if id(tensor) in sharded
+        ]
         with torch.no_grad():
             for buffer in model.buffers():
+                if id(buffer) in sharded:
+                    continue
                 value = buffer.contiguous().reshape(-1).view(torch.uint8)
-                torch.distributed.broadcast(value, src=0, group=ps.dp_group)
+                torch.distributed.broadcast(value, src=0, group=gradient_group)
                 buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
         if ps.ep_size > 1:
             expert_ids = {
                 id(b.tensor) for b in model.parameter_bindings() if b.role == "expert"
             }
-            model._ddp_params_and_buffers_to_ignore = [
+            model._ddp_params_and_buffers_to_ignore += [
                 name
                 for name, parameter in model.named_parameters()
                 if id(parameter) in expert_ids
@@ -179,7 +283,7 @@ def build_model(model_cfg, *, impl_cfg):
                     )
         execution_model = DistributedDataParallel(
             model,
-            process_group=ps.dp_group,
+            process_group=gradient_group,
             broadcast_buffers=False,
             find_unused_parameters=True,
         )
@@ -188,13 +292,16 @@ def build_model(model_cfg, *, impl_cfg):
         ps,
         optimizer=optimizer,
         finalize_grads=(
-            optimizer.finalize_expert_grads if optimizing and ps.ep_size > 1 else None
+            optimizer.finalize_grads
+            if optimizing and (ps.ep_size > 1 or model.engram_group is not None)
+            else None
         ),
         forward_step=partial(
             _forward_step, optimizer=optimizer, execution_model=execution_model
         ),
         extras={
             'model_cfg': model_cfg,
+            **({'pipeline_dtype': torch.float32} if p.pp > 1 else {}),
             'vision_schedule': model.vision_schedule,
             'prepare_microbatches': partial(prepare_microbatches, dp_group=ps.dp_group),
             'optimizer_backend': 'none' if optimizer is None else 'v41',
@@ -302,7 +409,10 @@ def _forward_step(model, batch, *, optimizer=None, execution_model=None):
 
 
 def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
-    _validate_text_batch(batch, multimodal=True)
+    if model.ps.pp_size > 1:
+        _validate_pipeline_batch(batch)
+    else:
+        _validate_text_batch(batch, multimodal=True)
     _validate_replay(model, batch)
     precision = (
         torch.autocast(device_type=batch.input_ids.device.type, enabled=False)
@@ -310,15 +420,36 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
         else nullcontext()
     )
     modality = dict(batch.extras)
+    cp_context = None
+    ids = batch.input_ids[None]
+    if model.ps.cp_size > 1:
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+        if (
+            modality
+            or batch.routed_experts is not None
+            or batch.r3_replay_mask is not None
+        ):
+            raise NotImplementedError(
+                'CP text training does not yet accept modality or replay inputs'
+            )
+        cp_context = ContiguousCPSequence(
+            batch.total_tokens, model.ps.cp_rank, model.ps.cp_size, model.ps.cp_group
+        )
+        ids = cp_context.slice(ids)
     if 'token_types' in modality:
         if modality['token_types'].shape != batch.input_ids.shape:
             raise ValueError('Packed token types must match the input IDs')
         modality['token_types'] = modality['token_types'][None]
     with precision:
         output = (model if execution_model is None else execution_model)(
-            batch.input_ids[None], cu_seqlens=batch.cu_seqlens, **modality
+            ids, cu_seqlens=batch.cu_seqlens, cp_context=cp_context, **modality
         )
-    result = _text_output(output['logits'][0], batch)
+    result = (
+        {'hidden_states': output['hidden_states']}
+        if 'hidden_states' in output
+        else _text_output(output['logits'][0], batch, cp_context=cp_context)
+    )
     if optimizer is not None and model.training and torch.is_grad_enabled():
         optimizer.accumulate_modality_loads(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
@@ -381,7 +512,24 @@ def _pipeline_ranges(model, batch, start, end, states):
     return outputs, result
 
 
-def _text_output(logits, batch):
+def _cp_targets(batch, cp_context):
+    mask = (
+        torch.ones_like(batch.labels, dtype=torch.float32)
+        if batch.loss_mask is None
+        else batch.loss_mask
+    )
+    labels, mask = (
+        roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
+        for value in (batch.labels, mask)
+    )
+    return (
+        cp_context.slice(labels, seq_dim=0),
+        cp_context.slice(mask, seq_dim=0),
+        mask.sum().clamp_min(1),
+    )
+
+
+def _text_output(logits, batch, *, cp_context=None):
     from megatron.lite.runtime.contracts.loss import get_loss_context
 
     context = get_loss_context()
@@ -401,17 +549,23 @@ def _text_output(logits, batch):
         )
         if mask.shape != labels.shape:
             raise ValueError('Loss mask must match packed input shape')
-        labels, mask = (
-            roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
-            for value in (labels, mask)
-        )
+        if cp_context is None:
+            labels, mask = (
+                roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
+                for value in (labels, mask)
+            )
+            denominator = mask.sum().clamp_min(1)
+        else:
+            labels, mask, denominator = _cp_targets(batch, cp_context)
         token_loss = F.cross_entropy(logits, labels, reduction='none')
-        denominator = mask.sum().clamp_min(1)
         if context is not None and context.normalization_denominator is not None:
             denominator = context.normalization_denominator
             if not math.isfinite(denominator) or denominator <= 0:
                 raise ValueError('Loss denominator must be finite and positive')
         result['loss'] = (token_loss * mask).sum() / denominator
+        if cp_context is not None:
+            # DDP averages the disjoint CP token contributions.
+            result['loss'] = result['loss'] * cp_context.size
         if context is not None:
             result['loss'] = result['loss'] * context.loss_scale
         if context is None or context.return_log_probs:
@@ -428,6 +582,13 @@ def unpack_forward_output(model, batch, output):
             key: unpack_forward_output(model, batch, value)
             for key, value in output.items()
         }
+    if model.ps.cp_size > 1 and isinstance(output, torch.Tensor) and output.ndim > 0:
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+        cp_context = ContiguousCPSequence(
+            batch.total_tokens, model.ps.cp_rank, model.ps.cp_size, model.ps.cp_group
+        )
+        output = cp_context.gather(output, seq_dim=0)
     if (
         isinstance(output, torch.Tensor)
         and output.ndim > 0

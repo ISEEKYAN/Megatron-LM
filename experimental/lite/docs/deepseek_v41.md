@@ -51,9 +51,30 @@ yet supported with DP.
 The two-GPU regression preserves all 40 layers with reduced dimensions in the
 floating diagnostic mode. It checks two optimizer steps, unequal token counts,
 replica equality, and comparison with a single-process global batch. This does
-not establish full-size or native quantized training support. `build_model` still
-rejects PP > 1 (and TP/CP/VPP/ETP); local pipeline range helpers are not a supported
-PP runtime.
+not establish full-size or native quantized training support. TP/VPP/ETP remain unsupported. Text-only PP2 model forward/backward is
+available separately, with the limits described below.
+
+
+## Contiguous context parallel text training
+Use `ParallelConfig(cp=2)` in an initialized two-rank world, keeping TP, EP,
+PP and VPP at one. The protocol receives the complete packed batch, shifts
+labels and loss weights within each document, then assigns one contiguous
+interval per rank. Uneven lengths pad transport only. Each rank visits every
+document, including empty intersections, and hashes complete document history
+before selecting its Engram rows. CSA2 queries and selections are local; window
+KV, compressor groups and shared KV remain document-global.
+
+Communication uses the shared differentiable CP gather and DDP gradient
+averaging. This correctness path materializes full-document KV; it does not
+provide fused sparse attention's memory or throughput characteristics. CP
+modality/replay inputs and CP combined with other parallel dimensions are
+rejected. In particular, CP>1 with EP>1 raises
+`CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED`. TP/VPP/ETP, PP sizes other than 1 or 2, and custom pipeline
+layouts raise `V4.1_UNSUPPORTED_PARALLELISM`, listing the rejected settings.
+Floating tests retain the 40-layer assembly, all three CSA2 modes,
+frozen indexers, and nonzero frozen/trainable Engram tables. The strict reference
+preserves local operator shapes and the gather backward reduction order;
+parameter contributions are checked before DDP averaging as well as after it.
 
 
 ## Expert parallel text training
@@ -133,9 +154,10 @@ Known limitations retained for this release:
   `1 / num_microbatches`, assuming CP=1. It does not apply the CP group-size
   multiplier. CP text-path checks do not establish correctness of nonzero
   auxiliary losses under CP>1; that combination remains unvalidated.
-- **HF-RESYNC:** direct deployment resync calls can pass unsupported keywords to
-  the fixed V4.1 protocol signature and raise `TypeError`. Native HF checkpoint
-  save is separate and preserves masters; deployment resync is not supported.
+- **HF-RESYNC:** the reviewed fixed protocol signature rejected deployment
+  keywords with `TypeError`. The integrated native-export wrapper now forwards
+  them to named option validation (`ValueError`); deployment resync remains
+  unsupported. Native HF checkpoint save is separate and preserves masters.
 - **PP replay and optimizer:** PP>1 record mode raises `NotImplementedError`;
   the PP2 assembly rejects distributed optimizer configuration.
 - **Replay evidence:** zero changed routes produces a warning. Record mode has
@@ -146,3 +168,47 @@ Known limitations retained for this release:
   incomplete (there is no model-compose leaf). Existing workflow checks are not
   end-to-end acceptance; cross-model R3 tests use `_TinyChunk` and do not prove
   execution through every full model assembly.
+
+## Text-only PP2 model forward/backward
+
+In an initialized two-rank world, use:
+
+```python
+ImplConfig(
+    parallel=ParallelConfig(pp=2),
+    pipeline_split_layer=20,
+    text_only=True,
+    optimizer=None,
+    # Set device, dtype, token_map and quantized mode as usual.
+)
+```
+
+The model uses Megatron-core's pipeline layout API. Stage 0 owns text layers
+0–19, the embeddings, both Engram tables (layers 1 and 14), and the inactive
+vision encoder/aligner. Stage 1 owns layers 20–39 and the final norm/head.
+`pipeline_split_layer` is explicit, but values other than 20 (including 15) raise
+`V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED`: those cuts need additional CSA2 owner state.
+At layer 20, CSA2 recreates its KV/index state, and the saved CED pair is exactly
+the layer-19 hidden/pre-mix pair.
+
+The pair travels as one three-dimensional FP32 tensor through the model's
+`set_input_tensor` interface. FP32 preserves native pre-mix values and gradients
+even when residual activations are BF16. The bundle publishes `pipeline_dtype`,
+and the runtime passes it to the shared pipeline schedule. Other models keep the
+existing BF16 communication default. This follows NVIDIA/Megatron-LM
+`dev@68447eeaae0b8b5300dc5e3ae8d91d8a0753fae6`, fetched
+2026-09-14T04:11:46Z, where P2P receive buffers use `config.pipeline_dtype`.
+
+Only text-only PP2 at 20/20 is covered, using the floating diagnostic mode.
+PP with EP/CP, PP optimizer training, and distributed HF checkpoint assembly are
+not validated. Multimodal PP remains rejected by `V4.1_PP_TEXT_ONLY`; this does
+not add pipeline support for staged backward callbacks. Both stages contain
+text layers, so neither is an encoder-only stage. The upstream no-image backward
+and encoder-only CP scaling cases are reference context, not multimodal PP
+validation evidence.
+
+The dedicated two-GPU test runs the real runtime and shared P2P schedule with
+variable-length packed microbatches, nonuniform loss weights, and frozen/trainable
+resident Engram tables. It compares logits, token-normalized losses and local
+parameter gradients with the complete model at zero tolerance. This establishes
+model forward/backward behavior, not full-size or end-to-end training support.
