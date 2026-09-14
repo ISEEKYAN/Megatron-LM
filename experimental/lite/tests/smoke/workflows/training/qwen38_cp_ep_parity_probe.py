@@ -162,7 +162,26 @@ def mutation_record(mutation, rank, checks):
 
 
 def train_actual(runtime, handle, model, batch, rank):
-    saved = {'tested_trace': {}}
+    saved = {'tested_trace': {}, 'halo_trace': []}
+    from megatron.lite.model.qwen3_8_flash_next import cp
+    from qwen38_cp_reference import capture
+
+    original_halo = cp.qwen3_8_flash_next_cp_left_halo
+
+    def observe_halo(tensor, *args, **kwargs):
+        output = original_halo(tensor, *args, **kwargs)
+        trace = {}
+        capture(trace, rank, 'halo', 'input', tensor)
+        capture(trace, rank, 'halo', 'output', output)
+        saved['halo_trace'].append(trace)
+        return output
+
+    cp.qwen3_8_flash_next_cp_left_halo = observe_halo
+    saved['conv_before'] = {
+        n: p.detach().cpu().clone()
+        for n, p in model.named_parameters()
+        if n.endswith('ple.conv1d.weight')
+    }
     hooks = []
     for name, child in model.named_modules():
         if name and any(
@@ -210,6 +229,7 @@ def train_actual(runtime, handle, model, batch, rank):
             runtime.forward_backward(handle, [batch], objective, num_microbatches=1)
     finally:
         dist.all_to_all_single = original_exchange
+        cp.qwen3_8_flash_next_cp_left_halo = original_halo
         handle._extras['finalize_grads'] = original_finalize
         for hook in hooks:
             hook.remove()
@@ -372,6 +392,28 @@ def main():
             and not compare(saved['state'], saved['reference_state']),
             'CP_MODEL_ORDERED_NORM': norm == expected_norm,
         }
+        halo = saved['halo_trace'][0][str(rank)]['halo']
+        activity = dict(
+            rank=rank,
+            step=step,
+            halo_grad_nonzero=int(halo['output_grad'].count_nonzero()),
+            conv_before_nonzero={
+                n: int(v.count_nonzero()) for n, v in saved['conv_before'].items()
+            },
+            conv_grad_nonzero={
+                n: int(saved['local_gradients'][n].count_nonzero())
+                for n in saved['conv_before']
+            },
+        )
+        saved['halo_activity'] = activity
+        print('CP_EP_HALO_ACTIVITY', json.dumps(activity), flush=True)
+        if args.mutation is None:
+            active = all(activity['conv_grad_nonzero'].values()) and (
+                rank == 0 or step == 0 or activity['halo_grad_nonzero'] > 0
+            )
+            flags = [None, None]
+            dist.all_gather_object(flags, active)
+            checks['CP_EP_HALO_TRAINING_ACTIVE'] = all(flags)
         saved['checks'] = checks
         args.output.mkdir(parents=True, exist_ok=True)
         torch.save(saved, args.output / f'step{step}-rank{rank}.pt')

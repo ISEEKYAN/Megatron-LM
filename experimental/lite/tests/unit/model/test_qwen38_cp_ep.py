@@ -37,11 +37,11 @@ def test_cp_ep_contract_accepts_only_verified_overlap():
         ):
             validate_cp_ep_contract(state(rank), ple_owner_sharding=True)
             with pytest.raises(
-                NotImplementedError, match='QWEN38_CP_COMBINATION_NOT_VALIDATED'
+                NotImplementedError, match='^QWEN38_CP_COMBINATION_NOT_VALIDATED$'
             ):
                 validate_cp_ep_contract(state(rank), ple_owner_sharding=False)
             groups['ep'] = [1, 0]
-            with pytest.raises(ValueError, match='QWEN38_CP_EP_OWNER_GROUPS'):
+            with pytest.raises(ValueError, match='^QWEN38_CP_EP_OWNER_GROUPS$'):
                 validate_cp_ep_contract(state(rank), ple_owner_sharding=True)
 
 
@@ -61,7 +61,7 @@ def test_cp_ep_unverified_combinations_stay_closed(field, value):
     ps = state()
     setattr(ps, field, value)
     with pytest.raises(
-        NotImplementedError, match='QWEN38_CP_COMBINATION_NOT_VALIDATED'
+        NotImplementedError, match='^QWEN38_CP_COMBINATION_NOT_VALIDATED$'
     ):
         validate_cp_ep_contract(ps, ple_owner_sharding=True)
 
@@ -156,6 +156,6 @@ def test_model_wires_cp_ep_with_owner_flag(transformer_engine_import_stub, monke
         )
         assert built == [(2, 2, True), (2, 2, True)], 'CP_EP_MODEL_OWNER_WIRING'
         with pytest.raises(
-            NotImplementedError, match='QWEN38_CP_COMBINATION_NOT_VALIDATED'
+            NotImplementedError, match='^QWEN38_CP_COMBINATION_NOT_VALIDATED$'
         ):
             module.Qwen38Model(build_model_config(tiny_training_config()), state())
