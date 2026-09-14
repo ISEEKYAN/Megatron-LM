@@ -273,23 +273,7 @@ def test_v41_online_export_engine_kwargs(
     )
 
 
-@pytest.mark.parametrize('resync_format', [None, 'mxfp4'])
-@pytest.mark.parametrize('resync_config', [{}, {'expert_dtype': 'fp4'}])
-@pytest.mark.parametrize(
-    'capability', [False, True, None], ids=['v41', 'supported', 'legacy']
-)
-def test_v41_engine_online_export_resync_contract(
-    tmp_path,
-    transformer_engine_import_stub,
-    monkeypatch,
-    resync_format,
-    resync_config,
-    capability,
-):
-    transformer_engine_import_stub()
-    from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
-
+def _online_export_method():
     # Execute the production engine method without importing optional VERL.
     source = LITE_ROOT / 'examples/verl/verl_mlite/engine/mlite_engine.py'
     cls = next(
@@ -307,6 +291,57 @@ def test_v41_engine_online_export_resync_contract(
         compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'),
         namespace,
     )
+    return namespace['get_per_tensor_param']
+
+
+@pytest.mark.parametrize('extras', [{}, {'protocol': None}], ids=['absent', 'none'])
+def test_online_export_requires_protocol_for_resync(extras):
+    export_calls = []
+
+    def checked_export(*args, **kwargs):
+        # Sentinel after the missing-protocol guard, at the runtime call boundary.
+        export_calls.append(dict(kwargs))
+        assert False, 'ONLINE_EXPORT_MISSING_PROTOCOL_BOUNDARY'
+
+    engine = SimpleNamespace(
+        _require_initialized=lambda: None,
+        is_param_offload_enabled=False,
+        _initial_sync_cache_cleared=True,
+        _resolve_model_name=lambda: 'deepseek_v41',
+        handle=SimpleNamespace(_extras=extras),
+        runtime=SimpleNamespace(export_weights=checked_export),
+        engine_config=SimpleNamespace(
+            resync_format='mxfp4',
+            resync_config={'expert_dtype': 'fp4'},
+            export_dtype='bfloat16',
+            qat={},
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match='^online weight export with resync_format requires a model protocol$',
+    ):
+        _online_export_method()(engine)
+    assert export_calls == [], 'ONLINE_EXPORT_MISSING_PROTOCOL_FAILS_BEFORE_DISPATCH'
+
+
+@pytest.mark.parametrize('resync_format', [None, 'mxfp4'])
+@pytest.mark.parametrize('resync_config', [{}, {'expert_dtype': 'fp4'}])
+@pytest.mark.parametrize(
+    'capability', [False, True, None], ids=['v41', 'supported', 'legacy']
+)
+def test_v41_engine_online_export_resync_contract(
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+    resync_format,
+    resync_config,
+    capability,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
     model, values, archive = _v41_export_model(tmp_path)
     export_calls = []
     export_weights = protocol.export_hf_weights
@@ -353,7 +388,7 @@ def test_v41_engine_online_export_resync_contract(
             qat={},
         ),
     )
-    weights, metadata = namespace['get_per_tensor_param'](engine)
+    weights, metadata = _online_export_method()(engine)
     tensors = dict(weights)  # Consume the lazy generator through checkpoint export.
     assert len(export_calls) == 1, 'ONLINE_EXPORT_RUNTIME_BOUNDARY_EXECUTED'
     assert metadata is None, 'ONLINE_EXPORT_METADATA'

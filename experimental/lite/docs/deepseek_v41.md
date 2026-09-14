@@ -131,6 +131,10 @@ Both engine paths use the protocol's `HF_SAVE_SUPPORTS_RESYNC=False` capability
 to omit deployment conversion options and emit native HF weights. This does
 not implement quantized rollout conversion; consumers must accept native weights.
 Direct unsupported export keywords still raise `TypeError` naming the keyword.
+When `resync_format` is configured, online export requires a protocol object;
+a missing object raises `RuntimeError` before runtime export dispatch. Existing
+protocols without the capability attribute retain the compatibility default
+(`True`) and receive deployment options.
 
 ## Validation loss and release caveats
 

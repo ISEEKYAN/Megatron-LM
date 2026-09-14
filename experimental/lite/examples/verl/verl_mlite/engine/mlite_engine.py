@@ -389,12 +389,16 @@ class MegatronLiteEngine(BaseEngine):
             buffer_max_size_bytes=2 * 1024**3,
             cpu=False,
         )
-        if self.engine_config.resync_format is not None and getattr(
-            self.handle._extras.get("protocol"), "HF_SAVE_SUPPORTS_RESYNC", True
-        ):
-            export_kwargs["target"] = self.engine_config.resync_format
-            if self.engine_config.resync_config:
-                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+        if self.engine_config.resync_format is not None:
+            proto = self.handle._extras.get("protocol")
+            if proto is None:
+                raise RuntimeError(
+                    "online weight export with resync_format requires a model protocol"
+                )
+            if getattr(proto, "HF_SAVE_SUPPORTS_RESYNC", True):
+                export_kwargs["target"] = self.engine_config.resync_format
+                if self.engine_config.resync_config:
+                    export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
         elif self._resolve_model_name() == "qwen3_5":
             # Qwen3.5 selects its vLLM checkpoint layout through target=.
             # Qwen3-MoE's HF exporter has no target parameter, so forwarding
