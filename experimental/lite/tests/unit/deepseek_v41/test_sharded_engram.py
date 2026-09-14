@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import pytest
 import torch
+import torch.distributed as dist
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
@@ -101,6 +102,58 @@ def test_model_allocates_only_owned_engram_rows(
             assert table.master.dtype == torch.float32
 
 
+def _gather_reference_rows(value, counts, group):
+    width = max(counts)
+    padded = value.new_zeros((width, *value.shape[1:]))
+    padded[: value.shape[0]].copy_(value)
+    wire = padded.view(torch.uint8) if value.element_size() == 1 else padded
+    output = [torch.empty_like(wire) for _ in counts]
+    dist.all_gather(output, wire, group=group)
+    return torch.cat(
+        [part.view(value.dtype)[:count] for part, count in zip(output, counts)]
+    )
+
+
+class _ReferenceRows(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, master, ids, boundaries, group):
+        counts = [None] * dist.get_world_size(group)
+        dist.all_gather_object(counts, ids.numel(), group=group)
+        all_ids = _gather_reference_rows(ids.flatten(), counts, group)
+        rank = dist.get_rank(group)
+        begin, end = boundaries[rank : rank + 2]
+        owned = (all_ids >= begin) & (all_ids < end)
+        ctx.save_for_backward(master, all_ids[owned] - begin, owned)
+        ctx.counts, ctx.group = counts, group
+        rows = [b - a for a, b in zip(boundaries, boundaries[1:])]
+        return _gather_reference_rows(master, rows, group)[ids]
+
+    @staticmethod
+    def backward(ctx, gradient):
+        master, ids, owned = ctx.saved_tensors
+        incoming = _gather_reference_rows(
+            gradient.reshape(-1, master.shape[1]), ctx.counts, ctx.group
+        )[owned]
+        # Match the physical index-backward shape and rank/query order while
+        # obtaining requests by all-gather, independently of all-to-all routing.
+        with torch.enable_grad():
+            local = master.detach().requires_grad_()
+            result = torch.autograd.grad(local[ids], local, incoming)[0]
+        return result, None, None, None
+
+
+def _reference_lookup(table, ids):
+    lookup = table.lookup
+    rows = [b - a for a, b in zip(lookup.boundaries, lookup.boundaries[1:])]
+    values = _gather_reference_rows(table.weight, rows, lookup.group)
+    scales = _gather_reference_rows(table.scale, rows, lookup.group)
+    return (
+        values.view(torch.uint8)[ids].view(values.dtype),
+        scales.view(torch.uint8)[ids].view(scales.dtype),
+        _ReferenceRows.apply(table.master, ids, lookup.boundaries, lookup.group),
+    )
+
+
 def _train_shards(rank, config, trainable, world, ep, cp, directory):
     from dataclasses import replace
     from datetime import timedelta
@@ -133,17 +186,37 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             optimizer="muon",
             optimizer_config=OptimizerConfig(1e-4, 5, "quintic"),
         )
-        reference = protocol.build_model(config, impl_cfg=impl)
+        reference = protocol.build_model(
+            config, impl_cfg=replace(impl, shard_engram=trainable)
+        )
         actual = protocol.build_model(config, impl_cfg=replace(impl, shard_engram=True))
         full, local = reference.chunks[0], actual.chunks[0]
+        if trainable:
+            from types import MethodType
+
+            def forbidden(*args, **kwargs):
+                raise AssertionError('Independent reference must not call RowLookup')
+
+            # Keep physical row/index-backward/Sinkhorn and DDP bucket shapes
+            # equal. The oracle gathers the logical table and all requests;
+            # production exchanges only owner requests through all-to-all.
+            for index in full.engram_layer_ids:
+                table = full.layers[index].engram.embed
+                table.lookup_fp8 = MethodType(_reference_lookup, table)
+                table.lookup.fetch = forbidden
         # Row-dependent nonzero values ensure lookup ownership and backward
         # affect the result; zero-filled tables would hide routing defects.
         for layer_id in full.engram_layer_ids:
             table = full.layers[layer_id].engram.embed
             value = (
-                torch.arange(table.weight.numel(), device=rank).reshape(
-                    table.weight.shape
-                )
+                (
+                    torch.arange(table.weight.numel(), device=rank)
+                    + (
+                        table.lookup.boundaries[rank] * table.weight.shape[1]
+                        if trainable
+                        else 0
+                    )
+                ).reshape(table.weight.shape)
                 % 7
                 - 3
             ).float() / 8
@@ -154,7 +227,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
         state = full.state_dict()
         for name, value in local.state_dict().items():
             source = state[name]
-            if ".engram.embed." in name:
+            if ".engram.embed." in name and not trainable:
                 layer_id = int(name.split(".")[1])
                 lookup = local.layers[layer_id].engram.embed.lookup
                 source = source[lookup.boundaries[rank] : lookup.boundaries[rank + 1]]
@@ -191,16 +264,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 assert (p.grad is None) == (q.grad is None), name
                 if p.grad is not None:
                     grad = q.grad
-                    if ".engram.embed.master" in name:
-                        lookup = local.layers[
-                            int(name.split(".")[1])
-                        ].engram.embed.lookup
-                        grad = grad[
-                            lookup.boundaries[rank] : lookup.boundaries[rank + 1]
-                        ]
-                    torch.testing.assert_close(
-                        p.grad, grad, atol=0, rtol=0, msg=name
-                    )
+                    torch.testing.assert_close(p.grad, grad, atol=0, rtol=0, msg=name)
             ref_step, actual_step = reference.optimizer.step(), actual.optimizer.step()
             assert ref_step[0] and actual_step[0]
             assert actual_step[1] == ref_step[1]
@@ -210,9 +274,6 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             )
             for name, p in local.named_parameters():
                 q = expected[name]
-                if ".engram.embed.master" in name:
-                    lookup = local.layers[int(name.split(".")[1])].engram.embed.lookup
-                    q = q[lookup.boundaries[rank] : lookup.boundaries[rank + 1]]
                 torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
         print(
             f"SHARDED_ENGRAM_OK rank={rank} world={world} ep={ep} cp={cp} trainable={trainable}",
@@ -249,7 +310,34 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 atol=0,
                 rtol=0,
             )
-        print(f"SHARDED_CHECKPOINT_EXPORT_OK rank={rank}", flush=True)
+        import json
+
+        from megatron.lite.model.deepseek_v41.lite.checkpoint import load_model
+        from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
+
+        destination = Path(directory) / 'active_export'
+        stream_export_to_shards(
+            ((name, value.cpu()) for name, value in export_model(local)),
+            str(destination),
+        )
+        if rank == 0:
+            (destination / 'config.json').write_text(
+                json.dumps(local.config.to_hf_dict())
+            )
+        dist.barrier()
+        with torch.no_grad():
+            for parameter in local.parameters():
+                parameter.zero_()
+        load_model(local, destination, allow_missing_mtp=True)
+        for name, value in local.state_dict().items():
+            torch.testing.assert_close(
+                value.reshape(-1).view(torch.uint8),
+                snapshot[name].reshape(-1).view(torch.uint8),
+                atol=0,
+                rtol=0,
+                msg=name,
+            )
+        print(f"SHARDED_CHECKPOINT_EXPORT_RELOAD_OK rank={rank}", flush=True)
     finally:
         dist.destroy_process_group()
 
@@ -257,7 +345,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
 @pytest.mark.gpus(4)
 @pytest.mark.parametrize("world,ep,cp", [(2, 1, 1), (4, 2, 1), (2, 1, 2)])
 @pytest.mark.parametrize("trainable", [False, True])
-def test_sharded_model_matches_replicated_training(
+def test_sharded_model_matches_layout_matched_reference(
     model_config, tmp_path, trainable, world, ep, cp
 ):
     assert torch.cuda.device_count() >= world
