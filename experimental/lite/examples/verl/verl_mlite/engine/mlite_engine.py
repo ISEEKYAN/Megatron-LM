@@ -390,9 +390,15 @@ class MegatronLiteEngine(BaseEngine):
             cpu=False,
         )
         if self.engine_config.resync_format is not None:
-            export_kwargs["target"] = self.engine_config.resync_format
-            if self.engine_config.resync_config:
-                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+            proto = self.handle._extras.get("protocol")
+            if proto is None:
+                raise RuntimeError(
+                    "online weight export with resync_format requires a model protocol"
+                )
+            if getattr(proto, "HF_SAVE_SUPPORTS_RESYNC", True):
+                export_kwargs["target"] = self.engine_config.resync_format
+                if self.engine_config.resync_config:
+                    export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
         elif self._resolve_model_name() == "qwen3_5":
             # Qwen3.5 selects its vLLM checkpoint layout through target=.
             # Qwen3-MoE's HF exporter has no target parameter, so forwarding
@@ -519,7 +525,9 @@ class MegatronLiteEngine(BaseEngine):
             dist.barrier()
 
         save_kwargs: dict[str, Any] = {}
-        if self.engine_config.resync_format is not None:
+        if self.engine_config.resync_format is not None and getattr(
+            proto, "HF_SAVE_SUPPORTS_RESYNC", True
+        ):
             save_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 save_kwargs["resync_config"] = dict(self.engine_config.resync_config)
@@ -743,6 +751,12 @@ class MegatronLiteEngine(BaseEngine):
         if batch_num_tokens <= 0:
             raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
         loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
+        if (
+            loss_function is None
+            and self.handle._extras.get("prepare_microbatches") is not None
+        ):
+            # The model prepares the global next-token denominator itself.
+            loss_scale = 1.0
         for micro_idx, micro_batch in enumerate(micro_batches):
             tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
             micro_batch = micro_batch.to(get_device_id())
