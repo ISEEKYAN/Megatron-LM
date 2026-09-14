@@ -751,7 +751,7 @@ def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
                 forward_only=mode == 'forward_only',
             )
         assert prepared_calls == (
-            [2] if mode == 'sft' else []
+            [2] if mode != 'external_loss' else []
         ), 'PP must prepare SFT exactly once like non-PP'
         assert all(
             a is b for a, b in zip(consumed, batches)
@@ -761,7 +761,7 @@ def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
             ctx.source_batch == 'original' and ctx.loss_scale == 0.5 for ctx in contexts
         )
         assert [ctx.normalization_denominator for ctx in contexts] == (
-            [3.5] * 2 if mode == 'sft' else [None] * 2
+            [3.5] * 2 if mode != 'external_loss' else [None] * 2
         )
         outputs.append(result.model_output.loss)
         gradients.append(model.weight.grad)
@@ -772,6 +772,111 @@ def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
         torch.testing.assert_close(
             gradients[0], gradients[1], rtol=0, atol=0, msg='PP versus non-PP gradient'
         )
+
+
+@pytest.mark.parametrize('pp_size', [1, 2])
+@pytest.mark.parametrize('count', [1, 2])
+@pytest.mark.parametrize('policy', ['native', 'external', 'inference'])
+@pytest.mark.parametrize('forward_only', [False, True])
+def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.parallel import pipeline
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    model = nn.Linear(1, 1, bias=False)
+    nn.init.ones_(model.weight)
+    # Two and six predicted tokens with respective per-token losses one and three.
+    # The independently weighted reference is (2 * 1 + 6 * 3) / 8 = 2.5,
+    # not the mean of local means (2) or the last local mean (3).
+    batches = [PackedBatch(torch.ones(n), torch.ones(n), torch.tensor([n])) for n in (3, 7)]
+    if count == 1:
+        batches = [PackedBatch(torch.ones(10), torch.ones(10), torch.tensor([3, 7]))]
+    numerators = iter([20.0] if count == 1 else [2.0, 18.0])
+    consumed, prepared, backward_calls = [], [], []
+
+    def prepare(data_iter, size):
+        prepared.append(size)
+        return protocol.prepare_microbatches(data_iter, size)
+
+    def forward(module, batch):
+        consumed.append(batch)
+        ctx = get_loss_context()
+        # This probe executes after the prepare guard, in the actual model call.
+        if policy == 'native':
+            assert (
+                ctx.normalization_denominator == 8 / count
+            ), 'FWD_ONLY_PREPARED_TOKEN_DENOMINATOR'
+        value = module.weight.sum() * next(numerators)
+
+        def backward(loss):
+            backward_calls.append(True)
+            loss.backward()
+
+        return {
+            'loss': value / (ctx.normalization_denominator or 1),
+            'numerator': value,
+            'backward': backward,
+        }
+
+    def external(out, batch, ctx):
+        # The VERL adapter multiplies a caller-normalized contribution by N.
+        loss = out['numerator'] * count / 8 if policy == 'external' else out['numerator'] * 0
+        return loss, {'tokens': batch.total_tokens}
+
+    def schedule(forward_fn, chunks, data_iter, config, ps, **kwargs):
+        outputs = []
+        for _ in range(config.num_microbatches):
+            item = next(data_iter)
+            out = forward_fn(chunks[0], item)
+            if kwargs['loss_fn'] is not None:
+                out['loss'], out['metrics'] = kwargs['loss_fn'](out, item)
+            if not kwargs['forward_only']:
+                out['backward'](out['loss'] / config.num_microbatches)
+            outputs.append(out)
+        return outputs
+
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=pp_size, pp_group=None, pp_global_ranks=None),
+        _extras={
+            'forward_step': forward,
+            'prepare_microbatches': prepare,
+            'model_cfg': types.SimpleNamespace(hidden_size=1),
+        },
+    )
+    original_tensor = torch.tensor
+
+    def cpu_tensor(*args, **kwargs):
+        if kwargs.get('device') == 'cuda':
+            kwargs['device'] = 'cpu'
+        return original_tensor(*args, **kwargs)
+
+    items = iter([(b, LossContext(source_batch=b)) for b in batches] + [('tail', None)])
+    with torch.set_grad_enabled(not forward_only), patch.object(
+        pipeline, 'forward_backward_pipelining', schedule
+    ), patch.object(torch, 'tensor', cpu_tensor):
+        result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+            handle,
+            items,
+            None if policy == 'native' else external,
+            num_microbatches=count,
+            forward_only=forward_only,
+        )
+    # Post-return sentinel: aggregation was reached after all model calls.
+    assert consumed == batches, 'FWD_ONLY_ALL_MICROBATCHES_EXECUTED'
+    assert next(items) == ('tail', None), 'FWD_ONLY_NO_EXTRA_MICROBATCH_CONSUMED'
+    assert prepared == ([count] if policy == 'native' else []), 'FWD_ONLY_PREPARE_POLICY'
+    assert len(backward_calls) == (0 if forward_only else count), 'FWD_ONLY_NO_BACKWARD'
+    expected = torch.tensor(0.0 if policy == 'inference' else 2.5)
+    if forward_only:
+        assert torch.equal(result.model_output.loss, expected), 'FWD_ONLY_MICROBATCH_AGGREGATE'
+        assert model.weight.grad is None, 'FWD_ONLY_NO_PARAMETER_GRADIENT'
+    else:
+        assert torch.equal(model.weight.grad.squeeze(), expected), 'TRAIN_MICROBATCH_GRADIENT'
+    if policy != 'native':
+        assert result.metrics == {
+            'tokens': [b.total_tokens for b in batches]
+        }, 'FWD_ONLY_METRICS_PRESERVED'
 
 
 @pytest.mark.parametrize('live', [False, True])

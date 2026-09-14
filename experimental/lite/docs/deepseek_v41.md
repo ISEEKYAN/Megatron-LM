@@ -108,3 +108,41 @@ HF checkpoint saves retain trainable masters and archival bytes even when the
 engine has a rollout resync format configured. The engine uses the protocol's
 HF-save capability to keep deployment conversion options out of this native
 checkpoint path. Direct unsupported export options still fail explicitly.
+
+## Validation loss and release caveats
+
+Forward-only runtime loss is `sum(microbatch_loss / num_microbatches)`, matching
+training's backward scaling, for both PP and non-PP dispatch. Native SFT runs
+`prepare_microbatches` in validation as well as training: it only prepares the
+shared next-token denominator and does not require gradients. With unequal token
+counts this yields the token-weighted objective, rather than a mean of local
+means. External loss callbacks retain ownership of normalization and bypass this
+hook. The VERL adapter multiplies caller-normalized loss contributions by the
+microbatch count, so runtime averaging recovers their sum. Its inference callback
+returns zero loss and collects per-microbatch outputs separately; token outputs
+are not combined through the runtime scalar loss.
+
+Returning only the last validation microbatch loss was inherited from main.
+Excluding forward-only execution from the preparation hook was introduced with
+this integration. Both behaviors are corrected together without changing the
+training gradient scale or external callback metrics.
+
+Known limitations retained for this release:
+
+- **CP-AUX-SCALE:** the generic train-step auxiliary-loss hook still supplies
+  `1 / num_microbatches`, assuming CP=1. It does not apply the CP group-size
+  multiplier. CP text-path checks do not establish correctness of nonzero
+  auxiliary losses under CP>1; that combination remains unvalidated.
+- **HF-RESYNC:** direct deployment resync calls can pass unsupported keywords to
+  the fixed V4.1 protocol signature and raise `TypeError`. Native HF checkpoint
+  save is separate and preserves masters; deployment resync is not supported.
+- **PP replay and optimizer:** PP>1 record mode raises `NotImplementedError`;
+  the PP2 assembly rejects distributed optimizer configuration.
+- **Replay evidence:** zero changed routes produces a warning. Record mode has
+  no replay-equivalent execution probes, and the runtime unit seam does not
+  establish an end-to-end R3 integration assertion. Replay with no observed
+  routes is rejected by `R3_REPLAY_VOID`.
+- **Workflow coverage:** skill routing and model-composition guidance remain
+  incomplete (there is no model-compose leaf). Existing workflow checks are not
+  end-to-end acceptance; cross-model R3 tests use `_TinyChunk` and do not prove
+  execution through every full model assembly.

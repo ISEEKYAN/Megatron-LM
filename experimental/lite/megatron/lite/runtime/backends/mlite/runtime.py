@@ -525,7 +525,7 @@ class MegatronLiteRuntime(RuntimeBase):
             try:
                 prepare = handle._extras.get("prepare_microbatches")
                 # Match the non-PP SFT policy before shape inspection and scheduling.
-                if prepare is not None and loss_fn is None and not forward_only:
+                if prepare is not None and loss_fn is None:
                     data_iter = iter(prepare(data_iter, num_microbatches))
                 first_item = next(data_iter)
                 first_batch, _loss_context = split_loss_context(first_item)
@@ -557,6 +557,16 @@ class MegatronLiteRuntime(RuntimeBase):
                 if replay_driver is not None:
                     replay_driver.end()
             out = _last_loss_output(outputs)
+            if forward_only and out.get("loss") is not None:
+                # Match non-PP validation and the training loss/N contract.
+                out = dict(
+                    out,
+                    loss=sum(
+                        item["loss"].detach() / num_microbatches
+                        for item in outputs
+                        if item.get("loss") is not None
+                    ),
+                )
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
                 loss_float = float(loss_obj.detach().item())
