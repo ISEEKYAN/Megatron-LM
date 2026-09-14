@@ -44,11 +44,7 @@ def test_model_allocates_only_owned_engram_rows(
     ps = ParallelState(dp_cp_group=group, dp_cp_size=3, dp_cp_rank=rank)
     with torch.device("meta"):
         model = DeepseekV41Model(
-            model_config,
-            parallel_state=ps,
-            shard_engram=True,
-            trainable_engram=trainable,
-            quantized=False,
+            model_config, parallel_state=ps, trainable_engram=trainable, quantized=False
         )
     for index, total in zip(model.engram_layer_ids, [152, 220]):
         table = model.layers[index].engram.embed
@@ -62,6 +58,41 @@ def test_model_allocates_only_owned_engram_rows(
         if trainable:
             assert table.master.shape == table.weight.shape
             assert table.master.dtype == torch.float32
+
+
+def test_protocol_defaults_to_owner_sharding():
+    from megatron.lite.model.deepseek_v41.lite.protocol import ImplConfig
+
+    assert ImplConfig().shard_engram
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+def test_official_engram_storage_is_local(moe, model_config, monkeypatch, trainable):
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    config = model_config.to_hf_dict()
+    totals = [384006168, 384016682]
+    config['text_config'].update(engram_num_embeddings=totals, engram_head_dim=256)
+    group, owners, rank = object(), 8, 7
+    monkeypatch.setattr(dist, 'get_world_size', lambda g: owners)
+    monkeypatch.setattr(dist, 'get_rank', lambda g: rank)
+    ps = ParallelState(dp_cp_group=group, dp_cp_size=owners, dp_cp_rank=rank)
+    with torch.device('meta'):
+        model = DeepseekV41Model(
+            DeepseekV41Config(config),
+            parallel_state=ps,
+            trainable_engram=trainable,
+            quantized=False,
+        )
+    for layer, total in zip(model.engram_layer_ids, totals):
+        table = model.layers[layer].engram.embed
+        rows = total - total * rank // owners
+        assert table.weight.shape == (rows, 256)
+        assert table.scale.shape == (rows, 8)
+        assert (table.master is not None) == trainable
+        if trainable:
+            assert table.master.shape == (rows, 256)
 
 
 def _gather_reference_rows(value, counts, group):
@@ -199,11 +230,12 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 3 + step, 11 + step + (0 if cp > 1 else rank), device=rank
             )
             batch = PackedBatch(ids, ids, torch.tensor([len(ids)], device=rank))
-            logits = []
+            logits, losses = [], []
             for bundle in (reference, actual):
                 bundle.optimizer.zero_grad()
                 result = bundle.forward_step(bundle.chunks[0], batch)
                 logits.append(result["logits"].detach())
+                losses.append(result["loss"].detach())
                 # Use the production normalization and gradient finalization.
                 bundle.optimizer.zero_grad()
                 run_microbatch_loop(
@@ -220,7 +252,34 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 flush=True,
             )
             torch.testing.assert_close(*logits, atol=0, rtol=0)
+            torch.testing.assert_close(*losses, atol=0, rtol=0)
             expected = dict(full.named_parameters())
+            for layer_id in local.engram_layer_ids:
+                table = local.layers[layer_id].engram.embed
+                counts = [
+                    b - a
+                    for a, b in zip(
+                        table.lookup.boundaries, table.lookup.boundaries[1:]
+                    )
+                ]
+                assert table.weight.shape[0] == counts[rank]
+                if trainable:
+                    assert table.master.grad.shape == table.master.shape
+                    assert (
+                        table.master.main_grad.data_ptr()
+                        == table.master.grad.data_ptr()
+                    )
+                    assert (
+                        table.master.grad.untyped_storage().nbytes()
+                        == table.master.numel() * 4
+                    )
+                print(
+                    f"OWNER_STORAGE rank={rank} layer={layer_id} rows={counts[rank]} "
+                    f"fp8_scale_bytes={table.weight.numel() + table.scale.numel()} "
+                    f"master_bytes={0 if table.master is None else table.master.numel() * 4} "
+                    f"main_grad_bytes={0 if table.master is None else table.master.grad.numel() * 4}",
+                    flush=True,
+                )
             for name, p in local.named_parameters():
                 q = expected[name]
                 assert (p.grad is None) == (q.grad is None), name

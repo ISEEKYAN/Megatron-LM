@@ -138,7 +138,7 @@ class DeepseekV41Model(nn.Module):
         token_map=None,
         quantized=True,
         trainable_engram=False,
-        shard_engram=False,
+        shard_engram=True,
         gate_temperature=1.0,
         bias_rate=0.001,
         enable_dspark_execution=False,

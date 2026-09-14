@@ -169,6 +169,47 @@ Known limitations retained for this release:
   end-to-end acceptance; cross-model R3 tests use `_TinyChunk` and do not prove
   execution through every full model assembly.
 
+## Resident Engram row owners
+
+`ImplConfig(shard_engram=True)` is the default. Each DP/CP group rank stores
+only its contiguous row interval, including with EP enabled and CP=1. Uneven
+tables use boundaries `total_rows * rank // owner_count`; no padding rows are
+added to persistent storage. `shard_engram=False` selects replicated tables for
+small diagnostic comparisons. Existing parallelism restrictions still apply.
+
+`trainable_engram=False` keeps only FP8 weights and E8M0 scales. Setting it to
+`True` adds a persistent local FP32 master; its FP32 gradient has the same local
+shape and aliases `main_grad`. Owner masters stay outside dense DDP buckets.
+Lookup backward sums owner requests, gradient finalization normalizes once, and
+Sinkhorn reduces logical-table statistics across owners. Local training
+checkpoints retain this ownership and require the same topology on resume.
+HF export currently assembles complete tables and is not a bounded-memory
+export for the official dimensions.
+
+The transport reuses NVIDIA-NeMo/Automodel `8a646a739d30ed99ac022e39541e7db8c35ab2db`
+and the verified Qwen3.8 owner implementation: fixed-capacity All-to-All,
+source-rank request order, stable sorting, count agreement, and received-ID
+validation. Sorted-owner validation uses row boundaries to support nondivisible
+tables. FP8/scale byte transport and the existing FP32 index gradient arithmetic
+remain separate from the floating PLE lookup.
+
+For the official two tables (384006168 and 384016682 rows, width 256), the
+maximum persistent storage per rank is below, in GiB. These are arithmetic
+bounds, excluding optimizer state, activations and temporary buffers.
+
+| Owners | FP8 + scales | FP32 master, if trainable | FP32 main gradient |
+| --- | ---: | ---: | ---: |
+| 1 | 188.833133 | 732.443666 | 732.443666 |
+| 8 | 23.604142 | 91.555459 | 91.555459 |
+| 16 | 11.802071 | 45.777730 | 45.777730 |
+| 32 | 5.901036 | 22.888865 | 22.888865 |
+
+Distributed tests use reduced tables and check logits, losses, gradients and
+updates at zero tolerance, with matched physical parameter/bucket layouts for
+trainable comparisons. The reference gathers rows and requests independently
+of the production All-to-All. This does not establish official-scale training
+capacity or bitwise equivalence across different DDP bucket geometries.
+
 ## Text-only PP2 model forward/backward
 
 In an initialized two-rank world, use:

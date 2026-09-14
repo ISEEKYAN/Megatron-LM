@@ -80,6 +80,7 @@ def _init_parallel_worker(rank, config, trainable, directory):
         quantized=False,
         token_map=list(range(256)),
         trainable_engram=trainable,
+        shard_engram=False,
         optimizer='muon',
         optimizer_config=OptimizerConfig(0.0001, 5, 'quintic'),
     )

@@ -13,7 +13,7 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from .moe import _AllToAll
+from .owner_row_transport import OwnerRowTransport, _FixedCapacityAllToAll
 
 
 @dataclass
@@ -23,11 +23,14 @@ class _Route:
     local_ids: torch.Tensor | None
     send_counts: list[int]
     recv_counts: list[int]
+    capacity: int
 
     def exchange(self, tensor, send_counts, recv_counts):
         if self.group is None:
             return tensor
-        return _AllToAll.apply(tensor, send_counts, recv_counts, self.group)
+        return _FixedCapacityAllToAll.apply(
+            tensor, send_counts, recv_counts, self.capacity, self.group
+        )
 
     def return_rows(self, rows):
         ordered = self.exchange(rows, self.recv_counts, self.send_counts)
@@ -49,18 +52,23 @@ def _gather_rows(tensor, ids, route=None):
     return rows.reshape(*ids.shape, tensor.shape[1])
 
 
-class RowLookup:
+class RowLookup(OwnerRowTransport):
     def __init__(self, boundaries, group=None):
         self.boundaries = tuple(boundaries)
         self.group = group
         self.size = 1 if group is None else dist.get_world_size(group)
         self.rank = 0 if group is None else dist.get_rank(group)
+        self.process_group = group
+        self.owner_world_size = self.size
+        self.owner_rank = self.rank
         if (
             len(self.boundaries) != self.size + 1
             or self.boundaries[0] != 0
             or any(a > b for a, b in zip(self.boundaries, self.boundaries[1:]))
         ):
-            raise ValueError("Require monotone row boundaries matching process group size")
+            raise ValueError(
+                "Require monotone row boundaries matching process group size"
+            )
 
     def _check(self, invalid, reference, message):
         device = reference.device
@@ -79,7 +87,9 @@ class RowLookup:
             dist.all_reduce(low, op=dist.ReduceOp.MIN, group=self.group)
             dist.all_reduce(high, op=dist.ReduceOp.MAX, group=self.group)
             if not torch.equal(low, high):
-                raise ValueError('Lookup ranks disagree on row widths, dtype or trainability')
+                raise ValueError(
+                    'Lookup ranks disagree on row widths, dtype or trainability'
+                )
 
     def route(self, ids):
         self._check(
@@ -97,26 +107,34 @@ class RowLookup:
         owners = torch.bucketize(flat, cuts, right=True)
         order = torch.argsort(owners, stable=True)
         counts = torch.bincount(owners, minlength=self.size)
-        received = torch.empty_like(counts)
-        if self.group is None:
-            received.copy_(counts)
-        else:
-            dist.all_to_all_single(received, counts, group=self.group)
-        # Only small per-rank split metadata crosses to the host.
-        send_counts, recv_counts = counts.tolist(), received.tolist()
-        route = _Route(self.group, order, None, send_counts, recv_counts)
-        routed = route.exchange(flat[order], send_counts, recv_counts)
+        self._validate_sorted_send_ids(flat[order], counts)
+        routed, send_counts, recv_counts, capacity = self._exchange_ids(
+            flat[order], counts
+        )
+        begin, end = self.boundaries[self.rank : self.rank + 2]
+        self._check(
+            routed.numel() != sum(recv_counts)
+            or bool(((routed < begin) | (routed >= end)).any()),
+            ids,
+            'Received row ID outside local ownership interval',
+        )
+        route = _Route(self.group, order, None, send_counts, recv_counts, capacity)
         route.local_ids = routed - self.boundaries[self.rank]
         return route
 
     def _validate_rows(self, tensors, ids, valid_dtype, message):
         rows = self.boundaries[self.rank + 1] - self.boundaries[self.rank]
         invalid = any(
-            t.ndim != 2 or t.shape[0] != rows or t.device != ids.device or not valid_dtype(t)
+            t.ndim != 2
+            or t.shape[0] != rows
+            or t.device != ids.device
+            or not valid_dtype(t)
             for t in tensors
         )
         self._check(
-            invalid or ids.dtype != torch.int64 or (self.group is not None and not ids.is_cuda),
+            invalid
+            or ids.dtype != torch.int64
+            or (self.group is not None and not ids.is_cuda),
             ids,
             message,
         )
@@ -131,10 +149,13 @@ class RowLookup:
             'Expected colocated floating row shard and int64 IDs',
         )
         self._schema(
-            [values.shape[1], dtypes.index(values.dtype), int(values.requires_grad)], ids.device
+            [values.shape[1], dtypes.index(values.dtype), int(values.requires_grad)],
+            ids.device,
         )
         route = self.route(ids)
-        return route.return_rows(values[route.local_ids]).reshape(*ids.shape, values.shape[1])
+        return route.return_rows(values[route.local_ids]).reshape(
+            *ids.shape, values.shape[1]
+        )
 
     def fetch(self, values, scales, ids, master=None):
         self._validate_rows(
@@ -218,7 +239,9 @@ class EngramTable(nn.Module):
         return decoded.to(self.output_dtype)
 
     def lookup_fp8(self, ids):
-        return tuple(_gather_rows(t, ids) for t in (self.weight, self.scale, self.master))
+        return tuple(
+            _gather_rows(t, ids) for t in (self.weight, self.scale, self.master)
+        )
 
     @torch.no_grad()
     def refresh_storage(self):
@@ -226,7 +249,9 @@ class EngramTable(nn.Module):
             return
         from megatron.lite.primitive.quantization import block_fp8
 
-        weight, scale = block_fp8.quantize_block_fp8(self.master, (1, 32), scale_format="e8m0")
+        weight, scale = block_fp8.quantize_block_fp8(
+            self.master, (1, 32), scale_format="e8m0"
+        )
         self.weight.copy_(weight)
         self.scale.copy_(scale)
 
@@ -238,7 +263,9 @@ class ShardedEngramTable(EngramTable):
     outside lookup. All ranks in the row group must execute backward together.
     """
 
-    def __init__(self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16):
+    def __init__(
+        self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16
+    ):
         super().__init__(weight, scale, trainable=trainable, output_dtype=output_dtype)
         expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
         if weight.shape[0] != expected:
@@ -281,6 +308,7 @@ def hash_multipliers(layer_ids, max_ngram_size, vocab_size):
     if vocab_size < 1 or max_ngram_size < 2:
         raise ValueError("Require nonempty compressed vocabulary and ngram order >= 2")
     bound = max(1, (np.iinfo(np.int64).max // vocab_size) // 2)
+
     def multiplier(layer):
         rng = np.random.default_rng(10007 * layer)
         values = rng.integers(0, bound, size=max_ngram_size, dtype=np.int64)
@@ -300,7 +328,10 @@ def prime_buckets(layer_ids, max_ngram_size, heads, vocab_size):
         return current
 
     return torch.tensor(
-        [[[bucket() for _ in range(heads)] for _ in range(max_ngram_size - 1)] for _ in layer_ids],
+        [
+            [[bucket() for _ in range(heads)] for _ in range(max_ngram_size - 1)]
+            for _ in layer_ids
+        ],
         dtype=torch.int64,
     )
 
@@ -323,7 +354,9 @@ class NgramHash(nn.Module):
             raise ValueError("Hash layout and multiplier shape mismatch")
         self.pad_id = int(mapping[pad_id])
         self.register_buffer("token_map", mapping, persistent=False)
-        self.register_buffer("multipliers", multipliers.to(torch.int64), persistent=False)
+        self.register_buffer(
+            "multipliers", multipliers.to(torch.int64), persistent=False
+        )
         self.register_buffer("primes", primes.to(torch.int64), persistent=False)
         flat = primes.flatten(1)
         self.register_buffer("offsets", flat.cumsum(-1) - flat, persistent=False)
