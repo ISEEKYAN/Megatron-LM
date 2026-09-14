@@ -18,8 +18,6 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 from megatron.lite.primitive.modules.ep_participation import check_ep_participation
 
-from megatron.lite.primitive.modules.ep_participation import check_ep_participation
-
 __all__ = ["MoEAuxLossAutoScaler", "_AllToAll"]
 
 
