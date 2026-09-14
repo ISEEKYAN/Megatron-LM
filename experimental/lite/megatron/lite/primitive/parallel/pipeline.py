@@ -273,6 +273,14 @@ def _1f1b_schedule(
             unwrap_model(model).set_input_tensor(input_tensor)
         with use_loss_context(loss_context):
             out = forward_step_fn(model, batch)
+            # Reject before output compaction drops the callback. The loss-only
+            # callback contract cannot consume a nonterminal stage's gradient.
+            if out.get("backward") is not None:
+                raise RuntimeError(
+                    f"pipeline_unsupported_backward_callback: rank={dist.get_rank()} "
+                    f"stage={ps.pp_rank} microbatch={mb_idx - 1}; "
+                    "output['backward'] is unsupported in PP training"
+                )
             if ps.pp_is_last:
                 _apply_external_loss(out, batch, loss_fn, loss_context)
         return out
@@ -838,6 +846,14 @@ def _interleaved_1f1b_schedule(
                     loss_fn=loss_fn,
                 )
 
+                # Use the same explicit contract as non-interleaved PP, even
+                # when the returned loss/hidden tensor is detached.
+                if out.get("backward") is not None:
+                    raise RuntimeError(
+                        f"pipeline_unsupported_backward_callback: rank={rank} "
+                        f"stage={stage_id} microbatch={mb_id}; "
+                        "output['backward'] is unsupported in PP training"
+                    )
                 hidden = out.get("hidden_states")
                 if _dbg:
                     hidden_shape = None if hidden is None else tuple(hidden.shape)
