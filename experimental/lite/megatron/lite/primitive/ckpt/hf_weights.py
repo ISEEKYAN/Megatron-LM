@@ -1421,6 +1421,11 @@ def export_hf_weights(
         """Yield parameters plus persistent buffers present in the HF load plan."""
         for chunk in chunks:
             base_chunk = unwrap_model(chunk)
+            iter_export = getattr(spec, "iter_export_tensors", None)
+            if callable(iter_export):
+                # Model-owned views use global layer IDs and local expert IDs.
+                yield from iter_export(base_chunk)
+                continue
             state = base_chunk.state_dict()
             layer_map = (
                 {
