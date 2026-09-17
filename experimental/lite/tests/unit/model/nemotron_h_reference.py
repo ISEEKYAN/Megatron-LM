@@ -490,7 +490,7 @@ def install_linear_forward(model):
     """Replace dense linear forward with the same BI GEMM used by vLLM."""
     from types import MethodType
 
-    from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
+    from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
 
     def forward(module, x):
         inputs = (x, module.weight)

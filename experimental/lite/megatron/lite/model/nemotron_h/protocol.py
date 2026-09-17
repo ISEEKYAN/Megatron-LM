@@ -139,7 +139,7 @@ def build_model(model_cfg, *, impl_cfg):
     p = impl_cfg.parallel
     if p.tp != 1 or (p.etp or 1) != 1 or p.vpp != 1:
         raise ValueError("Native Nemotron currently requires TP1/ETP1/VPP1")
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     init_batch_invariance()
     ps = init_parallel(p)

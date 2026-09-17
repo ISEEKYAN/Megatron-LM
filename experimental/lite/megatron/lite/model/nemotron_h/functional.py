@@ -37,7 +37,7 @@ def visible_forward(visible, native, *inputs):
 
 
 def linear(x, weight, bias=None):
-    from vllm.model_executor.determinism.batch_invariant import linear_batch_invariant
+    from vllm.model_executor.layers.batch_invariant import linear_batch_invariant
 
     inputs = (x, weight) if bias is None else (x, weight, bias)
     return visible_forward(linear_batch_invariant, torch.nn.functional.linear, *inputs)

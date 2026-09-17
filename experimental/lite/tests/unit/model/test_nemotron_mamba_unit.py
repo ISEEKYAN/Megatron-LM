@@ -132,7 +132,7 @@ def test_packed_ssd_matches_independent_requests_and_native_vjp(lengths):
     from megatron.lite.model.nemotron_h.mamba import packed_scan
     from transformers.models.nemotron_h.modeling_nemotron_h import mamba2_chunk_scan
 
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     native_scan = getattr(mamba2_chunk_scan, "__wrapped__", mamba2_chunk_scan)
     init_batch_invariance()
@@ -186,7 +186,7 @@ def _ssd_cp_worker(rank, rendezvous):
     from megatron.lite.model.nemotron_h.mamba import packed_scan
     from megatron.lite.primitive.parallel.cp import get_parameter_local_cp_headwise
 
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
@@ -258,7 +258,7 @@ def test_full_mamba_mixer_matches_frozen_hf_alignment_with_real_weights():
     from transformers import AutoConfig
     from transformers.models.nemotron_h import modeling_nemotron_h as hf
 
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     if "NEMOTRON_TEST_MODEL" not in os.environ:
         pytest.skip("Set NEMOTRON_TEST_MODEL to the frozen BF16 checkpoint")
@@ -334,7 +334,7 @@ def _mixer_cp_worker(rank, rendezvous, model_path):
     from megatron.lite.primitive.parallel.state import ParallelState
     from safetensors import safe_open
 
-    from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
+    from vllm.model_executor.layers.batch_invariant import init_batch_invariance
 
     torch.cuda.set_device(rank)
     dist.init_process_group(
