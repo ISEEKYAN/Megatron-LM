@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 import pytest
 import torch
-from megatron.lite.primitive.modules import owner_row_transport as transport
+from megatron.lite.primitive.modules import engram_lookup as transport
 
 
 @pytest.fixture
