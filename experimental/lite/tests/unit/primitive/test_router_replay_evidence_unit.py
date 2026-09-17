@@ -148,3 +148,18 @@ def test_zero_changed_emits_a_warning_rather_than_silence(capsys):
     assert "R3_REPLAY_WARN changed=0" in out
     assert d.metrics["router_replay/changed"] == 0
     assert d.metrics["router_replay/changed_frac"] == 0.0
+
+
+def test_later_zero_changed_microbatches_each_warn(capsys):
+    d = _driver_with(stats_calls=1, stats_rows=2)
+    RouterReplay.replay_rows_changed = 1
+    d._emit_replay_evidence()
+    capsys.readouterr()
+    RouterReplay.replay_rows_changed = 0
+    for _ in range(2):
+        d._emit_replay_evidence()
+        out = capsys.readouterr().out
+        assert "R3_REPLAY_WARN changed=0" in out
+        assert "R3_REPLAY_EVIDENCE" not in out
+    assert d.metrics["router_replay/rows"] == 6
+    assert d.metrics["router_replay/changed"] == 1

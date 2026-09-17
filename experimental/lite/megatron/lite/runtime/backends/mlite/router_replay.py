@@ -195,15 +195,14 @@ class RouterReplayDriver:
                 f"routers={self._num_routers}",
                 flush=True,
             )
-            if stats["changed"] == 0:
-                # Not fatal -- at step 0 the actor and the rollout share weights, so
-                # every replayed route can legitimately equal the live one. It is
-                # fatal-looking later, so make it loud rather than swallowing it.
-                print(
-                    "R3_REPLAY_WARN changed=0 on the first replayed step; this is "
-                    "expected only while actor and rollout weights are identical.",
-                    flush=True,
-                )
+        if stats["changed"] == 0:
+            # Identical routes can be legitimate, but every zero-change microbatch
+            # must remain visible even after the first evidence line.
+            print(
+                "R3_REPLAY_WARN changed=0 on this replayed microbatch; "
+                "check whether actor and rollout routes are expected to match.",
+                flush=True,
+            )
 
     @property
     def metrics(self) -> dict[str, int | float]:

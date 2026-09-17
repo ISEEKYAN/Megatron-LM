@@ -28,8 +28,13 @@ on an optional Core installation broke standalone CPU execution and CED tests.
 V4.1 mHC execution does not require `megatron.core`.
 
 ## Official reference
-Oracle comparisons load the pinned upstream source from `DS41_REFERENCE_DIR` at
-test time and verify SHA-256; no official source is vendored into this repo.
+Reference source: `https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277`;
+fetched at `2026-09-17T17:25:23.437086+00:00`. All seven pinned files were re-fetched at this
+revision and matched the existing SHA-256 checks. Oracle comparisons load
+`DS41_REFERENCE_DIR` at test time; per-file hashes remain integrity checks,
+not a substitute for the repository revision. No official source is vendored.
+The directory flattens `inference/*.py`, renames `inference/config.json` to
+`inference_config.json`, and retains root `config.json`.
 
 ## Assembly example
 ```python
@@ -169,7 +174,8 @@ Known limitations retained for this release:
   resync, plus supported/legacy capability controls. It is a CPU contract test,
   not an end-to-end rollout synchronization or quantized-consumer acceptance.
 - **R3-WARN-0 / R3-EV-003:** `changed=0` is a warning, not an error; replay
-  evidence is logged once per driver, not once per step.
+  the evidence summary is logged once per driver; every zero-change replayed
+  microbatch emits a warning. Per-step totals also reach runtime/engine metrics.
 - **R3-EV-001 / R3-EV-002:** cross-model contracts use `_TinyChunk` and do not
   establish full-model execution liveness. Record mode has no `VOID` gate;
   replay with no observed routes is rejected by `R3_REPLAY_VOID`. Review found

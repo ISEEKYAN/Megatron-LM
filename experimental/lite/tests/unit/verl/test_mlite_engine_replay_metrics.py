@@ -10,7 +10,19 @@ import torch
 
 
 @pytest.mark.parametrize('collect_outputs', [False, True])
-def test_engine_preserves_runtime_replay_metrics(collect_outputs):
+def test_engine_preserves_runtime_replay_metrics(
+    collect_outputs, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.modules.router_replay import RouterReplay
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.backends.mlite.runtime import (
+        MegatronLiteRuntime,
+        ModelHandle,
+    )
+    from megatron.lite.runtime.contracts import PackedBatch
+
     source = (
         Path(__file__).parents[3] / 'examples/verl/verl_mlite/engine/mlite_engine.py'
     )
@@ -25,7 +37,9 @@ def test_engine_preserves_runtime_replay_metrics(collect_outputs):
         if isinstance(n, ast.FunctionDef)
         and n.name == '_forward_backward_batch_with_runtime'
     )
-    # Execute the real method; only optional VERL batching/postprocessing is isolated.
+    # Execute the real engine method and runtime/router below. Optional VERL
+    # TensorDict/loss collection is isolated so this CPU contract needs neither
+    # the VERL training stack nor distributed actors; it is not VERL e2e coverage.
     scope = dict(
         torch=torch,
         TensorDict=object,
@@ -52,33 +66,73 @@ def test_engine_preserves_runtime_replay_metrics(collect_outputs):
     }
     calls = []
 
-    def forward_backward(handle, batches, **kwargs):
-        calls.append((list(batches), kwargs))
-        return SimpleNamespace(
-            metrics={**evidence, 'loss_metric': [9.0]},
-            model_output=SimpleNamespace(loss=torch.tensor(7.0)),
-        )
+    model = SigmoidTopKRouter(
+        SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            routed_scaling_factor=1.0,
+            hidden_size=4,
+        ),
+        ParallelState(),
+        compute_aux_loss=False,
+    )
+    with torch.no_grad():
+        model.gate.weight.zero_()
+        model.gate.weight[:, 0] = torch.tensor([4.0, 3.0, 2.0, 1.0])
 
-    packed = SimpleNamespace(routed_experts=torch.ones(1))
+    def forward(module, batch):
+        weights = module(torch.ones(len(batch.input_ids), 4))[0]
+        return {'loss': weights.sum() * 0 + 7.0}
+
+    handle = ModelHandle(
+        model=model,
+        parallel_state=SimpleNamespace(pp_size=1),
+        _extras={'forward_step': forward},
+    )
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    def forward_backward(handle, batches, **kwargs):
+        batches = list(batches)
+        calls.append((batches, kwargs))
+        result = runtime.forward_backward(handle, iter(batches), **kwargs)
+        assert result.metrics == evidence, 'REAL_RUNTIME_REPLAY_METRICS'
+        # Unrelated loss metric verifies the engine preserves collector output.
+        result.metrics['loss_metric'] = [9.0]
+        return result
+
+    batches = [
+        PackedBatch(
+            torch.arange(n),
+            None,
+            torch.tensor([n]),
+            routed_experts=torch.tensor([[routes] * n]),
+            r3_replay_mask=torch.ones(n, dtype=torch.bool),
+        )
+        for n, routes in [(3, [[0, 1]]), (1, [[2, 3]])]
+    ]
     engine = SimpleNamespace(
-        handle=SimpleNamespace(_extras={}),
+        handle=handle,
         engine_config=SimpleNamespace(router_replay_mode='R3'),
         runtime=SimpleNamespace(forward_backward=forward_backward),
         get_data_parallel_size=lambda: 1,
         is_mp_src_rank_with_outputs=lambda: True,
-        _make_runtime_batch=lambda batch: packed,
+        _make_runtime_batch=lambda batch: batch,
         _make_runtime_loss_context=lambda batch, **kw: None,
-        _make_runtime_loss_fn=lambda *args: object(),
+        _make_runtime_loss_fn=lambda *args: None,
     )
-    batch = SimpleNamespace(to=lambda device: packed)
-    result = scope[method.name](
-        engine,
-        data=object(),
-        micro_batches=[batch],
-        indices=None,
-        loss_function=(lambda: None) if collect_outputs else None,
-        forward_only=False,
-    )
+    instances = RouterReplay.global_router_replay_instances[:]
+    try:
+        result = scope[method.name](
+            engine,
+            data=object(),
+            micro_batches=[SimpleNamespace(to=lambda device, b=b: b) for b in batches],
+            indices=None,
+            loss_function=(lambda: None) if collect_outputs else None,
+            forward_only=False,
+        )
+    finally:
+        RouterReplay.clear_global_state()
+        RouterReplay.global_router_replay_instances[:] = instances
     assert len(calls) == 1 and calls[0][1]['router_replay'] == {'action': 'replay'}
     assert result['metrics'] == {
         **{k: [v] for k, v in evidence.items()},

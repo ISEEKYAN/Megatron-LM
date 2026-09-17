@@ -10,6 +10,9 @@ from pathlib import Path
 import pytest
 import torch
 
+# Reference source: https://huggingface.co/deepseek-ai/DeepSeek-V4.1-Flash@dba1be0a40aa45a94ad051997016db3960a90277
+# Fetched at 2026-09-17T17:25:23.437086+00:00; all seven files matched this revision.
+# Per-file hashes below verify integrity; source provenance is the repo@commit.
 REFERENCE_SHA256 = {
     'model.py': '4e9ae23620edc8028ccc5d5fef552ab7fdc7dcd6f79608754fe9f67644056f65',
     'kernel.py': '1236c3507019ed176f5dba5e04bcea58867cf654818c6cf138ed4845398c2455',
