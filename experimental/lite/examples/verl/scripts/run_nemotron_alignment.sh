@@ -9,7 +9,7 @@ export NNODES=2 NGPUS_PER_NODE=4
 export ACTOR_TP=1 ACTOR_PP=2 ACTOR_CP=2 ACTOR_EP=4 ACTOR_ETP=1
 export MLITE_MODEL_NAME=nemotron_h MLITE_IMPL=lite MLITE_OPTIMIZER_BACKEND=dist_opt
 export PARAM_OFFLOAD=False OPTIMIZER_OFFLOAD=False GRAD_OFFLOAD=False
-export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-4}" ROLLOUT_N="${ROLLOUT_N:-2}"
+export TRAIN_BATCH_SIZE="${TRAIN_BATCH_SIZE:-32}" ROLLOUT_N="${ROLLOUT_N:-2}"
 export PPO_MINI_BATCH_SIZE="${PPO_MINI_BATCH_SIZE:-${TRAIN_BATCH_SIZE}}"
 export ACTOR_PPO_MICRO_BATCH_SIZE_PER_GPU=1
 export MAX_PROMPT_LENGTH=2048 MAX_RESPONSE_LENGTH=8192
@@ -31,6 +31,8 @@ script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 exec bash "${script_dir}/run_qwen3moe_gsm8k_grpo.sh" \
   'data.filter_overlong_prompts_workers=8' \
   'algorithm.rollout_correction.bypass_mode=False' \
+  'actor_rollout_ref.actor.use_dynamic_bsz=False' \
+  'actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=False' \
   'actor_rollout_ref.actor.engine.export_dtype=null' \
   '~actor_rollout_ref.actor.engine.grad_offload' \
   '+actor_rollout_ref.actor.engine.full_determinism=True' \

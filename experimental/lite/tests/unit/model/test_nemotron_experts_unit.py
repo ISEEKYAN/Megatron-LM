@@ -149,12 +149,11 @@ def test_composed_moe_matches_frozen_hf_alignment():
         pytest.skip("CUDA required")
     from megatron.lite.model.nemotron_h.experts import MoE
     from megatron.lite.primitive.parallel import ParallelState
-    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMoE
-
-    from verl.models.transformers.nemotron_h_alignment import (
+    from nemotron_h_reference import (
         install_linear_forward,
         install_transformers_moe_forward,
     )
+    from transformers.models.nemotron_h.modeling_nemotron_h import NemotronHMoE
 
     config = _config()
     config.num_local_experts = config.n_routed_experts

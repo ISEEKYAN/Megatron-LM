@@ -75,6 +75,7 @@ def test_export_stacked_experts_preserves_hf_layout(ep_rank):
 def test_real_seven_layer_model_logits_match_frozen_hf_alignment():
     if not torch.cuda.is_available() or "NEMOTRON_TEST_MODEL" not in os.environ:
         pytest.skip("CUDA and NEMOTRON_TEST_MODEL required")
+    import nemotron_h_reference as oracle
     from megatron.lite.model.nemotron_h.checkpoint import load_hf_weights
     from megatron.lite.model.nemotron_h.config import NemotronHConfig
     from megatron.lite.model.nemotron_h.mamba import SSMMeta
@@ -83,7 +84,6 @@ def test_real_seven_layer_model_logits_match_frozen_hf_alignment():
     from transformers import AutoConfig
     from transformers.models.nemotron_h import modeling_nemotron_h as hf
 
-    from verl.models.transformers import nemotron_h_alignment as oracle
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     root = Path(os.environ["NEMOTRON_TEST_MODEL"])

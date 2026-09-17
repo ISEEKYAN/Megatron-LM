@@ -250,6 +250,7 @@ def test_full_mamba_mixer_matches_frozen_hf_alignment_with_real_weights():
     import os
     from pathlib import Path
 
+    import nemotron_h_reference as oracle
     from megatron.lite.model.nemotron_h.config import NemotronHConfig
     from megatron.lite.model.nemotron_h.mamba import MambaMixer
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -257,7 +258,6 @@ def test_full_mamba_mixer_matches_frozen_hf_alignment_with_real_weights():
     from transformers import AutoConfig
     from transformers.models.nemotron_h import modeling_nemotron_h as hf
 
-    from verl.models.transformers import nemotron_h_alignment as oracle
     from vllm.model_executor.determinism.batch_invariant import init_batch_invariance
 
     if "NEMOTRON_TEST_MODEL" not in os.environ:

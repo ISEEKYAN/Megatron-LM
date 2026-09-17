@@ -14,8 +14,7 @@ def test_packed_attention_matches_frozen_oracle_and_separate_requests():
         pytest.skip("CUDA required")
     from megatron.lite.model.nemotron_h.attention import packed_attention
     from megatron.lite.model.nemotron_h.mamba import SSMMeta
-
-    from verl.models.transformers.nemotron_h_alignment import (
+    from nemotron_h_reference import (
         _sequence_boundaries,
         attention_forward,
     )
@@ -116,8 +115,7 @@ def test_residual_norm_matches_frozen_forward_and_vjp():
     if not torch.cuda.is_available():
         pytest.skip("CUDA required")
     from megatron.lite.model.nemotron_h.functional import RMSNorm
-
-    from verl.models.transformers.nemotron_h_alignment import residual_rms
+    from nemotron_h_reference import residual_rms
 
     torch.manual_seed(83)
     norm = RMSNorm(2688, 1e-5, device="cuda")
