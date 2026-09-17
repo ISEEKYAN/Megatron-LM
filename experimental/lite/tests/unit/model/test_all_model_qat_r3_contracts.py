@@ -61,9 +61,17 @@ class _TinyModel(nn.Module):
 
 
 class _TinyChunk(nn.Module):
-    def __init__(self, model_name: str, *, mtp_enabled: bool):
+    def __init__(self, model_name: str, *, mtp_enabled: bool, stage_range=None):
         super().__init__()
         self.model = _TinyModel(model_name, mtp_enabled=mtp_enabled)
+        if stage_range is not None:
+            assert model_name == "deepseek_v41"
+            start, end = stage_range
+            assert end - start == len(self.model.layers) == 2
+            self.local_layer_range = stage_range
+            self.model.layers = nn.ModuleList(
+                [None] * start + list(self.model.layers) + [None] * (4 - end)
+            )
 
     @property
     def layers(self):
@@ -182,16 +190,24 @@ def _protocol(model_name: str, transformer_engine_import_stub, monkeypatch):
 
 def _layers(chunk: _TinyChunk) -> list[nn.Module]:
     layers = chunk.model.layers
-    return list(layers.values()) if isinstance(layers, nn.ModuleDict) else list(layers)
+    layers = (
+        list(layers.values()) if isinstance(layers, nn.ModuleDict) else list(layers)
+    )
+    return [layer for layer in layers if layer is not None]
 
 
 def _case(
-    model_name: str, transformer_engine_import_stub, monkeypatch, *, mtp_enabled: bool
+    model_name: str,
+    transformer_engine_import_stub,
+    monkeypatch,
+    *,
+    mtp_enabled: bool,
+    stage_range=None,
 ) -> _ModelCase:
     return _ModelCase(
         name=model_name,
         protocol=_protocol(model_name, transformer_engine_import_stub, monkeypatch),
-        chunk=_TinyChunk(model_name, mtp_enabled=mtp_enabled),
+        chunk=_TinyChunk(model_name, mtp_enabled=mtp_enabled, stage_range=stage_range),
     )
 
 
@@ -448,6 +464,10 @@ def _real_tiny_model(model_name: str, monkeypatch, *, quantized=False):
 
 
 R3_SUPPORTED_MODEL_NAMES = MODEL_NAMES
+R3_ROOT_CASES = [(name, None) for name in R3_SUPPORTED_MODEL_NAMES] + [
+    ('deepseek_v41', (0, 2)),
+    ('deepseek_v41', (2, 4)),
+]
 
 
 def test_mapped_model_state_has_no_optional_override(
@@ -669,20 +689,36 @@ def test_glm5_r3_route_packing_matches_contiguous_forward_layout(
     assert torch.equal(glm5_mask, deepseek_v4_mask)
 
 
-@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
+@pytest.mark.parametrize("model_name,stage_range", R3_ROOT_CASES)
 @pytest.mark.parametrize("mtp_enabled", [False, True], ids=["mtp-off", "mtp-on"])
 def test_supported_model_replay_roots_are_exact_decoder_layers(
-    model_name: str, mtp_enabled: bool, transformer_engine_import_stub, monkeypatch
+    model_name: str,
+    stage_range,
+    mtp_enabled: bool,
+    transformer_engine_import_stub,
+    monkeypatch,
 ):
     case = _case(
-        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=mtp_enabled
+        model_name,
+        transformer_engine_import_stub,
+        monkeypatch,
+        mtp_enabled=mtp_enabled,
+        stage_range=stage_range,
     )
+    if stage_range is not None:
+        assert (
+            getattr(case.chunk, 'local_layer_range', None) == stage_range
+        ), 'PP_STAGE_FIXTURE_REQUIRED'
+        assert len(case.chunk.layers) == 4
+        assert [layer is not None for layer in case.chunk.layers] == [
+            stage_range[0] <= i < stage_range[1] for i in range(4)
+        ], 'PP_GLOBAL_NONE_SLOTS_REQUIRED'
     expected = _layers(case.chunk)
 
     roots = case.protocol.router_replay_roots(case.chunk)
 
     assert roots == expected
-    assert len(roots) == len(case.chunk.model.layers)
+    assert len(roots) == len(_layers(case.chunk))
     assert roots != [
         case.chunk
     ], "falling back to the whole chunk would include MTP routers"
@@ -691,12 +727,16 @@ def test_supported_model_replay_roots_are_exact_decoder_layers(
         assert all(root not in mtp_modules for root in roots)
 
 
-@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
+@pytest.mark.parametrize("model_name,stage_range", R3_ROOT_CASES)
 def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
-    model_name: str, transformer_engine_import_stub, monkeypatch
+    model_name: str, stage_range, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=False
+        model_name,
+        transformer_engine_import_stub,
+        monkeypatch,
+        mtp_enabled=False,
+        stage_range=stage_range,
     )
     old_count = attach_router_replay(case.chunk, reset=False)
     detach_router_replay(case.chunk)
@@ -704,25 +744,29 @@ def test_supported_model_mtp_off_replay_attachment_count_is_unchanged(
     roots = case.protocol.router_replay_roots(case.chunk)
     new_count = sum(attach_router_replay(root, reset=False) for root in roots)
     try:
-        assert old_count == len(case.chunk.model.layers)
+        assert old_count == len(_layers(case.chunk))
         assert new_count == old_count
     finally:
         for root in roots:
             detach_router_replay(root)
 
 
-@pytest.mark.parametrize("model_name", R3_SUPPORTED_MODEL_NAMES)
+@pytest.mark.parametrize("model_name,stage_range", R3_ROOT_CASES)
 def test_supported_model_attaches_replay_only_to_decoder_router_count(
-    model_name: str, transformer_engine_import_stub, monkeypatch
+    model_name: str, stage_range, transformer_engine_import_stub, monkeypatch
 ):
     case = _case(
-        model_name, transformer_engine_import_stub, monkeypatch, mtp_enabled=True
+        model_name,
+        transformer_engine_import_stub,
+        monkeypatch,
+        mtp_enabled=True,
+        stage_range=stage_range,
     )
     roots = case.protocol.router_replay_roots(case.chunk)
 
     count = sum(attach_router_replay(root, reset=False) for root in roots)
     try:
-        assert count == len(case.chunk.model.layers)
+        assert count == len(_layers(case.chunk))
         assert all(
             layer.moe.router.router_replay is not None for layer in _layers(case.chunk)
         )

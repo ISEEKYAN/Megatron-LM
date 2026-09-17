@@ -790,23 +790,35 @@ class MegatronLiteEngine(BaseEngine):
             forward_only=forward_only,
             router_replay={"action": "replay"} if replay_enabled else None,
         )
+        # Keep step-wide replay evidence on both the native-loss and VERL collector paths.
+        metrics = {
+            key: (
+                value
+                if isinstance(value, list)
+                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                else [value]
+            )
+            for key, value in result.metrics.items()
+        }
         if reduced_outputs is not None:
-            return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
-        metrics = dict(result.metrics)
+            output = postprocess_batch_func(
+                output_lst=reduced_outputs, indices=indices, data=data
+            )
+            replay_metrics = {
+                key: value
+                for key, value in metrics.items()
+                if key.startswith("router_replay/")
+            }
+            if replay_metrics:
+                output.setdefault("metrics", {}).update(replay_metrics)
+            return output
         loss = result.model_output.loss
         losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
         return {
             "model_output": {},
             "loss": losses,
-            # Pass Metric aggregators through unchanged (reduce_metrics folds them);
-            # list-wrap plain scalars as the legacy contract expects.
-            "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
-                for key, value in metrics.items()
-            },
+            # Metric aggregators and legacy scalar lists retain their existing form.
+            "metrics": metrics,
         }
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:

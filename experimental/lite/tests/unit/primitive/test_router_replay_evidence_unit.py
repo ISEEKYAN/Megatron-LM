@@ -106,6 +106,7 @@ def _driver_with(stats_calls: int, stats_rows: int, num_routers: int = 4):
     d = RouterReplayDriver.__new__(RouterReplayDriver)
     d._num_routers = num_routers
     d._emitted_evidence = False
+    d._replay_totals = dict.fromkeys(("calls", "rows", "changed"), 0)
     RouterReplay.clear_global_router_replay_instances()
     RouterReplay.reset_replay_stats()
     RouterReplay.replay_calls = stats_calls
@@ -145,3 +146,5 @@ def test_zero_changed_emits_a_warning_rather_than_silence(capsys):
     out = capsys.readouterr().out
     assert "R3_REPLAY_EVIDENCE" in out
     assert "R3_REPLAY_WARN changed=0" in out
+    assert d.metrics["router_replay/changed"] == 0
+    assert d.metrics["router_replay/changed_frac"] == 0.0

@@ -73,7 +73,7 @@ _ENGINE_EXPORT_KWARGS = {
 
 
 @pytest.mark.parametrize(
-    "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4", "deepseek_v41"]
+    "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4"]
 )
 def test_hf_save_protocols_accept_engine_export_kwargs(
     model_name: str,
@@ -82,9 +82,6 @@ def test_hf_save_protocols_accept_engine_export_kwargs(
     tmp_path,
 ) -> None:
     transformer_engine_import_stub()
-    if model_name == "deepseek_v41":
-        _check_v41_save(tmp_path)
-        return
     if model_name == "deepseek_v4":
         # DS4 protocol drags in megatron.core via the CSA module at import time.
         pytest.importorskip(
@@ -206,7 +203,10 @@ def _v41_export_model(tmp_path):
     return model, values, archive
 
 
-def _check_v41_save(tmp_path):
+def test_v41_save_casts_masters_and_preserves_archive(
+    tmp_path, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
     from megatron.lite.model.deepseek_v41.lite import protocol
     from safetensors.torch import load_file
 
@@ -401,7 +401,21 @@ def test_v41_engine_online_export_resync_contract(
             qat={},
         ),
     )
+    runtime_calls = []
+    runtime_export = MegatronLiteRuntime.export_weights
+
+    def checked_runtime_export(runtime, handle, **kwargs):
+        runtime_calls.append(dict(kwargs))
+        assert {
+            key: kwargs[key]
+            for key in ('limit', 'include_mtp_only', 'include_local_prefixes')
+            if key in kwargs
+        } == selection, 'ONLINE_ENGINE_SELECTION_KWARGS'
+        return runtime_export(runtime, handle, **kwargs)
+
+    monkeypatch.setattr(MegatronLiteRuntime, 'export_weights', checked_runtime_export)
     weights, metadata = _online_export_method()(engine, **selection)
+    assert len(runtime_calls) == 1, 'ONLINE_ENGINE_RUNTIME_BOUNDARY_EXECUTED'
     tensors = dict(weights)  # Consume the lazy generator through checkpoint export.
     assert len(export_calls) == 1, 'ONLINE_EXPORT_RUNTIME_BOUNDARY_EXECUTED'
     assert metadata is None, 'ONLINE_EXPORT_METADATA'

@@ -44,6 +44,7 @@ class RouterReplayDriver:
         self._pp_offset = 0
         self._pp_total = 0
         self._emitted_evidence = False
+        self._replay_totals = dict.fromkeys(("calls", "rows", "changed"), 0)
 
     def _replay_roots(self):
         selector = (
@@ -73,7 +74,9 @@ class RouterReplayDriver:
             attach_router_replay(root, reset=False) for root in self._replay_roots()
         )
         if self._num_routers == 0:
-            raise RuntimeError("router replay requested but the model has no MoE routers.")
+            raise RuntimeError(
+                "router replay requested but the model has no MoE routers."
+            )
         self._ps = parallel_state_from_model(self._chunks[-1])
         self._compute_pp_layout()
         if self.action == "record":
@@ -84,7 +87,9 @@ class RouterReplayDriver:
         if ps is None or ps.pp_size <= 1:
             self._pp_total = self._num_routers
             return
-        counts = [torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)]
+        counts = [
+            torch.zeros(1, dtype=torch.long, device="cuda") for _ in range(ps.pp_size)
+        ]
         dist.all_gather(
             counts,
             torch.tensor([self._num_routers], dtype=torch.long, device="cuda"),
@@ -124,15 +129,21 @@ class RouterReplayDriver:
                 raise ValueError("R3 router replay requires batch.routed_experts.")
             routed = self._select_local_layers(routed)
             pack_routes = _protocol_fn(
-                self._protocol, "pack_routed_experts", protocol_utils.pack_routed_experts
+                self._protocol,
+                "pack_routed_experts",
+                protocol_utils.pack_routed_experts,
             )
             pack_mask = _protocol_fn(
-                self._protocol, "pack_r3_replay_mask", protocol_utils.pack_r3_replay_mask
+                self._protocol,
+                "pack_r3_replay_mask",
+                protocol_utils.pack_r3_replay_mask,
             )
             targets = pack_routes(model, batch, routed)
             replay_mask = pack_mask(model, batch)
             RouterReplay.set_replay_data(targets, replay_mask=replay_mask)
-            RouterReplay.set_global_router_replay_action(RouterReplayAction.REPLAY_FORWARD)
+            RouterReplay.set_global_router_replay_action(
+                RouterReplayAction.REPLAY_FORWARD
+            )
             RouterReplay.reset_replay_stats()
             try:
                 result = forward_step(model, batch)
@@ -173,6 +184,8 @@ class RouterReplayDriver:
                 f"R3_REPLAY_VOID: replay ran ({stats['calls']} calls) but saw zero "
                 "routing rows. Replay is not happening."
             )
+        for key, value in stats.items():
+            self._replay_totals[key] += value
         frac = stats["changed"] / stats["rows"]
         if not self._emitted_evidence:
             self._emitted_evidence = True
@@ -191,6 +204,22 @@ class RouterReplayDriver:
                     "expected only while actor and rollout weights are identical.",
                     flush=True,
                 )
+
+    @property
+    def metrics(self) -> dict[str, int | float]:
+        """Local-rank step totals; count forward routing slots, not recomputation."""
+        if not self._replay_totals["rows"]:
+            return {}
+        return {
+            **{
+                f"router_replay/{key}": value
+                for key, value in self._replay_totals.items()
+            },
+            "router_replay/changed_frac": (
+                self._replay_totals["changed"] / self._replay_totals["rows"]
+            ),
+            "router_replay/routers": self._num_routers,
+        }
 
     def _select_local_layers(self, routed):
         ps = self._ps

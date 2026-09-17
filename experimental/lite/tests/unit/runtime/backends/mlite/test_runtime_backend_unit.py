@@ -914,16 +914,31 @@ def test_runtime_replay_driver_requires_observed_routes(
         ParallelState(),
         compute_aux_loss=False,
     )
+    with torch.no_grad():
+        model.gate.weight.zero_()
+        model.gate.weight[:, 0] = torch.tensor([4.0, 3.0, 2.0, 1.0])
     batch = PackedBatch(
         torch.arange(3),
         None,
         torch.tensor([3]),
-        routed_experts=torch.tensor([[[[2, 3]], [[2, 3]], [[2, 3]]]]),
+        routed_experts=torch.tensor([[[[0, 1]], [[0, 1]], [[0, 1]]]]),
         r3_replay_mask=torch.ones(3, dtype=torch.bool),
     )
 
+    second = PackedBatch(
+        torch.arange(1),
+        None,
+        torch.tensor([1]),
+        routed_experts=torch.tensor([[[[2, 3]]]]),
+        r3_replay_mask=torch.ones(1, dtype=torch.bool),
+    )
+
     def forward(module, batch):
-        value = module(torch.ones(3, 4))[0] if live else module.gate.weight
+        value = (
+            module(torch.ones(len(batch.input_ids), 4))[0]
+            if live
+            else module.gate.weight
+        )
         return {'loss': value.sum()}
 
     handle = ModelHandle(
@@ -935,14 +950,33 @@ def test_runtime_replay_driver_requires_observed_routes(
     try:
         runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
         if live:
-            runtime.forward_backward(
+            result = runtime.forward_backward(
                 handle,
-                iter([batch]),
+                iter([batch, second]),
                 None,
-                num_microbatches=1,
+                num_microbatches=2,
                 router_replay={'action': 'replay'},
             )
             assert 'R3_REPLAY_EVIDENCE calls=1 rows=6' in capsys.readouterr().out
+            assert result.metrics == {
+                'router_replay/calls': 2,
+                'router_replay/rows': 8,
+                'router_replay/changed': 2,
+                'router_replay/changed_frac': 0.25,
+                'router_replay/routers': 1,
+            }, 'R3_STEP_METRICS_SURVIVE_CLEANUP'
+            next_step = runtime.forward_backward(
+                handle, iter([second]), None, router_replay={'action': 'replay'}
+            )
+            assert next_step.metrics == {
+                'router_replay/calls': 1,
+                'router_replay/rows': 2,
+                'router_replay/changed': 2,
+                'router_replay/changed_frac': 1.0,
+                'router_replay/routers': 1,
+            }, 'R3_METRICS_RESET_EACH_STEP'
+            disabled = runtime.forward_backward(handle, iter([second]), None)
+            assert disabled.metrics == {}, 'DISABLED_REPLAY_HAS_NO_EVIDENCE_METRICS'
         else:
             with pytest.raises(RuntimeError, match='R3_REPLAY_VOID'):
                 runtime.forward_backward(

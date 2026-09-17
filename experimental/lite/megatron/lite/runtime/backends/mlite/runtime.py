@@ -637,6 +637,9 @@ class MegatronLiteRuntime(RuntimeBase):
             for key, value in row.items():
                 metrics.setdefault(key, []).append(value)
 
+        if replay_driver is not None:
+            metrics.update(replay_driver.metrics)
+
         return ForwardResult(
             model_output=ModelOutputs(
                 loss=loss_tensor,
