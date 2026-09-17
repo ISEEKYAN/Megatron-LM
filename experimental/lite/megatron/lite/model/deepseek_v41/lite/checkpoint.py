@@ -504,48 +504,41 @@ def save_model(model, path, *, export_dtype=None, cpu=True, buffer_max_size_byte
     staging = Path(tempfile.mkdtemp(prefix='.v41-export-', dir=path.parent))
     try:
         if export_dtype is not None or buffer_max_size_bytes is not None or not cpu:
+            buffer_size = (
+                DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+                if buffer_max_size_bytes is None
+                else buffer_max_size_bytes
+            )
             stream_export_to_shards(
                 export_checkpoint(
                     model,
                     export_dtype=export_dtype,
                     cpu=cpu,
-                    buffer_max_size_bytes=(
-                        buffer_max_size_bytes
-                        if buffer_max_size_bytes is not None
-                        else DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
-                    ),
+                    buffer_max_size_bytes=buffer_size,
                 ),
                 str(staging),
-                shard_size_bytes=(
-                    buffer_max_size_bytes
-                    if buffer_max_size_bytes is not None
-                    else DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
-                ),
+                shard_size_bytes=buffer_size,
             )
-            (staging / 'config.json').write_text(
-                json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
-            )
-            os.rename(staging, path)
-            return
-        spool = staging / '.active-bytes'
-        entries = dict(archive.entries)
-        with spool.open('wb') as stream:
-            for name, value in export_model(model):
-                value = value.cpu().contiguous()
-                raw = value.reshape(-1).view(torch.uint8).numpy().tobytes()
-                dtype = _header_dtype(str(value.dtype))
-                entries[name] = TensorEntry(
-                    name,
-                    dtype,
-                    tuple(value.shape),
-                    len(raw),
-                    str(spool),
-                    stream.tell(),
-                    hashlib.sha256(raw).hexdigest(),
-                )
-                stream.write(raw)
-        CheckpointTensorStore(entries).save(staging / 'model.safetensors')
-        spool.unlink()
+        else:
+            spool = staging / '.active-bytes'
+            entries = dict(archive.entries)
+            with spool.open('wb') as stream:
+                for name, value in export_model(model):
+                    value = value.cpu().contiguous()
+                    raw = value.reshape(-1).view(torch.uint8).numpy().tobytes()
+                    dtype = _header_dtype(str(value.dtype))
+                    entries[name] = TensorEntry(
+                        name,
+                        dtype,
+                        tuple(value.shape),
+                        len(raw),
+                        str(spool),
+                        stream.tell(),
+                        hashlib.sha256(raw).hexdigest(),
+                    )
+                    stream.write(raw)
+            CheckpointTensorStore(entries).save(staging / 'model.safetensors')
+            spool.unlink()
         (staging / 'config.json').write_text(
             json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
         )

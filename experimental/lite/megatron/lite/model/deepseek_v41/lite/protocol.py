@@ -237,23 +237,14 @@ def build_model(model_cfg, *, impl_cfg):
         # DDP synchronizes parameter initialization. Encoded Engram buffers need
         # byte collectives because NCCL does not accept their FP8 storage dtype.
         gradient_group = ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group
-        sharded = (
-            {
-                id(tensor)
-                for block in model.layers
-                if block.engram is not None
-                for tensor in block.engram.embed.buffers()
-            }
-            if model.engram_group is not None
-            else set()
-        )
-        sharded.update(
-            id(block.engram.embed.master)
-            for block in model.layers
-            if model.engram_group is not None
-            and block.engram is not None
-            and block.engram.embed.master is not None
-        )
+        sharded = set()
+        if model.engram_group is not None:
+            for block in model.layers:
+                if block.engram is not None:
+                    table = block.engram.embed
+                    sharded.update(id(tensor) for tensor in table.buffers())
+                    if table.master is not None:
+                        sharded.add(id(table.master))
         model._ddp_params_and_buffers_to_ignore = [
             name
             for name, tensor in (*model.named_parameters(), *model.named_buffers())

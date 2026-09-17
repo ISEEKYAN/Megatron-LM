@@ -3,7 +3,6 @@
 
 import json
 from dataclasses import replace
-from datetime import timedelta
 from pathlib import Path
 
 import pytest
@@ -13,6 +12,7 @@ import torch.multiprocessing as mp
 from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+from parallel_test_utils import assert_exact, init_world
 from test_data_parallel import (
     _check_parallel_buffers,
     _init_parallel_worker,
@@ -95,7 +95,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
                         errors['gradient_max_abs'], float((p.grad - q.grad).abs().max())
                     )
                     # This fixture has an exact serial baseline, including unequal token counts.
-                    torch.testing.assert_close(p.grad, q.grad, atol=0, rtol=0, msg=name)
+                    assert_exact(p.grad, q.grad, msg=name)
             assert serial.optimizer.step()[0]
             assert parallel.optimizer.step()[0]
             changed = next(
@@ -111,14 +111,14 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
             assert not any(failures), f'EP_PARAMETER_PARITY: {failures}'
             for name, p in model.named_parameters():
                 q = serial_parameters[name]
-                torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
+                assert_exact(p, q, msg=name)
                 errors['parameter_max_abs'] = max(
                     errors['parameter_max_abs'], float((p - q).detach().abs().max())
                 )
                 if '.ffn.experts.' not in name:
                     replicas = [torch.empty_like(p) for _ in range(2)]
                     dist.all_gather(replicas, p)
-                    torch.testing.assert_close(*replicas, atol=0, rtol=0, msg=name)
+                    assert_exact(*replicas, msg=name)
             _check_parallel_buffers(parallel, serial, rank, trainable)
         Path(directory, f'rank-{rank}.json').write_text(json.dumps(errors))
     finally:
@@ -188,9 +188,7 @@ def _check_optimizer_contract(bundle, rank, failure):
         optimizer.optimizers[0].prepare_step = lambda: False
     assert not optimizer.step()[0], 'EP_SKIP_MUST_REACH_EVERY_RANK'
     for name, p in model.named_parameters():
-        torch.testing.assert_close(
-            p, parameters[name], atol=0, rtol=0, msg='EP_SKIP_PARAMETER:' + name
-        )
+        assert_exact(p, parameters[name], msg='EP_SKIP_PARAMETER:' + name)
     for name, b in model.named_buffers():
         assert torch.equal(
             b.contiguous().reshape(-1).view(torch.uint8), buffers[name]
@@ -260,20 +258,16 @@ def _finalize_reference_expert_wgrad(records, reference, rank):
             )
             summary[key] = max(summary[key], float((joined - split).abs().max()))
             if dtype == torch.float32:
-                torch.testing.assert_close(
+                assert_exact(
                     parameters[name].grad,
                     split,
-                    atol=0,
-                    rtol=0,
                     msg='SERIAL_EXPERT_AUTOGRAD_RECONSTRUCTION:' + name,
                 )
                 parameters[name].grad = parameters[name].main_grad = joined
             if dtype == torch.float64:
-                torch.testing.assert_close(
+                assert_exact(
                     joined.float(),
                     split.float(),
-                    atol=0,
-                    rtol=0,
                     msg='EXPERT_FP64_REDUCTION_ROUNDED_TO_MASTER:' + name,
                 )
                 summary['fp64_rounded_fp32_difference'] = max(
@@ -289,13 +283,7 @@ def _missing_ep_peer_worker(rank, directory):
     from megatron.lite.primitive.parallel.state import init_parallel
 
     torch.cuda.set_device(rank)
-    dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rendezvous').as_uri(),
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=30),
-    )
+    init_world(rank, directory, world=2, timeout=30, rendezvous='rendezvous')
     try:
         ps = init_parallel(ParallelConfig(ep=2))
         dispatcher = dispatch_module.TokenDispatcher(4, 2, ps, use_deepep=False)
@@ -342,13 +330,7 @@ def test_native_ep_missing_peer_fails_before_transport(tmp_path):
 def _expert_replica_group_worker(rank, config, directory):
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
-    dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rendezvous').as_uri(),
-        rank=rank,
-        world_size=4,
-        timeout=timedelta(seconds=60),
-    )
+    init_world(rank, directory, world=4, timeout=60, rendezvous='rendezvous')
     try:
         bundle = protocol.build_model(
             config,

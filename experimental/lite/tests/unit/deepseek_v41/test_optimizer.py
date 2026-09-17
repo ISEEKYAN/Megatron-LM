@@ -10,6 +10,7 @@ from megatron.lite.model.deepseek_v41.lite.optimizer_groups import (
     parameter_groups,
 )
 from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn, sinkhorn_direction
+from parallel_test_utils import assert_exact
 
 
 @pytest.mark.parametrize(
@@ -257,19 +258,13 @@ def test_step_publishes_accumulated_modality_bias(
                     for expert, count in enumerate(row):
                         counts[router][modality][expert] += count
             for router, actual in biases().items():
-                torch.testing.assert_close(
-                    actual, before[router], atol=0, rtol=0, msg='forward mutated bias'
-                )
+                assert_exact(actual, before[router], msg='forward mutated bias')
             (output['loss'] / len(batches)).backward()
             if recompute:
                 assert len(seen) > forward_visits, 'recompute was not exercised'
             for router, actual in biases().items():
-                torch.testing.assert_close(
-                    actual,
-                    before[router],
-                    atol=0,
-                    rtol=0,
-                    msg='backward/recompute mutated bias',
+                assert_exact(
+                    actual, before[router], msg='backward/recompute mutated bias'
                 )
         skipped = step == 1
         if skipped:
@@ -288,11 +283,9 @@ def test_step_publishes_accumulated_modality_bias(
                         expected[modality][expert] += 0.125 * (
                             (mean > count) - (mean < count)
                         )
-            torch.testing.assert_close(
+            assert_exact(
                 actual,
                 torch.tensor(expected),
-                atol=0,
-                rtol=0,
                 msg='step-time modality bias differs from accumulated routing counts',
             )
             changed |= not torch.equal(actual, before[router])
@@ -303,12 +296,10 @@ def test_step_publishes_accumulated_modality_bias(
             parameter.grad = parameter.main_grad = None
         assert optimizer.step()[0]
         for router, actual in biases().items():
-            torch.testing.assert_close(
+            assert_exact(
                 actual,
                 snapshot[router],
-                atol=0,
-                rtol=0,
-                msg=f'stale bias statistics reused after {"skipped" if skipped else "successful"} step',
+                msg=f"stale bias statistics reused after {('skipped' if skipped else 'successful')} step",
             )
     assert changed, 'successful steps never changed load-balancing biases'
     snapshot = biases()
@@ -316,10 +307,8 @@ def test_step_publishes_accumulated_modality_bias(
     optimizer.zero_grad()
     assert optimizer.step()[0]
     for router, actual in biases().items():
-        torch.testing.assert_close(
+        assert_exact(
             actual,
             snapshot[router],
-            atol=0,
-            rtol=0,
             msg='ZERO_GRAD_DISCARDS_UNCOMMITTED_MODALITY_LOADS',
         )

@@ -3,6 +3,7 @@
 
 import pytest
 import torch
+from parallel_test_utils import assert_exact, init_world, seed_engram
 
 
 def test_cp_nondivisible_contiguous_ownership(moe):
@@ -84,7 +85,6 @@ def test_cp_preserves_unsupported_parallel_rejection(moe, model_config, key):
 def _cp_worker(rank, config, trainable, lengths, directory):
     import json
     from dataclasses import replace
-    from datetime import timedelta
     from pathlib import Path
 
     import torch.distributed as dist
@@ -109,26 +109,11 @@ def _cp_worker(rank, config, trainable, lengths, directory):
     )
     serial = protocol.build_model(config, impl_cfg=impl)
     # Both Engram arms consume nonzero row-dependent memory from the first step.
-    with torch.no_grad():
-        for block in serial.chunks[0].layers:
-            if block.engram is not None:
-                table = block.engram.embed
-                rows = torch.linspace(
-                    -0.25, 0.25, table.weight.numel(), device=rank
-                ).reshape(table.weight.shape)
-                table.weight.copy_(rows.to(table.weight.dtype))
-                if table.master is not None:
-                    table.master.copy_(table.weight.float())
+    seed_engram(serial.chunks[0])
     ordered = [protocol.build_model(config, impl_cfg=impl) for _ in range(2)]
     for bundle in ordered:
         bundle.chunks[0].load_state_dict(serial.chunks[0].state_dict())
-    dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rendezvous').as_uri(),
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=120),
-    )
+    init_world(rank, directory, world=2, timeout=120, rendezvous='rendezvous')
     try:
         parallel = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(cp=2))
@@ -169,9 +154,7 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                     f'CP logits rank={rank} step={step} full={raw_error} ordered={errors["logits_max_abs"]}',
                     flush=True,
                 )
-                torch.testing.assert_close(
-                    actual, expected, atol=0, rtol=0, msg='CP_ORDERED_LOCAL_LOGITS'
-                )
+                assert_exact(actual, expected, msg='CP_ORDERED_LOCAL_LOGITS')
             for b in ordered:
                 b.optimizer.zero_grad()
             ref_logits, loads = _ordered_reference(
@@ -201,13 +184,7 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                             f'CP pre-reduction rank={rank} {name} max_abs={error}',
                             flush=True,
                         )
-                    torch.testing.assert_close(
-                        p.grad,
-                        q.grad,
-                        atol=0,
-                        rtol=0,
-                        msg=f'CP_PRE_REDUCTION_GRAD {name}',
-                    )
+                    assert_exact(p.grad, q.grad, msg=f'CP_PRE_REDUCTION_GRAD {name}')
             # Clear diagnostic statistics, then exercise production DDP backward.
             parallel.optimizer.zero_grad()
             run_microbatch_loop(
@@ -231,23 +208,15 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                     + (torch.zeros_like(right) if right.grad is None else right.grad)
                 ) / 2
                 assert p.grad is not None, f'CP_GRAD_MEMBERSHIP {name}'
-                torch.testing.assert_close(
+                assert_exact(
                     p.main_grad if p.main_grad is not None else p.grad,
                     p.grad,
-                    atol=0,
-                    rtol=0,
                     msg=f'CP_OPTIMIZER_GRAD_VIEW {name}',
                 )
                 errors['gradient_max_abs'] = max(
                     errors['gradient_max_abs'], float((p.grad - average).abs().max())
                 )
-                torch.testing.assert_close(
-                    p.grad,
-                    average,
-                    atol=0,
-                    rtol=0,
-                    msg=f'CP_ORDERED_GLOBAL_GRAD {name}',
-                )
+                assert_exact(p.grad, average, msg=f'CP_ORDERED_GLOBAL_GRAD {name}')
                 left.grad = left.main_grad = average.clone()
                 right.grad = right.main_grad = average.clone()
             for b in ordered:
@@ -263,18 +232,14 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                 errors['parameter_max_abs'] = max(
                     errors['parameter_max_abs'], float((p - q).detach().abs().max())
                 )
-                torch.testing.assert_close(
-                    p, q, atol=0, rtol=0, msg=f'CP_STEP_PARAMETER {name}'
-                )
+                assert_exact(p, q, msg=f'CP_STEP_PARAMETER {name}')
             for block, other in zip(
                 model.layers, ordered[0].chunks[0].layers, strict=True
             ):
                 for name in ('bias', 'bias_vl'):
-                    torch.testing.assert_close(
+                    assert_exact(
                         getattr(block.ffn.gate, name),
                         getattr(other.ffn.gate, name),
-                        atol=0,
-                        rtol=0,
                         msg='CP_GLOBAL_ROUTER_LOAD',
                     )
                 if block.attn.indexer is not None:
@@ -345,12 +310,7 @@ def test_cp_attention_uses_document_global_query_positions(
         CSA2Attention,
     )
 
-    module = CSA2Attention(
-        model_config.attention_config(
-            linear_fp8=False, main_qat=False, index_qat=False, swa_fp8=False
-        ),
-        0,
-    ).float()
+    module = CSA2Attention(config, 0).float()
     x = torch.randn(1, 7, config.dim)
     ownership = ContiguousCPSequence(7, 1, 2, group=object())
     monkeypatch.setattr(ContiguousCPSequence, 'gather', lambda self, local, **kwargs: x)

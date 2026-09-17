@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Text PP2 must preserve the complete model's native HC values and gradients."""
+
 from dataclasses import replace
 
 import pytest
@@ -12,6 +13,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import (
 from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
+from parallel_test_utils import assert_exact, init_world, seed_engram
 
 
 def _impl(dtype=torch.float32, trainable=False, device='cpu'):
@@ -56,7 +58,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
     impl = _impl(dtype, trainable)
     serial = protocol.build_model(model_config, impl_cfg=impl)
     reference = serial.chunks[0]
-    _seed_engram(reference)
+    seed_engram(reference)
     stages = _local_stages(model_config, impl, monkeypatch)
     models = [b.chunks[0] for b in stages]
     for rank, (bundle, model) in enumerate(zip(stages, models)):
@@ -98,9 +100,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
         models[1].set_input_tensor(received)
         actual = stages[1].forward_step(models[1], batch)
         for key in ('logits', 'log_probs', 'loss'):
-            torch.testing.assert_close(
-                actual[key], expected[key], rtol=0, atol=0, msg='PP_PAIRED_' + key
-            )
+            assert_exact(actual[key], expected[key], msg='PP_PAIRED_' + key)
         expected['loss'].backward()
         actual['loss'].backward()
         wire.backward(received.grad)
@@ -109,9 +109,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
                 q = dict(reference.named_parameters())[name]
                 assert (p.grad is None) == (q.grad is None), 'PP_GRAD_OWNER:' + name
                 if p.grad is not None:
-                    torch.testing.assert_close(
-                        p.grad, q.grad, rtol=0, atol=0, msg='PP_GRAD:' + name
-                    )
+                    assert_exact(p.grad, q.grad, msg='PP_GRAD:' + name)
         for model in [reference, *models]:
             model.zero_grad(set_to_none=True)
 
@@ -127,22 +125,8 @@ def test_pp2_rejects_untransported_csa2_state(model_config, cut):
         )
 
 
-def _seed_engram(model):
-    with torch.no_grad():
-        for block in model.layers:
-            if block is not None and block.engram is not None:
-                table = block.engram.embed
-                rows = torch.linspace(
-                    -0.25, 0.25, table.weight.numel(), device=table.weight.device
-                ).reshape(table.weight.shape)
-                table.weight.copy_(rows.to(table.weight.dtype))
-                if table.master is not None:
-                    table.master.copy_(table.weight.float())
-
-
 def _pp_worker(rank, config, dtype, trainable, directory):
     import json
-    from datetime import timedelta
     from pathlib import Path
 
     import torch.distributed as dist
@@ -156,14 +140,8 @@ def _pp_worker(rank, config, dtype, trainable, directory):
     impl = _impl(dtype, trainable, f'cuda:{rank}')
     serial = protocol.build_model(config, impl_cfg=impl)
     reference = serial.chunks[0]
-    _seed_engram(reference)
-    dist.init_process_group(
-        'nccl',
-        init_method=(Path(directory) / 'rendezvous').as_uri(),
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=120),
-    )
+    seed_engram(reference)
+    init_world(rank, directory, world=2, timeout=120, rendezvous='rendezvous')
     try:
         bundle = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(pp=2))
@@ -223,9 +201,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
             )
         if ps.pp_is_last:
             for actual, expected in zip(seen_logits, expected_logits, strict=True):
-                torch.testing.assert_close(
-                    actual, expected, atol=0, rtol=0, msg='PP_GPU_FORWARD_EXACT'
-                )
+                assert_exact(actual, expected, msg='PP_GPU_FORWARD_EXACT')
         counts.update(forward=0, backward=0)
         seen_logits.clear()
         seen_loss.clear()
@@ -249,9 +225,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
         assert counts == {'forward': 2, 'backward': 2}, 'PP_NO_IMAGE_PARTICIPATION'
         if ps.pp_is_last:
             for actual, expected in zip(seen_loss, reference_losses, strict=True):
-                torch.testing.assert_close(
-                    actual, expected, atol=0, rtol=0, msg='PP_TOKEN_NORMALIZATION'
-                )
+                assert_exact(actual, expected, msg='PP_TOKEN_NORMALIZATION')
         gradient_max_abs = 0.0
         for name, p in model.named_parameters():
             q = dict(reference.named_parameters())[name]
@@ -260,9 +234,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
                 gradient_max_abs = max(
                     gradient_max_abs, float((p.grad - q.grad).abs().max())
                 )
-                torch.testing.assert_close(
-                    p.grad, q.grad, rtol=0, atol=0, msg='PP_GPU_GRAD_EXACT:' + name
-                )
+                assert_exact(p.grad, q.grad, msg='PP_GPU_GRAD_EXACT:' + name)
         for block in model.layers:
             if block is not None and block.engram is not None:
                 table = block.engram.embed

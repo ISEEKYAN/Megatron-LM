@@ -3,6 +3,7 @@ import pytest
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel.state import ParallelState
+from parallel_test_utils import assert_exact, init_world
 
 
 def test_runtime_accepts_serialized_v41_optimizer_config():
@@ -149,7 +150,6 @@ def _reference_lookup(table, ids):
 
 def _train_shards(rank, config, trainable, world, ep, cp, directory):
     from dataclasses import replace
-    from datetime import timedelta
     from pathlib import Path
 
     import torch.distributed as dist
@@ -161,13 +161,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
     torch.set_num_threads(1)
     torch.cuda.set_device(rank)
     torch.manual_seed(19)
-    dist.init_process_group(
-        "nccl",
-        init_method=(Path(directory) / "rdzv").as_uri(),
-        rank=rank,
-        world_size=world,
-        timeout=timedelta(seconds=120),
-    )
+    init_world(rank, directory, world=world, timeout=120, rendezvous='rdzv')
     try:
         impl = protocol.ImplConfig(
             parallel=ParallelConfig(ep=ep, cp=cp),
@@ -251,8 +245,8 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 f"SHARD_STEP rank={rank} step={step} logits_max_abs={float((logits[0] - logits[1]).abs().max())}",
                 flush=True,
             )
-            torch.testing.assert_close(*logits, atol=0, rtol=0)
-            torch.testing.assert_close(*losses, atol=0, rtol=0)
+            assert_exact(*logits)
+            assert_exact(*losses)
             expected = dict(full.named_parameters())
             for layer_id in local.engram_layer_ids:
                 table = local.layers[layer_id].engram.embed
@@ -285,7 +279,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 assert (p.grad is None) == (q.grad is None), name
                 if p.grad is not None:
                     grad = q.grad
-                    torch.testing.assert_close(p.grad, grad, atol=0, rtol=0, msg=name)
+                    assert_exact(p.grad, grad, msg=name)
             ref_step, actual_step = reference.optimizer.step(), actual.optimizer.step()
             assert ref_step[0] and actual_step[0]
             assert actual_step[1] == ref_step[1]
@@ -295,7 +289,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             )
             for name, p in local.named_parameters():
                 q = expected[name]
-                torch.testing.assert_close(p, q, atol=0, rtol=0, msg=name)
+                assert_exact(p, q, msg=name)
         print(
             f"SHARDED_ENGRAM_OK rank={rank} world={world} ep={ep} cp={cp} trainable={trainable}",
             flush=True,
@@ -313,7 +307,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             target = ref_export.pop(name)
             if value.element_size() == 1:
                 value, target = value.view(torch.uint8), target.view(torch.uint8)
-            torch.testing.assert_close(value, target, atol=0, rtol=0, msg=name)
+            assert_exact(value, target, msg=name)
         assert not ref_export
         snapshot = {name: value.clone() for name, value in local.state_dict().items()}
         save_training_checkpoint(local, actual.optimizer, 2, directory, use_dcp=False)
@@ -325,12 +319,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
             == 2
         )
         for name, value in local.state_dict().items():
-            torch.testing.assert_close(
-                value.view(torch.uint8),
-                snapshot[name].view(torch.uint8),
-                atol=0,
-                rtol=0,
-            )
+            assert_exact(value.view(torch.uint8), snapshot[name].view(torch.uint8))
         import json
 
         from megatron.lite.model.deepseek_v41.lite.checkpoint import load_model
@@ -351,11 +340,9 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 parameter.zero_()
         load_model(local, destination, allow_missing_mtp=True)
         for name, value in local.state_dict().items():
-            torch.testing.assert_close(
+            assert_exact(
                 value.reshape(-1).view(torch.uint8),
                 snapshot[name].reshape(-1).view(torch.uint8),
-                atol=0,
-                rtol=0,
                 msg=name,
             )
         print(f"SHARDED_CHECKPOINT_EXPORT_RELOAD_OK rank={rank}", flush=True)
