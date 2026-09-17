@@ -22,7 +22,8 @@ from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
 from torch.nn import functional as F
 
-from .checkpoint import export_checkpoint, load_model, save_model
+from .checkpoint import export_hf_weights as _export_hf_weights_impl
+from .checkpoint import load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
 from .training import VisionSchedule, VisionTrainability
 
@@ -612,7 +613,7 @@ def _single(chunks):
 
 
 def export_hf_weights(chunks, model_cfg, ps, **kwargs):
-    yield from export_checkpoint(_single(chunks), **kwargs)
+    yield from _export_hf_weights_impl(chunks, model_cfg, ps, **kwargs)
 
 
 def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):

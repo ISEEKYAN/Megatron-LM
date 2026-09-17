@@ -409,6 +409,23 @@ def export_model(model):
             yield name, value
 
 
+def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    """Adapt online export options without changing the archival checkpoint stream."""
+    if len(chunks) != 1:
+        raise NotImplementedError('Single-rank V4.1 export requires one chunk')
+    # Match Qwen3.5: no executable MTP path; local prefixes are a legacy hint.
+    include_mtp_only = kwargs.pop('include_mtp_only', False)
+    kwargs.pop('include_local_prefixes', None)
+    if include_mtp_only:
+        return
+    limit = kwargs.pop('limit', None)
+    for exported_params, pair in enumerate(export_checkpoint(chunks[0], **kwargs), 1):
+        yield pair
+        # Match the shared HF exporter's post-yield limit check.
+        if limit is not None and exported_params >= limit:
+            return
+
+
 def export_checkpoint(
     model,
     *,

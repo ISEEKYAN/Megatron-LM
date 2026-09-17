@@ -325,6 +325,17 @@ def test_online_export_requires_protocol_for_resync(extras):
     assert export_calls == [], 'ONLINE_EXPORT_MISSING_PROTOCOL_FAILS_BEFORE_DISPATCH'
 
 
+@pytest.mark.parametrize(
+    'selection',
+    [
+        {},
+        {'limit': 1},
+        {'include_mtp_only': False},
+        {'include_mtp_only': True},
+        {'include_local_prefixes': ['model.']},
+        {'limit': 1, 'include_mtp_only': False, 'include_local_prefixes': ['model.']},
+    ],
+)
 @pytest.mark.parametrize('resync_format', [None, 'mxfp4'])
 @pytest.mark.parametrize('resync_config', [{}, {'expert_dtype': 'fp4'}])
 @pytest.mark.parametrize(
@@ -337,6 +348,7 @@ def test_v41_engine_online_export_resync_contract(
     resync_format,
     resync_config,
     capability,
+    selection,
 ):
     transformer_engine_import_stub()
     from megatron.lite.model.deepseek_v41.lite import protocol
@@ -354,6 +366,7 @@ def test_v41_engine_online_export_resync_contract(
             'cpu': False,
             'export_dtype': 'bfloat16',
         }
+        expected.update(selection)
         if capability is not False and resync_format is not None:
             expected['target'] = resync_format
             if resync_config:
@@ -388,7 +401,7 @@ def test_v41_engine_online_export_resync_contract(
             qat={},
         ),
     )
-    weights, metadata = _online_export_method()(engine)
+    weights, metadata = _online_export_method()(engine, **selection)
     tensors = dict(weights)  # Consume the lazy generator through checkpoint export.
     assert len(export_calls) == 1, 'ONLINE_EXPORT_RUNTIME_BOUNDARY_EXECUTED'
     assert metadata is None, 'ONLINE_EXPORT_METADATA'
@@ -396,6 +409,13 @@ def test_v41_engine_online_export_resync_contract(
         assert set(tensors) == {'control.weight'}, 'ONLINE_EXPORT_CONTROL_KEYS'
         assert tensors['control.weight'].item() == 7, 'ONLINE_EXPORT_CONTROL_VALUE'
         return
+    if selection.get('include_mtp_only'):
+        assert tensors == {}, 'ONLINE_EXPORT_NO_EXECUTABLE_MTP'
+        return
+    if selection.get('limit') == 1:
+        assert list(tensors) == [next(iter(values))], 'ONLINE_EXPORT_LIMIT'
+        values = {name: values[name] for name in tensors}
+        archive = {}
     assert (
         tensors.keys() == values.keys() | archive.keys()
     ), 'ONLINE_EXPORT_COMPLETE_KEYS'
@@ -405,9 +425,11 @@ def test_v41_engine_online_export_resync_contract(
             tensors[name], value.bfloat16()
         ), 'ONLINE_EXPORT_MASTER_VALUE'
         assert value.dtype == torch.float32, 'ONLINE_EXPORT_MASTER_UNMODIFIED'
-    assert torch.equal(
-        tensors['mtp.weight'].view(torch.uint8), archive['mtp.weight'].view(torch.uint8)
-    ), 'ONLINE_EXPORT_ARCHIVE_BYTES'
+    if archive:
+        assert torch.equal(
+            tensors['mtp.weight'].view(torch.uint8),
+            archive['mtp.weight'].view(torch.uint8),
+        ), 'ONLINE_EXPORT_ARCHIVE_BYTES'
 
 
 @pytest.mark.parametrize(
