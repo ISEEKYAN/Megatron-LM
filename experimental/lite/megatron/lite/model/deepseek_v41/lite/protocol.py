@@ -322,7 +322,6 @@ pack_r3_replay_mask = partial(
 
 
 router_replay_roots = partial(_protocol_utils.router_replay_roots, contiguous=True)
-unpack_recorded_routed_experts = _protocol_utils.unpack_recorded_routed_experts
 
 
 def _cp_targets(batch, cp_context):
