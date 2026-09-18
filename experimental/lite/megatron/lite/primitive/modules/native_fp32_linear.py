@@ -38,7 +38,16 @@ def native_fp32_linear(x, weight):
 class Linear(torch.nn.Module):
     """Bias-free floating, block-FP8 or group32-FP4 projection."""
 
-    def __init__(self, input_size, output_size, *, fp8=False, dtype=torch.bfloat16):
+    def __init__(
+        self,
+        input_size,
+        output_size,
+        *,
+        fp8=False,
+        dtype=torch.bfloat16,
+        fp8_operator=None,
+        fake_quant=None
+    ):
         super().__init__()
         self.in_features, self.out_features = input_size, output_size
         self.weight = torch.nn.Parameter(
@@ -46,23 +55,20 @@ class Linear(torch.nn.Module):
         )
         torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         self.fp8 = fp8
+        self.fp8_operator, self.fake_quant = fp8_operator, fake_quant
 
     def forward(self, x):
         weight = self.weight
         if getattr(self, 'quantized', False):
-            from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
-
-            x, weight = fake_quant_index(x), fake_quant_index(weight)
+            x, weight = self.fake_quant(x), self.fake_quant(weight)
         if self.fp8:
-            from megatron.lite.primitive.quantization.ds41_fp8 import dynamic_fp8_linear
-
-            return dynamic_fp8_linear(x, weight)
+            return self.fp8_operator(x, weight)
         linear = native_fp32_linear if getattr(self, 'native_fp32', False) else F.linear
         return linear(x, weight)
 
 
-def FP4Linear(input_size, output_size, *, quantized):
-    module = Linear(input_size, output_size)
+def FP4Linear(input_size, output_size, *, quantized, fake_quant):
+    module = Linear(input_size, output_size, fake_quant=fake_quant)
     module.quantized = quantized
     return module
 

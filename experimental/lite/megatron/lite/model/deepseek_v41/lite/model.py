@@ -30,7 +30,7 @@ from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from torch import nn
 
-from ..codecs import attention_codecs
+from ..codecs import CODECS, attention_codecs
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import DeferredModule, Rule, TensorBinding, validate_execution
 from .moe import DeepseekV41MoE, ModalityRouter
@@ -144,7 +144,11 @@ class DeepseekV41Model(nn.Module):
             group=self.engram_group,
             group_size=self.ps.dp_cp_size,
             local_range=(start, end),
-            projection=partial(Linear, fp8=quantized),
+            projection=partial(
+                Linear,
+                fp8=quantized,
+                fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")],
+            ),
             constructors=memory.MEMORY_FACTORIES,
         )
         for index, module in memories.items():
@@ -186,9 +190,17 @@ class DeepseekV41Model(nn.Module):
         width = t.moe_intermediate_size * (t.n_shared_experts if shared else 1)
 
         projection = (
-            partial(Linear, fp8=quantized)
+            partial(
+                Linear,
+                fp8=quantized,
+                fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")],
+            )
             if shared
-            else partial(FP4Linear, quantized=quantized)
+            else partial(
+                FP4Linear,
+                quantized=quantized,
+                fake_quant=CODECS[("index", 32, "e8m0", "e2m1")],
+            )
         )
         return SwiGLUMLP.from_projections(
             *(projection(a, b) for a, b in ((dim, width), (width, dim), (dim, width))),

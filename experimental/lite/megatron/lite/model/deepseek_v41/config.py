@@ -2,10 +2,10 @@
 """Release policy and one topology table, including inactive archival metadata."""
 from copy import deepcopy
 
+from megatron.lite.primitive.config import load_hf_config_dict
 from megatron.lite.primitive.config_fields import (
     nested_fields,
     project_fields,
-    read_config,
     require_fields,
 )
 
@@ -78,7 +78,7 @@ class DeepseekV41Config:
 
     @classmethod
     def from_hf(cls, path):
-        return cls._from_hf_dict(read_config(path))
+        return cls._from_hf_dict(load_hf_config_dict(path))
 
     @classmethod
     def _from_hf_dict(cls, hf):

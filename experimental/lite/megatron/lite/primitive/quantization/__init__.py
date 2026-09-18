@@ -32,3 +32,9 @@ __all__ = [
     "quantize_weight",
     "unpack_int4",
 ]
+
+
+# Compatibility import names; implementations are format-owned.
+from . import mxfp4 as ds41_index
+from . import mxfp8 as ds41_fp8
+from . import nvfp4 as ds41_kv

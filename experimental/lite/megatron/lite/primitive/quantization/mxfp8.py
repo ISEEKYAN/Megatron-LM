@@ -6,7 +6,8 @@ from dataclasses import dataclass
 import torch
 
 from .block_fp8 import dequantize_block_fp8, quantize_block_fp8
-from .ds41_kv import _IdentityGradient, _validate_input
+from .mxfp4 import _validate_input
+from .qat import _FloatFakeQuantSTE
 
 
 @dataclass(frozen=True)
@@ -38,7 +39,7 @@ def quantize_swa(post_rope):
 
 
 def fake_quant_swa(post_rope):
-    return _IdentityGradient.apply(post_rope, quantize_swa(post_rope).decoded)
+    return _FloatFakeQuantSTE.apply(post_rope, quantize_swa(post_rope).decoded, None)
 
 
 def _fp8_gemm(a, a_scale, b, b_scale):

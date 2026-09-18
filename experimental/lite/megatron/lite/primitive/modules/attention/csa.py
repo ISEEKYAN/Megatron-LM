@@ -479,19 +479,22 @@ class CompressedSparseAttention(nn.Module):
         self.ratio, self.kv_owner, self.index_owner = ratio, kv_owner, index_owner
         self.candidate_mode = candidate_mode
         self.owns_kv, self.owns_index = layer_id == kv_owner, layer_id == index_owner
-        self.wq_a = Linear(config.dim, config.q_rank, fp8=config.linear_fp8)
+        from functools import partial
+
+        linear = partial(Linear, fp8_operator=mxfp8.dynamic_fp8_linear)
+        self.wq_a = linear(config.dim, config.q_rank, fp8=config.linear_fp8)
         self.q_norm = RMSNorm(config.q_rank, config.eps)
-        self.wq_b = Linear(
+        self.wq_b = linear(
             config.q_rank, config.heads * config.head_dim, fp8=config.linear_fp8
         )
-        self.wkv = Linear(config.dim, config.head_dim, fp8=config.linear_fp8)
+        self.wkv = linear(config.dim, config.head_dim, fp8=config.linear_fp8)
         self.kv_norm = RMSNorm(config.head_dim, config.eps)
         self.attn_sink = nn.Parameter(torch.zeros(config.heads, dtype=torch.float32))
-        self.wo_a = Linear(
+        self.wo_a = linear(
             config.heads * config.head_dim // config.groups,
             config.groups * config.o_rank,
         )
-        self.wo_b = Linear(
+        self.wo_b = linear(
             config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
         )
         self.compressor = (
@@ -505,9 +508,7 @@ class CompressedSparseAttention(nn.Module):
         c, layer, ratio = self.config, self.layer_id, self.ratio
         main_codec = fake_quant_main_kv if self.codecs is None else self.codecs["main"]
         index_codec = fake_quant_index if self.codecs is None else self.codecs["index"]
-        swa_codec = (
-            ds41_fp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
-        )
+        swa_codec = mxfp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
         b, length, _ = x.shape
         full_x = x if cp_context is None else cp_context.gather(x)
         global_length = full_x.shape[1]
@@ -1397,9 +1398,9 @@ from megatron.lite.primitive.modules.native_fp32_linear import (
     Linear,
     native_fp32_linear,
 )
-from megatron.lite.primitive.quantization import ds41_fp8
-from megatron.lite.primitive.quantization.ds41_index import fake_quant_index
-from megatron.lite.primitive.quantization.ds41_kv import fake_quant_main_kv
+from megatron.lite.primitive.quantization import mxfp8
+from megatron.lite.primitive.quantization.mxfp4 import fake_quant_index
+from megatron.lite.primitive.quantization.nvfp4 import fake_quant_main_kv
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
 from torch import nn
 from torch.nn import functional as F

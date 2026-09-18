@@ -1,12 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Nested configuration field validation and explicit name projection."""
-import json
-from pathlib import Path
-
-
-def read_config(path):
-    path = Path(path)
-    return json.loads((path / 'config.json' if path.is_dir() else path).read_text())
 
 
 def nested_fields(release, model_type, sections):
