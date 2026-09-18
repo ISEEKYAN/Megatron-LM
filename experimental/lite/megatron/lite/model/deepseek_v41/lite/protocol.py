@@ -293,7 +293,14 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
 export_hf_weights = _export_hf_weights_impl
 
 
-def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+def save_hf_weights(
+    chunks, path, model_cfg, ps, *, target=None, resync_config=None, **kwargs
+):
+    if target is not None or resync_config is not None:
+        raise NotImplementedError(
+            "V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require "
+            "a resync exporter; this entry point only saves archival HF weights"
+        )
     if len(chunks) != 1:
         raise NotImplementedError('Single-rank V4.1 export requires one chunk')
     save_model(chunks[0], path, **kwargs)
