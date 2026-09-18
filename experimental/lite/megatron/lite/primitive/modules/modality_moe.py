@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Expert computation through shared dispatch and modality statistics."""
 
+import math
+import os
 from dataclasses import dataclass
 
 import torch
@@ -44,6 +46,17 @@ class ModalityRouter(nn.Module):
         self.router = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
         self.gate_temperature = gate_temperature
         self.bias_rate = bias_rate
+        self.world_size = max(
+            math.prod(
+                getattr(ps, name, 1)
+                for name in ("tp_size", "cp_size", "pp_size", "dp_size")
+            ),
+            math.prod(
+                getattr(ps, name, 1)
+                for name in ("etp_size", "ep_size", "pp_size", "expert_dp_size")
+            ),
+            int(os.environ.get("WORLD_SIZE", "1")),
+        )
         self.register_buffer("bias", torch.zeros(config.n_routed_experts))
         self.register_buffer("bias_vl", torch.zeros(config.n_routed_experts))
 
@@ -82,13 +95,17 @@ class ModalityRouter(nn.Module):
         """
         if stats.counts.shape != (2, self.router.num_experts):
             raise ValueError("Expected text/image expert counts")
+        world_size = max(
+            self.world_size, dist.get_world_size() if dist.is_initialized() else 1
+        )
+        if world_size > 1 and not dist.is_initialized():
+            raise RuntimeError("Multi-rank router bias updates require a process group")
         for modality, bias in enumerate((self.bias, self.bias_vl)):
             counts = stats.counts[modality].float()
             if counts.sum() > 0:
-                if not dist.is_initialized():
-                    raise RuntimeError(
-                        "Router bias updates require an initialized process group"
-                    )
+                if world_size == 1:
+                    bias.add_(torch.sign(counts.mean() - counts) * self.bias_rate)
+                    continue
                 bias.copy_(
                     get_updated_expert_bias(
                         counts, bias, self.bias_rate, dist.group.WORLD

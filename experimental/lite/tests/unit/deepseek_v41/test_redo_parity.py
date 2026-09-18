@@ -113,7 +113,9 @@ def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
     ids = torch.tensor([[1, 8, 3, 6]])
     for _ in range(2):
         optimizer.zero_grad()
-        model(ids)['logits'].square().mean().backward()
+        output = model(ids)
+        optimizer.accumulate_modality_loads(output['modality_loads'])
+        output['logits'].square().mean().backward()
         assert optimizer.step()[0]
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     next(p for p in model.parameters() if p.grad is not None).grad.flatten()[0] = float('nan')

@@ -125,7 +125,10 @@ def test_routing_selects_the_bias_belonging_to_each_token_modality(moe):
     assert not (image_rows == 0).all()
 
 
-def test_update_bias_requires_an_initialized_process_group(moe):
+def test_update_bias_requires_an_initialized_process_group_for_multiple_ranks(
+    moe, monkeypatch
+):
+    monkeypatch.setenv("WORLD_SIZE", "2")
     # Without a group the merge cannot happen, so updating from local counts
     # would quietly diverge the replicas instead of failing.
     router = _router(moe)
@@ -154,5 +157,74 @@ def test_update_bias_moves_each_modality_from_its_own_counts(moe, tmp_path):
         # Each modality reads only its own row.
         assert torch.equal(router.bias[1], router.bias[2])
         assert torch.equal(router.bias_vl[0], router.bias_vl[1])
+    finally:
+        torch.distributed.destroy_process_group()
+
+
+def test_update_bias_uses_local_counts_without_a_group(moe, monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    assert not torch.distributed.is_initialized()
+    router = _router(moe, rate=0.5)
+    stats = moe.ModalityLoad(
+        torch.tensor([[8, 0, 0, 0], [0, 0, 0, 8]]), torch.tensor([4, 4])
+    )
+    router.update_bias(stats)
+    torch.testing.assert_close(router.bias, torch.tensor([-0.5, 0.5, 0.5, 0.5]))
+    torch.testing.assert_close(router.bias_vl, torch.tensor([0.5, 0.5, 0.5, -0.5]))
+
+
+def test_parallel_topology_cannot_silently_use_local_counts(moe, monkeypatch):
+    monkeypatch.setenv("WORLD_SIZE", "1")
+    # Construct through the same router config, but declare two DP ranks.
+    from types import SimpleNamespace
+
+    from megatron.lite.primitive.parallel.state import ParallelState
+
+    config = SimpleNamespace(
+        n_routed_experts=4,
+        num_experts_per_tok=2,
+        hidden_size=8,
+        norm_topk_prob=True,
+        topk_method='noaux_tc',
+        n_group=1,
+        topk_group=1,
+        routed_scaling_factor=1.0,
+    )
+    router = moe.ModalityRouter(config, ParallelState(dp_size=2))
+    stats = moe.ModalityLoad(
+        torch.tensor([[8, 0, 0, 0], [0, 0, 0, 8]]), torch.tensor([4, 4])
+    )
+    with pytest.raises(RuntimeError, match='process group'):
+        router.update_bias(stats)
+
+
+def test_multiple_ranks_still_reduce_counts_before_bias_update(
+    moe, monkeypatch, tmp_path
+):
+    monkeypatch.setenv('WORLD_SIZE', '2')
+    router = _router(moe, rate=0.5)
+    torch.distributed.init_process_group(
+        backend='gloo',
+        init_method=f"file://{tmp_path / 'multi-store'}",
+        world_size=1,
+        rank=0,
+    )
+    try:
+        monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+        calls = []
+
+        def reduce_counts(counts, *, group):
+            assert group is torch.distributed.group.WORLD
+            calls.append(counts.clone())
+            counts.add_(torch.tensor([0.0, 0.0, 0.0, 16.0]))
+
+        monkeypatch.setattr(torch.distributed, 'all_reduce', reduce_counts)
+        stats = moe.ModalityLoad(
+            torch.tensor([[8, 0, 0, 0], [8, 0, 0, 0]]), torch.tensor([4, 4])
+        )
+        router.update_bias(stats)
+        assert len(calls) == 2
+        torch.testing.assert_close(router.bias, torch.tensor([-0.5, 0.5, 0.5, -0.5]))
+        torch.testing.assert_close(router.bias_vl, router.bias)
     finally:
         torch.distributed.destroy_process_group()
