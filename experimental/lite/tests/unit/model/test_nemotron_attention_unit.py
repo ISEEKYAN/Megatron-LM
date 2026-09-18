@@ -14,10 +14,7 @@ def test_packed_attention_matches_frozen_oracle_and_separate_requests():
         pytest.skip("CUDA required")
     from megatron.lite.model.nemotron_h.attention import packed_attention
     from megatron.lite.model.nemotron_h.mamba import SSMMeta
-    from nemotron_h_reference import (
-        _sequence_boundaries,
-        attention_forward,
-    )
+    from nemotron_h_reference import _sequence_boundaries, attention_forward
 
     torch.manual_seed(81)
     q = torch.randn(36, 4, 32, device="cuda", dtype=torch.bfloat16, requires_grad=True)
@@ -43,6 +40,26 @@ def test_packed_attention_matches_frozen_oracle_and_separate_requests():
     )
     torch.testing.assert_close(output, separate, rtol=0, atol=0)
     output.float().square().sum().backward()
+    assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q, k, v))
+
+
+@pytest.mark.gpus(1)
+def test_packed_attention_vjp_supports_long_gqa_sequence():
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA required")
+    from megatron.lite.model.nemotron_h.attention import packed_attention
+    from megatron.lite.model.nemotron_h.mamba import SSMMeta
+
+    tokens = 11_600
+    q = torch.randn(
+        tokens, 16, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    k = torch.randn(
+        tokens, 1, 128, device="cuda", dtype=torch.bfloat16, requires_grad=True
+    )
+    v = torch.randn_like(k, requires_grad=True)
+    output = packed_attention(q, k, v, SSMMeta((0, tokens)), scale=128**-0.5)
+    output.float().square().mean().backward()
     assert all(x.grad is not None and torch.isfinite(x.grad).all() for x in (q, k, v))
 
 
@@ -80,9 +97,7 @@ def _cp_worker(rank, init_file):
         candidate = Attention(
             config,
             ParallelState(
-                cp_group=torch.distributed.group.WORLD,
-                cp_size=2,
-                cp_rank=rank,
+                cp_group=torch.distributed.group.WORLD, cp_size=2, cp_rank=rank
             ),
             device=device,
         )

@@ -1,7 +1,5 @@
 """Cache-free packed attention with native mlite sequence/head exchange."""
 
-from types import SimpleNamespace
-
 import torch
 from torch import nn
 
@@ -10,11 +8,7 @@ from .mamba import SSMMeta, exchange_sequence_channels
 
 
 def packed_attention(q, k, v, meta: SSMMeta, *, scale):
-    """THD causal GQA: shared FA2 forward, per-request HF attention VJP."""
-    from transformers.models.nemotron_h.modeling_nemotron_h import (
-        eager_attention_forward,
-    )
-
+    """THD causal GQA with linear-memory fused forward and VJP."""
     from vllm.vllm_flash_attn import flash_attn_varlen_func
 
     meta.validate_tokens(q.shape[0])
@@ -41,19 +35,18 @@ def packed_attention(q, k, v, meta: SSMMeta, *, scale):
         )
 
     def native(q, k, v):
-        module = SimpleNamespace(
-            num_key_value_groups=q.shape[1] // k.shape[1], training=False
-        )
         outputs = []
         for a, b in zip(meta.boundaries, meta.boundaries[1:]):
             query, key, value = (x[a:b].transpose(0, 1)[None] for x in (q, k, v))
-            mask = torch.full(
-                (b - a, b - a), -torch.inf, device=q.device, dtype=q.dtype
-            ).triu(1)
-            output, _ = eager_attention_forward(
-                module, query, key, value, mask, scaling=scale, dropout=0.0
+            output = torch.nn.functional.scaled_dot_product_attention(
+                query,
+                key,
+                value,
+                is_causal=True,
+                scale=scale,
+                enable_gqa=q.shape[1] != k.shape[1],
             )
-            outputs.append(output.squeeze(0))
+            outputs.append(output.transpose(1, 2).squeeze(0))
         return torch.cat(outputs)
 
     return visible_forward(visible, native, q, k, v)
