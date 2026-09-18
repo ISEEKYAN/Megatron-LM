@@ -273,7 +273,12 @@ def build_model(model_cfg, *, impl_cfg):
             'model_cfg': model_cfg,
             **({'pipeline_dtype': torch.float32} if p.pp > 1 else {}),
             'vision_schedule': model.vision_schedule,
-            'prepare_microbatches': partial(prepare_microbatches, dp_group=ps.dp_group),
+            'prepare_microbatches': partial(
+                prepare_microbatches,
+                dp_group=ps.dp_cp_group if ps.cp_size > 1 else ps.dp_group,
+                cp_rank=ps.cp_rank,
+                cp_size=ps.cp_size,
+            ),
             'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
         },

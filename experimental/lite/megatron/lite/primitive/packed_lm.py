@@ -9,8 +9,8 @@ from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from torch.nn import functional as F
 
 
-def prepare_microbatches(data_iter, count, *, dp_group=None):
-    """Use one valid-token denominator for all SFT microbatches."""
+def prepare_microbatches(data_iter, count, *, dp_group=None, cp_rank=0, cp_size=1):
+    """Sum owned token weights over the gradient averaging group (DP x CP)."""
     from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
 
     if count < 1:
@@ -35,6 +35,14 @@ def prepare_microbatches(data_iter, count, *, dp_group=None):
         # The packed shift zeros each sequence tail (there is no next label),
         # so the original first-token weight does not contribute.
         shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
+        if cp_size > 1:
+            from megatron.lite.primitive.modules.attention.cp import (
+                ContiguousCPSequence,
+            )
+
+            shifted_mask = ContiguousCPSequence(
+                batch.input_ids.numel(), cp_rank, cp_size
+            ).slice(shifted_mask, seq_dim=0)
         total += float(shifted_mask.sum())
     # The generic runtime divides every microbatch by count after this loss.
     dp_size = 1
@@ -97,8 +105,10 @@ def text_output(logits, batch, *, cp_context=None):
             if not math.isfinite(denominator) or denominator <= 0:
                 raise ValueError('Loss denominator must be finite and positive')
         result['loss'] = (token_loss * mask).sum() / denominator
-        if cp_context is not None:
-            # DDP averages the disjoint CP token contributions.
+        if cp_context is not None and (
+            context is None or context.normalization_denominator is None
+        ):
+            # Prepared denominators already compensate for DP x CP averaging.
             result['loss'] = result['loss'] * cp_context.size
         if context is not None:
             result['loss'] = result['loss'] * context.loss_scale
