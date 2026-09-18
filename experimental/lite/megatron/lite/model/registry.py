@@ -122,6 +122,14 @@ register_model(
 # ---------------------------------------------------------------------------
 
 
+register_model(
+    "nemotron_h",
+    package="megatron.lite.model.nemotron_h",
+    hf_model_types=["nemotron_h"],
+    impls={"lite": "megatron.lite.model.nemotron_h.protocol"},
+)
+
+
 def get_model_package(model_name: str):
     if model_name not in MODEL_PACKAGES:
         raise ValueError(f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}")

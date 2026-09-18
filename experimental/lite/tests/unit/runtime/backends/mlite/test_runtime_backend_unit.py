@@ -17,12 +17,27 @@ from megatron.lite.runtime.backends.mlite.runtime import (
     MegatronLiteRuntime,
     _apply_attention_backend_env,
     _build_impl_cfg,
+    _infer_pipeline_tensor_shape,
     _pipeline_callbacks,
     _reset_parameters,
 )
 from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+from megatron.lite.runtime.contracts.data import PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
+
+
+@pytest.mark.parametrize(
+    "explicit_width,hc_mult,expected",
+    [(5376, 1, 5376), (None, 4, 10752), (None, 1, 2688)],
+)
+def test_pipeline_shape_respects_model_payload_width(explicit_width, hc_mult, expected):
+    batch = PackedBatch(torch.zeros(36, dtype=torch.long), None, torch.tensor([17, 19]))
+    config = types.SimpleNamespace(hidden_size=2688, hc_mult=hc_mult)
+    if explicit_width is not None:
+        config.pipeline_hidden_size = explicit_width
+    ps = types.SimpleNamespace(tp_size=1, cp_size=2)
+    assert _infer_pipeline_tensor_shape(batch, config, ps) == (20, 1, expected)
 
 
 def test_runtime_returns_loss_separately_from_microbatch_metrics():

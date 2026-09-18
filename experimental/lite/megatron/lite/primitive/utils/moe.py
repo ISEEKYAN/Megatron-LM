@@ -7,21 +7,25 @@ from typing import Optional, Tuple
 
 import torch
 
-from transformer_engine.pytorch.cpp_extensions import general_gemm
-from transformer_engine.pytorch.module import base as te_module_base
-from transformer_engine.pytorch.permutation import moe_permute as fused_permute
-from transformer_engine.pytorch.permutation import (
-    moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
-)
-from transformer_engine.pytorch.permutation import (
-    moe_permute_with_probs as fused_permute_with_probs,
-)
-from transformer_engine.pytorch.permutation import moe_unpermute as fused_unpermute
-from transformer_engine.pytorch.router import (
-    fused_compute_score_for_moe_aux_loss,
-    fused_moe_aux_loss,
-    fused_topk_with_score_function,
-)
+try:
+    from transformer_engine.pytorch.cpp_extensions import general_gemm
+    from transformer_engine.pytorch.module import base as te_module_base
+    from transformer_engine.pytorch.permutation import moe_permute as fused_permute
+    from transformer_engine.pytorch.permutation import (
+        moe_permute_and_pad_with_probs as fused_permute_and_pad_with_probs,
+    )
+    from transformer_engine.pytorch.permutation import (
+        moe_permute_with_probs as fused_permute_with_probs,
+    )
+    from transformer_engine.pytorch.permutation import moe_unpermute as fused_unpermute
+    from transformer_engine.pytorch.router import (
+        fused_compute_score_for_moe_aux_loss,
+        fused_moe_aux_loss,
+        fused_topk_with_score_function,
+    )
+except ImportError:
+    general_gemm = None
+    te_module_base = None
 
 
 def _te_general_gemm(
@@ -34,6 +38,8 @@ def _te_general_gemm(
     bias: torch.Tensor | None = None,
     grad: bool = False,
 ):
+    if general_gemm is None or te_module_base is None:
+        return None
     if (get_workspace := getattr(te_module_base, "get_workspace", None)) is None:
         return None
     kwargs = dict(
