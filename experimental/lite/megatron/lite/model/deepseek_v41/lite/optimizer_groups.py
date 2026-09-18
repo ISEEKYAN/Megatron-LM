@@ -7,13 +7,11 @@ multimodal assembly; frozen visual and archival MTP owners allocate no state.
 """
 
 
-import torch
 from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
 from megatron.lite.primitive.optimizers.owned_groups import (
     OwnedParameterGroups,
     add_visual_groups,
 )
-from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
 from ..vision_config import OptimizerConfig, VisionOptimizerConfig
 

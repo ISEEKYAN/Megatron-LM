@@ -20,10 +20,6 @@ def validate_execution(*, enable_dspark_execution: bool = False) -> None:
 
 class DeepseekV41WeightSpec:
     optional_prefix = 'mtp.'
-    staging_prefix = '.v41-export-'
-    archive_required_message = (
-        'Complete MTP/vision/aligner archival storage is required for export' )
-    frozen_storage_message = 'Frozen Engram requires FP8 table storage'
 
     @staticmethod
     def row_block(name):

@@ -97,7 +97,6 @@ class DeepseekV41Model(nn.Module):
             )
             block.engram = None
             self.layers[layer_id] = block
-        self.engram_hash = None
         self.engram_layer_ids = tuple(t.engram_layer_ids)
         self.engram_hash, memories = build_row_memories(
             **project_fields(
