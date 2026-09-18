@@ -38,9 +38,10 @@ def _ordered_topk_from_routing_map(
 
 
 def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
-    if router_replay is not None and router_replay.router_replay_action in (
-        RouterReplayAction.REPLAY_FORWARD,
-        RouterReplayAction.REPLAY_BACKWARD,
+    if (
+        router_replay is not None
+        and router_replay.router_replay_action
+        in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
     ):
         raise RuntimeError(
             "R3 router aux loss must be disabled: replay dispatches the supplied "
@@ -81,9 +82,7 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias",
-            torch.zeros(config.num_experts, dtype=torch.float32),
-            persistent=False,
+            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -147,9 +146,7 @@ class TopKRouter(nn.Module):
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(
-                    group=self._aux_loss_group
-                )
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
             aux_loss = moe_ops.switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -283,9 +280,7 @@ class SigmoidTopKRouter(nn.Module):
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(
-                    group=self._aux_loss_group
-                )
+                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
             aux_loss = moe_ops.switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
