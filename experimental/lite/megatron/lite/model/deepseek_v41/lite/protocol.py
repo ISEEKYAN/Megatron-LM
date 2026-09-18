@@ -7,13 +7,23 @@ from functools import partial
 
 import torch
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.protocol_utils import ( pack_r3_replay_mask as _pack_r3_replay_mask, )
-from megatron.lite.model.protocol_utils import ( pack_routed_experts as _pack_routed_experts, )
+from megatron.lite.model.protocol_utils import (
+    pack_r3_replay_mask as _pack_r3_replay_mask,
+)
+from megatron.lite.model.protocol_utils import (
+    pack_routed_experts as _pack_routed_experts,
+)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config_fields import project_fields
-from megatron.lite.primitive.modules.vision_training import ( VisionSchedule, VisionTrainability, )
+from megatron.lite.primitive.modules.vision_training import (
+    VisionSchedule,
+    VisionTrainability,
+)
 from megatron.lite.primitive.packed_lm import _forward_step as _packed_step
-from megatron.lite.primitive.packed_lm import ( prepare_microbatches, unpack_forward_output, )
+from megatron.lite.primitive.packed_lm import (
+    prepare_microbatches,
+    unpack_forward_output,
+)
 from megatron.lite.primitive.parallel import route_records as _route_records
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
@@ -51,7 +61,9 @@ class ImplConfig:
     def __post_init__(self):
         # Runtime/VERL configurations arrive as serialized mappings.
         if isinstance(self.optimizer_config, Mapping):
-            object.__setattr__( self, "optimizer_config", OptimizerConfig(**self.optimizer_config) )
+            object.__setattr__(
+                self, "optimizer_config", OptimizerConfig(**self.optimizer_config)
+            )
         if isinstance(self.dtype, str):
             dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
             if self.dtype not in dtypes:
@@ -62,14 +74,22 @@ class ImplConfig:
 def build_model_config(source, **overrides):
     if overrides:
         raise ValueError('Apply overrides to the explicit nested source config')
-    return ( DeepseekV41Config(source) if isinstance(source, dict)
-        else DeepseekV41Config.from_hf(source) )
+    return (
+        DeepseekV41Config(source)
+        if isinstance(source, dict)
+        else DeepseekV41Config.from_hf(source)
+    )
 
 
-UNSUPPORTED = ( ( lambda c, p: p.pp > 1
-        and (not c.text_only or c.external_vision_device is not None), NotImplementedError,
+UNSUPPORTED = (
+    (
+        lambda c, p: p.pp > 1
+        and (not c.text_only or c.external_vision_device is not None),
+        NotImplementedError,
         'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training',
-    ), ( lambda c, p: p.pp > 1 and c.pipeline_split_layer != 20,
+    ),
+    (
+        lambda c, p: p.pp > 1 and c.pipeline_split_layer != 20,
         NotImplementedError,
         'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state',
     ),

@@ -5,26 +5,36 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
 # of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
+from megatron.lite.primitive import transformer_engine as te
+
 try:
     from megatron.core.transformer.experimental_attention_variant import (
-        csa_cp_layout_kernels, csa_cp_utils as cp_utils,
+        csa_cp_layout_kernels,
     )
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_utils as cp_utils,
+    )
+
     _MODERN_CSA_LAYOUT = False
 except ImportError:
     from megatron.core.transformer.experimental_attention_variant.csa_utils import (
-        cp_layout_kernels as csa_cp_layout_kernels, cp_utils,
+        cp_layout_kernels as csa_cp_layout_kernels,
     )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_utils,
+    )
+
     _MODERN_CSA_LAYOUT = True
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
 )
+
 # MCore moved the fused CSA entry points in the development branch. Keep the
 # Lite adapter compatible with both layouts while downstream snapshots migrate.
 try:
@@ -37,6 +47,7 @@ except ImportError:
         FusedCSAIndexerSparseAttnFromTopkFunc,
         csa_sparse_attn,
     )
+
 from megatron.core.transformer.experimental_attention_variant.dsa import (
     DSAIndexerLossAutoScaler,
     DSAIndexerLossLoggingHelper,
@@ -63,7 +74,9 @@ class GroupedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out_per_group = self.out_features // self.n_groups
-        weight = self.weight.view(self.n_groups, out_per_group, self.in_features_per_group)
+        weight = self.weight.view(
+            self.n_groups, out_per_group, self.in_features_per_group
+        )
         return torch.einsum("...gd,god->...go", x, weight)
 
 
@@ -77,7 +90,10 @@ def build_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32) / rope_head_dim)
+        ** (
+            torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32)
+            / rope_head_dim
+        )
     )
     freqs = torch.einsum("bs,d->bsd", position_ids.to(torch.float32), inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)
@@ -95,11 +111,13 @@ def build_yarn_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = rope_head_dim
     inv_freq_extra = 1.0 / (
-        rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     inv_freq_inter = 1.0 / (
         config.rotary_scaling_factor
-        * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        * rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     low, high = _yarn_find_correction_range(
         config.beta_fast,
@@ -134,7 +152,9 @@ def build_compressed_rope_cos_sin(
             device=device,
             dtype=dtype,
         )
-    return build_rope_cos_sin(position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype)
+    return build_rope_cos_sin(
+        position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype
+    )
 
 
 def apply_partial_rope(
@@ -158,7 +178,9 @@ def apply_partial_rope(
 
 
 class CompressedSequenceCompressor(nn.Module):
-    def __init__(self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False):
+    def __init__(
+        self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False
+    ):
         super().__init__()
         self.config = config
         self.compress_ratio = compress_ratio
@@ -179,7 +201,9 @@ class CompressedSequenceCompressor(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
-    def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
+    def _overlap_transform(
+        self, tensor: torch.Tensor, fill_value: float
+    ) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
         out = tensor.new_full((bsz, n_blocks, 2 * ratio, head_dim), fill_value)
         out[:, :, ratio:] = tensor[:, :, :, 1]
@@ -199,7 +223,9 @@ class CompressedSequenceCompressor(nn.Module):
         gate = self.wgate(x[:, :cutoff])
         content = content.view(bsz, n_blocks, ratio, self.coff, self.head_dim)
         gate = gate.view_as(content)
-        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(gate.device)
+        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(
+            gate.device
+        )
         if self.overlap:
             content = self._overlap_transform(content, 0.0)
             gate = self._overlap_transform(gate, float("-inf"))
@@ -275,17 +301,23 @@ class CompressedSequenceCompressor(nn.Module):
         gate = self.wgate(hidden_compact)
         kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
         gate_grouped = gate.reshape(total_comp, ratio, 1, -1)
-        gate_grouped = gate_grouped + self.ape.view(1, ratio, 1, -1).to(gate_grouped.device)
+        gate_grouped = gate_grouped + self.ape.view(1, ratio, 1, -1).to(
+            gate_grouped.device
+        )
         if self.overlap:
             is_first = compressed_group_ids[:total_comp] == 0
             kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, 0.0)
-            gate_grouped = self._overlap_transform_thd(gate_grouped, is_first, float("-inf"))
+            gate_grouped = self._overlap_transform_thd(
+                gate_grouped, is_first, float("-inf")
+            )
         # Non-overlap (coff == 1): kv_grouped/gate_grouped are already
         # (total_comp, ratio, 1, head_dim); no windowing needed.
         weights = torch.softmax(gate_grouped.float(), dim=1).to(kv_grouped.dtype)
         compressed = (kv_grouped * weights).sum(dim=1)  # (total_comp, 1, head_dim)
         compressed = self.norm(compressed)
-        positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        positions = (
+            compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        )
         cos, sin = build_compressed_rope_cos_sin(
             positions.view(1, total_comp),
             self.rope_head_dim,
@@ -333,7 +365,9 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.wq_b = nn.Linear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+        self.weights_proj = nn.Linear(
+            config.hidden_size, config.index_n_heads, bias=False
+        )
         self.compressor = CompressedSequenceCompressor(
             config, compress_ratio, config.index_head_dim, rotate=True
         )
@@ -362,12 +396,22 @@ class CompressedSparseAttention(nn.Module):
         self.cross_layer = candidate_mode is not None
         self.codecs = codecs
         if self.cross_layer:
-            if candidate_mode not in ("none", "build", "reuse") or compress_ratio is None:
-                raise ValueError("Cross-layer attention requires a ratio and candidate mode")
+            if (
+                candidate_mode not in ("none", "build", "reuse")
+                or compress_ratio is None
+            ):
+                raise ValueError(
+                    "Cross-layer attention requires a ratio and candidate mode"
+                )
             self.ps = ps
-            self._init_cross_layer(config, layer_idx, ratio=compress_ratio,
-                                   kv_owner=kv_owner, index_owner=index_owner,
-                                   candidate_mode=candidate_mode)
+            self._init_cross_layer(
+                config,
+                layer_idx,
+                ratio=compress_ratio,
+                kv_owner=kv_owner,
+                index_owner=index_owner,
+                candidate_mode=candidate_mode,
+            )
             return
         self.config = config
         self.ps = ps
@@ -397,7 +441,9 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = 0
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
@@ -405,7 +451,9 @@ class CompressedSparseAttention(nn.Module):
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
@@ -446,14 +494,20 @@ class CompressedSparseAttention(nn.Module):
         self.wo_b = Linear(
             config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
         )
-        self.compressor = CrossLayerCompressor(config, self.ratio) if self.owns_kv else None
-        self.indexer = CrossLayerIndexer(config, self.owns_kv) if self.owns_index else None
+        self.compressor = (
+            CrossLayerCompressor(config, self.ratio) if self.owns_kv else None
+        )
+        self.indexer = (
+            CrossLayerIndexer(config, self.owns_kv) if self.owns_index else None
+        )
 
     def _forward_cross_layer(self, x, state, *, candidate_mask=None, cp_context=None):
         c, layer, ratio = self.config, self.layer_id, self.ratio
         main_codec = fake_quant_main_kv if self.codecs is None else self.codecs["main"]
         index_codec = fake_quant_index if self.codecs is None else self.codecs["index"]
-        swa_codec = ds41_fp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
+        swa_codec = (
+            ds41_fp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
+        )
         b, length, _ = x.shape
         full_x = x if cp_context is None else cp_context.gather(x)
         global_length = full_x.shape[1]
@@ -482,9 +536,7 @@ class CompressedSparseAttention(nn.Module):
                 index_k = index_codec(
                     rotate(index_k, cp, c, ratio), enabled=c.index_qat
                 )
-                main = main_codec(
-                    rotate(latent, cp, c, ratio), enabled=c.main_qat
-                )
+                main = main_codec(rotate(latent, cp, c, ratio), enabled=c.main_qat)
                 state = AttentionState(
                     kv_owner=layer, latent=latent, main_kv=main, index_k=index_k
                 )
@@ -499,9 +551,7 @@ class CompressedSparseAttention(nn.Module):
             lengths = ((positions + 1) // ratio).unsqueeze(-1)
             if self.owns_index:
                 iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
-                iq = index_codec(
-                    rotate(iq, positions, c, ratio), enabled=c.index_qat
-                )
+                iq = index_codec(rotate(iq, positions, c, ratio), enabled=c.index_qat)
                 weights = self.indexer.weights_proj(x) * (
                     c.index_dim**-0.5 * c.index_heads**-0.5
                 )
@@ -578,9 +628,12 @@ class CompressedSparseAttention(nn.Module):
     ) -> torch.Tensor:
         if self.cross_layer:
             if state is None:
-                raise ValueError("Cross-layer attention requires explicit AttentionState")
-            return self._forward_cross_layer(x, state, candidate_mask=candidate_mask,
-                                             cp_context=cp_context)
+                raise ValueError(
+                    "Cross-layer attention requires explicit AttentionState"
+                )
+            return self._forward_cross_layer(
+                x, state, candidate_mask=candidate_mask, cp_context=cp_context
+            )
         # THD packed sequences take the primary DSv4 CP path. THD is the only
         # sequence-parallel route now: the BSHD dense fallback has been removed.
         if packed_seq_params is not None:
@@ -591,10 +644,14 @@ class CompressedSparseAttention(nn.Module):
                 )
             return self._forward_thd_packed(x, position_ids, packed_seq_params)
         if self.ps.cp_size > 1 and attention_mask is not None:
-            raise ValueError("CP expects attention_mask=None; masks are derived from position_ids.")
+            raise ValueError(
+                "CP expects attention_mask=None; masks are derived from position_ids."
+            )
         batch, seq_len, _ = x.shape
         attention_rope_theta = (
-            self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
         )
         cos, sin = build_compressed_rope_cos_sin(
             position_ids,
@@ -606,11 +663,19 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.wq_b(q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = q * torch.rsqrt(
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_norm(self.wkv(x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
         use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
@@ -633,12 +698,7 @@ class CompressedSparseAttention(nn.Module):
             )
         if use_sparse_backend and self.ps.cp_size == 1 and attention_mask is None:
             return self._forward_fused_sparse_no_indexer_cp1(
-                x,
-                q,
-                kv,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
+                x, q, kv, position_ids=position_ids, cos=cos, sin=sin
             )
 
         # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
@@ -654,10 +714,15 @@ class CompressedSparseAttention(nn.Module):
     def _project_context(
         self, context: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(1, 2)
+        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(
+            1, 2
+        )
         batch, seq_len = context.shape[:2]
         grouped = context.reshape(
-            batch, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
+            batch,
+            seq_len,
+            self.config.o_groups,
+            self.num_heads_per_group * self.head_dim,
         )
         return self.wo_b(self.wo_a(grouped).flatten(2))
 
@@ -677,22 +742,19 @@ class CompressedSparseAttention(nn.Module):
         kv_full = kv.squeeze(1)
         kv_full = kv_full.transpose(0, 1).contiguous()
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
 
         compressed = None
         if self.compressor is not None and self.compress_ratio > 1:
             compressed = self.compressor(
-                x,
-                position_ids=position_ids,
-                rope_theta=self.config.compress_rope_theta,
+                x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
             )
             if compressed is not None:
                 compressed_kv = compressed.squeeze(1)
-                kv_full = torch.cat([kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0)
+                kv_full = torch.cat(
+                    [kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0
+                )
 
         if compressed is not None:
             n_compressed = compressed.size(2)
@@ -716,20 +778,16 @@ class CompressedSparseAttention(nn.Module):
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
 
         out = dsa_kernels.dsa_sparse_attn(
-            query,
-            kv_full,
-            self.sinks.float(),
-            flat_idxs,
-            self.head_dim**-0.5,
+            query, kv_full, self.sinks.float(), flat_idxs, self.head_dim**-0.5
         )
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         return self._project_context(context, cos, sin)
 
@@ -746,7 +804,9 @@ class CompressedSparseAttention(nn.Module):
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
         if self.ps.cp_size != 1:
-            raise NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")
+            raise NotImplementedError(
+                "DeepSeek V4 fused DSA path currently supports CP=1 only."
+            )
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
@@ -771,17 +831,15 @@ class CompressedSparseAttention(nn.Module):
             kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         index_comp = self.indexer.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         if compressed is None or index_comp is None:
-            raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
+            raise RuntimeError(
+                "DeepSeek V4 fused DSA requires at least one compressed KV entry."
+            )
         compressed_kv = compressed.squeeze(1)
         index_k = index_comp.squeeze(1).transpose(0, 1).contiguous()
         kv_full = torch.cat([kv.squeeze(1), compressed_kv], dim=1)
@@ -800,11 +858,16 @@ class CompressedSparseAttention(nn.Module):
             batch, seq_len, self.indexer.index_n_heads, self.indexer.index_head_dim
         )
         q_indexer = q_indexer.transpose(1, 2)
-        q_indexer = apply_partial_rope(q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim)
+        q_indexer = apply_partial_rope(
+            q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim
+        )
         q_indexer = rotate_activation(q_indexer)
         q_indexer = q_indexer.transpose(1, 2).transpose(0, 1).contiguous()
         weights_indexer = (
-            (self.indexer.weights_proj(x).to(dtype=x.dtype) * (self.indexer.index_n_heads**-0.5))
+            (
+                self.indexer.weights_proj(x).to(dtype=x.dtype)
+                * (self.indexer.index_n_heads**-0.5)
+            )
             .transpose(0, 1)
             .contiguous()
         )
@@ -812,10 +875,7 @@ class CompressedSparseAttention(nn.Module):
         if indexer_topk <= 0:
             raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
         query = q.transpose(1, 2).transpose(0, 1).contiguous()
         sink = self.sinks.float()
@@ -848,9 +908,7 @@ class CompressedSparseAttention(nn.Module):
                 indexer_softmax_scale=self.indexer.softmax_scale,
             )
             topk_indices = torch.where(
-                topk_indices >= 0,
-                topk_indices + seq_len,
-                topk_indices,
+                topk_indices >= 0, topk_indices + seq_len, topk_indices
             ).to(torch.int32)
             flat_idxs, flat_tlen = dsa_kernels.build_flat_topk_idxs(
                 window_idxs,
@@ -869,7 +927,9 @@ class CompressedSparseAttention(nn.Module):
             )
 
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         if pad:
             context = context[:, :, :orig_seq_len, :].contiguous()
@@ -904,8 +964,12 @@ class CompressedSparseAttention(nn.Module):
         ``boundary_kv.squeeze(-2).squeeze(1)`` contract in ``_forward_thd_cp``.
         """
         d_window = boundary_hidden.shape[0]
-        bkv = self.kv_norm(self.wkv(boundary_hidden.reshape(d_window, -1)))  # (d_window, head_dim)
-        b_pos = cp_utils._thd_cp_position_ids(cu_seqlens, int(global_start) - d_window, d_window)
+        bkv = self.kv_norm(
+            self.wkv(boundary_hidden.reshape(d_window, -1))
+        )  # (d_window, head_dim)
+        b_pos = cp_utils._thd_cp_position_ids(
+            cu_seqlens, int(global_start) - d_window, d_window
+        )
         cos, sin = build_compressed_rope_cos_sin(
             b_pos.view(1, d_window).long(),
             self.rope_head_dim,
@@ -915,15 +979,14 @@ class CompressedSparseAttention(nn.Module):
             device=bkv.device,
             dtype=bkv.dtype,
         )
-        bkv = bkv.view(1, 1, d_window, self.head_dim)  # (batch=1, head=1, seq=d_window, hd)
+        bkv = bkv.view(
+            1, 1, d_window, self.head_dim
+        )  # (batch=1, head=1, seq=d_window, hd)
         bkv = apply_partial_rope(bkv, cos, sin, self.rope_head_dim)
         return bkv.permute(2, 0, 1, 3).contiguous()  # (d_window, 1, 1, head_dim)
 
     def _forward_thd_packed(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        packed_seq_params: Any,
+        self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params: Any
     ) -> torch.Tensor:
         """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention.
 
@@ -943,13 +1006,17 @@ class CompressedSparseAttention(nn.Module):
         global_start = cp_rank * seq_len
 
         attention_rope_theta = (
-            self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
         )
         # Positions come from cu_seqlens + this rank's global offset (CP-correct
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(1, seq_len)
+        local_pos = cp_utils._thd_cp_position_ids(
+            cu_seqlens, global_start, seq_len
+        ).view(1, seq_len)
         cos, sin = build_compressed_rope_cos_sin(
             local_pos.long(),
             self.rope_head_dim,
@@ -960,11 +1027,19 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.wq_b(q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = q * torch.rsqrt(
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_norm(self.wkv(x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
@@ -985,7 +1060,9 @@ class CompressedSparseAttention(nn.Module):
             # through the same method, so materialize the zero boundary directly
             # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
             d_comp = (
-                8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
+                8
+                if self.compress_ratio == 4
+                else self.compress_ratio if self.compress_ratio > 1 else 0
             )
             d_window = max(int(self.config.sliding_window), d_comp)
             boundary_hidden = x_thd.new_zeros((d_window,) + tuple(x_thd.shape[1:]))
@@ -994,7 +1071,13 @@ class CompressedSparseAttention(nn.Module):
         )
 
         context = self._forward_thd_cp(
-            query_thd, key_thd, x_thd, qr_thd, boundary_hidden, boundary_kv, packed_seq_params
+            query_thd,
+            key_thd,
+            x_thd,
+            qr_thd,
+            boundary_hidden,
+            boundary_kv,
+            packed_seq_params,
         )
         # context: (total, 1, np * hn). Reshape to (1, np, total, hn) for the shared
         # output projection (inverse RoPE + wo), then return (1, total, hidden).
@@ -1033,7 +1116,9 @@ class CompressedSparseAttention(nn.Module):
 
         l_local = query.shape[0]
         if l_local != key.shape[0]:
-            raise RuntimeError("DSv4 THD CP path currently supports self-attention only.")
+            raise RuntimeError(
+                "DSv4 THD CP path currently supports self-attention only."
+            )
         cu_seqlens = self._thd_cu_seqlens(packed_seq_params)
         max_seqlen_q = int(packed_seq_params.max_seqlen_q)
 
@@ -1070,11 +1155,16 @@ class CompressedSparseAttention(nn.Module):
                 )
             )
             if _MODERN_CSA_LAYOUT:
-                (hidden_compact, compressed_group_ids, _, _, _,
-                 cu_seqlens_compressed, seq_to_rank_row) = (
-                    cp_utils.prepare_cp_compressor_input(
-                        x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
-                    )
+                (
+                    hidden_compact,
+                    compressed_group_ids,
+                    _,
+                    _,
+                    _,
+                    cu_seqlens_compressed,
+                    seq_to_rank_row,
+                ) = cp_utils.prepare_cp_compressor_input(
+                    x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
                 )
             else:
                 hidden_compact, compressed_group_ids, seq_to_rank_row = (
@@ -1098,7 +1188,9 @@ class CompressedSparseAttention(nn.Module):
                 q_indexer_cp = indexer.wq_b(indexer_qr.squeeze(1)).view(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                idx_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
+                idx_pos = cp_utils._thd_cp_position_ids(
+                    cu_seqlens, global_start, l_local
+                )
                 idx_cos, idx_sin = build_compressed_rope_cos_sin(
                     idx_pos.view(1, l_local).long(),
                     indexer.rope_head_dim,
@@ -1110,7 +1202,9 @@ class CompressedSparseAttention(nn.Module):
                 )
                 # lite RoPE wants the sequence axis at dim -2: (1, n_heads, l_local, hd).
                 q_rope = q_indexer_cp.permute(1, 0, 2).unsqueeze(0)
-                q_rope = apply_partial_rope(q_rope, idx_cos, idx_sin, indexer.rope_head_dim)
+                q_rope = apply_partial_rope(
+                    q_rope, idx_cos, idx_sin, indexer.rope_head_dim
+                )
                 q_indexer_cp = q_rope.squeeze(0).permute(1, 0, 2).contiguous()
                 q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp = indexer.weights_proj(indexer_x.squeeze(1)) * (
@@ -1133,7 +1227,10 @@ class CompressedSparseAttention(nn.Module):
                 topk_keys = k_indexer_seq_major
                 if _MODERN_CSA_LAYOUT:
                     logical = cp_utils.build_cp_indexer_layout(
-                        cu_seqlens, cu_seqlens_compressed, global_start, l_local,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        l_local,
                         k_indexer_seq_major.shape[0],
                     )
                     layout = logical
@@ -1141,8 +1238,12 @@ class CompressedSparseAttention(nn.Module):
                         layout, row_map = cp_utils.build_cp_compact_indexer_layout(
                             logical, cu_seqlens_compressed, topk_keys.shape[0], ratio
                         )
-                        topk_keys = cp_utils.pack_cp_compact_indexer_k(topk_keys, row_map)
-                    topk_options = dict(indexer_layout=layout, logical_indexer_layout=logical)
+                        topk_keys = cp_utils.pack_cp_compact_indexer_k(
+                            topk_keys, row_map
+                        )
+                    topk_options = dict(
+                        indexer_layout=layout, logical_indexer_layout=logical
+                    )
                 topk_result = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
@@ -1169,32 +1270,34 @@ class CompressedSparseAttention(nn.Module):
                 compressed_kv_local.squeeze(1), group=cp_group
             )
 
-        kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
+        kv_full_thd = torch.cat(
+            (boundary_kv, kv_local, compressed_kv_rank_major), dim=0
+        )
         use_indexer_loss = (
-            training_with_grad and indexer_loss_coeff > 0 and compressed_topk is not None
+            training_with_grad
+            and indexer_loss_coeff > 0
+            and compressed_topk is not None
         )
         compressed_width = (
             compressed_topk.shape[-1]
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        attention_indices = (
-            csa_cp_layout_kernels.build_attention_indices(
-                cu_seqlens,
-                global_start,
-                l_local,
-                d_window,
-                self.config.sliding_window,
-                ratio,
-                compressed_width,
-                compressed_topk,
-                cu_seqlens_compressed=cu_seqlens_compressed,
-                seq_to_rank_row=seq_to_rank_row,
-                for_indexer_loss=use_indexer_loss,
+        attention_indices = csa_cp_layout_kernels.build_attention_indices(
+            cu_seqlens,
+            global_start,
+            l_local,
+            d_window,
+            self.config.sliding_window,
+            ratio,
+            compressed_width,
+            compressed_topk,
+            cu_seqlens_compressed=cu_seqlens_compressed,
+            seq_to_rank_row=seq_to_rank_row,
+            for_indexer_loss=use_indexer_loss,
             # nv/dev now requires the physical capacity of the compressed buffer
             # the indices will address; it is the gathered rank-major KV itself.
             compressed_rows=compressed_kv_rank_major.shape[0],
-            )
         )
 
         topk_idxs, topk_length, indexer_topk_rank_major = attention_indices[:3]
@@ -1293,6 +1396,7 @@ scores; it does not claim fused sparse-kernel performance.
 from dataclasses import dataclass, replace
 
 import torch
+from megatron.lite.primitive.modules.attention.mhc import RMSNorm
 from megatron.lite.primitive.modules.native_fp32_linear import (
     Linear,
     native_fp32_linear,
@@ -1303,8 +1407,6 @@ from megatron.lite.primitive.quantization.ds41_kv import fake_quant_main_kv
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
 from torch import nn
 from torch.nn import functional as F
-
-from megatron.lite.primitive.modules.attention.mhc import RMSNorm
 
 
 @dataclass(frozen=True)
@@ -1402,9 +1504,6 @@ class CrossLayerIndexer(nn.Module):
         # Post-training port policy: selection is frozen, with no indexer loss.
         # Shared compressor/Q projections outside this module remain trainable.
         self.requires_grad_(False)
-
-
-
 
 
 def _visible(scores, lengths):

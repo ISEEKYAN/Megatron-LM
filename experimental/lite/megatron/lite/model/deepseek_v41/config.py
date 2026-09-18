@@ -2,8 +2,12 @@
 """Release policy and one topology table, including inactive archival metadata."""
 from copy import deepcopy
 
-from megatron.lite.primitive.config_fields import ( nested_fields, project_fields, read_config,
-    require_fields, )
+from megatron.lite.primitive.config_fields import (
+    nested_fields,
+    project_fields,
+    read_config,
+    require_fields,
+)
 
 from .topology import TopologySpec, build_topology
 
@@ -11,8 +15,11 @@ from .topology import TopologySpec, build_topology
 class DeepseekV41Config:
     def __init__(self, release):
         self._release = deepcopy(release)
-        text, _, quantization = nested_fields( self._release, 'deepseek_v41',
-            'text_config vision_config quantization_config', )
+        text, _, quantization = nested_fields(
+            self._release,
+            'deepseek_v41',
+            'text_config vision_config quantization_config',
+        )
         self.topology = build_topology(
             TopologySpec(
                 **{

@@ -27,9 +27,9 @@ from megatron.lite.primitive.protocols import (
     default_expert_classifier,
     default_placement_fn,
 )
-from torch.distributed.device_mesh import (
+from torch.distributed.device_mesh import (  # pyright: ignore[reportMissingImports]
     DeviceMesh,
-)  # pyright: ignore[reportMissingImports]
+)
 from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
