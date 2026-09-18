@@ -71,6 +71,13 @@ def test_reject_inconsistent_architecture(lightning_config, field, value):
         NemotronHConfig._from_hf_dict(lightning_config)
 
 
+def test_original_hf_layer_names_preserve_architecture(lightning_config):
+    lightning_config["layers_block_type"] = ["mamba", "moe", "attention"]
+    cfg = NemotronHConfig._from_hf_dict(lightning_config)
+    assert cfg.layers_block_type == ["linear_attention", "moe", "full_attention"]
+    assert lightning_config["layers_block_type"] == ["mamba", "moe", "attention"]
+
+
 def test_missing_mamba_heads_cannot_fall_back_to_expand(lightning_config):
     del lightning_config["mamba_num_heads"]
     with pytest.raises(ValueError, match="mamba_num_heads"):

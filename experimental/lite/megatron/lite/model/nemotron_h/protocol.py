@@ -12,6 +12,7 @@ from megatron.lite.primitive.parallel.thd import (
     thd_pack_meta,
     unpack_thd_to_nested,
 )
+from megatron.lite.primitive.recompute import apply_recompute, parse_recompute_spec
 from megatron.lite.runtime.contracts import OptimizerConfig, ParallelConfig
 from megatron.lite.runtime.contracts.loss import get_loss_context
 
@@ -26,8 +27,12 @@ from .model import NemotronModel
 class ImplConfig:
     parallel: ParallelConfig = field(default_factory=ParallelConfig)
     optimizer: str | None = "dist_opt"
+    recompute: list[str] = field(default_factory=list)
     optimizer_config: OptimizerConfig | None = None
     deterministic: bool = True
+
+
+MODULE_MAP = {}
 
 
 def build_model_config(source, **overrides):
@@ -149,6 +154,10 @@ def build_model(model_cfg, *, impl_cfg):
         count * (ps.pp_rank + 1) // ps.pp_size,
     )
     chunks = [NemotronModel(model_cfg, ps, layer_range=(start, end), device="cuda")]
+    recompute_spec = parse_recompute_spec(impl_cfg.recompute)
+    if recompute_spec:
+        for chunk in chunks:
+            apply_recompute(chunk.layers.values(), recompute_spec, MODULE_MAP)
     optimizer = finalize_grads = None
     if impl_cfg.optimizer == "dist_opt":
         from megatron.lite.primitive.optimizers.megatron_wrap import (

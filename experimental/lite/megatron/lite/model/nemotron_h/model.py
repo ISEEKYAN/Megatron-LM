@@ -111,7 +111,7 @@ class NemotronModel(nn.Module):
             hidden, residual = self._input_tensor[:, 0].chunk(2, dim=-1)
             self._input_tensor = None
         for layer in self.layers.values():
-            hidden, residual = layer(hidden, residual, meta)
+            hidden, residual = layer(hidden, residual, meta=meta)
         if not self.post_process:
             return torch.cat((hidden, residual), dim=-1).unsqueeze(1)
         hidden, _ = self.norm_f(hidden, residual)

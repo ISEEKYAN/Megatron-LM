@@ -138,7 +138,12 @@ class NemotronHConfig:
             raise ValueError(
                 f"Missing explicit Nemotron architecture fields: {sorted(missing)}"
             )
-        config = cls(**{name: hf[name] for name in names})
+        values = {name: hf[name] for name in names}
+        aliases = {"mamba": "linear_attention", "attention": "full_attention"}
+        values["layers_block_type"] = [
+            aliases.get(kind, kind) for kind in values["layers_block_type"]
+        ]
+        config = cls(**values)
         if (
             hf.get("num_hidden_layers", config.num_hidden_layers)
             != config.num_hidden_layers

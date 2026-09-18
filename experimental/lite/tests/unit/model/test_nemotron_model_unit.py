@@ -7,6 +7,69 @@ import pytest
 import torch
 
 
+def test_protocol_full_recompute_wraps_every_local_layer(monkeypatch):
+    from types import SimpleNamespace
+
+    from megatron.lite.model.nemotron_h import protocol
+
+    class FakeModel(torch.nn.Module):
+        def __init__(self, *args, **kwargs):
+            super().__init__()
+            self.layers = torch.nn.ModuleDict(
+                {"0": torch.nn.Identity(), "1": torch.nn.Identity()}
+            )
+
+    ps = SimpleNamespace(pp_rank=0, pp_size=1)
+    calls = []
+    monkeypatch.setattr(protocol, "init_parallel", lambda _: ps)
+    monkeypatch.setattr(protocol, "NemotronModel", FakeModel)
+    monkeypatch.setattr(
+        protocol,
+        "apply_recompute",
+        lambda layers, spec, module_map: calls.append(
+            (list(layers), spec, module_map)
+        ),
+    )
+    bundle = protocol.build_model(
+        SimpleNamespace(num_hidden_layers=2),
+        impl_cfg=protocol.ImplConfig(optimizer=None, recompute="full"),
+    )
+    assert calls == [
+        (list(bundle.chunks[0].layers.values()), ["full"], protocol.MODULE_MAP)
+    ]
+
+
+@pytest.mark.gpus(1)
+def test_full_recompute_preserves_nemotron_layer_forward_and_backward():
+    from types import SimpleNamespace
+
+    from megatron.lite.model.nemotron_h.model import NemotronModel
+    from megatron.lite.primitive.recompute import apply_recompute
+
+    class Layer(torch.nn.Module):
+        def forward(self, hidden, residual, meta):
+            assert meta is sentinel
+            residual = hidden if residual is None else residual
+            return hidden.square(), residual
+
+    sentinel = object()
+    model = NemotronModel.__new__(NemotronModel)
+    torch.nn.Module.__init__(model)
+    model.config = SimpleNamespace(hidden_size=3)
+    model.pre_process = True
+    model.post_process = False
+    model.embeddings = torch.nn.Embedding(5, 3)
+    model.layers = torch.nn.ModuleDict({"0": Layer()})
+    apply_recompute(model.layers.values(), ["full"], {})
+
+    output = model(torch.tensor([1, 2]), meta=sentinel)
+    expected_hidden = model.embeddings(torch.tensor([1, 2]))
+    torch.testing.assert_close(output[:, 0, :3], expected_hidden.square())
+    torch.testing.assert_close(output[:, 0, 3:], expected_hidden)
+    output.sum().backward()
+    assert model.embeddings.weight.grad is not None
+
+
 @pytest.mark.parametrize("mask", [[1, 0, 0, 1, 1, 1], [0, 0, 0, 1, 1, 1], [0] * 6])
 def test_cp_loss_unequal_valid_counts_matches_unsharded_gradient(mask):
     from megatron.lite.model.nemotron_h.protocol import _token_mean_loss
