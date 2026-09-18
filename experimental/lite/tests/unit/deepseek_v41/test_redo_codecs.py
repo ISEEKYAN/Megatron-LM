@@ -4,7 +4,7 @@ import torch
 
 from megatron.lite.model.deepseek_v41.codecs import CODECS
 from megatron.lite.primitive.ckpt.hf_weights import _dequantize_block_scaled_tensor
-from megatron.lite.primitive.quantization import ds41_index, ds41_kv, qat
+from megatron.lite.primitive.quantization import mxfp4, nvfp4, qat
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 
@@ -20,8 +20,8 @@ def test_grouping_preserves_rows_and_backward(shape, group):
 
 
 @pytest.mark.parametrize('codec,block,dtype', [
-    (ds41_kv.quantize_main_kv, 16, torch.float8_e4m3fn),
-    (ds41_index.quantize_index, 32, torch.float8_e8m0fnu),
+    (nvfp4.quantize_main_kv, 16, torch.float8_e4m3fn),
+    (mxfp4.quantize_index, 32, torch.float8_e8m0fnu),
 ])
 def test_fp4_codec_rounding_and_surface(codec, block, dtype):
     values = torch.tensor([0., .25, .75, 1.25, 1.75, 2.5, 3.5, 5., 6.]).repeat(8)[:64]
