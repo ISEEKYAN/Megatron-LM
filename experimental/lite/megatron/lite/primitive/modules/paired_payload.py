@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Paired PP payload lifetime; the C4 protocol owns scheduling and layer binding."""
+"""Paired pipeline payload lifetime; callers own scheduling and layer binding."""
 
 from dataclasses import dataclass, fields
 

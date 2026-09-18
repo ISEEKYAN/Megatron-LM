@@ -1,7 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Differentiable V4.1 vision tower and spatial aligner.
+"""Differentiable vision tower and spatial aligner.
 
-State names follow the pinned release; no inference-mode boundary is installed.
+No inference-mode boundary is installed.
 Trainability and distributed synchronization belong to the training protocol.
 """
 

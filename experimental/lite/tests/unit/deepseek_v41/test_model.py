@@ -3,12 +3,13 @@ from copy import deepcopy
 
 import pytest
 import torch
-from megatron.lite.model.deepseek_v41.lite import image_data, protocol
+from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.model.deepseek_v41.lite.optimizer_groups import (
     OptimizerConfig,
     VisionOptimizerConfig,
 )
 from megatron.lite.primitive.modules import engram_lookup as engram
+from megatron.lite.primitive.modules import image_data
 from megatron.lite.primitive.quantization import ds41_fp8
 from megatron.lite.primitive.train_step import run_microbatch_loop
 from megatron.lite.runtime.contracts import PackedBatch

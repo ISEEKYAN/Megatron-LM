@@ -4,10 +4,11 @@ from types import SimpleNamespace
 
 import pytest
 import torch
-from megatron.lite.model.deepseek_v41.lite import block as hc
-from megatron.lite.model.deepseek_v41.lite import image_data as data
-from megatron.lite.model.deepseek_v41.lite import vision
+from megatron.lite.primitive.modules import hyper_connection as hc
+from megatron.lite.primitive.modules import image_data as data
+from megatron.lite.primitive.modules import vision
 from PIL import Image
+from pinned_ds41_reference import official  # noqa: F401
 
 
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])

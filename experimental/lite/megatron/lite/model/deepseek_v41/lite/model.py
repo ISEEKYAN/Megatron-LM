@@ -22,8 +22,10 @@ from megatron.lite.primitive.modules.engram_lookup import (
     hash_multipliers,
     prime_buckets,
 )
+from megatron.lite.primitive.modules.image_data import TEXT, merge_image_embeddings
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
 from megatron.lite.primitive.modules.router_replay import PackedRouterReplay
+from megatron.lite.primitive.modules.vision import Aligner, ViT
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
@@ -33,9 +35,7 @@ from torch.nn import functional as F
 from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import validate_execution
-from .image_data import TEXT, merge_image_embeddings
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
-from .vision import Aligner, ViT
 
 
 def packed_forward(
@@ -558,7 +558,7 @@ class DeepseekV41Model(nn.Module):
         parameter sharder. Input IDs belong to one unpacked sequence batch; the
         caller must split packed samples before constructing each generation.
         """
-        from .pipeline import PairedPayload
+        from megatron.lite.primitive.modules.paired_payload import PairedPayload
 
         if (
             type(start) is not int
@@ -749,7 +749,7 @@ class DeepseekV41Model(nn.Module):
             return
         if any(value not in (0, 1) for value in values):
             raise ValueError('Invalid post-training mask in checkpoint')
-        from .training import VisionTrainability
+        from megatron.lite.primitive.modules.vision_training import VisionTrainability
 
         VisionTrainability(*map(bool, values)).apply(module)
 

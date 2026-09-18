@@ -8,40 +8,14 @@ multimodal assembly; frozen visual and archival MTP owners allocate no state.
 
 import math
 from copy import deepcopy
-from dataclasses import dataclass
 from operator import attrgetter
 
 import torch
 from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
-
-
-@dataclass(frozen=True)
-class VisionOptimizerConfig:
-    """Caller-selected post-training LR/decay, not pretraining defaults.
-
-    Image vectors retain the DS4 non-matrix AdamW representation. They are
-    never reshaped into Muon/Sinkhorn matrices. All numeric policy is explicit.
-    """
-
-    encoder_lr_multiplier: float
-    image_vector_lr_multiplier: float
-    image_vector_weight_decay: float
-
-    def __post_init__(self):
-        if any(not math.isfinite(value) or value < 0 for value in vars(self).values()):
-            raise ValueError(
-                'Visual optimizer policy requires finite nonnegative values'
-            )
-
-
-@dataclass(frozen=True)
-class OptimizerConfig:
-    lr: float
-    ns_steps: int
-    coefficient_type: str
-    clip_grad: float = 1.0
-    vision_policy: VisionOptimizerConfig | None = None
-
+from megatron.lite.primitive.optimizers.vision_config import (
+    OptimizerConfig,
+    VisionOptimizerConfig,
+)
 
 # Role -> (matrix algorithm, matrix decay, vector decay, LR multiplier).
 # Roles are validated against an independently enumerated object inventory below.
@@ -416,7 +390,7 @@ class V41Optimizer(MixedOptimizer):
         empty state. This is an explicit post-training transition, not an
         automatic pretraining unfreeze or LR schedule.
         """
-        from .training import VisionTrainability
+        from megatron.lite.primitive.modules.vision_training import VisionTrainability
 
         if not isinstance(mask, VisionTrainability):
             raise TypeError('Expected explicit visual trainability mask')

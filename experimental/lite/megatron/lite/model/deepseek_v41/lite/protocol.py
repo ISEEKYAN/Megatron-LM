@@ -17,6 +17,10 @@ from megatron.lite.model.protocol_utils import (
 )
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
+from megatron.lite.primitive.modules.vision_training import (
+    VisionSchedule,
+    VisionTrainability,
+)
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -25,7 +29,6 @@ from torch.nn import functional as F
 from .checkpoint import export_hf_weights as _export_hf_weights_impl
 from .checkpoint import load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
-from .training import VisionSchedule, VisionTrainability
 
 # HF checkpoints store trainable masters and byte-preserved archives.
 HF_SAVE_SUPPORTS_RESYNC = False
@@ -486,7 +489,7 @@ def _validate_pipeline_batch(batch):
 
 
 def _pipeline_ranges(model, batch, start, end, states):
-    from .pipeline import PairedPayload
+    from megatron.lite.primitive.modules.paired_payload import PairedPayload
 
     outputs = tuple(
         model.forward_pipeline_range(
