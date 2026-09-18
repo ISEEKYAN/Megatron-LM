@@ -21,8 +21,10 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, vocab_parallel_logits, target, tp_group):
-        # Cast to float32 and compute max for numerical stability.
-        vocab_parallel_logits = vocab_parallel_logits.float()
+        # Accumulate low-precision inputs in FP32 without truncating FP64 callers.
+        vocab_parallel_logits = vocab_parallel_logits.to(
+            torch.promote_types(vocab_parallel_logits.dtype, torch.float32)
+        )
         logits_max = torch.max(vocab_parallel_logits, dim=-1)[0]
 
         if tp_group is not None and dist.get_world_size(tp_group) > 1:
@@ -39,7 +41,9 @@ class _VocabParallelCrossEntropy(torch.autograd.Function):
         else:
             rank = 0
             world_size = 1
-        vocab_start_index, vocab_end_index = _vocab_range(partition_vocab_size, rank, world_size)
+        vocab_start_index, vocab_end_index = _vocab_range(
+            partition_vocab_size, rank, world_size
+        )
 
         # Mask targets outside this partition's vocab range.
         target_mask = (target < vocab_start_index) | (target >= vocab_end_index)

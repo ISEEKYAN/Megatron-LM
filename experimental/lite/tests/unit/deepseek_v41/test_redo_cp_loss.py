@@ -5,7 +5,8 @@ from types import SimpleNamespace
 import pytest
 import torch
 import torch.nn.functional as F
-from megatron.lite.primitive.packed_lm import prepare_microbatches, text_output
+from megatron.lite.model.deepseek_v41.lite.protocol import text_output
+from megatron.lite.primitive.train_step import prepare_microbatches
 from megatron.lite.runtime.contracts.loss import use_loss_context
 
 
@@ -102,10 +103,12 @@ def test_cp_loss_matches_global_token_weighted_ce(
             )
             for (batch, context), (_, x) in zip(prepared, replica):
                 partition = ContiguousCPSequence(len(batch.labels), cp, 2)
-                logits = partition.slice(x @ weight, seq_dim=0)
+                hidden = partition.slice(x, seq_dim=0)
                 with use_loss_context(context):
                     contributions.append(
-                        text_output(logits, batch, cp_context=partition)['loss']
+                        text_output(hidden, weight.t(), batch, cp_context=partition)[
+                            'loss'
+                        ]
                     )
     assert (len(set(local_totals)) == 1) == equal_tokens
     # Runtime averages microbatches; DDP averages the four rank contributions.

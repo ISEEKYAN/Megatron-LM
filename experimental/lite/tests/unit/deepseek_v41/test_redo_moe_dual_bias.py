@@ -16,7 +16,7 @@ def moe(transformer_engine_import_stub):
     import megatron.core.fp8_utils  # noqa: F401
 
     transformer_engine_import_stub()
-    from megatron.lite.primitive.modules import modality_moe
+    from megatron.lite.model.deepseek_v41.lite import moe as modality_moe
 
     return modality_moe
 
