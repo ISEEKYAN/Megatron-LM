@@ -337,5 +337,3 @@ __all__ = [
     "set_cross_entropy_fusion",
     "unpack_thd_forward_output",
 ]
-
-

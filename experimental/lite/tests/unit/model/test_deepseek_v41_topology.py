@@ -73,5 +73,3 @@ def test_policies_derive_from_sources_instead_of_release_magic_numbers():
     assert [p.candidate_mode for p in policies] == ["none"] * 4 + ["build"] + [
         "reuse"
     ] * 3
-
-

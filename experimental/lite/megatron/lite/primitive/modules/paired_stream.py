@@ -48,5 +48,3 @@ def unpack_pair(carrier, input_shape, copies, width, dtype, message):
 
 def pack_pair(hidden, pre):
     return torch.cat((hidden.float(), pre.unsqueeze(-1)), dim=-1).flatten(2)
-
-
