@@ -13,16 +13,11 @@ from megatron.lite.primitive.config_fields import project_fields
 from megatron.lite.primitive.modules import engram_lookup as memory
 from megatron.lite.primitive.modules import paired_stream as stream
 from megatron.lite.primitive.modules import vision_training as visual
-from megatron.lite.primitive.modules.attention.csa import (
-    AttentionState,
-    CompressedSparseAttention,
-    Linear,
-)
+from megatron.lite.primitive.modules.attention.csa import ( AttentionState,
+    CompressedSparseAttention, Linear, )
 from megatron.lite.primitive.modules.image_data import validate_image_spans
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
-from megatron.lite.primitive.modules.row_memory_build import (
-    build_row_memories,
-    sequence_hashes,
+from megatron.lite.primitive.modules.row_memory_build import ( build_row_memories, sequence_hashes,
 )
 from megatron.lite.primitive.modules.vision import Aligner, ViT
 from megatron.lite.primitive.packed_lm import packed_paired_forward as packed_forward
@@ -37,28 +32,16 @@ from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
 
 
 class DeepseekV41Model(nn.Module):
-    def __init__(
-        self,
-        config,
-        *,
-        token_map=None,
-        quantized=True,
-        trainable_engram=False,
-        shard_engram=True,
-        gate_temperature=1.0,
-        bias_rate=0.001,
-        enable_dspark_execution=False,
-        layer_range=None,
-        parallel_state=None,
-    ):
+    def __init__( self, config, *, token_map=None, quantized=True, trainable_engram=False,
+        shard_engram=True, gate_temperature=1.0, bias_rate=0.001, enable_dspark_execution=False,
+        layer_range=None, parallel_state=None, ):
         nn.Module.__init__(self)
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         self.topology = config.topology
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
-            self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
-        )
+            self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None )
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
@@ -66,9 +49,7 @@ class DeepseekV41Model(nn.Module):
         expert_start = self.ps.ep_rank * local_experts
         self.hc_mult = copies
         self.vision_schedule = None
-        self.register_buffer(
-            '_vision_trainability', torch.full((4,), -1, dtype=torch.int8)
-        )
+        self.register_buffer( '_vision_trainability', torch.full((4,), -1, dtype=torch.int8) )
         self.register_load_state_dict_post_hook(self._restore_vision_trainability)
         count = t.num_hidden_layers
         start, end = self.initialize_bindings(layer_range, count)
@@ -79,24 +60,14 @@ class DeepseekV41Model(nn.Module):
             self.norm = RMSNorm(dim, eps)
             self.head = nn.Linear(dim, t.vocab_size, bias=False, dtype=torch.float32)
         self.layers = nn.ModuleList([None] * count)
-        ac = config.attention_config(
-            **dict.fromkeys(
-                ('linear_fp8', 'main_qat', 'index_qat', 'swa_fp8'), quantized
-            )
-        )
+        ac = config.attention_config( **dict.fromkeys(
+                ('linear_fp8', 'main_qat', 'index_qat', 'swa_fp8'), quantized ) )
         for layer_id in range(start, end):
             policy = self.topology[layer_id]
-            attention = CompressedSparseAttention(
-                ac,
-                layer_idx=layer_id,
-                ps=self.ps,
-                compress_ratio=policy.compress_ratio,
-                kv_owner=policy.kv_owner,
-                index_owner=policy.index_owner,
-                candidate_mode=policy.candidate_mode,
-                query_head_rms=False,
-                codecs=attention_codecs(),
-            )
+            attention = CompressedSparseAttention( ac, layer_idx=layer_id, ps=self.ps,
+                compress_ratio=policy.compress_ratio, kv_owner=policy.kv_owner,
+                index_owner=policy.index_owner, candidate_mode=policy.candidate_mode,
+                query_head_rms=False, codecs=attention_codecs(), )
             router = ModalityRouter(
                 t,
                 SimpleNamespace(tp_size=1),

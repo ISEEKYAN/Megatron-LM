@@ -3,24 +3,12 @@
 from dataclasses import replace
 from functools import partial
 
-from megatron.lite.primitive.ckpt.binding_records import (
-    DeferredModule,
-    Rule,
-    TensorBinding,
-)
-from megatron.lite.primitive.ckpt.hf_weights import (
-    export_checkpoint as _export_checkpoint,
-)
+from megatron.lite.primitive.ckpt.binding_records import ( DeferredModule, Rule, TensorBinding, )
+from megatron.lite.primitive.ckpt.hf_weights import ( export_checkpoint as _export_checkpoint, )
 from megatron.lite.primitive.ckpt.hf_weights import export_model as _export_model
-from megatron.lite.primitive.ckpt.hf_weights import (
-    load_bound_model,
-    load_bound_weight,
-    save_bound_model,
-)
-from megatron.lite.primitive.modules.engram_lookup import (
-    EngramTable,
-    ShardedEngramTable,
-)
+from megatron.lite.primitive.ckpt.hf_weights import ( load_bound_model, load_bound_weight,
+    save_bound_model, )
+from megatron.lite.primitive.modules.engram_lookup import ( EngramTable, ShardedEngramTable, )
 
 
 def validate_execution(*, enable_dspark_execution: bool = False) -> None:
@@ -34,8 +22,7 @@ class DeepseekV41WeightSpec:
     optional_prefix = 'mtp.'
     staging_prefix = '.v41-export-'
     archive_required_message = (
-        'Complete MTP/vision/aligner archival storage is required for export'
-    )
+        'Complete MTP/vision/aligner archival storage is required for export' )
     frozen_storage_message = 'Frozen Engram requires FP8 table storage'
 
     @staticmethod
@@ -48,10 +35,7 @@ class DeepseekV41WeightSpec:
 
     @staticmethod
     def scale_block(binding):
-        return (
-            1 if binding.encoding == 'I8' or binding.role == 'engram_table' else 32,
-            32,
-        )
+        return ( 1 if binding.encoding == 'I8' or binding.role == 'engram_table' else 32, 32, )
 
     @staticmethod
     def frozen_storage(owner):
