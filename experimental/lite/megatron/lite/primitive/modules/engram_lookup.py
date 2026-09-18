@@ -125,24 +125,6 @@ class RowLookup(object):
             message,
         )
 
-    def gather_rows(self, values, ids):
-        """Gather floating parameter rows with symmetric validation and additive VJP."""
-        dtypes = (torch.float16, torch.bfloat16, torch.float32, torch.float64)
-        self._validate_rows(
-            (values,),
-            ids,
-            lambda t: t.dtype in dtypes,
-            'Expected colocated floating row shard and int64 IDs',
-        )
-        self._schema(
-            [values.shape[1], dtypes.index(values.dtype), int(values.requires_grad)],
-            ids.device,
-        )
-        route = self.route(ids)
-        return route.return_rows(values[route.local_ids]).reshape(
-            *ids.shape, values.shape[1]
-        )
-
     def fetch(self, values, scales, ids, master=None):
         self._validate_rows(
             (values, scales),
@@ -322,34 +304,6 @@ class ShardedEngramTable(nn.Module):
         )
         self.weight.copy_(weight)
         self.scale.copy_(scale)
-
-
-def build_compressed_token_map(tokenizer):
-    from tokenizers import Regex, normalizers
-
-    sentinel = "\ue000"
-    normalizer = normalizers.Sequence(
-        [
-            normalizers.NFKC(),
-            normalizers.NFD(),
-            normalizers.StripAccents(),
-            normalizers.Lowercase(),
-            normalizers.Replace(Regex(r"[ \t\r\n]+"), " "),
-            normalizers.Replace(Regex(r"^ $"), sentinel),
-            normalizers.Strip(),
-            normalizers.Replace(sentinel, " "),
-        ]
-    )
-    mapping, keys = [], {}
-    backend = tokenizer.backend_tokenizer
-    for token_id in range(len(tokenizer)):
-        text = backend.decode([token_id], skip_special_tokens=False)
-        if "\ufffd" in text:
-            key = backend.id_to_token(token_id)
-        else:
-            key = normalizer.normalize_str(text) or text
-        mapping.append(keys.setdefault(key, len(keys)))
-    return mapping, len(keys)
 
 
 def hash_multipliers(layer_ids, max_ngram_size, vocab_size):

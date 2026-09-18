@@ -50,6 +50,3 @@ def pack_pair(hidden, pre):
     return torch.cat((hidden.float(), pre.unsqueeze(-1)), dim=-1).flatten(2)
 
 
-def project_logits(hidden, pre, norm, head, contract):
-    hidden = norm(contract(hidden, pre))
-    return F.linear(hidden.float(), head.weight.float())

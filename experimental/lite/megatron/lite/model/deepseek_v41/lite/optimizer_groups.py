@@ -122,8 +122,4 @@ def V41Optimizer(model, config, *, dp_group=None, ps=None):
         stats_factory=ModalityLoad,
         rebuild=lambda: V41Optimizer(model, config, dp_group=dp_group, ps=ps),
     )
-    optimizer.engram_parameters, optimizer.engram_ids = (
-        optimizer.row_parameters,
-        optimizer.row_ids,
-    )
     return optimizer

@@ -11,10 +11,8 @@ from megatron.lite.primitive.ckpt.binding_records import (
 from megatron.lite.primitive.ckpt.hf_weights import (
     export_checkpoint as _export_checkpoint,
 )
-from megatron.lite.primitive.ckpt.hf_weights import export_model as _export_model
 from megatron.lite.primitive.ckpt.hf_weights import (
     load_bound_model,
-    load_bound_weight,
     save_bound_model,
 )
 from megatron.lite.primitive.modules.engram_lookup import (
@@ -40,13 +38,6 @@ class DeepseekV41WeightSpec:
     @staticmethod
     def row_shard(owner):
         return getattr(owner, "lookup", None)
-
-    @staticmethod
-    def scale_block(binding):
-        return (
-            1 if binding.encoding == 'I8' or binding.role == 'engram_table' else 32,
-            32,
-        )
 
     @staticmethod
     def frozen_storage(owner):
@@ -76,10 +67,7 @@ class DeepseekV41WeightSpec:
 
 
 _SPEC = DeepseekV41WeightSpec()
-WeightSpec = DeepseekV41WeightSpec
 export_checkpoint = partial(_export_checkpoint, spec=_SPEC)
-load_weight = partial(load_bound_weight, spec=_SPEC)
-export_model = partial(_export_model, spec=_SPEC)
 save_model = partial(save_bound_model, spec=_SPEC)
 
 

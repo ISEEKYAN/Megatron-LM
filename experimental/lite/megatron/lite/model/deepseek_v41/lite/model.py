@@ -97,7 +97,6 @@ class DeepseekV41Model(nn.Module):
                 kv_owner=policy.kv_owner,
                 index_owner=policy.index_owner,
                 candidate_mode=policy.candidate_mode,
-                query_head_rms=False,
                 codecs=attention_codecs(),
             )
             router = ModalityRouter(
@@ -421,9 +420,6 @@ class DeepseekV41Model(nn.Module):
     _restore_vision_trainability = staticmethod(visual.restore_vision_trainability)
     encode_image = visual.encode_image
     merge_image_embeddings = visual.merge_image_inputs
-
-    def forward_spec(self, *args, **kwargs):
-        raise NotImplementedError('DSpark execution is not implemented')
 
     def parameter_bindings(self):
         return (

@@ -145,9 +145,6 @@ class Experts(nn.Module):
     def __iter__(self):
         return iter(self._modules.values())
 
-    def __getitem__(self, index):
-        return self._modules[str(index)]
-
     def __len__(self):
         return len(self._modules)
 

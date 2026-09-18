@@ -363,11 +363,9 @@ class CompressedSparseAttention(nn.Module):
         index_owner: int | None = None,
         candidate_mode: str | None = None,
         compress_ratio: int | None = None,
-        query_head_rms: bool = True,
         codecs=None,
     ):
         super().__init__()
-        self.query_head_rms = query_head_rms
         self.cross_layer = candidate_mode is not None
         self.codecs = codecs
         if self.cross_layer:

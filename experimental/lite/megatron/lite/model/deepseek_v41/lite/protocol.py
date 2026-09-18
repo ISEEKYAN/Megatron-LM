@@ -325,12 +325,6 @@ router_replay_roots = partial(_protocol_utils.router_replay_roots, contiguous=Tr
 unpack_recorded_routed_experts = _protocol_utils.unpack_recorded_routed_experts
 
 
-def validate_router_replay(chunks, action):
-    if len(chunks) != 1:
-        raise NotImplementedError("Replay requires one local PP chunk")
-    router_replay_roots(chunks[0])
-
-
 def _cp_targets(batch, cp_context):
     """Shift full documents once, then optionally select this CP rank's tokens."""
     mask = (
