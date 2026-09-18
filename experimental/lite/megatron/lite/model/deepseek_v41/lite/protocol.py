@@ -24,7 +24,7 @@ from megatron.lite.primitive.packed_lm import (
     prepare_microbatches,
     unpack_forward_output,
 )
-from megatron.lite.primitive.parallel import route_records as _route_records
+from megatron.lite.model import protocol_utils as _protocol_utils
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -319,10 +319,11 @@ pack_r3_replay_mask = partial(
 )
 
 
-router_replay_roots = partial(_route_records.router_replay_roots, model_name='V4.1')
-validate_router_replay = partial(
-    _route_records.validate_router_replay, model_name='V4.1'
-)
-unpack_recorded_routed_experts = partial(
-    _route_records.unpack_recorded_routed_experts, model_name='V4.1'
-)
+router_replay_roots = partial(_protocol_utils.router_replay_roots, contiguous=True)
+unpack_recorded_routed_experts = _protocol_utils.unpack_recorded_routed_experts
+
+
+def validate_router_replay(chunks, action):
+    if len(chunks) != 1:
+        raise NotImplementedError("Replay requires one local PP chunk")
+    router_replay_roots(chunks[0])

@@ -294,7 +294,7 @@ def packed_paired_forward(
 
 from contextlib import nullcontext
 
-from megatron.lite.primitive.parallel.route_records import router_replay_roots
+from megatron.lite.model.protocol_utils import router_replay_roots
 
 _text_output = text_output
 
@@ -305,7 +305,7 @@ def _validate_replay(model, batch, *, model_name):
 
         routers = [
             module
-            for root in router_replay_roots(model, model_name=model_name)
+            for root in router_replay_roots(model, contiguous=True)
             for module in root.modules()
             if hasattr(module, 'router_replay')
         ]

@@ -33,7 +33,7 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
-def router_replay_roots(chunk) -> list:
+def router_replay_roots(chunk, *, contiguous=False) -> list:
     """Select decoder layers for R3, excluding MTP-only routers.
 
     The current rollout configuration does not run MTP, so route tensors have
@@ -42,12 +42,26 @@ def router_replay_roots(chunk) -> list:
     future rollout enables MTP speculative decoding, this assumption must be
     reevaluated.
     """
+    while hasattr(chunk, "module"):
+        chunk = chunk.module
     model = getattr(chunk, "model", chunk)
     layers = getattr(model, "layers", None)
     if layers is None:
         return [chunk]
     values = getattr(layers, "values", None)
-    return list(values()) if callable(values) else list(layers)
+    layers = list(values()) if callable(values) else list(layers)
+    if contiguous:
+        start, end = getattr(model, "local_layer_range", (0, len(layers)))
+        if not 0 <= start < end <= len(layers):
+            raise ValueError("Invalid replay layer interval")
+        if any(
+            (layer is not None) != (start <= i < end) for i, layer in enumerate(layers)
+        ):
+            raise ValueError(
+                "Replay requires contiguous stage-owned global layer slots"
+            )
+        return layers[start:end]
+    return layers
 
 
 def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
@@ -299,3 +313,61 @@ __all__ = [
     "set_cross_entropy_fusion",
     "unpack_thd_forward_output",
 ]
+
+
+def unpack_recorded_routed_experts(model, batch, recorded, *, pipeline_drained=False):
+    """Invert local route packing. PP record needs E's post-drain scheduler hook."""
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt.hf_weights import allgather_concat
+    from megatron.lite.primitive.parallel.thd import (
+        parallel_state_from_model,
+        thd_pack_meta,
+    )
+
+    ps = parallel_state_from_model(model) or ParallelState()
+    if not recorded or any(row is None for row in recorded):
+        raise RuntimeError('record did not visit every local router')
+    full = torch.stack(recorded, dim=1)
+    for size, group in ((ps.tp_size, ps.tp_group), (ps.cp_size, ps.cp_group)):
+        if size > 1:
+            if group is None:
+                raise RuntimeError(
+                    'route gather requires the corresponding parallel group'
+                )
+            full = allgather_concat(full, size, group, dim=0)
+    if ps.pp_size > 1:
+        if ps.pp_group is None:
+            raise RuntimeError('PP route gather requires pp_group after pipeline drain')
+        widths = allgather_concat(
+            torch.tensor([full.shape[1]], dtype=torch.long, device=full.device),
+            ps.pp_size,
+            ps.pp_group,
+            dim=0,
+        ).tolist()
+        current = model
+        while hasattr(current, 'module'):
+            current = current.module
+        expected_range = (sum(widths[: ps.pp_rank]), sum(widths[: ps.pp_rank + 1]))
+        valid = torch.tensor(
+            [getattr(current, 'local_layer_range', None) == expected_range],
+            dtype=torch.int32,
+            device=full.device,
+        )
+        dist.all_reduce(valid, op=dist.ReduceOp.MIN, group=ps.pp_group)
+        if not valid.item():
+            raise ValueError('PP router counts disagree with global stage layer order')
+        padded = full.new_zeros(full.shape[0], max(widths), full.shape[2])
+        padded[:, : full.shape[1]] = full
+        parts = [torch.empty_like(padded) for _ in widths]
+        dist.all_gather(parts, padded, group=ps.pp_group)
+        full = torch.cat([part[:, :width] for part, width in zip(parts, widths)], dim=1)
+    meta = thd_pack_meta(
+        batch.seq_lens, tp_size=ps.tp_size, cp_size=ps.cp_size, contiguous=True
+    )
+    if full.shape[0] != int(meta.cu_seqlens_padded[-1]):
+        raise ValueError('recorded rows differ from the shared THD token layout')
+    rows = [
+        full[int(start) : int(start) + int(length)]
+        for start, length in zip(meta.cu_seqlens_padded[:-1], meta.lengths)
+    ]
+    return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
