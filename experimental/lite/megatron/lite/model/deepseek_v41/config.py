@@ -22,18 +22,12 @@ class DeepseekV41Config:
             if not isinstance(self._release.get(section), dict):
                 raise ValueError(f'Missing nested {section}')
         text = self._release['text_config']
-        topology = {
+        fixed = {
             'num_hidden_layers': 40,
             'kv_source_layer_ids': [2, 8, 14, 20],
             'index_source_layer_ids': [2, 8, 14, 20, 24, 28, 32, 36],
             'candidate_source_layer_id': 20,
             'compress_ratios': [0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
-        }
-        for key, expected in topology.items():
-            if text.get(key) != expected:
-                raise ValueError(f'Unsupported {key}: expected {expected}')
-
-        fixed = {
             'num_key_value_heads': 1,
             'hidden_act': 'silu',
             'attention_bias': False,

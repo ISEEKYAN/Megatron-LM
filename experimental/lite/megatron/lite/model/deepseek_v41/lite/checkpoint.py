@@ -440,7 +440,7 @@ def export_checkpoint(
     export_dtype applies only to active plain floating-point weights.
     """
     dtype = _resolve_export_dtype(export_dtype)
-    if dtype not in (None, torch.float32, torch.float16, torch.bfloat16):
+    if dtype not in (None, *_PLAIN):
         raise ValueError(f'Unsupported export_dtype={export_dtype!r}')
     if type(cpu) is not bool:
         raise ValueError('cpu must be bool')
@@ -452,11 +452,8 @@ def export_checkpoint(
         raise ValueError('Complete archival storage is required for export')
     for name, tensor in export_model(model):
         target_dtype = (
-            dtype
-            if tensor.dtype in (torch.float32, torch.float16, torch.bfloat16)
-            else None
+            (dtype or tensor.dtype) if tensor.dtype in _PLAIN else tensor.dtype
         )
-        target_dtype = target_dtype or tensor.dtype
         device = torch.device('cpu') if cpu else tensor.device
         if target_dtype != tensor.dtype or device != tensor.device:
             output = torch.empty(tensor.shape, dtype=target_dtype, device=device)

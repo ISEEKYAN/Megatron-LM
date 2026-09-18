@@ -47,17 +47,7 @@ class OptimizerConfig:
 # Roles are validated against an independently enumerated object inventory below.
 _RULES = {
     **dict.fromkeys(
-        (
-            'wq_a',
-            'wq_b',
-            'wkv',
-            'wo_a',
-            'wo_b',
-            'router',
-            'expert',
-            'shared_expert',
-            'compressor',
-        ),
+        'wq_a wq_b wkv wo_a wo_b router expert shared_expert compressor'.split(),
         ('muon', 0.1, 0.1, 1),
     ),
     'embedding': ('sinkhorn', 0, 0, 1),
@@ -130,12 +120,9 @@ def parameter_groups(model, *, lr, vision_policy=None):
         for path in paths.split():
             add(attrgetter(path)(owner), role, **policy)
 
-    for paths, role in (
-        ('embed.weight', 'embedding'),
-        ('head.weight', 'head'),
-        ('norm.weight', 'norm'),
-    ):
-        route(model, paths, role)
+    route(model, 'embed.weight', 'embedding')
+    route(model, 'head.weight', 'head')
+    route(model, 'norm.weight', 'norm')
     for block in model.layers:
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
@@ -147,11 +134,8 @@ def parameter_groups(model, *, lr, vision_policy=None):
             shape=(c.heads, c.head_dim, c.q_rank),
             heads=c.heads,
         )
-        for owner, paths, role in (
-            (a, 'q_norm.weight kv_norm.weight', 'norm'),
-            (a, 'attn_sink', 'attention_sink'),
-        ):
-            route(owner, paths, role)
+        route(a, 'q_norm.weight kv_norm.weight', 'norm')
+        route(a, 'attn_sink', 'attention_sink')
         if a.compressor is not None:
             route(a.compressor, 'wkv.weight', 'compressor')
             route(a.compressor, 'norm.weight', 'compressor', vector=True)
@@ -180,11 +164,8 @@ def parameter_groups(model, *, lr, vision_policy=None):
             e = block.engram
             if e.embed.master is not None:
                 route(e, 'embed.master', 'engram_table')
-            for paths, role in (
-                ('wkv.weight', 'engram_projection'),
-                ('q_weight k_weight', 'engram_norm'),
-            ):
-                route(e, paths, role)
+            route(e, 'wkv.weight', 'engram_projection')
+            route(e, 'q_weight k_weight', 'engram_norm')
     vision = model.vision
     if hasattr(vision, 'patch_embed'):
         encoder_active = any(

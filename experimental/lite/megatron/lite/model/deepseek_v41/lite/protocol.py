@@ -505,6 +505,7 @@ def _pipeline_ranges(model, batch, start, end, states):
 
 
 def _cp_targets(batch, cp_context):
+    """Shift full documents once, then optionally select this CP rank's tokens."""
     mask = (
         torch.ones_like(batch.labels, dtype=torch.float32)
         if batch.loss_mask is None
@@ -514,10 +515,13 @@ def _cp_targets(batch, cp_context):
         roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
         for value in (batch.labels, mask)
     )
+    denominator = mask.sum().clamp_min(1)
+    if cp_context is None:
+        return labels, mask, denominator
     return (
         cp_context.slice(labels, seq_dim=0),
         cp_context.slice(mask, seq_dim=0),
-        mask.sum().clamp_min(1),
+        denominator,
     )
 
 
@@ -533,22 +537,9 @@ def _text_output(logits, batch, *, cp_context=None):
     if batch.labels is not None:
         if batch.labels.shape != batch.input_ids.shape:
             raise ValueError('Labels must match packed input shape')
-        labels = batch.labels.clone()
-        mask = (
-            torch.ones_like(labels, dtype=torch.float32)
-            if batch.loss_mask is None
-            else batch.loss_mask.clone()
-        )
-        if mask.shape != labels.shape:
+        if batch.loss_mask is not None and batch.loss_mask.shape != batch.labels.shape:
             raise ValueError('Loss mask must match packed input shape')
-        if cp_context is None:
-            labels, mask = (
-                roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
-                for value in (labels, mask)
-            )
-            denominator = mask.sum().clamp_min(1)
-        else:
-            labels, mask, denominator = _cp_targets(batch, cp_context)
+        labels, mask, denominator = _cp_targets(batch, cp_context)
         token_loss = F.cross_entropy(logits, labels, reduction='none')
         if context is not None and context.normalization_denominator is not None:
             denominator = context.normalization_denominator
