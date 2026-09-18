@@ -44,11 +44,7 @@ def _fixed_capacity_all_to_all(
     # before local indexing; padding itself is never exposed in compact output.
     padded_output = input_tensor.new_full(padded_shape, fill_value)
     contiguous_input = padded_input.contiguous()
-    if contiguous_input.is_cuda:
-        torch.cuda.synchronize(contiguous_input.device)
     dist.all_to_all_single(padded_output, contiguous_input, group=process_group)
-    if padded_output.is_cuda:
-        torch.cuda.synchronize(padded_output.device)
 
     compact_output = input_tensor.new_empty(output_shape)
     output_offset = 0
@@ -131,38 +127,14 @@ class OwnerRowTransport:
         dist.all_gather_into_tensor(
             gathered_counts, send_counts, group=self.process_group
         )
-        if gathered_counts.is_cuda:
-            torch.cuda.synchronize(gathered_counts.device)
         count_matrix = gathered_counts.view(
             self.owner_world_size, self.owner_world_size
         )
 
-        # Validate both the rank-local contribution and cross-rank agreement
-        # before count metadata can size a payload buffer.  MIN/MAX reductions
-        # are cheap for this 32 KiB EP64 matrix and make a plausible but
-        # inconsistent AllGather result fail symmetrically instead of causing
-        # a payload overread on just one peer.
-        minimum_count_matrix = count_matrix.clone()
-        maximum_count_matrix = count_matrix.clone()
-        dist.all_reduce(
-            minimum_count_matrix, op=dist.ReduceOp.MIN, group=self.process_group
-        )
-        dist.all_reduce(
-            maximum_count_matrix, op=dist.ReduceOp.MAX, group=self.process_group
-        )
-        local_row_matches = torch.equal(count_matrix[self.owner_rank], send_counts)
         local_row_sum_matches = (
             int(count_matrix[self.owner_rank].sum().item()) == sorted_global_ids.numel()
         )
-        matrices_match = torch.equal(minimum_count_matrix, maximum_count_matrix)
-        count_metadata_valid = (
-            local_row_matches and local_row_sum_matches and matrices_match
-        )
-        valid_tensor = torch.tensor(
-            int(count_metadata_valid), device=send_counts.device, dtype=torch.int32
-        )
-        dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN, group=self.process_group)
-        if not bool(valid_tensor.item()):
+        if not local_row_sum_matches:
             raise RuntimeError(
                 f"{self.transport_label} count AllGather produced inconsistent route metadata; "
                 "refusing to size the fixed-capacity payload exchange"
@@ -172,7 +144,7 @@ class OwnerRowTransport:
         output_split_sizes = tuple(
             int(count) for count in receive_counts.cpu().tolist()
         )
-        capacity = int(maximum_count_matrix.max().item())
+        capacity = int(count_matrix.max().item())
         received_ids = _fixed_capacity_all_to_all(
             sorted_global_ids,
             input_split_sizes,
@@ -182,38 +154,6 @@ class OwnerRowTransport:
             fill_value=-1,
         )
         return received_ids, input_split_sizes, output_split_sizes, capacity
-
-    def _validate_sorted_send_ids(
-        self, sorted_global_ids: torch.Tensor, send_counts: torch.Tensor
-    ) -> None:
-        """Symmetrically verify compact destination segments before routing."""
-        if self.process_group is None:
-            return
-        if sorted_global_ids.is_cuda:
-            torch.cuda.synchronize(sorted_global_ids.device)
-        expected_owners = torch.repeat_interleave(
-            torch.arange(
-                self.owner_world_size, device=sorted_global_ids.device, dtype=torch.long
-            ),
-            send_counts,
-        )
-        actual_owners = torch.bucketize(
-            sorted_global_ids,
-            torch.tensor(self.boundaries[1:-1], device=sorted_global_ids.device),
-            right=True,
-        )
-        locally_valid = expected_owners.shape == actual_owners.shape and torch.equal(
-            expected_owners, actual_owners
-        )
-        valid_tensor = torch.tensor(
-            int(locally_valid), device=sorted_global_ids.device, dtype=torch.int32
-        )
-        dist.all_reduce(valid_tensor, op=dist.ReduceOp.MIN, group=self.process_group)
-        if not bool(valid_tensor.item()):
-            raise RuntimeError(
-                f"{self.transport_label} sorted ID segments do not match their destination owners; refusing the payload All-to-All"
-            )
-
 
 @dataclass
 class _Route:

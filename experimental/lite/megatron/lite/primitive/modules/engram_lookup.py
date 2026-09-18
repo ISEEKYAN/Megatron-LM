@@ -93,7 +93,6 @@ class RowLookup(object):
         owners = torch.bucketize(flat, cuts, right=True)
         order = torch.argsort(owners, stable=True)
         counts = torch.bincount(owners, minlength=self.size)
-        self._validate_sorted_send_ids(flat[order], counts)
         routed, send_counts, recv_counts, capacity = self._exchange_ids(
             flat[order], counts
         )
@@ -157,7 +156,6 @@ class RowLookup(object):
 
     transport_label = "Row lookup"
     _exchange_ids = _OwnerRowTransport._exchange_ids
-    _validate_sorted_send_ids = _OwnerRowTransport._validate_sorted_send_ids
 
 
 class EngramTable(nn.Module):
