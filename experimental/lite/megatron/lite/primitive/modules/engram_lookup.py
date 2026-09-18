@@ -228,7 +228,7 @@ class EngramTable(nn.Module):
         self.scale.copy_(scale)
 
 
-class ShardedEngramTable(nn.Module):
+class ShardedEngramTable(EngramTable):
     """Engram provider with resident local rows and collective request routing.
 
     Replica gradient reduction and optimizer-state sharding are step operations,
@@ -238,7 +238,7 @@ class ShardedEngramTable(nn.Module):
     def __init__(
         self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16
     ):
-        self._base___init__(
+        super().__init__(
             weight, scale, trainable=trainable, output_dtype=output_dtype
         )
         expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
@@ -248,63 +248,6 @@ class ShardedEngramTable(nn.Module):
 
     def lookup_fp8(self, ids):
         return self.lookup.fetch(self.weight, self.scale, ids, self.master)
-
-    def _base___init__(
-        self, weight, scale, *, trainable=False, output_dtype=torch.bfloat16
-    ):
-        nn.Module.__init__(self)
-        if (
-            weight.ndim != 2
-            or weight.shape[1] % 32
-            or weight.dtype != torch.float8_e4m3fn
-            or scale.dtype != torch.float8_e8m0fnu
-            or scale.shape != (weight.shape[0], weight.shape[1] // 32)
-            or scale.device != weight.device
-        ):
-            raise ValueError("Expected FP8 table [rows,D] and E8M0 row/block32 scales")
-        self.output_dtype = output_dtype
-        self.register_buffer("weight", weight.detach().clone())
-        self.register_buffer("scale", scale.detach().clone())
-        if trainable:
-            master = weight.float() * scale.float().repeat_interleave(32, -1)
-            self.master = nn.Parameter(master)
-        else:
-            self.register_parameter("master", None)
-
-    def _apply(self, fn, recurse=True):
-        self.output_dtype = fn(
-            torch.empty(0, dtype=self.output_dtype, device=self.weight.device)
-        ).dtype
-
-        # A parent .bfloat16() must not widen FP8 storage or round the master.
-        # Probe only the destination device/dtype, without a lossy round-trip.
-        def preserve_dtype(tensor):
-            probe = fn(torch.empty(0, dtype=tensor.dtype, device=tensor.device))
-            if probe.dtype == tensor.dtype:
-                return fn(tensor)
-            return tensor.to(device=probe.device)
-
-        return super()._apply(preserve_dtype, recurse=recurse)
-
-    def forward(self, ids):
-        rows, scales, floating = self.lookup_fp8(ids)
-        decoded = rows.float() * scales.float().repeat_interleave(32, -1)
-        if floating is not None:
-            decoded = floating + (decoded - floating).detach()
-        return decoded.to(self.output_dtype)
-
-    @torch.no_grad()
-    def refresh_storage(self):
-        if self.master is None:
-            return
-        from megatron.lite.primitive.quantization import block_fp8
-
-        weight, scale = block_fp8.quantize_block_fp8(
-            self.master, (1, 32), scale_format="e8m0"
-        )
-        self.weight.copy_(weight)
-        self.scale.copy_(scale)
-
 
 def hash_multipliers(layer_ids, max_ngram_size, vocab_size):
     if vocab_size < 1 or max_ngram_size < 2:
