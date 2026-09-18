@@ -19,6 +19,7 @@ from megatron.lite.primitive.modules.attention.csa import (
     Linear,
 )
 from megatron.lite.primitive.modules.image_data import validate_image_spans
+from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
 from megatron.lite.primitive.modules.row_memory_build import (
     build_row_memories,
@@ -32,7 +33,7 @@ from torch import nn
 from ..codecs import attention_codecs
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import DeferredModule, Rule, TensorBinding, validate_execution
-from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
+from .moe import DeepseekV41MoE, ModalityRouter
 
 
 class DeepseekV41Model(nn.Module):
@@ -186,7 +187,7 @@ class DeepseekV41Model(nn.Module):
             if shared
             else partial(FP4Linear, quantized=quantized)
         )
-        return SwiGLUExpert(
+        return SwiGLUMLP.from_projections(
             *(projection(a, b) for a, b in ((dim, width), (width, dim), (dim, width))),
             swiglu_limit=t.swiglu_limit,
         )
@@ -391,7 +392,11 @@ class DeepseekV41Model(nn.Module):
         result = (
             {'head_hidden': head_hidden}
             if return_head_hidden
-            else {'logits': torch.nn.functional.linear(head_hidden, self.head.weight.float())}
+            else {
+                'logits': torch.nn.functional.linear(
+                    head_hidden, self.head.weight.float()
+                )
+            }
         )
         if loads is not None:
             result['modality_loads'] = tuple(tuple(entries) for entries in loads)

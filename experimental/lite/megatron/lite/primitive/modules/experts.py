@@ -10,9 +10,11 @@ from typing import Any
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
+from megatron.lite.primitive.kernels.swiglu import (
+    bias_swiglu_impl,
+    weighted_bias_swiglu_impl,
+)
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
@@ -27,7 +29,10 @@ __all__ = ["Experts", "_AllReduceETP"]
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if (
+        os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -133,6 +138,24 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
+    @classmethod
+    def from_modules(cls, modules):
+        experts = cls.__new__(cls)
+        nn.Module.__init__(experts)
+        experts.individual = True
+        for index, module in enumerate(modules):
+            experts.add_module(str(index), module)
+        return experts
+
+    def __iter__(self):
+        return iter(self._modules.values())
+
+    def __getitem__(self, index):
+        return self._modules[str(index)]
+
+    def __len__(self):
+        return len(self._modules)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -145,9 +168,27 @@ class Experts(nn.Module):
             if tokens_per_expert_list is None
             else list(tokens_per_expert_list)
         )
+        if getattr(self, 'individual', False):
+            scores = permuted_probs.split(m_splits)
+            values = [
+                (
+                    expert(tokens, weights=probs[:, None])
+                    if tokens.shape[0]
+                    else (tokens * probs[:, None]).to(tokens.dtype)
+                )
+                for expert, tokens, probs in zip(
+                    (e for e in self if e is not None),
+                    x.split(m_splits),
+                    scores,
+                    strict=True,
+                )
+            ]
+            return torch.cat(values)
         pad_mask = None
         if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
+            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(
+                x, permuted_probs, m_splits
+            )
 
         etp_real_len = x.shape[0]
         if self.etp_group is not None:
@@ -159,7 +200,10 @@ class Experts(nn.Module):
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                            max_len - etp_real_len,
+                            x.shape[1],
+                            dtype=x.dtype,
+                            device=x.device,
                         ),
                     ],
                     dim=0,
@@ -169,7 +213,9 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                                max_len - etp_real_len,
+                                dtype=permuted_probs.dtype,
+                                device=x.device,
                             ),
                         ],
                         dim=0,
@@ -184,7 +230,9 @@ class Experts(nn.Module):
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -217,13 +265,17 @@ class Experts(nn.Module):
         mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
         probs_pad = None
         if permuted_probs is not None:
-            probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
+            probs_pad = torch.zeros(
+                total_padded, device=device, dtype=permuted_probs.dtype
+            )
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
             x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
             mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[
+                    src_off : src_off + real
+                ]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask
