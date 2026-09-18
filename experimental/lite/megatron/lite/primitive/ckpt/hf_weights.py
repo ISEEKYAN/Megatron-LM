@@ -47,7 +47,9 @@ def _local_source(target, source):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -383,9 +385,25 @@ def _unpack_groupwise_int4(packed: torch.Tensor, shape: torch.Size) -> torch.Ten
 
 
 def _dequantize_block_scaled_tensor(
-    tensor: torch.Tensor, scale: torch.Tensor, target_shape: torch.Size
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    target_shape: torch.Size,
+    *,
+    block_shape: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     target = tuple(int(dim) for dim in target_shape)
+    if block_shape is not None:
+        if len(block_shape) != len(target) or any(block <= 0 for block in block_shape):
+            raise ValueError(
+                "block_shape must have one positive size per target dimension"
+            )
+        expected = tuple(
+            math.ceil(size / block) for size, block in zip(target, block_shape)
+        )
+        if tuple(scale.shape) != expected:
+            raise ValueError(
+                f"scale shape mismatch: {tuple(scale.shape)} != {expected}"
+            )
     while scale.ndim > len(target) and scale.shape[0] == 1:
         scale = scale.squeeze(0)
     while scale.ndim < len(target):
@@ -399,7 +417,12 @@ def _dequantize_block_scaled_tensor(
         scale = scale.float()
     for dim, size in enumerate(target):
         if scale.shape[dim] != size:
-            scale = scale.repeat_interleave(math.ceil(size / scale.shape[dim]), dim=dim)
+            block = (
+                math.ceil(size / scale.shape[dim])
+                if block_shape is None
+                else block_shape[dim]
+            )
+            scale = scale.repeat_interleave(block, dim=dim)
     scale = scale[tuple(slice(0, size) for size in target)]
 
     if (
@@ -469,11 +492,34 @@ def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype
 
 
 def _cast_export_tensor(
-    tensor: torch.Tensor, export_dtype: torch.dtype | None
+    tensor: torch.Tensor,
+    export_dtype: torch.dtype | None,
+    *,
+    device: torch.device | str | None = None,
+    buffer_max_size_bytes: int | None = None,
 ) -> torch.Tensor:
-    if export_dtype is None or not tensor.is_floating_point():
+    dtype = (
+        export_dtype
+        if export_dtype is not None and tensor.is_floating_point()
+        else tensor.dtype
+    )
+    device = tensor.device if device is None else torch.device(device)
+    if dtype == tensor.dtype and device == tensor.device:
         return tensor
-    return tensor.to(dtype=export_dtype)
+    if buffer_max_size_bytes is None:
+        return tensor.to(device=device, dtype=dtype)
+    count = buffer_max_size_bytes // max(
+        tensor.element_size(), torch.empty((), dtype=dtype).element_size()
+    )
+    if count < 1:
+        raise ValueError(
+            "export buffer must hold at least one source and destination element"
+        )
+    output = torch.empty(tensor.shape, dtype=dtype, device=device)
+    source, destination = tensor.reshape(-1), output.view(-1)
+    for start in range(0, tensor.numel(), count):
+        destination[start : start + count].copy_(source[start : start + count])
+    return output
 
 
 # ======================================================================
@@ -582,7 +628,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -879,10 +926,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -1103,8 +1147,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1115,7 +1163,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1127,15 +1177,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1202,8 +1244,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1212,10 +1258,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1290,10 +1333,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1494,9 +1534,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -1822,4 +1862,223 @@ def save_hf_weights(
         ),
         hf_path,
         shard_size_bytes=shard_size_bytes,
+    )
+
+
+def export_raw_tensors(reader, names, *, cpu=True):
+    """Pass inactive tensors through without dtype conversion or decoding."""
+    device = torch.device("cpu") if cpu else reader.device
+    for name in names:
+        yield name, reader._get_raw_tensor(name, device)
+
+
+def _export_rows(lookup, tensor):
+    if lookup is None:
+        return tensor
+    sizes = [b - a for a, b in zip(lookup.boundaries, lookup.boundaries[1:])]
+    # NCCL transports encoded FP8 storage as bytes. Padding is transport only.
+    value = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
+    padded = value.new_zeros(max(sizes), value.shape[1])
+    padded[: value.shape[0]].copy_(value)
+    chunks = [torch.empty_like(padded) for _ in sizes]
+    _ep_all_gather(chunks, padded, lookup.group)
+    return torch.cat([chunk[:size] for chunk, size in zip(chunks, sizes)]).view(
+        tensor.dtype
+    )
+
+
+def _local_rows(lookup, tensor):
+    if lookup is None:
+        return tensor
+    return tensor[lookup.boundaries[lookup.rank] : lookup.boundaries[lookup.rank + 1]]
+
+
+def export_bound_tensors(model, spec):
+    """Yield active numerical masters; immutable inactive bytes stay in the store.
+
+    Plain masters intentionally drop encoded scale siblings, as load_weight's
+    plain-export contract requires. Frozen encoded tables retain their storage dtype.
+    This is a lossless training export, not a quantized deployment conversion.
+    """
+    if model.local_layer_range != (0, len(model.layers)):
+        raise NotImplementedError(
+            'Pipeline stage export requires distributed checkpoint assembly'
+        )
+    model.validate_parameter_bindings()
+    for name, binding in model.tensor_bindings.items():
+        if binding.role == 'scale':
+            continue
+        if model.ps.ep_size > 1 and binding.role == 'expert':
+            continue
+        tensor = binding.tensor.detach()
+        if tensor.is_meta:
+            raise ValueError(f'Cannot export unmaterialized parameter: {name}')
+        yield name, _export_rows(spec.row_shard(binding.owner), tensor)
+        storage = spec.frozen_storage(binding.owner)
+        if storage is not None:
+            yield name[:-6] + 'scale', _export_rows(
+                spec.row_shard(binding.owner), storage[1].detach()
+            )
+    if model.ps.ep_size > 1:
+        import torch.distributed as dist
+
+        local = {
+            name: b.tensor.detach()
+            for name, b in model.tensor_bindings.items()
+            if b.role == 'expert'
+        }
+        metadata = [
+            (name, tuple(t.shape), t.dtype, dist.get_rank())
+            for name, t in local.items()
+        ]
+        gathered = [None] * model.ps.ep_size
+        dist.all_gather_object(gathered, metadata, group=model.ps.ep_group)
+        device = next(model.parameters()).device
+        for name, shape, dtype, source in sorted(
+            record for records in gathered for record in records
+        ):
+            value = (
+                local[name].contiguous()
+                if name in local
+                else torch.empty(shape, dtype=dtype, device=device)
+            )
+            dist.broadcast(value, src=source, group=model.ps.ep_group)
+            yield name, value
+
+
+_PLAIN = (torch.float32, torch.bfloat16, torch.float16)
+
+
+def _keys(reader):
+    if reader.index:
+        return set(reader.index)
+    with safe_open(str(reader.path / 'model.safetensors'), framework='pt') as source:
+        return set(source.keys())
+
+
+def load_bound_weight(reader, name, spec, *, output_dtype=torch.bfloat16):
+    from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+    if output_dtype not in _PLAIN:
+        raise TypeError('Output dtype must be floating point')
+    value = reader._get_raw_tensor(name, torch.device('cpu'))
+    scale_name = name[:-6] + 'scale'
+    if value.dtype in _PLAIN:
+        if reader.has_tensor(scale_name):
+            raise ValueError(f'Unexpected scale for plain weight: {name}')
+        return value.to(output_dtype)
+    scale = reader._get_raw_tensor(scale_name, torch.device('cpu'))
+    if scale.dtype != torch.float8_e8m0fnu:
+        raise TypeError('Release weight scales require E8M0')
+    if value.dtype == torch.int8:
+        decoded = dequantize_mxfp4(value, scale)
+    elif value.dtype == torch.float8_e4m3fn:
+        decoded = _dequantize_block_scaled_tensor(
+            value, scale, value.shape, block_shape=(spec.row_block(name) or 32, 32)
+        )
+    else:
+        raise TypeError(f'Unsupported weight dtype: {value.dtype}')
+    if not torch.isfinite(decoded).all():
+        raise ValueError(f'Nonfinite weight: {name}')
+    return decoded.to(output_dtype)
+
+
+@torch.no_grad()
+def load_bound_model(model, path, spec, *, allow_missing_archive=False):
+    path = Path(path)
+    if json.loads((path / 'config.json').read_text()) != model.config.to_hf_dict():
+        raise ValueError('Checkpoint config differs from the constructed model')
+    reader = SafeTensorReader(str(path))
+    keys = _keys(reader)
+    bindings = spec.expand_bindings(
+        model, {**model.tensor_bindings, **model.archival_bindings}
+    )
+    active = {
+        name for name, b in bindings.items() if b.role not in ('scale', 'archival')
+    }
+    required_archive = set(model.archival_bindings)
+    if allow_missing_archive and not any(
+        name.startswith(spec.optional_prefix) for name in keys
+    ):
+        required_archive = set()
+    expected = active | required_archive
+    if not expected <= keys or keys - set(bindings):
+        raise ValueError('Checkpoint key coverage mismatch')
+    with reader:
+        for name, binding in model.tensor_bindings.items():
+            if binding.role == 'scale':
+                continue
+            target, owner = binding.tensor, binding.owner
+            storage = spec.frozen_storage(owner)
+            lookup = spec.row_shard(owner)
+            if storage is not None:
+                for key, destination in (
+                    (name, storage[0]),
+                    (name[:-6] + 'scale', storage[1]),
+                ):
+                    value = reader._get_raw_tensor(key, torch.device('cpu'))
+                    value = _local_rows(lookup, value)
+                    if (
+                        value.shape != destination.shape
+                        or value.dtype != destination.dtype
+                    ):
+                        raise ValueError(f'Frozen storage mismatch: {key}')
+                    destination.copy_(value.to(destination.device))
+            else:
+                value = (
+                    load_bound_weight(reader, name, spec, output_dtype=target.dtype)
+                    if name.endswith('.weight')
+                    else reader._get_raw_tensor(name, torch.device('cpu'))
+                )
+                value = _local_rows(lookup, value)
+                if value.shape != target.shape:
+                    raise ValueError(f'Weight shape mismatch: {name}')
+                target.copy_(value.to(target.device))
+                spec.refresh_storage(owner)
+    model.archival_store = reader
+    model.archival_keys = sorted(required_archive)
+
+
+def export_model(model, spec):
+    yield from export_bound_tensors(model, spec)
+
+
+def export_checkpoint(
+    model, spec, *, export_dtype=None, cpu=False, buffer_max_size_bytes=5 * 1024**3
+):
+    dtype = _resolve_export_dtype(export_dtype)
+    if (
+        type(cpu) is not bool
+        or type(buffer_max_size_bytes) is not int
+        or buffer_max_size_bytes < 4
+    ):
+        raise ValueError('Invalid export CPU or buffer option')
+    if model.archival_bindings and model.archival_store is None:
+        raise ValueError('Complete archival storage is required for export')
+    for name, tensor in export_model(model, spec):
+        if tensor.dtype in _PLAIN:
+            tensor = _cast_export_tensor(tensor, export_dtype=dtype)
+        yield name, tensor.cpu() if cpu else tensor
+    if model.archival_store is not None:
+        yield from export_raw_tensors(
+            model.archival_store, model.archival_keys, cpu=cpu
+        )
+
+
+def save_bound_model(
+    model, path, spec, *, export_dtype=None, buffer_max_size_bytes=5 * 1024**3
+):
+    stream_export_to_shards(
+        export_checkpoint(
+            model,
+            spec,
+            export_dtype=export_dtype,
+            cpu=True,
+            buffer_max_size_bytes=buffer_max_size_bytes,
+        ),
+        str(path),
+        shard_size_bytes=buffer_max_size_bytes,
+    )
+    (Path(path) / 'config.json').write_text(
+        json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
     )
