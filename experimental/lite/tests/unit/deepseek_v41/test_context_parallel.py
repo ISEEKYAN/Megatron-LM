@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Contiguous CP ownership and document-boundary contracts."""
 
+import parallel_test_utils as harness
 import pytest
 import torch
-from parallel_test_utils import assert_exact, init_world, seed_engram
+from parallel_test_utils import assert_exact
 
 
 def test_cp_nondivisible_contiguous_ownership(moe):
@@ -83,38 +84,19 @@ def test_cp_preserves_unsupported_parallel_rejection(moe, model_config, key):
 
 
 def _cp_worker(rank, config, trainable, lengths, directory):
-    import json
     from dataclasses import replace
-    from pathlib import Path
 
-    import torch.distributed as dist
     from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
     from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
-    from megatron.lite.primitive.train_step import run_microbatch_loop
     from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
-    torch.set_num_threads(1)
-    torch.cuda.set_device(rank)
-    torch.manual_seed(19)
-    impl = protocol.ImplConfig(
-        device=f'cuda:{rank}',
-        dtype=torch.float32,
-        quantized=False,
-        token_map=list(range(256)),
-        trainable_engram=trainable,
-        shard_engram=False,  # Keep the serial-reference parameter/bucket layout.
-        optimizer='muon',
-        optimizer_config=OptimizerConfig(0.0001, 5, 'quintic'),
-    )
-    serial = protocol.build_model(config, impl_cfg=impl)
+    serial, impl = harness._init_parallel_worker(rank, config, trainable)
     # Both Engram arms consume nonzero row-dependent memory from the first step.
-    seed_engram(serial.chunks[0])
+    harness.seed_engram(serial.chunks[0])
     ordered = [protocol.build_model(config, impl_cfg=impl) for _ in range(2)]
     for bundle in ordered:
         bundle.chunks[0].load_state_dict(serial.chunks[0].state_dict())
-    init_world(rank, directory, world=2, timeout=120, rendezvous='rendezvous')
-    try:
+    with harness.world(rank, directory):
         parallel = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(cp=2))
         )
@@ -166,10 +148,8 @@ def _cp_worker(rank, config, trainable, lengths, directory):
             # Isolate every parameter's contribution before DDP averaging.
             with execution.no_sync():
                 parallel.forward_step(model, batch)['loss'].backward()
-            for (name, p), (_, q) in zip(
-                model.named_parameters(),
-                ordered[rank].chunks[0].named_parameters(),
-                strict=True,
+            for name, p, q in harness.parameter_pairs(
+                model, ordered[rank].chunks[0], strict=True
             ):
                 assert (p.grad is None) == (
                     q.grad is None
@@ -187,18 +167,9 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                     assert_exact(p.grad, q.grad, msg=f'CP_PRE_REDUCTION_GRAD {name}')
             # Clear diagnostic statistics, then exercise production DDP backward.
             parallel.optimizer.zero_grad()
-            run_microbatch_loop(
-                model,
-                iter([batch]),
-                1,
-                parallel.forward_step,
-                prepare_microbatches=parallel.extras['prepare_microbatches'],
-            )
-            for (name, p), (_, left), (_, right) in zip(
-                model.named_parameters(),
-                ordered[0].chunks[0].named_parameters(),
-                ordered[1].chunks[0].named_parameters(),
-                strict=True,
+            harness.backward(parallel, [batch])
+            for name, p, left, right in harness.parameter_pairs(
+                model, *(b.chunks[0] for b in ordered), strict=True
             ):
                 if left.grad is None and right.grad is None:
                     assert p.grad is None, f'CP_GRAD_MEMBERSHIP {name}'
@@ -224,14 +195,10 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                     b.optimizer.accumulate_modality_loads(item)
                 assert b.optimizer.step()[0]
             assert parallel.optimizer.step()[0]
-            for (name, p), (_, q) in zip(
-                model.named_parameters(),
-                ordered[0].chunks[0].named_parameters(),
-                strict=True,
+            for name, p, q in harness.parameter_pairs(
+                model, ordered[0].chunks[0], strict=True
             ):
-                errors['parameter_max_abs'] = max(
-                    errors['parameter_max_abs'], float((p - q).detach().abs().max())
-                )
+                harness.record_error(errors, 'parameter_max_abs', p, q)
                 assert_exact(p, q, msg=f'CP_STEP_PARAMETER {name}')
             for block, other in zip(
                 model.layers, ordered[0].chunks[0].layers, strict=True
@@ -247,14 +214,7 @@ def _cp_worker(rank, config, trainable, lengths, directory):
                         not p.requires_grad and p.grad is None
                         for p in block.attn.indexer.parameters()
                     ), 'CP_FROZEN_INDEXER'
-        Path(directory, f'rank-{rank}.json').write_text(json.dumps(errors))
-    except Exception:
-        import traceback
-
-        traceback.print_exc()
-        raise
-    finally:
-        dist.destroy_process_group()
+        harness.report_rank(directory, rank, errors)
 
 
 @pytest.mark.gpus(2)
@@ -265,19 +225,10 @@ def _cp_worker(rank, config, trainable, lengths, directory):
     'lengths', [(7,), (5, 7, 9)], ids=['nondivisible', 'cross_document']
 )
 def test_cp_two_step_training(model_config, trainable, lengths, tmp_path):
-    import torch.multiprocessing as mp
-
     assert torch.cuda.device_count() >= 2, 'CP requires two allocated GPUs'
-    mp.spawn(
-        _cp_worker,
-        args=(model_config, trainable, lengths, str(tmp_path)),
-        nprocs=2,
-        join=True,
+    harness.run_workers(
+        _cp_worker, (model_config, trainable, lengths), tmp_path, report=True
     )
-    for rank in range(2):
-        print(
-            f'CP trainable={trainable} lengths={lengths} rank={rank}: {(tmp_path / f"rank-{rank}.json").read_text()}'
-        )
 
 
 def test_cp_transport_padding_is_not_a_document_token(moe, monkeypatch):
@@ -333,10 +284,11 @@ def _trace_cp_forward(serial, parallel, batch, ownership):
     from megatron.lite.primitive.modules.hyper_connection import HCMixes, RMSNorm
     from megatron.lite.primitive.modules.native_fp32_linear import Linear
 
-    cached, calls, handles = defaultdict(list), defaultdict(int), []
+    cached, calls = defaultdict(list), defaultdict(int)
     from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE
 
-    eligible = (HCMixes, RMSNorm, Linear, torch.nn.Embedding, DeepseekV41MoE)
+    types = (HCMixes, RMSNorm, Linear, torch.nn.Embedding, DeepseekV41MoE)
+    eligible = lambda name, module: isinstance(module, types) and ".ffn." not in name
     modules = dict(serial.chunks[0].named_modules())
 
     def tensors(value):
@@ -347,18 +299,9 @@ def _trace_cp_forward(serial, parallel, batch, ownership):
             (args[0].detach().clone(), [v.detach().clone() for v in tensors(output)])
         )
 
-    for name, module in modules.items():
-        if isinstance(module, eligible) and '.ffn.' not in name:
-            handles.append(
-                module.register_forward_hook(
-                    lambda m, a, o, n=name: capture(n, m, a, o)
-                )
-            )
-    with torch.no_grad():
+    with harness.forward_hooks(serial.chunks[0], eligible, capture), torch.no_grad():
         serial.forward_step(serial.chunks[0], batch)
-    for h in handles:
-        h.remove()
-    handles, mismatches = [], []
+    mismatches = []
 
     def compare(name, module, args, output):
         index = calls[name]
@@ -399,19 +342,8 @@ def _trace_cp_forward(serial, parallel, batch, ownership):
             )
         )
 
-    for name, module in parallel.chunks[0].named_modules():
-        if isinstance(module, eligible) and '.ffn.' not in name:
-            handles.append(
-                module.register_forward_hook(
-                    lambda m, a, o, n=name: compare(n, m, a, o)
-                )
-            )
-    try:
-        with torch.no_grad():
-            parallel.forward_step(parallel.chunks[0], batch)
-    finally:
-        for h in handles:
-            h.remove()
+    with harness.forward_hooks(parallel.chunks[0], eligible, compare), torch.no_grad():
+        parallel.forward_step(parallel.chunks[0], batch)
     print(f'CP_PRE_REDUCTION rank={ownership.rank}: {mismatches}', flush=True)
     assert all(m['local_replay_exact'] for m in mismatches), 'CP_LOCAL_OPERATOR_REPLAY'
 

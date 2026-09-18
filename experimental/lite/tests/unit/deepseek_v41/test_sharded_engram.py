@@ -1,9 +1,10 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+import parallel_test_utils as harness
 import pytest
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel.state import ParallelState
-from parallel_test_utils import assert_exact, init_world
+from parallel_test_utils import assert_exact
 
 
 def test_runtime_accepts_serialized_v41_optimizer_config():
@@ -155,14 +156,10 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
     import torch.distributed as dist
     from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
-    from megatron.lite.primitive.train_step import run_microbatch_loop
     from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
 
-    torch.set_num_threads(1)
-    torch.cuda.set_device(rank)
-    torch.manual_seed(19)
-    init_world(rank, directory, world=world, timeout=120, rendezvous='rdzv')
-    try:
+    harness.prepare_worker(rank)
+    with harness.world(rank, directory, world=world, rendezvous='rdzv'):
         impl = protocol.ImplConfig(
             parallel=ParallelConfig(ep=ep, cp=cp),
             device=f"cuda:{rank}",
@@ -232,22 +229,13 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 losses.append(result["loss"].detach())
                 # Use the production normalization and gradient finalization.
                 bundle.optimizer.zero_grad()
-                run_microbatch_loop(
-                    bundle.chunks[0],
-                    iter([batch]),
-                    1,
-                    bundle.forward_step,
-                    prepare_microbatches=bundle.extras["prepare_microbatches"],
-                )
-                if bundle.finalize_grads is not None:
-                    bundle.finalize_grads()
+                harness.backward(bundle, [batch], finalize=True)
             print(
                 f"SHARD_STEP rank={rank} step={step} logits_max_abs={float((logits[0] - logits[1]).abs().max())}",
                 flush=True,
             )
             assert_exact(*logits)
             assert_exact(*losses)
-            expected = dict(full.named_parameters())
             for layer_id in local.engram_layer_ids:
                 table = local.layers[layer_id].engram.embed
                 counts = [
@@ -274,8 +262,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                     f"main_grad_bytes={0 if table.master is None else table.master.grad.numel() * 4}",
                     flush=True,
                 )
-            for name, p in local.named_parameters():
-                q = expected[name]
+            for name, p, q in harness.parameter_pairs(local, full):
                 assert (p.grad is None) == (q.grad is None), name
                 if p.grad is not None:
                     grad = q.grad
@@ -287,8 +274,7 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 f"SHARD_NORM rank={rank} step={step} reference={ref_step[1]} sharded={actual_step[1]}",
                 flush=True,
             )
-            for name, p in local.named_parameters():
-                q = expected[name]
+            for name, p, q in harness.parameter_pairs(local, full):
                 assert_exact(p, q, msg=name)
         print(
             f"SHARDED_ENGRAM_OK rank={rank} world={world} ep={ep} cp={cp} trainable={trainable}",
@@ -346,8 +332,6 @@ def _train_shards(rank, config, trainable, world, ep, cp, directory):
                 msg=name,
             )
         print(f"SHARDED_CHECKPOINT_EXPORT_RELOAD_OK rank={rank}", flush=True)
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.gpus(4)
@@ -357,9 +341,6 @@ def test_sharded_model_matches_layout_matched_reference(
     model_config, tmp_path, trainable, world, ep, cp
 ):
     assert torch.cuda.device_count() >= world
-    torch.multiprocessing.spawn(
-        _train_shards,
-        args=(model_config, trainable, world, ep, cp, str(tmp_path)),
-        nprocs=world,
-        join=True,
+    harness.run_workers(
+        _train_shards, (model_config, trainable, world, ep, cp), tmp_path, world=world
     )

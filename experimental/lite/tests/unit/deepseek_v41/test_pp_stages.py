@@ -3,6 +3,7 @@
 
 from dataclasses import replace
 
+import parallel_test_utils as harness
 import pytest
 import torch
 
@@ -13,7 +14,7 @@ from megatron.core.transformer.pipeline_parallel_layer_layout import (
 from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
-from parallel_test_utils import assert_exact, init_world, seed_engram
+from parallel_test_utils import assert_exact
 
 
 def _impl(dtype=torch.float32, trainable=False, device='cpu'):
@@ -45,12 +46,6 @@ def _local_stages(config, impl, monkeypatch):
     return stages
 
 
-def _load_stage(stage, reference):
-    state = reference.state_dict()
-    local = stage.state_dict()
-    stage.load_state_dict({key: state[key] for key in local})
-
-
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('trainable', [False, True])
 def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trainable):
@@ -58,7 +53,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
     impl = _impl(dtype, trainable)
     serial = protocol.build_model(model_config, impl_cfg=impl)
     reference = serial.chunks[0]
-    seed_engram(reference)
+    harness.seed_engram(reference)
     stages = _local_stages(model_config, impl, monkeypatch)
     models = [b.chunks[0] for b in stages]
     for rank, (bundle, model) in enumerate(zip(stages, models)):
@@ -76,7 +71,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
             if block is not None and block.engram is not None
         ] == ([1, 14] if rank == 0 else []), 'PP_ENGRAM_OWNER'
         model.validate_parameter_bindings()
-        _load_stage(model, reference)
+        harness.load_local_state(model, reference)
     owned = [set(dict(m.named_parameters())) for m in models]
     assert not owned[0] & owned[1], 'PP_DISJOINT_PARAMETERS'
     assert owned[0] | owned[1] == set(
@@ -105,8 +100,7 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
         actual['loss'].backward()
         wire.backward(received.grad)
         for model in models:
-            for name, p in model.named_parameters():
-                q = dict(reference.named_parameters())[name]
+            for name, p, q in harness.parameter_pairs(model, reference):
                 assert (p.grad is None) == (q.grad is None), 'PP_GRAD_OWNER:' + name
                 if p.grad is not None:
                     assert_exact(p.grad, q.grad, msg='PP_GRAD:' + name)
@@ -126,28 +120,20 @@ def test_pp2_rejects_untransported_csa2_state(model_config, cut):
 
 
 def _pp_worker(rank, config, dtype, trainable, directory):
-    import json
-    from pathlib import Path
-
-    import torch.distributed as dist
-    from megatron.lite.primitive.train_step import run_microbatch_loop
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
     from megatron.lite.runtime.contracts.handle import ModelHandle
 
-    torch.set_num_threads(1)
-    torch.cuda.set_device(rank)
-    torch.manual_seed(17)
+    harness.prepare_worker(rank, seed=17)
     impl = _impl(dtype, trainable, f'cuda:{rank}')
     serial = protocol.build_model(config, impl_cfg=impl)
     reference = serial.chunks[0]
-    seed_engram(reference)
-    init_world(rank, directory, world=2, timeout=120, rendezvous='rendezvous')
-    try:
+    harness.seed_engram(reference)
+    with harness.world(rank, directory):
         bundle = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(pp=2))
         )
         model = bundle.chunks[0]
-        _load_stage(model, reference)
+        harness.load_local_state(model, reference)
         ps = bundle.parallel_state
         assert (
             ps.pp_size == 2 and ps.dp_size == ps.cp_size == ps.ep_size == 1
@@ -212,13 +198,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
             reference_losses.append(out['loss'].detach().clone())
             return out
 
-        run_microbatch_loop(
-            reference,
-            iter(batches),
-            2,
-            reference_forward,
-            prepare_microbatches=serial.extras['prepare_microbatches'],
-        )
+        harness.backward(serial, batches, reference_forward)
         runtime.forward_backward(
             handle, iter(batches), loss_fn=None, num_microbatches=2
         )
@@ -227,8 +207,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
             for actual, expected in zip(seen_loss, reference_losses, strict=True):
                 assert_exact(actual, expected, msg='PP_TOKEN_NORMALIZATION')
         gradient_max_abs = 0.0
-        for name, p in model.named_parameters():
-            q = dict(reference.named_parameters())[name]
+        for name, p, q in harness.parameter_pairs(model, reference):
             assert (p.grad is None) == (q.grad is None), 'PP_GPU_GRAD_OWNER:' + name
             if p.grad is not None:
                 gradient_max_abs = max(
@@ -245,40 +224,28 @@ def _pp_worker(rank, config, dtype, trainable, directory):
                     assert (
                         table.master.is_cuda and table.master.grad is not None
                     ), 'PP_ENGRAM_TRAINABLE'
-        Path(directory, f'rank-{rank}.json').write_text(
-            json.dumps(
-                dict(
-                    gradient_max_abs=gradient_max_abs,
-                    logits_max_abs=0.0,
-                    loss_max_abs=0.0,
-                    counts=counts,
-                    layer_range=model.local_layer_range,
-                    pipeline_dtype=str(bundle.extras['pipeline_dtype']),
-                )
-            )
+        harness.report_rank(
+            directory,
+            rank,
+            dict(
+                gradient_max_abs=gradient_max_abs,
+                logits_max_abs=0.0,
+                loss_max_abs=0.0,
+                counts=counts,
+                layer_range=model.local_layer_range,
+                pipeline_dtype=str(bundle.extras['pipeline_dtype']),
+            ),
         )
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.gpus(2)
 @pytest.mark.parametrize('dtype', [torch.float32, torch.bfloat16])
 @pytest.mark.parametrize('trainable', [False, True])
 def test_pp2_runtime_forward_backward(model_config, dtype, trainable, tmp_path):
-    import torch.multiprocessing as mp
-
     assert torch.cuda.device_count() >= 2, 'PP requires two Slurm-allocated GPUs'
-    mp.spawn(
-        _pp_worker,
-        args=(model_config, dtype, trainable, str(tmp_path)),
-        nprocs=2,
-        join=True,
+    harness.run_workers(
+        _pp_worker, (model_config, dtype, trainable), tmp_path, report=True
     )
-    for rank in range(2):
-        print(
-            f'PP2 dtype={dtype} trainable={trainable} rank={rank}: '
-            f'{(tmp_path / f"rank-{rank}.json").read_text()}'
-        )
 
 
 @pytest.mark.parametrize(

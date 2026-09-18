@@ -5,24 +5,19 @@ import json
 from dataclasses import replace
 from pathlib import Path
 
+import parallel_test_utils as harness
 import pytest
 import torch
 import torch.distributed as dist
-import torch.multiprocessing as mp
 from megatron.lite.model.deepseek_v41.lite import protocol
 from megatron.lite.model.deepseek_v41.lite.optimizer_groups import OptimizerConfig
-from megatron.lite.runtime.contracts import PackedBatch, ParallelConfig
-from parallel_test_utils import assert_exact, init_world
-from test_data_parallel import (
-    _check_parallel_buffers,
-    _init_parallel_worker,
-    _train_parallel_step,
-)
+from megatron.lite.runtime.contracts import ParallelConfig
+from parallel_test_utils import assert_exact
 
 
 def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
-    serial, impl = _init_parallel_worker(rank, config, trainable, directory)
-    try:
+    serial, impl = harness._init_parallel_worker(rank, config, trainable)
+    with harness.world(rank, directory):
         parallel = protocol.build_model(
             config, impl_cfg=replace(impl, parallel=ParallelConfig(ep=2))
         )
@@ -35,10 +30,7 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
 
         model = parallel.chunks[0]
         reference = serial.chunks[0]
-        local_state = model.state_dict()
-        model.load_state_dict(
-            {k: v for k, v in reference.state_dict().items() if k in local_state}
-        )
+        harness.load_local_state(model, reference)
         for bundle in (serial, parallel):
             for layer in bundle.chunks[0].layers:
                 # Both sources route to experts 0/1: rank 1 receives zero tokens.
@@ -52,91 +44,78 @@ def _ep_worker(rank, config, trainable, directory, optimizer_failure=None):
             _check_optimizer_contract(parallel, rank, optimizer_failure)
             return
         records = {}
-        _capture_expert_linear_inputs(reference, records)
-        errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
-        for step in range(2):
-            records.clear()
-            # Step 0 leaves one receiving rank empty; step 1 exercises both
-            # owners while leaving one expert empty on each rank.
-            for bundle in (serial, parallel):
-                for layer in bundle.chunks[0].layers:
-                    layer.ffn.gate.bias.fill_(-100)
-                    layer.ffn.gate.bias[[0, 1 if step == 0 else 2]] = 100
-            _train_parallel_step(serial, parallel, rank, step)
-            _finalize_reference_expert_wgrad(records, reference, rank)
-            diagnostics = {}
-            serial_parameters = dict(reference.named_parameters())
-            for name, parameter in model.named_parameters():
-                reference_gradient = serial_parameters[name].grad
-                if (parameter.grad is None) != (reference_gradient is None):
-                    diagnostics[name] = {'gradient_presence_mismatch': True}
-                if parameter.grad is not None and reference_gradient is not None:
-                    delta = float((parameter.grad - reference_gradient).abs().max())
-                    if delta:
-                        diagnostics[name] = {
-                            'max_abs': delta,
-                            'reference_max': float(reference_gradient.abs().max()),
-                        }
-            Path(directory, f'gradient-rank-{rank}.json').write_text(
-                json.dumps(diagnostics)
-            )
-            print(
-                f'EP gradient differences rank={rank}: {json.dumps(diagnostics)}',
-                flush=True,
-            )
-            failures = [None, None]
-            dist.all_gather_object(failures, next(iter(diagnostics), None))
-            assert not any(failures), f'EP_GRADIENT_PARITY: {failures}'
-            for name, p in model.named_parameters():
-                q = serial_parameters[name]
-                assert (p.grad is None) == (q.grad is None), name
-                if p.grad is not None:
-                    errors['gradient_max_abs'] = max(
-                        errors['gradient_max_abs'], float((p.grad - q.grad).abs().max())
-                    )
-                    # This fixture has an exact serial baseline, including unequal token counts.
-                    assert_exact(p.grad, q.grad, msg=name)
-            assert serial.optimizer.step()[0]
-            assert parallel.optimizer.step()[0]
-            changed = next(
-                (
-                    name
-                    for name, parameter in model.named_parameters()
-                    if not torch.equal(parameter, serial_parameters[name])
-                ),
-                None,
-            )
-            failures = [None, None]
-            dist.all_gather_object(failures, changed)
-            assert not any(failures), f'EP_PARAMETER_PARITY: {failures}'
-            for name, p in model.named_parameters():
-                q = serial_parameters[name]
-                assert_exact(p, q, msg=name)
-                errors['parameter_max_abs'] = max(
-                    errors['parameter_max_abs'], float((p - q).detach().abs().max())
+        with _capture_expert_linear_inputs(reference, records):
+            errors = {'gradient_max_abs': 0.0, 'parameter_max_abs': 0.0}
+            for step in range(2):
+                records.clear()
+                # Step 0 leaves one receiving rank empty; step 1 exercises both
+                # owners while leaving one expert empty on each rank.
+                for bundle in (serial, parallel):
+                    for layer in bundle.chunks[0].layers:
+                        layer.ffn.gate.bias.fill_(-100)
+                        layer.ffn.gate.bias[[0, 1 if step == 0 else 2]] = 100
+                harness._train_parallel_step(serial, parallel, rank, step)
+                _finalize_reference_expert_wgrad(records, reference, rank)
+                diagnostics = {}
+                serial_parameters = dict(reference.named_parameters())
+                for name, parameter in model.named_parameters():
+                    reference_gradient = serial_parameters[name].grad
+                    if (parameter.grad is None) != (reference_gradient is None):
+                        diagnostics[name] = {'gradient_presence_mismatch': True}
+                    if parameter.grad is not None and reference_gradient is not None:
+                        delta = float((parameter.grad - reference_gradient).abs().max())
+                        if delta:
+                            diagnostics[name] = {
+                                'max_abs': delta,
+                                'reference_max': float(reference_gradient.abs().max()),
+                            }
+                Path(directory, f'gradient-rank-{rank}.json').write_text(
+                    json.dumps(diagnostics)
                 )
-                if '.ffn.experts.' not in name:
-                    replicas = [torch.empty_like(p) for _ in range(2)]
-                    dist.all_gather(replicas, p)
-                    assert_exact(*replicas, msg=name)
-            _check_parallel_buffers(parallel, serial, rank, trainable)
-        Path(directory, f'rank-{rank}.json').write_text(json.dumps(errors))
-    finally:
-        dist.destroy_process_group()
+                print(
+                    f'EP gradient differences rank={rank}: {json.dumps(diagnostics)}',
+                    flush=True,
+                )
+                failures = [None, None]
+                dist.all_gather_object(failures, next(iter(diagnostics), None))
+                assert not any(failures), f'EP_GRADIENT_PARITY: {failures}'
+                for name, p in model.named_parameters():
+                    q = serial_parameters[name]
+                    assert (p.grad is None) == (q.grad is None), name
+                    if p.grad is not None:
+                        harness.record_error(errors, 'gradient_max_abs', p.grad, q.grad)
+                        # This fixture has an exact serial baseline, including unequal token counts.
+                        assert_exact(p.grad, q.grad, msg=name)
+                assert serial.optimizer.step()[0]
+                assert parallel.optimizer.step()[0]
+                changed = next(
+                    (
+                        name
+                        for name, parameter in model.named_parameters()
+                        if not torch.equal(parameter, serial_parameters[name])
+                    ),
+                    None,
+                )
+                failures = [None, None]
+                dist.all_gather_object(failures, changed)
+                assert not any(failures), f'EP_PARAMETER_PARITY: {failures}'
+                for name, p in model.named_parameters():
+                    q = serial_parameters[name]
+                    assert_exact(p, q, msg=name)
+                    harness.record_error(errors, 'parameter_max_abs', p, q)
+                    if '.ffn.experts.' not in name:
+                        replicas = [torch.empty_like(p) for _ in range(2)]
+                        dist.all_gather(replicas, p)
+                        assert_exact(*replicas, msg=name)
+                harness._check_parallel_buffers(parallel, serial, rank, trainable)
+            harness.report_rank(directory, rank, errors)
 
 
 @pytest.mark.gpus(2)
 @pytest.mark.parametrize('trainable', [False, True])
 def test_ep_matches_global_batch(model_config, trainable, tmp_path):
     assert torch.cuda.device_count() >= 2, 'EP comparison requires two allocated GPUs'
-    mp.spawn(
-        _ep_worker, args=(model_config, trainable, str(tmp_path)), nprocs=2, join=True
-    )
-    for rank in range(2):
-        print(
-            f'EP parity trainable_engram={trainable} rank={rank}: '
-            f'{(tmp_path / f"rank-{rank}.json").read_text()}'
-        )
+    harness.run_workers(_ep_worker, (model_config, trainable), tmp_path, report=True)
 
 
 def test_ep_requires_distributed_world(moe, model_config):
@@ -200,12 +179,7 @@ def _check_optimizer_contract(bundle, rank, failure):
 @pytest.mark.parametrize('failure', ['gradient', 'candidate'])
 def test_ep_global_norm_and_atomic_skip(model_config, failure, tmp_path):
     assert torch.cuda.device_count() >= 2, 'EP optimizer comparison requires two GPUs'
-    mp.spawn(
-        _ep_worker,
-        args=(model_config, True, str(tmp_path), failure),
-        nprocs=2,
-        join=True,
-    )
+    harness.run_workers(_ep_worker, (model_config, True), tmp_path, tail=(failure,))
 
 
 def _capture_expert_linear_inputs(model, records):
@@ -222,11 +196,11 @@ def _capture_expert_linear_inputs(model, records):
 
         output.register_hook(gradient)
 
-    from functools import partial
-
-    for name, module in model.named_modules():
-        if '.ffn.experts.' in name and isinstance(module, Linear):
-            module.register_forward_hook(partial(capture, name))
+    return harness.forward_hooks(
+        model,
+        lambda name, module: '.ffn.experts.' in name and isinstance(module, Linear),
+        capture,
+    )
 
 
 def _finalize_reference_expert_wgrad(records, reference, rank):
@@ -283,8 +257,7 @@ def _missing_ep_peer_worker(rank, directory):
     from megatron.lite.primitive.parallel.state import init_parallel
 
     torch.cuda.set_device(rank)
-    init_world(rank, directory, world=2, timeout=30, rendezvous='rendezvous')
-    try:
+    with harness.world(rank, directory, world=2, timeout=30, rendezvous='rendezvous'):
         ps = init_parallel(ParallelConfig(ep=2))
         dispatcher = dispatch_module.TokenDispatcher(4, 2, ps, use_deepep=False)
         ep_participation._TIMEOUT = 0.5
@@ -315,8 +288,6 @@ def _missing_ep_peer_worker(rank, directory):
         failures = [None, None]
         dist.all_gather_object(failures, failure)
         assert not any(failures), f'EP_MISSING_PEER_CONTRACT: {failures}'
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.gpus(2)
@@ -324,14 +295,13 @@ def test_native_ep_missing_peer_fails_before_transport(tmp_path):
     assert (
         torch.cuda.device_count() >= 2
     ), 'EP participation requires two allocated GPUs'
-    mp.spawn(_missing_ep_peer_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    harness.run_workers(_missing_ep_peer_worker, (), tmp_path)
 
 
 def _expert_replica_group_worker(rank, config, directory):
     torch.cuda.set_device(rank)
     torch.set_num_threads(1)
-    init_world(rank, directory, world=4, timeout=60, rendezvous='rendezvous')
-    try:
+    with harness.world(rank, directory, world=4, timeout=60, rendezvous='rendezvous'):
         bundle = protocol.build_model(
             config,
             impl_cfg=protocol.ImplConfig(
@@ -365,8 +335,6 @@ def _expert_replica_group_worker(rank, config, directory):
         assert float(dense.grad.flatten()[0]) == 3, 'EP_FINALIZE_MUST_NOT_RESCALE_DENSE'
         norm = optimizer._grad_norm([dense, expert], [dense.grad, expert.grad])
         assert float(norm) == 13.0, 'EP_REPLICA_NORM_COUNTS_UNIQUE_OWNERS'
-    finally:
-        dist.destroy_process_group()
 
 
 @pytest.mark.gpus(4)
@@ -374,11 +342,8 @@ def test_ep_matching_expert_replica_groups(model_config, tmp_path):
     assert (
         torch.cuda.device_count() >= 4
     ), 'EP replica groups require four allocated GPUs'
-    mp.spawn(
-        _expert_replica_group_worker,
-        args=(model_config, str(tmp_path)),
-        nprocs=4,
-        join=True,
+    harness.run_workers(
+        _expert_replica_group_worker, (model_config,), tmp_path, world=4
     )
 
 
