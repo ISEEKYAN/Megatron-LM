@@ -295,6 +295,11 @@ class MixedOptimizer:
     def _all_finite(self, valid):
         return valid
 
+    def _finite(self, tensors):
+        return self._all_finite(
+            not any(not torch.isfinite(tensor).all() for tensor in tensors)
+        )
+
     @torch.no_grad()
     def step(self):
         self._validate_trainability()
@@ -328,13 +333,11 @@ class MixedOptimizer:
                         q.grad = p.grad
                     candidate.step()
                     candidates.update((id(p), q) for p, q in _pairs(backend, candidate))
-                    if not self._all_finite(
-                        not any(
-                            not torch.isfinite(v).all()
-                            for s in candidate.state.values()
-                            for v in s.values()
-                            if isinstance(v, torch.Tensor)
-                        )
+                    if not self._finite(
+                        v
+                        for s in candidate.state.values()
+                        for v in s.values()
+                        if isinstance(v, torch.Tensor)
                     ):
                         return False, float(norm), None
                     staged_adam.append((backend, candidate))
@@ -344,21 +347,14 @@ class MixedOptimizer:
                     candidates.update(
                         (id(p), value) for p, value in backend.candidates()
                     )
-            if not self._all_finite(
-                not any(not torch.isfinite(p).all() for p in candidates.values())
-            ):
+            if not self._finite(candidates.values()):
                 return False, float(norm), None
             storage = []
             for table in self.tables:
                 weight, scale = quantize_block_fp8(
                     candidates[id(table.master)], (1, 32), scale_format='e8m0'
                 )
-                if not self._all_finite(
-                    bool(
-                        torch.isfinite(weight.float()).all()
-                        and torch.isfinite(scale.float()).all()
-                    )
-                ):
+                if not self._finite(value.float() for value in (weight, scale)):
                     return False, float(norm), None
                 storage.append((table, weight, scale))
             for backend in self.optimizers:
