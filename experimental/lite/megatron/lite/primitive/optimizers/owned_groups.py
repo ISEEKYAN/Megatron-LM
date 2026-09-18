@@ -72,10 +72,7 @@ class OwnedParameterGroups:
 
     def visual_linear(self, module, role, *, multiplier=1, partitions=None):
         shape = (module.out_features, module.in_features)
-        if (
-            math.prod(shape) != module.weight.numel()
-            or tuple(module.weight.shape) != shape
-        ):
+        if tuple(module.weight.shape) != shape:
             raise ValueError('Visual linear shape disagrees with physical owner')
         if module.bias is not None and tuple(module.bias.shape) != (shape[0],):
             raise ValueError('Visual bias shape disagrees with physical owner')

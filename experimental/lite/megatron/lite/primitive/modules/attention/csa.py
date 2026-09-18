@@ -803,10 +803,6 @@ class CompressedSparseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.ps.cp_size != 1:
-            raise NotImplementedError(
-                "DeepSeek V4 fused DSA path currently supports CP=1 only."
-            )
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."

@@ -80,8 +80,6 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
             kv_owner = i
         if i in spec.index_source_layer_ids:
             index_owner = i
-        if not ratio and (kv_owner == i or index_owner == i):
-            raise ValueError("attention source cannot be uncompressed")
         if ratio:
             if kv_owner is None:
                 raise ValueError(f"layer {i} has no KV owner")

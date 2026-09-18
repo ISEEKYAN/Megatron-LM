@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
     default_expert_classifier,
@@ -34,13 +35,10 @@ def run_microbatch_loop(
             (when ``loss_fn`` is None) or model outputs (when ``loss_fn`` is provided).
         pre_forward_hook: Optional callable ``hook(scale: torch.Tensor) -> None``
             invoked once per microbatch, right before ``forward_fn``. ``scale`` is
-            ``1.0 / num_microbatches`` (matches MC's ``schedules.forward_step``,
+            ``cp_size / num_microbatches`` (matches MC's ``schedules.forward_step``,
             see `pipeline_parallel/schedules.py`). Used e.g. by MoE aux-loss
             scale-setting; runtime stays model-agnostic by passing the hook
             through from the model bundle's extras.
-            # TODO: once CP is supported, align with MC's
-            # `schedules:297`-style scale of `cp_group_size / num_microbatches`
-            # (currently assumes ``cp_group_size == 1``).
         loss_fn: Optional external loss function.
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
@@ -65,7 +63,8 @@ def run_microbatch_loop(
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
+            cp_size = getattr(parallel_state_from_model(model), "cp_size", 1)
+            scale = torch.tensor(cp_size / num_microbatches, device="cuda")
             pre_forward_hook(scale)
         with use_loss_context(loss_context):
             out = forward_fn(model, batch)

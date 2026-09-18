@@ -39,7 +39,6 @@ from .checkpoint import load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
 
 # HF checkpoints store trainable masters and byte-preserved archives.
-HF_SAVE_SUPPORTS_RESYNC = False
 
 
 @dataclass(frozen=True)

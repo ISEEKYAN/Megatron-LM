@@ -55,6 +55,9 @@ class DeepseekV41Model(nn.Module):
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         self.topology = config.topology
+        self.pipeline_cut = next(
+            policy.index for policy in self.topology if policy.candidate_mode == "build"
+        )
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
             self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
@@ -325,9 +328,9 @@ class DeepseekV41Model(nn.Module):
 
     def set_input_tensor(self, input_tensor):
         """Receive the FP32 paired HC carrier through the shared PP interface."""
-        if self.local_layer_range[0] != 20:
+        if self.local_layer_range[0] != self.pipeline_cut:
             raise RuntimeError(
-                'V4.1_PP_INPUT_STAGE: only the layer-20 stage accepts input'
+                'V4.1_PP_INPUT_STAGE: only the receiving stage accepts input'
             )
         if self._input_tensor is not None:
             raise RuntimeError('V4.1_PP_INPUT_PENDING: previous input was not consumed')
@@ -346,7 +349,8 @@ class DeepseekV41Model(nn.Module):
         from .protocol import packed_paired_forward as packed_forward
 
         local_start, local_end = self.local_layer_range
-        if (local_start, local_end) not in ((0, 40), (0, 20), (20, 40)):
+        cut, count = self.pipeline_cut, len(self.topology)
+        if (local_start, local_end) not in ((0, count), (0, cut), (cut, count)):
             raise RuntimeError(
                 'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol'
             )
@@ -359,7 +363,7 @@ class DeepseekV41Model(nn.Module):
         )
         loads = None
         image_mask = None
-        if local_start == 20:
+        if local_start == cut:
             carrier, self._input_tensor = self._input_tensor, None
             hidden, pre = stream.unpack_pair(
                 carrier,
@@ -386,7 +390,7 @@ class DeepseekV41Model(nn.Module):
                 packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
             )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
-        if local_end == 20:
+        if local_end == cut:
             return {'hidden_states': stream.pack_pair(hidden, pre)}
         head_hidden = self.norm(contract_hc(hidden, pre)).float()
         result = (

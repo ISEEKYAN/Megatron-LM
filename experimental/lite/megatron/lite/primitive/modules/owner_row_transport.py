@@ -19,22 +19,6 @@ def _fixed_capacity_all_to_all(
 ) -> torch.Tensor:
     """Exchange compact rank segments through an equal-split All-to-All."""
     world_size = dist.get_world_size(process_group)
-    if len(input_split_sizes) != world_size or len(output_split_sizes) != world_size:
-        raise ValueError(
-            "Fixed-capacity All-to-All split metadata must contain one entry per process-group rank"
-        )
-    if capacity < 0:
-        raise ValueError(
-            f"Fixed-capacity All-to-All capacity must be non-negative, got {capacity}"
-        )
-    if any(
-        count < 0 or count > capacity
-        for count in (*input_split_sizes, *output_split_sizes)
-    ):
-        raise ValueError(
-            f"Fixed-capacity All-to-All counts must lie in [0, {capacity}]: "
-            f"input={input_split_sizes}, output={output_split_sizes}"
-        )
     if input_tensor.shape[0] != sum(input_split_sizes):
         raise ValueError(
             "Fixed-capacity All-to-All input rows do not match its split metadata: "
