@@ -194,3 +194,33 @@ def merge_image_embeddings(
                 span[selected] = value.to(device=tokens.device, dtype=tokens.dtype)
             end = img.start + size
     return result
+
+
+def validate_image_spans(input_ids, images, token_types=None, cu_seqlens=None):
+    """Validate image positions against packed documents and return a token mask."""
+    if images is not None:
+        if len(images) != len(input_ids):
+            raise ValueError('Image batch size differs from input IDs')
+        expected_types = torch.full_like(input_ids, TEXT)
+        for batch, sample in enumerate(images):
+            for img in sample or ():
+                if cu_seqlens is not None:
+                    boundaries = cu_seqlens.tolist()
+                    if not any(
+                        a <= img.start and img.start + img.types.numel() <= b
+                        for a, b in zip(boundaries, boundaries[1:])
+                    ):
+                        raise ValueError(
+                            'Image span crosses a packed sequence boundary'
+                        )
+                expected_types[batch, img.start : img.start + img.types.numel()] = (
+                    img.types.to(input_ids.device)
+                )
+        if token_types is not None and not torch.equal(
+            token_types.to(input_ids.device), expected_types
+        ):
+            raise ValueError('Token types disagree with image spans')
+        return expected_types >= 0
+    elif token_types is not None:
+        if token_types.shape != input_ids.shape or (token_types != TEXT).any():
+            raise ValueError('Image token types require image inputs')

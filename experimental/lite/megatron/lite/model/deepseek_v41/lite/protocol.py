@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Text protocol with replicated data parallel training and explicit optimizer policy."""
 
-import math
 from collections.abc import Mapping
 from contextlib import nullcontext
 from dataclasses import dataclass, field, replace
@@ -21,10 +20,11 @@ from megatron.lite.primitive.modules.vision_training import (
     VisionSchedule,
     VisionTrainability,
 )
+from megatron.lite.primitive.packed_lm import _cp_targets, prepare_microbatches
+from megatron.lite.primitive.packed_lm import text_output as _text_output
+from megatron.lite.primitive.packed_lm import unpack_forward_output
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
-from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.runtime.contracts import ParallelConfig
-from torch.nn import functional as F
 
 from .checkpoint import export_hf_weights as _export_hf_weights_impl
 from .checkpoint import load_model, save_model
@@ -76,8 +76,15 @@ def build_model_config(source, **overrides):
     )
 
 
+def _reject_options(error, checks):
+    # Evaluate in declaration order, retaining distributed short-circuit checks.
+    for message, invalid in checks.items():
+        if invalid():
+            raise error(message)
+
+
 def build_model(model_cfg, *, impl_cfg):
-    p = impl_cfg.parallel
+    c, p = impl_cfg, impl_cfg.parallel
     unsupported = [key for key in ('tp', 'vpp') if getattr(p, key) != 1]
     if p.pp not in (1, 2):
         unsupported.append('pp')
@@ -91,30 +98,21 @@ def build_model(model_cfg, *, impl_cfg):
             'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
-    # An external schedule can publish a backward
-    # callback even with text_only=True or a frozen vision mask.
-    if p.pp > 1 and (
-        not impl_cfg.text_only or impl_cfg.external_vision_device is not None
-    ):
-        raise NotImplementedError(
-            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; '
-            'use PP=1 for multimodal training'
-        )
     if p.pp > 1:
-        if impl_cfg.pipeline_split_layer != 20:
-            raise NotImplementedError(
-                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; '
-                'other cuts require transporting CSA2 owner state'
-            )
-        if p.ep != 1 or p.cp != 1:
-            raise NotImplementedError(
-                'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
-            )
-        if impl_cfg.optimizer is not None:
-            raise NotImplementedError(
-                'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model '
-                'forward/backward; distributed optimizer training is not validated'
-            )
+        _reject_options(
+            NotImplementedError,
+            {
+                'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training': lambda: not c.text_only
+                or c.external_vision_device is not None,
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state': lambda: c.pipeline_split_layer
+                != 20,
+                'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1': lambda: p.ep
+                != 1
+                or p.cp != 1,
+                'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model forward/backward; distributed optimizer training is not validated': lambda: c.optimizer
+                is not None,
+            },
+        )
         if (
             not torch.distributed.is_initialized()
             or torch.distributed.get_world_size() != 2
@@ -305,52 +303,6 @@ def build_model(model_cfg, *, impl_cfg):
     )
 
 
-def prepare_microbatches(data_iter, count, *, dp_group=None):
-    """Use one valid-token denominator for all SFT microbatches (O16)."""
-    from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
-
-    if count < 1:
-        raise ValueError('Microbatch count must be positive')
-    items = [split_loss_context(next(data_iter)) for _ in range(count)]
-    total = 0.0
-    for batch, _ in items:
-        if batch.labels is None:
-            raise ValueError('SFT normalization requires labels')
-        mask = (
-            torch.ones_like(batch.labels, dtype=torch.float32)
-            if batch.loss_mask is None
-            else batch.loss_mask
-        )
-        if (
-            mask.shape != batch.input_ids.shape
-            or not torch.isfinite(mask).all()
-            or (mask < 0).any()
-        ):
-            raise ValueError('Expected finite nonnegative token loss weights')
-        # Count exactly the weights consumed by _text_output's next-token CE.
-        # The packed shift zeros each sequence tail (there is no next label),
-        # so the original first-token weight does not contribute.
-        shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
-        total += float(shifted_mask.sum())
-    # The generic runtime divides every microbatch by count after this loss.
-    dp_size = 1
-    if dp_group is not None:
-        tokens = torch.tensor(
-            total, dtype=torch.float64, device=items[0][0].input_ids.device
-        )
-        torch.distributed.all_reduce(tokens, group=dp_group)
-        total = float(tokens)
-        dp_size = torch.distributed.get_world_size(dp_group)
-    denominator = max(total, 1.0) / (count * dp_size)
-    return [
-        (
-            batch,
-            replace(context or LossContext(), normalization_denominator=denominator),
-        )
-        for batch, context in items
-    ]
-
-
 def _validate_replay(model, batch):
     if batch.routed_experts is not None:
         from megatron.lite.primitive.modules.router_replay import RouterReplayAction
@@ -505,85 +457,6 @@ def _pipeline_ranges(model, batch, start, end, states):
         )
         result = _text_output(model.finish_pipeline(final)[0], batch)
     return outputs, result
-
-
-def _cp_targets(batch, cp_context):
-    """Shift full documents once, then optionally select this CP rank's tokens."""
-    mask = (
-        torch.ones_like(batch.labels, dtype=torch.float32)
-        if batch.loss_mask is None
-        else batch.loss_mask
-    )
-    labels, mask = (
-        roll_packed_thd_left(value, cu_seqlens_padded=batch.cu_seqlens)[0]
-        for value in (batch.labels, mask)
-    )
-    denominator = mask.sum().clamp_min(1)
-    if cp_context is None:
-        return labels, mask, denominator
-    return (
-        cp_context.slice(labels, seq_dim=0),
-        cp_context.slice(mask, seq_dim=0),
-        denominator,
-    )
-
-
-def _text_output(logits, batch, *, cp_context=None):
-    from megatron.lite.runtime.contracts.loss import get_loss_context
-
-    context = get_loss_context()
-    temperature = 1.0 if context is None else context.temperature
-    if temperature <= 0:
-        raise ValueError('Temperature must be positive')
-    logits = logits / temperature
-    result = {'logits': logits}
-    if batch.labels is not None:
-        if batch.labels.shape != batch.input_ids.shape:
-            raise ValueError('Labels must match packed input shape')
-        if batch.loss_mask is not None and batch.loss_mask.shape != batch.labels.shape:
-            raise ValueError('Loss mask must match packed input shape')
-        labels, mask, denominator = _cp_targets(batch, cp_context)
-        token_loss = F.cross_entropy(logits, labels, reduction='none')
-        if context is not None and context.normalization_denominator is not None:
-            denominator = context.normalization_denominator
-            if not math.isfinite(denominator) or denominator <= 0:
-                raise ValueError('Loss denominator must be finite and positive')
-        result['loss'] = (token_loss * mask).sum() / denominator
-        if cp_context is not None:
-            # DDP averages the disjoint CP token contributions.
-            result['loss'] = result['loss'] * cp_context.size
-        if context is not None:
-            result['loss'] = result['loss'] * context.loss_scale
-        if context is None or context.return_log_probs:
-            result['log_probs'] = -token_loss
-    if context is not None and context.calculate_entropy:
-        log_probs = logits.log_softmax(-1)
-        result['entropy'] = -(log_probs.exp() * log_probs).sum(-1)
-    return result
-
-
-def unpack_forward_output(model, batch, output):
-    if isinstance(output, dict):
-        return {
-            key: unpack_forward_output(model, batch, value)
-            for key, value in output.items()
-        }
-    if model.ps.cp_size > 1 and isinstance(output, torch.Tensor) and output.ndim > 0:
-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
-
-        cp_context = ContiguousCPSequence(
-            batch.total_tokens, model.ps.cp_rank, model.ps.cp_size, model.ps.cp_group
-        )
-        output = cp_context.gather(output, seq_dim=0)
-    if (
-        isinstance(output, torch.Tensor)
-        and output.ndim > 0
-        and output.shape[0] == batch.total_tokens
-    ):
-        return torch.nested.as_nested_tensor(
-            list(output.split(batch.seq_lens.tolist()))
-        )
-    return output
 
 
 def load_hf_weights(chunk, hf_path, model_cfg, ps):

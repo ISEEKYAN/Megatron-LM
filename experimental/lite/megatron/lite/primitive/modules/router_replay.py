@@ -4,17 +4,11 @@
 from __future__ import annotations
 
 from contextlib import contextmanager
-from enum import Enum
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-
-class RouterReplayAction(Enum):
-    RECORD = "record"
-    REPLAY_FORWARD = "replay_forward"
-    REPLAY_BACKWARD = "replay_backward"
+from megatron.core.transformer.moe.router_replay import RouterReplayAction
 
 
 def build_r3_replay_mask(
@@ -167,7 +161,9 @@ class RouterReplay:
         else:
             return native_indices
         if target is None:
-            raise RuntimeError("router replay is active but no target indices were set.")
+            raise RuntimeError(
+                "router replay is active but no target indices were set."
+            )
 
         target = target.to(device=native_indices.device, dtype=torch.long)
         if target.shape != native_indices.shape:
@@ -206,7 +202,8 @@ class RouterReplay:
 @contextmanager
 def _preserve_replay(instances):
     saved = [
-        (r, r.router_replay_action, r.target_topk_idx, r.target_replay_mask) for r in instances
+        (r, r.router_replay_action, r.target_topk_idx, r.target_replay_mask)
+        for r in instances
     ]
     try:
         yield
@@ -238,17 +235,26 @@ class PackedRouterReplay:
                     raise RuntimeError('Packed replay backward target queue is empty')
                 target = replay.replay_backward_list.pop(0)
                 mask = replay.replay_backward_mask_list.pop(0)
-            if action in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD):
+            if action in (
+                RouterReplayAction.REPLAY_FORWARD,
+                RouterReplayAction.REPLAY_BACKWARD,
+            ):
                 if target is None or target.shape[0] != total_tokens:
-                    raise ValueError('Packed replay target must match the local token buffer')
+                    raise ValueError(
+                        'Packed replay target must match the local token buffer'
+                    )
                 if mask is not None and mask.numel() != total_tokens:
-                    raise ValueError('Packed replay mask must match the local token buffer')
+                    raise ValueError(
+                        'Packed replay mask must match the local token buffer'
+                    )
             self.entries.append((replay, action, target, mask, []))
 
     @contextmanager
     def sequence(self, begin, end):
         if begin != self.next_begin or not begin < end <= self.total_tokens:
-            raise ValueError('Packed replay ranges must partition the token buffer in order')
+            raise ValueError(
+                'Packed replay ranges must partition the token buffer in order'
+            )
         with _preserve_replay(entry[0] for entry in self.entries):
             for replay, action, target, mask, records in self.entries:
                 if action == RouterReplayAction.RECORD:
@@ -259,13 +265,17 @@ class PackedRouterReplay:
                 ):
                     replay.router_replay_action = RouterReplayAction.REPLAY_FORWARD
                     replay.target_topk_idx = target[begin:end]
-                    replay.target_replay_mask = None if mask is None else mask[begin:end]
+                    replay.target_replay_mask = (
+                        None if mask is None else mask[begin:end]
+                    )
             yield
             for replay, action, target, mask, records in self.entries:
                 if action == RouterReplayAction.RECORD:
                     result = replay.recorded_topk_idx
                     if result is None or result.shape[0] != end - begin:
-                        raise RuntimeError('Packed record did not visit every local router/token')
+                        raise RuntimeError(
+                            'Packed record did not visit every local router/token'
+                        )
                     records.append(result.detach().clone())
             self.next_begin = end
 
@@ -298,7 +308,9 @@ def router_replay_checkpoint_contexts(model=None):
     for replay in instances:
         action = replay.router_replay_action
         if action == RouterReplayAction.REPLAY_BACKWARD:
-            raise RuntimeError('Create checkpoint replay contexts during forward, not backward')
+            raise RuntimeError(
+                'Create checkpoint replay contexts during forward, not backward'
+            )
         target = replay.target_topk_idx
         mask = replay.target_replay_mask
         entries.append(

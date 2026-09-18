@@ -6,12 +6,11 @@ fail closed. Vision execution/its explicit trainability mask belong to the
 multimodal assembly; frozen visual and archival MTP owners allocate no state.
 """
 
-import math
-from copy import deepcopy
-from operator import attrgetter
 
-import torch
-from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
+from megatron.lite.primitive.optimizers.parameter_groups import OwnedParameterGroups
+from megatron.lite.primitive.optimizers.partitioned_mixed import (
+    PartitionedMixedOptimizer,
+)
 from megatron.lite.primitive.optimizers.vision_config import (
     OptimizerConfig,
     VisionOptimizerConfig,
@@ -39,61 +38,9 @@ _RULES = {
 
 
 def parameter_groups(model, *, lr, vision_policy=None):
-    if not math.isfinite(lr) or lr < 0:
-        raise ValueError('Invalid base learning rate')
-    model.validate_parameter_bindings()
-    bindings = {id(b.tensor): b for b in model.parameter_bindings()}
-    registered = list(model.named_parameters(remove_duplicate=False))
-    if len(registered) != len({id(p) for _, p in registered}):
-        raise ValueError('Unexpected parameter alias in module tree')
-    groups, seen = [], set()
-
-    def add(
-        p, role, *, shape=None, heads=None, partitions=None, vector=False, **policy
-    ):
-        if id(p) in seen:
-            raise ValueError('Duplicate optimizer owner')
-        seen.add(id(p))
-        b = bindings.get(id(p))
-        if b is None or b.role != role:
-            raise ValueError('Unknown or mismatched parameter owner role')
-        if b.head_count != heads:
-            raise ValueError('Unresolved or incorrect logical head count')
-        if not p.requires_grad:
-            return
-        algorithm, matrix_decay, vector_decay, multiplier = _RULES[role]
-        # Selection follows logical matrix rank, never a release-key prefix.
-        if vector:
-            algorithm = 'adamw'
-        if algorithm in ('muon', 'sinkhorn') and p.ndim != 2:
-            raise ValueError(
-                'Matrix optimizer requires the declared two-dimensional owner'
-            )
-        if shape is not None and math.prod(shape) != p.numel():
-            raise ValueError('Logical matrix shape disagrees with actual owner')
-        if (
-            shape is not None
-            and len(shape) == 3
-            and tuple(p.shape) != (shape[0] * shape[1], shape[2])
-        ):
-            raise ValueError('Head layout disagrees with physical matrix axes')
-        decay = vector_decay if vector else matrix_decay
-        groups.append(
-            dict(
-                params=[p],
-                algorithm=algorithm,
-                owner_key=b.release_key,
-                matrix_shape=tuple(p.shape) if shape is None else tuple(shape),
-                matrix_partitions=partitions,
-                lr=lr * policy.get('multiplier', multiplier),
-                weight_decay=policy.get('decay', decay),
-            )
-        )
-
-    def route(owner, paths, role, **policy):
-        for path in paths.split():
-            add(attrgetter(path)(owner), role, **policy)
-
+    builder = OwnedParameterGroups(model, _RULES, lr)
+    add, route, visual_linear = builder.add, builder.route, builder.visual_linear
+    bindings, seen = builder.bindings, builder.seen
     route(model, 'embed.weight', 'embedding')
     route(model, 'head.weight', 'head')
     route(model, 'norm.weight', 'norm')
@@ -156,34 +103,6 @@ def parameter_groups(model, *, lr, vision_policy=None):
             )
         multiplier = vision_policy.encoder_lr_multiplier if encoder_active else 1
 
-        def visual_linear(module, role, *, multiplier=1, partitions=None):
-            shape = (module.out_features, module.in_features)
-            if (
-                math.prod(shape) != module.weight.numel()
-                or tuple(module.weight.shape) != shape
-            ):
-                raise ValueError('Visual linear shape disagrees with physical owner')
-            if module.bias is not None and tuple(module.bias.shape) != (shape[0],):
-                raise ValueError('Visual bias shape disagrees with physical owner')
-            if partitions is not None and (
-                any(
-                    any(type(d) is not int or d < 1 for d in part)
-                    for part in partitions
-                )
-                or sum(math.prod(part) for part in partitions) != module.weight.numel()
-                or any(part[-1] != shape[-1] for part in partitions)
-            ):
-                raise ValueError('Logical partitions disagree with visual matrix shape')
-            add(
-                module.weight,
-                role,
-                shape=shape,
-                multiplier=multiplier,
-                partitions=partitions,
-            )
-            if module.bias is not None:
-                add(module.bias, role, multiplier=multiplier, decay=0, vector=True)
-
         visual_linear(vision.patch_embed.proj, 'vision', multiplier=multiplier)
         for block in vision.blocks:
             a, dim = block.attn, block.attn.wqkv.in_features
@@ -214,223 +133,40 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 else {}
             )
             add(vector, 'image_delimiter', **policy)
-    if seen != set(bindings):
-        raise ValueError('Unknown parameter owner; no catch-all optimizer route')
-    return groups
+    return builder.finish()
 
 
-class V41Optimizer(MixedOptimizer):
-    """Local correctness coordinator; every backend publishes on one commit.
+def _optimizer_owners(model):
+    experts = [
+        b.tensor
+        for b in model.parameter_bindings()
+        if b.role == 'expert' and b.tensor.requires_grad
+    ]
+    routers = [block.ffn.gate for block in model.layers]
+    tables = [
+        b.engram.embed
+        for b in model.layers
+        if b.engram is not None and b.engram.embed.master is not None
+    ]
+    return experts, routers, tables, model.engram_group
 
-    AdamW staging uses the real torch backend on private candidate parameters.
-    It deliberately costs extra local storage. Distributed staging/sharding is
-    owned by the parallel integration rather than silently approximated here.
-    """
 
+class V41Optimizer(PartitionedMixedOptimizer):
     def __init__(self, model, config, *, dp_group=None, ps=None):
         if not isinstance(config, OptimizerConfig):
             raise TypeError('V4.1 requires an explicit model OptimizerConfig')
-        if not math.isfinite(config.clip_grad) or config.clip_grad < 0:
-            raise ValueError('Invalid gradient clipping threshold')
-        groups = parameter_groups(
-            model, lr=config.lr, vision_policy=config.vision_policy
-        )
-        self.model = model
-        self.dp_group = dp_group
-        self.ps = ps
-        self.expert_parameters = [
-            b.tensor
-            for b in model.parameter_bindings()
-            if b.role == "expert" and b.tensor.requires_grad
-        ]
-        self.expert_ids = {id(p) for p in self.expert_parameters}
-        self.routers = [block.ffn.gate for block in model.layers]
-        self._modality_loads = [None] * len(self.routers)
-        tables = [
-            b.engram.embed
-            for b in model.layers
-            if b.engram is not None and b.engram.embed.master is not None
-        ]
-        super().__init__(groups, config, tables)
-        self.engram_parameters = (
-            [table.master for table in tables] if model.engram_group is not None else []
-        )
-        self.engram_ids = {id(p) for p in self.engram_parameters}
-        if self.engram_parameters:
-            from megatron.lite.primitive.optimizers.sinkhorn import Sinkhorn
-
-            # Reuse the distributed logical-row algorithm; local Sinkhorn would
-            # change rho_mean, column norms and hence every shard's update.
-            backend = next(o for o in self.optimizers if isinstance(o, Sinkhorn))
-            sharded = [
-                g for g in backend.param_groups if id(g['params'][0]) in self.engram_ids
-            ]
-            backend.param_groups = [
-                g
-                for g in backend.param_groups
-                if id(g['params'][0]) not in self.engram_ids
-            ]
-            self.optimizers.append(
-                Sinkhorn(sharded, lr=config.lr, row_group=model.engram_group)
-            )
-
-    @torch.no_grad()
-    def finalize_grads(self):
-        if self.ps.ep_size > 1:
-            self.finalize_expert_grads()
-        # Lookup backward sums requests from all data/context ranks. Dense DDP
-        # averages the same objective; apply that normalization exactly once.
-        for p in self.engram_parameters:
-            grad = p.main_grad if p.main_grad is not None else p.grad
-            if grad is not None:
-                grad.div_(self.ps.dp_cp_size)
-                p.grad = p.main_grad = grad
-
-    @torch.no_grad()
-    def finalize_expert_grads(self):
-        """Expert gradients already sum source tokens within EP dispatch.
-
-        Sum only matching expert replicas, then divide by the dense DP size
-        used to scale the loss. Never average different experts together.
-        """
-        import torch.distributed as dist
-
-        ps = self.ps
-        for p in self.expert_parameters:
-            grad = p.main_grad if p.main_grad is not None else p.grad
-            active = torch.tensor(int(grad is not None), device=p.device)
-            dist.all_reduce(active, group=ps.ep_dp_group)
-            if not active.item():
-                continue
-            if grad is None:
-                grad = torch.zeros_like(p)
-            dist.all_reduce(grad, group=ps.ep_dp_group)
-            grad.div_(ps.dp_size)
-            p.grad = p.main_grad = grad
-
-    def _grad_norm(self, parameters, gradients):
-        if self.ps is None or (self.ps.ep_size == 1 and not self.engram_parameters):
-            return super()._grad_norm(parameters, gradients)
-        # Dense gradients are replicated. Count each dense owner once and
-        # sum the disjoint expert shards across EP, not expert-DP replicas.
-        dense = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
-        expert = torch.zeros_like(dense)
-        engram = torch.zeros_like(dense)
-        for p, grad in zip(parameters, gradients, strict=True):
-            if grad is not None:
-                target = (
-                    engram
-                    if id(p) in self.engram_ids
-                    else expert if id(p) in self.expert_ids else dense
-                )
-                target.add_(grad.double().square().sum())
-        if self.ps.ep_size > 1:
-            torch.distributed.all_reduce(expert, group=self.ps.ep_group)
-        if self.engram_parameters:
-            torch.distributed.all_reduce(engram, group=self.model.engram_group)
-        return (dense + expert + engram).sqrt()
-
-    def _all_finite(self, valid):
-        if self.ps is None or (
-            self.ps.ep_size == 1 and self.model.engram_group is None
-        ):
-            return valid
-        flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
-        )
-        return bool(flag.item())
-
-    def accumulate_modality_loads(self, loads):
-        """One forward snapshot: global layer order, then packed sample order."""
         from .moe import ModalityLoad
 
-        for index, (previous, entries) in enumerate(
-            zip(self._modality_loads, loads, strict=True)
-        ):
-            for stats in entries:
-                previous = ModalityLoad(
-                    (
-                        stats.counts.detach().clone()
-                        if previous is None
-                        else previous.counts + stats.counts
-                    ),
-                    (
-                        stats.total_tokens.detach().clone()
-                        if previous is None
-                        else previous.total_tokens + stats.total_tokens
-                    ),
-                )
-            self._modality_loads[index] = previous
-
-    def zero_grad(self, set_to_none=True):
-        super().zero_grad(set_to_none=set_to_none)
-        self._modality_loads = [None] * len(self.routers)
-
-    def step(self):
-        result = super().step()
-        if result[0]:
-            for router, stats in zip(self.routers, self._modality_loads, strict=True):
-                if stats is not None:
-                    if self.dp_group is not None:
-                        torch.distributed.all_reduce(stats.counts, group=self.dp_group)
-                        torch.distributed.all_reduce(
-                            stats.total_tokens, group=self.dp_group
-                        )
-                    router.update_bias(stats)
-        # Successful publication and overflow skips both finish this window.
-        # Exceptions from the transactional backend retain statistics for retry.
-        self._modality_loads = [None] * len(self.routers)
-        return result
-
-    def reconfigure_vision(self, mask):
-        """Change a completed training stage, retaining common owners' momentum.
-
-        Frozen owners release their state. Newly trainable owners start with
-        empty state. This is an explicit post-training transition, not an
-        automatic pretraining unfreeze or LR schedule.
-        """
-        from megatron.lite.primitive.modules.vision_training import VisionTrainability
-
-        if not isinstance(mask, VisionTrainability):
-            raise TypeError('Expected explicit visual trainability mask')
-        if self.dp_group is not None:
-            raise NotImplementedError(
-                'Rebuild the DP bundle when changing vision trainability'
-            )
-        self._validate_trainability()
-        if any(
-            p.grad is not None or getattr(p, 'main_grad', None) is not None
-            for p in self.model.parameters()
-        ):
-            raise RuntimeError('Zero gradients before changing the training stage')
-        previous = self.model.vision_trainability
-        try:
-            mask.apply(self.model)
-            candidate = type(self)(self.model, self.config, dp_group=self.dp_group)
-        except Exception:
-            previous.apply(self.model)
-            raise
-        old_states = {
-            (id(p), type(backend)): state
-            for backend in self.optimizers
-            for p, state in backend.state.items()
-        }
-        for backend in candidate.optimizers:
-            for group in backend.param_groups:
-                for p in group['params']:
-                    old = old_states.get((id(p), type(backend)))
-                    if old is not None:
-                        backend.state[p] = deepcopy(old)
-        self.optimizers, self.tables = candidate.optimizers, candidate.tables
-
-    def _validate_trainability(self):
-        schedule = getattr(self.model, 'vision_schedule', None)
-        if schedule is not None and schedule.stage != 'idle':
-            raise RuntimeError('Optimizer requires completed vision backward')
-        expected = {id(p) for p in self.model.parameters() if p.requires_grad}
-        actual = {id(p) for g in self.param_groups for p in g['params']}
-        if actual != expected:
-            raise ValueError(
-                'Trainability changed; rebuild optimizer groups before training'
-            )
+        super().__init__(
+            model,
+            config,
+            dp_group=dp_group,
+            ps=ps,
+            group_builder=lambda: parameter_groups(
+                model, lr=config.lr, vision_policy=config.vision_policy
+            ),
+            owners=lambda: _optimizer_owners(model),
+            stats_factory=ModalityLoad,
+            rebuild=lambda: type(self)(model, config, dp_group=dp_group),
+        )
+        self.engram_parameters, self.engram_ids = self.row_parameters, self.row_ids

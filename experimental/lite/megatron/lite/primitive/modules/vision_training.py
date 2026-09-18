@@ -159,3 +159,36 @@ class VisionSchedule:
         self.pending = []
         self.weights = {}
         self.stage = 'idle'
+
+
+def restore_vision_trainability(module, incompatible_keys):
+    values = module._vision_trainability.tolist()
+    if values == [-1] * 4:
+        return
+    if any(value not in (0, 1) for value in values):
+        raise ValueError('Invalid post-training mask in checkpoint')
+    VisionTrainability(*map(bool, values)).apply(module)
+
+
+def encode_image(self, patches, n_vit_h, n_vit_w):
+    weight = self.vision.patch_embed.proj.weight
+    patches = patches.to(device=weight.device, dtype=weight.dtype)
+    return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
+
+
+def merge_image_inputs(self, images, h):
+    if self.vision_schedule is not None:
+        features = self.vision_schedule.forward(images)
+    else:
+        features = [
+            [
+                self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
+                for img in sample or ()
+            ]
+            for sample in images
+        ]
+    from .image_data import merge_image_embeddings
+
+    return merge_image_embeddings(
+        h, images, features, self.image_start, self.image_end, self.image_newline
+    )

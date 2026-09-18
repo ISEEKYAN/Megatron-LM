@@ -94,3 +94,47 @@ def test_decode_rejects_scale_damage(tmp_path, damage, message, monkeypatch):
             pytest.fail(f'CHECKPOINT_SCALE_GUARD_BEFORE_READ: {error}')
     if damage == 'missing':
         assert reads == [name], 'CHECKPOINT_MISSING_SCALE_NEVER_READ'
+
+
+@pytest.mark.parametrize('rows,columns,row_block', [(65, 67, 32), (3, 35, 1)])
+def test_fp8_tail_blocks_keep_declared_scale_width(tmp_path, rows, columns, row_block):
+    name = 'layers.1.' + (
+        'engram.embed.weight' if row_block == 1 else 'attn.wq_a.weight'
+    )
+    weight = torch.ones(rows, columns).to(torch.float8_e4m3fn)
+    scales = torch.arange(
+        ((rows + row_block - 1) // row_block) * ((columns + 31) // 32)
+    )
+    scale = (
+        (scales % 5 + 125)
+        .byte()
+        .reshape(-1, (columns + 31) // 32)
+        .view(torch.float8_e8m0fnu)
+    )
+    tensors = {name: weight, name[:-6] + 'scale': scale}
+    path = tmp_path / 'tail.safetensors'
+    save_file(tensors, path)
+    store = CheckpointTensorStore.load([path], expected_keys=tensors)
+    expected = (
+        scale.float()
+        .repeat_interleave(row_block, 0)
+        .repeat_interleave(32, 1)[:rows, :columns]
+    )
+    assert torch.equal(
+        load_weight(store, name, output_dtype=torch.float32), expected
+    ), 'FIXED_BLOCK_TAIL_SCALE'
+
+
+def test_archive_rejects_changed_payload_without_publishing(tmp_path):
+    source, destination = tmp_path / 'source', tmp_path / 'destination'
+    save_file({'mtp.weight': torch.tensor([1.0, 2.0])}, source)
+    store = CheckpointTensorStore.load([source], expected_keys=['mtp.weight'])
+    raw = bytearray(source.read_bytes())
+    raw[-1] ^= 1
+    source.write_bytes(raw)
+    with pytest.raises(ValueError, match='payload digest mismatch'):
+        store.read('mtp.weight')
+    with pytest.raises(ValueError, match='payload digest mismatch'):
+        store.save(destination)
+    assert not destination.exists(), 'CORRUPT_ARCHIVE_NOT_PUBLISHED'
+    assert not list(tmp_path.glob('.checkpoint-*')), 'FAILED_ARCHIVE_STAGING_REMOVED'

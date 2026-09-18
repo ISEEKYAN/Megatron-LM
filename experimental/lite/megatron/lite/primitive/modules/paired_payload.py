@@ -77,3 +77,57 @@ class PairedPayload:
 
 
 PAYLOAD_FIELDS = tuple(field.name for field in fields(PairedPayload))
+
+
+def packed_paired_forward(
+    sequence_forward,
+    hidden,
+    pre_mix,
+    cu_seqlens,
+    *,
+    input_ids=None,
+    image_mask=None,
+    cp_context=None,
+):
+    """Run a pure sequence callable over each logical sample, preserving its graph.
+
+    The callable returns (hidden, next_pre_mix), creates fresh sequence state
+    per invocation, and keeps bias/statistic publication outside forward. RNG is
+    consumed in sequence order, exactly as for independent calls. This is a
+    correctness path; CP transport and document ownership belong to the primitive.
+    """
+    from contextlib import nullcontext
+
+    from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
+
+    from .router_replay import PackedRouterReplay
+
+    if hidden.ndim != 4 or hidden.shape[0] != 1 or pre_mix.shape != hidden.shape[:-1]:
+        raise ValueError("Expected packed hidden [1,T,HC,D] and pre_mix [1,T,HC]")
+    for tensor in (input_ids, image_mask):
+        if tensor is not None and tensor.shape != hidden.shape[:2]:
+            raise ValueError("Token inputs must match packed [1,T] dimensions")
+    outputs, mixes = [], []
+    replay = PackedRouterReplay(hidden.shape[1]) if cp_context is None else None
+    total = hidden.shape[1] if cp_context is None else cp_context.total_length
+    offset = 0
+    for begin, end in packed_sequence_ranges(cu_seqlens, total):
+        kwargs = {}
+        if cp_context is not None:
+            document = cp_context.document(begin, end)
+            kwargs['cp_context'] = document
+            begin, end = offset, offset + document.local_length
+            offset = end
+        if input_ids is not None:
+            kwargs['input_ids'] = input_ids[:, begin:end]
+        if image_mask is not None:
+            kwargs['image_mask'] = image_mask[:, begin:end]
+        with replay.sequence(begin, end) if replay is not None else nullcontext():
+            h, p = sequence_forward(
+                hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
+            )
+        outputs.append(h)
+        mixes.append(p)
+    if replay is not None:
+        replay.finish()
+    return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)

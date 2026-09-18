@@ -5,14 +5,17 @@ Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
-from collections import namedtuple
 from contextlib import nullcontext
-from dataclasses import dataclass
-from fnmatch import fnmatchcase
 from functools import partial
 from types import SimpleNamespace
 
 import torch
+from megatron.lite.primitive.ckpt.bindings import (
+    BoundModule,
+    DeferredModule,
+    Rule,
+    TensorBinding,
+)
 from megatron.lite.primitive.modules.engram_lookup import (
     Engram,
     EngramTable,
@@ -22,13 +25,19 @@ from megatron.lite.primitive.modules.engram_lookup import (
     hash_multipliers,
     prime_buckets,
 )
-from megatron.lite.primitive.modules.image_data import TEXT, merge_image_embeddings
+from megatron.lite.primitive.modules.image_data import validate_image_spans
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
-from megatron.lite.primitive.modules.router_replay import PackedRouterReplay
+from megatron.lite.primitive.modules.paired_payload import (
+    packed_paired_forward as packed_forward,
+)
 from megatron.lite.primitive.modules.vision import Aligner, ViT
+from megatron.lite.primitive.modules.vision_training import (
+    encode_image,
+    merge_image_inputs,
+    restore_vision_trainability,
+)
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
-from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 from torch import nn
 from torch.nn import functional as F
 
@@ -36,90 +45,6 @@ from .attention import AttentionState, CSA2Attention, Linear
 from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import validate_execution
 from .moe import DeepseekV41MoE, ModalityRouter, SwiGLUExpert
-
-
-def packed_forward(
-    sequence_forward,
-    hidden,
-    pre_mix,
-    cu_seqlens,
-    *,
-    input_ids=None,
-    image_mask=None,
-    cp_context=None,
-):
-    """Run a pure sequence callable over each logical sample, preserving its graph.
-
-    The callable returns (hidden, next_pre_mix), creates a fresh AttentionState
-    per invocation, and keeps bias/statistic publication outside forward. RNG is
-    consumed in sequence order, exactly as for independent calls. This is a
-    correctness path; CP transport and document ownership belong to the primitive.
-    """
-    if hidden.ndim != 4 or hidden.shape[0] != 1 or pre_mix.shape != hidden.shape[:-1]:
-        raise ValueError("Expected packed hidden [1,T,HC,D] and pre_mix [1,T,HC]")
-    for tensor in (input_ids, image_mask):
-        if tensor is not None and tensor.shape != hidden.shape[:2]:
-            raise ValueError("Token inputs must match packed [1,T] dimensions")
-    outputs, mixes = [], []
-    replay = PackedRouterReplay(hidden.shape[1]) if cp_context is None else None
-    total = hidden.shape[1] if cp_context is None else cp_context.total_length
-    offset = 0
-    for begin, end in packed_sequence_ranges(cu_seqlens, total):
-        kwargs = {}
-        if cp_context is not None:
-            document = cp_context.document(begin, end)
-            kwargs['cp_context'] = document
-            begin, end = offset, offset + document.local_length
-            offset = end
-        if input_ids is not None:
-            kwargs['input_ids'] = input_ids[:, begin:end]
-        if image_mask is not None:
-            kwargs['image_mask'] = image_mask[:, begin:end]
-        with replay.sequence(begin, end) if replay is not None else nullcontext():
-            h, p = sequence_forward(
-                hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
-            )
-        outputs.append(h)
-        mixes.append(p)
-    if replay is not None:
-        replay.finish()
-    return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
-
-
-@dataclass(frozen=True)
-class TensorBinding:
-    release_key: str
-    owner: nn.Module
-    attribute: str | None
-    role: str
-    head_count: int | None = None
-    encoding: str | None = None
-    header: object = None
-    store: object = None
-    matrix_shape: tuple | None = None
-
-    @property
-    def tensor(self):
-        return None if self.attribute is None else getattr(self.owner, self.attribute)
-
-
-class DeferredModule(nn.Module):
-    """Archival subtree. F3 supplies vision/aligner computation at these interfaces."""
-
-    def __init__(self, scope):
-        super().__init__()
-        self.scope = scope
-
-    def forward(self, *args, **kwargs):
-        raise NotImplementedError(
-            f'{self.scope} execution is not implemented in text-only mode'
-        )
-
-
-Rule = namedtuple(
-    'Rule', 'attributes role encoding shape key', defaults=(None, None, None)
-)
-
 
 # Attention state -> PP carrier; native shapes and frozen selection are preserved.
 _STATE_PAYLOAD = dict(
@@ -130,7 +55,7 @@ _STATE_PAYLOAD = dict(
 )
 
 
-class DeepseekV41Model(nn.Module):
+class DeepseekV41Model(BoundModule):
     def __init__(
         self,
         config,
@@ -164,19 +89,7 @@ class DeepseekV41Model(nn.Module):
         )
         self.register_load_state_dict_post_hook(self._restore_vision_trainability)
         count = t.num_hidden_layers
-        start, end = (0, count) if layer_range is None else layer_range
-        if (
-            type(start) is not int
-            or type(end) is not int
-            or not 0 <= start < end <= count
-        ):
-            raise ValueError('Invalid local pipeline stage interval')
-        self.local_layer_range = (start, end)
-        self._input_tensor = None
-        self.tensor_bindings = {}
-        self.archival_bindings = {}
-        self.archival_store = None
-        self.checkpoint_bindings = None
+        start, end = self.initialize_bindings(layer_range, count)
         self.embed = self.norm = self.head = None
         if start == 0:
             self.embed = nn.Embedding(t.vocab_size, dim, dtype=torch.bfloat16)
@@ -301,25 +214,10 @@ class DeepseekV41Model(nn.Module):
         self._bind_table(t)
         self.validate_parameter_bindings()
 
-    def _bind(
-        self,
-        key,
-        owner,
-        attribute,
-        role,
-        head_count=None,
-        encoding=None,
-        matrix_shape=None,
-    ):
-        if key in self.tensor_bindings:
-            raise ValueError(f'duplicate binding: {key}')
-        self.tensor_bindings[key] = TensorBinding(
-            key, owner, attribute, role, head_count, encoding, matrix_shape=matrix_shape
-        )
+    def _scale_binding(self, key, owner, attribute, role, encoding):
         if encoding in ('I8', 'F8_E4M3') and role != 'engram_table':
-            scale = key[:-6] + 'scale'
-            self.tensor_bindings[scale] = TensorBinding(
-                scale, owner, attribute, 'scale', encoding='F8_E8M0'
+            return TensorBinding(
+                key[:-6] + 'scale', owner, attribute, 'scale', encoding='F8_E8M0'
             )
 
     @staticmethod
@@ -383,43 +281,24 @@ class DeepseekV41Model(nn.Module):
             rules[f'layers.*.{side}_mixes'] = Rule(
                 'fn base scale', 'hyper_connection', key='{parent}.hc_' + side + '_{a}'
             )
-        for path, owner in self.named_modules():
-            entries = [
-                rule for pattern, rule in rules.items() if fnmatchcase(path, pattern)
-            ]
-            if isinstance(owner, EngramTable):
-                attribute = 'weight' if owner.master is None else 'master'
-                entries.append(
-                    Rule(attribute, 'engram_table', fp8, key='{module}.weight')
+        self.bind_rules(rules, self._extra_binding_rules)
+
+    @staticmethod
+    def _extra_binding_rules(path, owner):
+        entries = []
+        if isinstance(owner, EngramTable):
+            attribute = 'weight' if owner.master is None else 'master'
+            entries.append(
+                Rule(attribute, 'engram_table', 'F8_E4M3', key='{module}.weight')
+            )
+        if path.split('.')[0] in ('vision', 'aligner'):
+            entries.append(
+                Rule(
+                    ' '.join(dict(owner.named_parameters(recurse=False))),
+                    path.split('.')[0],
                 )
-            if path.split('.')[0] in ('vision', 'aligner'):
-                entries.append(
-                    Rule(
-                        ' '.join(dict(owner.named_parameters(recurse=False))),
-                        path.split('.')[0],
-                    )
-                )
-            for attributes, role, encoding, shape, key in entries:
-                for attribute in attributes.split():
-                    tensor = getattr(owner, attribute, None)
-                    if tensor is None:
-                        continue
-                    name = (key or '{module}.{a}').format(
-                        module=path,
-                        a=attribute,
-                        parent=path.rsplit('.', 1)[0],
-                        grandparent=path.rsplit('.', 2)[0],
-                    )
-                    axes = tuple(tensor.shape) if shape is None else shape
-                    self._bind(
-                        name,
-                        owner,
-                        attribute,
-                        role,
-                        None if shape is None else shape[0],
-                        encoding,
-                        axes,
-                    )
+            )
+        return entries
 
     @staticmethod
     def _archive_keys(t):
@@ -454,18 +333,6 @@ class DeepseekV41Model(nn.Module):
         return (
             f'mtp.{i}.{key}' for layers, keys in scopes for i in layers for key in keys
         )
-
-    def parameter_bindings(self):
-        return (
-            b
-            for b in self.tensor_bindings.values()
-            if b.role != 'scale' and isinstance(b.tensor, nn.Parameter)
-        )
-
-    def validate_parameter_bindings(self):
-        ids = [id(b.tensor) for b in self.parameter_bindings()]
-        if len(ids) != len(set(ids)) or set(ids) != {id(p) for p in self.parameters()}:
-            raise ValueError('Every parameter must have exactly one binding')
 
     def _layers(
         self,
@@ -690,34 +557,9 @@ class DeepseekV41Model(nn.Module):
         embeddings = self.embed(input_ids)
         if hasattr(self, 'residual_dtype'):
             embeddings = embeddings.to(self.residual_dtype)
-        image_mask = None
+        image_mask = validate_image_spans(input_ids, images, token_types, cu_seqlens)
         if images is not None:
-            if len(images) != len(input_ids):
-                raise ValueError('Image batch size differs from input IDs')
-            expected_types = torch.full_like(input_ids, TEXT)
-            for batch, sample in enumerate(images):
-                for img in sample or ():
-                    if cu_seqlens is not None:
-                        boundaries = cu_seqlens.tolist()
-                        if not any(
-                            a <= img.start and img.start + img.types.numel() <= b
-                            for a, b in zip(boundaries, boundaries[1:])
-                        ):
-                            raise ValueError(
-                                'Image span crosses a packed sequence boundary'
-                            )
-                    expected_types[batch, img.start : img.start + img.types.numel()] = (
-                        img.types.to(input_ids.device)
-                    )
-            if token_types is not None and not torch.equal(
-                token_types.to(input_ids.device), expected_types
-            ):
-                raise ValueError('Token types disagree with image spans')
             embeddings = self.merge_image_embeddings(images, embeddings)
-            image_mask = expected_types >= 0
-        elif token_types is not None:
-            if token_types.shape != input_ids.shape or (token_types != TEXT).any():
-                raise ValueError('Image token types require image inputs')
         hidden, pre = expand_hc(embeddings, self.hc_mult)
         loads = [[] for _ in self.layers]
         sequence = partial(self._sequence, modality_loads=loads)
@@ -742,36 +584,9 @@ class DeepseekV41Model(nn.Module):
             'modality_loads': tuple(tuple(entries) for entries in loads),
         }
 
-    @staticmethod
-    def _restore_vision_trainability(module, incompatible_keys):
-        values = module._vision_trainability.tolist()
-        if values == [-1] * 4:
-            return
-        if any(value not in (0, 1) for value in values):
-            raise ValueError('Invalid post-training mask in checkpoint')
-        from megatron.lite.primitive.modules.vision_training import VisionTrainability
-
-        VisionTrainability(*map(bool, values)).apply(module)
-
-    def encode_image(self, patches, n_vit_h, n_vit_w):
-        weight = self.vision.patch_embed.proj.weight
-        patches = patches.to(device=weight.device, dtype=weight.dtype)
-        return self.aligner(self.vision(patches, n_vit_h, n_vit_w), n_vit_h, n_vit_w)
-
-    def merge_image_embeddings(self, images, h):
-        if self.vision_schedule is not None:
-            features = self.vision_schedule.forward(images)
-        else:
-            features = [
-                [
-                    self.encode_image(img.patches, img.n_vit_h, img.n_vit_w)
-                    for img in sample or ()
-                ]
-                for sample in images
-            ]
-        return merge_image_embeddings(
-            h, images, features, self.image_start, self.image_end, self.image_newline
-        )
+    _restore_vision_trainability = staticmethod(restore_vision_trainability)
+    encode_image = encode_image
+    merge_image_embeddings = merge_image_inputs
 
     def forward_spec(self, *args, **kwargs):
         raise NotImplementedError('DSpark execution is not implemented')

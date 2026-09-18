@@ -1,14 +1,24 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Pure PyTorch shifted hyper-connection operations, layout [B,S,HC,D]."""
+from inspect import unwrap
+
 import torch
+from megatron.core.transformer.hyper_connection import (
+    _sinkhorn_iterations,
+    native_h_aggregate,
+)
 from torch import nn
 from torch.nn import functional as F
+
+# Retain this primitive's eager execution; compilation belongs to its caller.
+_sinkhorn_iterations = unwrap(_sinkhorn_iterations)
+_native_h_aggregate = unwrap(native_h_aggregate)
 
 
 def contract_hc(hidden: torch.Tensor, pre_mix: torch.Tensor) -> torch.Tensor:
     if hidden.ndim != 4 or pre_mix.shape != hidden.shape[:-1]:
         raise ValueError("Expected paired hidden [B,S,HC,D] and pre_mix [B,S,HC]")
-    return (hidden.float() * pre_mix.float().unsqueeze(-1)).sum(2).to(hidden.dtype)
+    return _native_h_aggregate(hidden.float(), pre_mix.float()).to(hidden.dtype)
 
 
 def expand_hc(tokens: torch.Tensor, copies: int) -> tuple[torch.Tensor, torch.Tensor]:
@@ -58,11 +68,7 @@ class HCMixes(nn.Module):
         comb = (comb * self.scale[2] + bc).reshape(
             *flat.shape[:-1], self.copies, self.copies
         )
-        comb = comb.softmax(-1) + self.hc_eps
-        comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
-        for _ in range(self.iterations - 1):
-            comb = comb / (comb.sum(-1, keepdim=True) + self.hc_eps)
-            comb = comb / (comb.sum(-2, keepdim=True) + self.hc_eps)
+        comb = _sinkhorn_iterations(comb, self.iterations, self.hc_eps)
         return pre, post, comb
 
 
