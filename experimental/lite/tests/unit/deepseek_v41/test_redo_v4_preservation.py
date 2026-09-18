@@ -49,6 +49,9 @@ def test_v4_default_forward_and_all_parameter_gradients_are_bitwise(v4_arms, rat
     # compress_ratio>0 walks the shared-KV path, which asks its parallel state
     # for a real group. Both arms get the same single-rank world, so the
     # comparison stays a comparison of the two sources, not of two topologies.
+    # Check the device first: initialising NCCL on a CPU-only node raises a
+    # backend error that hides why the run is unusable.
+    assert torch.cuda.is_available(), "Run preservation on a Slurm CUDA worker"
     if not torch.distributed.is_initialized():
         os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
         os.environ.setdefault('MASTER_PORT', '29531')
