@@ -142,3 +142,47 @@ def test_engine_preserves_runtime_replay_metrics(
         assert result['model_output'] == {'kept': True}
     else:
         assert result['loss'] == [7.0]
+
+
+@pytest.mark.parametrize('mask_state', ['missing', 'none', 'present'])
+def test_engine_r3_packing_requires_response_mask(mask_state):
+    from megatron.lite.primitive.modules import router_replay
+
+    source = (
+        Path(__file__).parents[3] / 'examples/verl/verl_mlite/engine/mlite_engine.py'
+    )
+    cls = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == 'MegatronLiteEngine'
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == '_r3_replay_mask_for_packing'
+    )
+    method.decorator_list = []
+    scope = dict(torch=torch, TensorDict=dict, router_replay=router_replay)
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'), scope
+    )
+    pack = scope[method.name]
+    input_ids = torch.nested.as_nested_tensor(
+        [torch.arange(4), torch.arange(3)], layout=torch.jagged
+    )
+    batch = {'input_ids': input_ids}
+    if mask_state != 'missing':
+        batch['response_mask'] = (
+            torch.tensor([[1, 1], [0, 0]]) if mask_state == 'present' else None
+        )
+    if mask_state == 'present':
+        actual = pack(batch, input_ids)
+        assert [row.tolist() for row in actual.unbind()] == [
+            [True, True, True, False],
+            [False, False, False],
+        ]
+    else:
+        with pytest.raises(
+            ValueError, match='R3 replay requires micro_batch.response_mask'
+        ):
+            pack(batch, input_ids)
