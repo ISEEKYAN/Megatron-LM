@@ -1315,17 +1315,8 @@ class CompressedSparseAttention(nn.Module):
         return output.unsqueeze(1)
 
 
-# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Differentiable CSA2 full-sequence semantics with explicit per-call ownership.
-
-This correctness implementation supports contiguous context shards through the
-shared differentiable transport. It materializes full-document KV and attention
-scores; it does not claim fused sparse-kernel performance.
-"""
-
 from dataclasses import dataclass, replace
 
-import torch
 from megatron.lite.primitive.modules.attention.mhc import RMSNorm
 from megatron.lite.primitive.modules.native_fp32_linear import (
     Linear,
@@ -1335,7 +1326,6 @@ from megatron.lite.primitive.quantization import mxfp8
 from megatron.lite.primitive.quantization.mxfp4 import fake_quant_index
 from megatron.lite.primitive.quantization.nvfp4 import fake_quant_main_kv
 from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
-from torch import nn
 from torch.nn import functional as F
 
 
