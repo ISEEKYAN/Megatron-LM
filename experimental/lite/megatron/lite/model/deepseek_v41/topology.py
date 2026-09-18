@@ -103,28 +103,4 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
     return tuple(policies)
 
 
-def pipeline_stage_policies(
-    policies: tuple[LayerPolicy, ...], stages: int
-) -> tuple[tuple[LayerPolicy, ...], ...]:
-    """Partition a graph only when all attention dependencies remain stage-local.
-
-    CED hidden/pre-mix crossing the boundary is a separate pipeline payload;
-    this check establishes locality of KV, index and candidate ownership only.
-    """
-    if not policies or type(stages) is not int or stages <= 0 or len(policies) % stages:
-        raise ValueError("pipeline stages must evenly divide the backbone")
-    width = len(policies) // stages
-    result = tuple(policies[i : i + width] for i in range(0, len(policies), width))
-    for stage in result:
-        local = {p.index for p in stage}
-        candidate = next((p.index for p in stage if p.candidate_mode == "build"), None)
-        for p in stage:
-            dependencies = (p.kv_owner, p.index_owner)
-            if any(owner is not None and owner not in local for owner in dependencies):
-                raise ValueError("attention owner crosses pipeline stage boundary")
-            if p.candidate_mode == "reuse" and candidate is None:
-                raise ValueError("candidate owner crosses pipeline stage boundary")
-    return result
-
-
 V41_TOPOLOGY = build_topology(TopologySpec())

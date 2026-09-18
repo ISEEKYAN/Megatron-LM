@@ -6,7 +6,6 @@ from megatron.lite.model.deepseek_v41.topology import (
     V41_TOPOLOGY,
     TopologySpec,
     build_topology,
-    pipeline_stage_policies,
 )
 
 
@@ -76,19 +75,3 @@ def test_policies_derive_from_sources_instead_of_release_magic_numbers():
     ] * 3
 
 
-def test_pp2_ownership_does_not_cross_natural_stage_boundary():
-    stages = pipeline_stage_policies(V41_TOPOLOGY, 2)
-    assert tuple(p.index for p in stages[0]) == tuple(range(20))
-    assert tuple(p.index for p in stages[1]) == tuple(range(20, 40))
-    for stage in stages:
-        local = {p.index for p in stage}
-        builder = next((p.index for p in stage if p.candidate_mode == "build"), None)
-        for p in stage:
-            assert p.kv_owner is None or p.kv_owner in local
-            assert p.index_owner is None or p.index_owner in local
-            assert p.candidate_mode != "reuse" or builder is not None
-    assert pipeline_stage_policies(V41_TOPOLOGY, 1) == (V41_TOPOLOGY,)
-    with pytest.raises(ValueError, match="crosses pipeline"):
-        pipeline_stage_policies(V41_TOPOLOGY, 4)
-    with pytest.raises(ValueError, match="evenly"):
-        pipeline_stage_policies(V41_TOPOLOGY, 3)
