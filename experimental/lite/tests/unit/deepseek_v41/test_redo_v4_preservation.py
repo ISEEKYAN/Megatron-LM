@@ -46,7 +46,21 @@ def test_v4_default_forward_and_all_parameter_gradients_are_bitwise(v4_arms, rat
         qk_rope_head_dim=4, q_lora_rank=32, o_lora_rank=8, o_groups=1,
         index_n_heads=2, index_head_dim=32, index_topk=2, sliding_window=4,
         compress_ratios=[ratio], num_hidden_layers=1)
-    kwargs = dict(layer_idx=0, ps=ParallelState(), apply_dsa_kernel_fusion=False)
+    # compress_ratio>0 walks the shared-KV path, which asks its parallel state
+    # for a real group. Both arms get the same single-rank world, so the
+    # comparison stays a comparison of the two sources, not of two topologies.
+    if not torch.distributed.is_initialized():
+        os.environ.setdefault('MASTER_ADDR', '127.0.0.1')
+        os.environ.setdefault('MASTER_PORT', '29531')
+        torch.distributed.init_process_group(backend='nccl', world_size=1, rank=0)
+    # A bare ParallelState carries no groups, and the shared-KV path gathers
+    # through core's mappings, which reject group=None. Build the real
+    # single-rank state so both arms run the identical topology.
+    from megatron.lite.runtime.contracts import ParallelConfig
+    from megatron.lite.primitive.parallel.state import init_parallel
+
+    ps = init_parallel(ParallelConfig())
+    kwargs = dict(layer_idx=0, ps=ps, apply_dsa_kernel_fusion=False)
     torch.manual_seed(120)
     assert torch.cuda.is_available(), "Run preservation on a Slurm CUDA worker"
     expected = original.CompressedSparseAttention(config, **kwargs).cuda()
