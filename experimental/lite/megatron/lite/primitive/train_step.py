@@ -227,3 +227,60 @@ __all__ = [
     "optimizer_step",
     "run_microbatch_loop",
 ]
+
+
+def prepare_microbatches(data_iter, count, *, dp_group=None, cp_rank=0, cp_size=1):
+    """Sum owned token weights over the gradient averaging group (DP x CP)."""
+    from dataclasses import replace
+
+    from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
+    from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
+
+    if count < 1:
+        raise ValueError('Microbatch count must be positive')
+    items = [split_loss_context(next(data_iter)) for _ in range(count)]
+    total = 0.0
+    for batch, _ in items:
+        if batch.labels is None:
+            raise ValueError('SFT normalization requires labels')
+        mask = (
+            torch.ones_like(batch.labels, dtype=torch.float32)
+            if batch.loss_mask is None
+            else batch.loss_mask
+        )
+        if (
+            mask.shape != batch.input_ids.shape
+            or not torch.isfinite(mask).all()
+            or (mask < 0).any()
+        ):
+            raise ValueError('Expected finite nonnegative token loss weights')
+        # Count exactly the weights consumed by _text_output's next-token CE.
+        # The packed shift zeros each sequence tail (there is no next label),
+        # so the original first-token weight does not contribute.
+        shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
+        if cp_size > 1:
+            from megatron.lite.primitive.modules.attention.cp import (
+                ContiguousCPSequence,
+            )
+
+            shifted_mask = ContiguousCPSequence(
+                batch.input_ids.numel(), cp_rank, cp_size
+            ).slice(shifted_mask, seq_dim=0)
+        total += float(shifted_mask.sum())
+    # The generic runtime divides every microbatch by count after this loss.
+    dp_size = 1
+    if dp_group is not None:
+        tokens = torch.tensor(
+            total, dtype=torch.float64, device=items[0][0].input_ids.device
+        )
+        torch.distributed.all_reduce(tokens, group=dp_group)
+        total = float(tokens)
+        dp_size = torch.distributed.get_world_size(dp_group)
+    denominator = max(total, 1.0) / (count * dp_size)
+    return [
+        (
+            batch,
+            replace(context or LossContext(), normalization_denominator=denominator),
+        )
+        for batch, context in items
+    ]

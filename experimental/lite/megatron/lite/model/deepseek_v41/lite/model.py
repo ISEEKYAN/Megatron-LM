@@ -25,7 +25,6 @@ from megatron.lite.primitive.modules.row_memory_build import (
     sequence_hashes,
 )
 from megatron.lite.primitive.modules.vision import Aligner, ViT
-from megatron.lite.primitive.packed_lm import packed_paired_forward as packed_forward
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from torch import nn
@@ -341,7 +340,10 @@ class DeepseekV41Model(nn.Module):
         images=None,
         token_types=None,
         cp_context=None,
+        return_head_hidden=False,
     ):
+        from .protocol import packed_paired_forward as packed_forward
+
         local_start, local_end = self.local_layer_range
         if (local_start, local_end) not in ((0, 40), (0, 20), (20, 40)):
             raise RuntimeError(
@@ -385,11 +387,12 @@ class DeepseekV41Model(nn.Module):
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
         if local_end == 20:
             return {'hidden_states': stream.pack_pair(hidden, pre)}
-        result = {
-            'logits': stream.project_logits(
-                hidden, pre, self.norm, self.head, contract_hc
-            )
-        }
+        head_hidden = self.norm(contract_hc(hidden, pre)).float()
+        result = (
+            {'head_hidden': head_hidden}
+            if return_head_hidden
+            else {'logits': torch.nn.functional.linear(head_hidden, self.head.weight.float())}
+        )
         if loads is not None:
             result['modality_loads'] = tuple(tuple(entries) for entries in loads)
         return result

@@ -125,17 +125,41 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
 
 
 def unpack_thd_forward_output(
-    model, batch: PackedBatch, output: torch.Tensor
+    model, batch: PackedBatch, output: torch.Tensor, *, contiguous=False, unpadded=False
 ) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
+    if isinstance(output, dict):
+        return {
+            key: unpack_thd_forward_output(
+                model, batch, value, contiguous=contiguous, unpadded=unpadded
+            )
+            for key, value in output.items()
+        }
+    if not isinstance(output, torch.Tensor) or output.ndim == 0:
+        return output
     ps = _parallel_state(model)
+    if unpadded:
+        if ps.cp_size > 1:
+            from megatron.lite.primitive.modules.attention.cp import (
+                ContiguousCPSequence,
+            )
+
+            output = ContiguousCPSequence(
+                batch.total_tokens, ps.cp_rank, ps.cp_size, ps.cp_group
+            ).gather(output, seq_dim=0)
+        if output.shape[0] != batch.total_tokens:
+            return output
+        return torch.nested.as_nested_tensor(
+            list(output.split(batch.seq_lens.tolist()))
+        )
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
+        contiguous=contiguous,
     )
-    return unpack_thd_to_nested(output, meta, contiguous=False)
+    return unpack_thd_to_nested(output, meta, contiguous=contiguous)
 
 
 def pack_routed_experts(

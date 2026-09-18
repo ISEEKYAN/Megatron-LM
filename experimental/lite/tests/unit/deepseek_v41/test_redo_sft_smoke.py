@@ -12,6 +12,7 @@ import json
 import os
 import time
 import traceback
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -198,8 +199,9 @@ def test_release_sft_save_reload(tmp_path, capsys):
         model.archival_store = SafeTensorReader(str(archive_dir))
         model.archival_keys = sorted(archive)
         model.eval()
+        inference_batch = replace(batch, labels=None)
         with torch.no_grad():
-            expected = bundle.forward_step(model, batch)["logits"].clone()
+            expected = bundle.forward_step(model, inference_batch)["logits"].clone()
         saved = tmp_path / "saved"
         protocol.save_hf_weights(
             [model],
@@ -214,7 +216,7 @@ def test_release_sft_save_reload(tmp_path, capsys):
         protocol.load_hf_weights(loaded, str(saved), config, loaded.ps)
         loaded.eval()
         with torch.no_grad():
-            actual = restored.forward_step(loaded, batch)["logits"]
+            actual = restored.forward_step(loaded, inference_batch)["logits"]
         assert torch.equal(actual, expected), (actual - expected).abs().max().item()
         report["reload_logits_bitwise_equal"] = True
         torch.cuda.synchronize()
