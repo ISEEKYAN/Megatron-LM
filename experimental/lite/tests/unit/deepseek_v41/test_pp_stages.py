@@ -77,11 +77,8 @@ def test_pp2_stages_match_monolithic(moe, model_config, monkeypatch, dtype, trai
     assert owned[0] | owned[1] == set(
         dict(reference.named_parameters())
     ), 'PP_COMPLETE_PARAMETERS'
-    for lengths in ([5, 3], [3, 6]):
-        ids = torch.arange(3, 3 + sum(lengths))
-        batch = PackedBatch(
-            ids, ids.roll(-1), torch.tensor(lengths), torch.arange(len(ids)).float() % 3
-        )
+    for batch in _weighted_batches():
+        ids = batch.input_ids
         expected = serial.forward_step(reference, batch)
         outgoing = stages[0].forward_step(models[0], batch)
         assert 'backward' not in outgoing and 'loss' not in outgoing, 'PP_NO_CALLBACK'
@@ -163,17 +160,7 @@ def _pp_worker(rank, config, dtype, trainable, directory):
             _extras={**bundle.extras, 'forward_step': forward, 'model_chunks': [model]},
         )
         runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
-        batches = []
-        for lengths in ([5, 3], [3, 6]):
-            ids = torch.arange(3, 3 + sum(lengths), device=rank)
-            batches.append(
-                PackedBatch(
-                    ids,
-                    ids.roll(-1),
-                    torch.tensor(lengths, device=rank),
-                    torch.arange(len(ids), device=rank).float() % 3,
-                )
-            )
+        batches = list(_weighted_batches(rank))
         with torch.no_grad():
             expected_logits = [
                 serial.forward_step(reference, batch)['logits'] for batch in batches
@@ -272,4 +259,15 @@ def test_pp2_build_requires_initialized_world(model_config):
     with pytest.raises(ValueError, match='^V4.1_PP_WORLD:'):
         protocol.build_model(
             model_config, impl_cfg=replace(_impl(), parallel=ParallelConfig(pp=2))
+        )
+
+
+def _weighted_batches(device=None):
+    for lengths in ([5, 3], [3, 6]):
+        ids = torch.arange(3, 3 + sum(lengths), device=device)
+        yield PackedBatch(
+            ids,
+            ids.roll(-1),
+            torch.tensor(lengths, device=device),
+            torch.arange(len(ids), device=device).float() % 3,
         )
