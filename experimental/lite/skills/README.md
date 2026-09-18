@@ -81,6 +81,24 @@ validation commands instead of copying long design background.
 - `primitive.module.gqa`
 - `primitive.module.thd`
 
+Additional component contracts:
+- `primitive.module.vision`
+- `primitive.module.image_data`
+- `primitive.module.vision_training`
+- `primitive.module.paired_payload`
+- `primitive.optimizer.vision_config`
+- `primitive.module.engram_lookup`
+- `primitive.module.csa2`
+- `primitive.parallel.ep_participation`
+- `primitive.module.hyper_connection`
+- `primitive.module.native_fp32_linear`
+- `primitive.module.router_replay`
+- `primitive.optimizer.headwise_muon`
+- `primitive.optimizer.sinkhorn`
+- `primitive.quantization.ds41_fp8`
+- `primitive.quantization.ds41_index`
+- `primitive.quantization.ds41_kv`
+
 Primitive work has two reusable meta layers: `primitive.principle` defines what
 must be true, and `primitive.select_for_compose` decides when a primitive belongs
 in a model composition.

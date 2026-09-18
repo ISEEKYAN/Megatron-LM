@@ -5,12 +5,13 @@ from __future__ import annotations
 
 import ast
 import importlib
+import json
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
+import torch
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
-
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
@@ -32,9 +33,9 @@ def test_registered_protocol_exposes_hf_save(
         if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
     }
 
-    assert "save_hf_weights" in functions, (
-        f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
-    )
+    assert (
+        "save_hf_weights" in functions
+    ), f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
 
 
 @pytest.mark.parametrize("model_name", ["kimi_k2", "qwen3_moe"])
@@ -56,19 +57,9 @@ def test_new_hf_save_protocols_delegate_all_arguments(
     )
     chunks, model_cfg, parallel_state = object(), object(), object()
 
-    protocol.save_hf_weights(
-        chunks,
-        "/tmp/hf-save-contract",
-        model_cfg,
-        parallel_state,
-    )
+    protocol.save_hf_weights(chunks, "/tmp/hf-save-contract", model_cfg, parallel_state)
 
-    assert calls == [
-        (
-            (chunks, "/tmp/hf-save-contract", model_cfg, parallel_state),
-            {},
-        )
-    ]
+    assert calls == [((chunks, "/tmp/hf-save-contract", model_cfg, parallel_state), {})]
 
 
 # Engine-side ``save_contents=['hf_model']`` unconditionally forwards
@@ -85,7 +76,10 @@ _ENGINE_EXPORT_KWARGS = {
     "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4"]
 )
 def test_hf_save_protocols_accept_engine_export_kwargs(
-    model_name: str, monkeypatch: pytest.MonkeyPatch, transformer_engine_import_stub
+    model_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    transformer_engine_import_stub,
+    tmp_path,
 ) -> None:
     transformer_engine_import_stub()
     if model_name == "deepseek_v4":
@@ -178,3 +172,476 @@ def test_hf_save_checkpoint_warns_on_unused_export_kwargs(
     joined = "\n".join(warnings)
     for key in _ENGINE_EXPORT_KWARGS:
         assert key in joined
+
+
+def _v41_export_model(tmp_path):
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import CheckpointTensorStore
+    from megatron.lite.primitive.parallel.state import ParallelState
+    from safetensors.torch import save_file
+
+    archive_path = tmp_path / "archive.safetensors"
+    archive = {"mtp.weight": torch.tensor([1.1234567, -2.7654321])}
+    save_file(archive, archive_path)
+    store = CheckpointTensorStore.load([archive_path], expected_keys=archive)
+    values = {
+        "model.weight": torch.arange(24, dtype=torch.float32).reshape(3, 8) / 7,
+        "model.norm": torch.arange(8, dtype=torch.float32) / 3,
+    }
+    model = SimpleNamespace(
+        ps=ParallelState(),
+        local_layer_range=(0, 1),
+        layers=[None],
+        tensor_bindings={
+            name: SimpleNamespace(role="weight", tensor=value, owner=None)
+            for name, value in values.items()
+        },
+        archival_bindings=archive,
+        archival_store=store,
+        validate_parameter_bindings=lambda: None,
+        config=SimpleNamespace(to_hf_dict=lambda: {"model_type": "deepseek_v41"}),
+    )
+    return model, values, archive
+
+
+def test_v41_save_casts_masters_and_preserves_archive(
+    tmp_path, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from safetensors.torch import load_file
+
+    model, values, archive = _v41_export_model(tmp_path)
+    destination = tmp_path / "saved"
+    protocol.save_hf_weights(
+        [model],
+        destination,
+        model.config,
+        None,
+        export_dtype="bfloat16",
+        cpu=True,
+        buffer_max_size_bytes=48,
+    )
+    index = json.loads((destination / "model.safetensors.index.json").read_text())
+    tensors = {}
+    for shard in set(index["weight_map"].values()):
+        part = load_file(destination / shard)
+        assert sum(t.numel() * t.element_size() for t in part.values()) <= 48
+        tensors.update(part)
+    assert set(tensors) == set(values) | set(archive)
+    for name, value in values.items():
+        assert tensors[name].dtype == torch.bfloat16
+        assert torch.equal(tensors[name], value.bfloat16())
+    assert torch.equal(
+        tensors["mtp.weight"].view(torch.uint8), archive["mtp.weight"].view(torch.uint8)
+    )
+    assert (
+        json.loads((destination / "config.json").read_text())
+        == model.config.to_hf_dict()
+    )
+
+
+@pytest.mark.parametrize("cpu", [False, True])
+@pytest.mark.parametrize("export_dtype", ["bfloat16", torch.float16, None])
+def test_v41_online_export_engine_kwargs(
+    tmp_path, transformer_engine_import_stub, cpu, export_dtype
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    model, values, archive = _v41_export_model(tmp_path)
+    tensors = dict(
+        protocol.export_hf_weights(
+            [model],
+            model.config,
+            None,
+            export_dtype=export_dtype,
+            cpu=cpu,
+            buffer_max_size_bytes=16,
+        )
+    )
+    dtype = (
+        torch.bfloat16 if export_dtype == "bfloat16" else export_dtype or torch.float32
+    )
+    assert set(tensors) == set(values) | set(archive)
+    for name, value in values.items():
+        assert tensors[name].dtype == dtype
+        assert tensors[name].device == (torch.device("cpu") if cpu else value.device)
+        assert torch.equal(tensors[name], value.to(dtype))
+        assert value.dtype == torch.float32
+    assert torch.equal(
+        tensors["mtp.weight"].view(torch.uint8), archive["mtp.weight"].view(torch.uint8)
+    )
+
+
+def _online_export_method():
+    # Execute the production engine method without importing optional VERL.
+    source = LITE_ROOT / 'examples/verl/verl_mlite/engine/mlite_engine.py'
+    cls = next(
+        n
+        for n in ast.parse(source.read_text()).body
+        if isinstance(n, ast.ClassDef) and n.name == 'MegatronLiteEngine'
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == 'get_per_tensor_param'
+    )
+    namespace = {}
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'),
+        namespace,
+    )
+    return namespace['get_per_tensor_param']
+
+
+@pytest.mark.parametrize('extras', [{}, {'protocol': None}], ids=['absent', 'none'])
+def test_online_export_requires_protocol_for_resync(extras):
+    export_calls = []
+
+    def checked_export(*args, **kwargs):
+        # Sentinel after the missing-protocol guard, at the runtime call boundary.
+        export_calls.append(dict(kwargs))
+        assert False, 'ONLINE_EXPORT_MISSING_PROTOCOL_BOUNDARY'
+
+    engine = SimpleNamespace(
+        _require_initialized=lambda: None,
+        is_param_offload_enabled=False,
+        _initial_sync_cache_cleared=True,
+        _resolve_model_name=lambda: 'deepseek_v41',
+        handle=SimpleNamespace(_extras=extras),
+        runtime=SimpleNamespace(export_weights=checked_export),
+        engine_config=SimpleNamespace(
+            resync_format='mxfp4',
+            resync_config={'expert_dtype': 'fp4'},
+            export_dtype='bfloat16',
+            qat={},
+        ),
+    )
+    with pytest.raises(
+        RuntimeError,
+        match='^online weight export with resync_format requires a model protocol$',
+    ):
+        _online_export_method()(engine)
+    assert export_calls == [], 'ONLINE_EXPORT_MISSING_PROTOCOL_FAILS_BEFORE_DISPATCH'
+
+
+@pytest.mark.parametrize(
+    'selection',
+    [
+        {},
+        {'limit': 1},
+        {'include_mtp_only': False},
+        {'include_mtp_only': True},
+        {'include_local_prefixes': ['model.']},
+        {'limit': 1, 'include_mtp_only': False, 'include_local_prefixes': ['model.']},
+    ],
+)
+@pytest.mark.parametrize('resync_format', [None, 'mxfp4'])
+@pytest.mark.parametrize('resync_config', [{}, {'expert_dtype': 'fp4'}])
+@pytest.mark.parametrize(
+    'capability', [False, True, None], ids=['v41', 'supported', 'legacy']
+)
+def test_v41_engine_online_export_resync_contract(
+    tmp_path,
+    transformer_engine_import_stub,
+    monkeypatch,
+    resync_format,
+    resync_config,
+    capability,
+    selection,
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
+
+    model, values, archive = _v41_export_model(tmp_path)
+    export_calls = []
+    export_weights = protocol.export_hf_weights
+
+    def checked_export(*args, **kwargs):
+        # This sentinel is after the engine gate and actual runtime dispatch.
+        export_calls.append(dict(kwargs))
+        expected = {
+            'buffer_max_size_bytes': 2 * 1024**3,
+            'cpu': False,
+            'export_dtype': 'bfloat16',
+        }
+        expected.update(selection)
+        if capability is not False and resync_format is not None:
+            expected['target'] = resync_format
+            if resync_config:
+                expected['resync_config'] = resync_config
+        assert kwargs == expected, 'ONLINE_EXPORT_RESYNC_CAPABILITY_BOUNDARY'
+        if capability is False:
+            yield from export_weights(*args, **kwargs)
+        else:
+            # Supported/legacy protocol controls prove dispatch, not conversion.
+            yield 'control.weight', torch.tensor(7)
+
+    if capability is None:
+        monkeypatch.delattr(protocol, 'HF_SAVE_SUPPORTS_RESYNC')
+    else:
+        monkeypatch.setattr(protocol, 'HF_SAVE_SUPPORTS_RESYNC', capability)
+    monkeypatch.setattr(protocol, 'export_hf_weights', checked_export)
+    engine = SimpleNamespace(
+        _require_initialized=lambda: None,
+        is_param_offload_enabled=False,
+        _initial_sync_cache_cleared=True,
+        _resolve_model_name=lambda: 'deepseek_v41',
+        runtime=MegatronLiteRuntime.__new__(MegatronLiteRuntime),
+        handle=SimpleNamespace(
+            _model=model,
+            _parallel_state=None,
+            _extras={'protocol': protocol, 'model_cfg': model.config},
+        ),
+        engine_config=SimpleNamespace(
+            resync_format=resync_format,
+            resync_config=resync_config,
+            export_dtype='bfloat16',
+            qat={},
+        ),
+    )
+    runtime_calls = []
+    runtime_export = MegatronLiteRuntime.export_weights
+
+    def checked_runtime_export(runtime, handle, **kwargs):
+        runtime_calls.append(dict(kwargs))
+        assert {
+            key: kwargs[key]
+            for key in ('limit', 'include_mtp_only', 'include_local_prefixes')
+            if key in kwargs
+        } == selection, 'ONLINE_ENGINE_SELECTION_KWARGS'
+        return runtime_export(runtime, handle, **kwargs)
+
+    monkeypatch.setattr(MegatronLiteRuntime, 'export_weights', checked_runtime_export)
+    weights, metadata = _online_export_method()(engine, **selection)
+    assert len(runtime_calls) == 1, 'ONLINE_ENGINE_RUNTIME_BOUNDARY_EXECUTED'
+    tensors = dict(weights)  # Consume the lazy generator through checkpoint export.
+    assert len(export_calls) == 1, 'ONLINE_EXPORT_RUNTIME_BOUNDARY_EXECUTED'
+    assert metadata is None, 'ONLINE_EXPORT_METADATA'
+    if capability is not False:
+        assert set(tensors) == {'control.weight'}, 'ONLINE_EXPORT_CONTROL_KEYS'
+        assert tensors['control.weight'].item() == 7, 'ONLINE_EXPORT_CONTROL_VALUE'
+        return
+    if selection.get('include_mtp_only'):
+        assert tensors == {}, 'ONLINE_EXPORT_NO_EXECUTABLE_MTP'
+        return
+    if selection.get('limit') == 1:
+        assert list(tensors) == [next(iter(values))], 'ONLINE_EXPORT_LIMIT'
+        values = {name: values[name] for name in tensors}
+        archive = {}
+    assert (
+        tensors.keys() == values.keys() | archive.keys()
+    ), 'ONLINE_EXPORT_COMPLETE_KEYS'
+    for name, value in values.items():
+        assert tensors[name].dtype == torch.bfloat16, 'ONLINE_EXPORT_MASTER_DTYPE'
+        assert torch.equal(
+            tensors[name], value.bfloat16()
+        ), 'ONLINE_EXPORT_MASTER_VALUE'
+        assert value.dtype == torch.float32, 'ONLINE_EXPORT_MASTER_UNMODIFIED'
+    if archive:
+        assert torch.equal(
+            tensors['mtp.weight'].view(torch.uint8),
+            archive['mtp.weight'].view(torch.uint8),
+        ), 'ONLINE_EXPORT_ARCHIVE_BYTES'
+
+
+@pytest.mark.parametrize(
+    "option,value",
+    [
+        ("target", "mxfp4"),
+        ("resync_config", {}),
+        ("buffer_max_size_bytes", 0),
+        ("export_dtype", "int8"),
+    ],
+)
+def test_v41_export_rejects_named_unsupported_options(
+    tmp_path, transformer_engine_import_stub, option, value
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    model, _, _ = _v41_export_model(tmp_path)
+    with pytest.raises((ValueError, TypeError), match=option):
+        list(protocol.export_hf_weights([model], model.config, None, **{option: value}))
+    with pytest.raises((ValueError, TypeError), match=option):
+        protocol.save_hf_weights(
+            [model], tmp_path / "invalid", model.config, None, **{option: value}
+        )
+    assert not (tmp_path / "invalid").exists()
+
+
+def test_v41_conversion_copy_obeys_buffer_budget(
+    tmp_path, transformer_engine_import_stub, monkeypatch
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    model, _, _ = _v41_export_model(tmp_path)
+    original = torch.Tensor.copy_
+    copies = []
+
+    def record_copy(destination, source, *args, **kwargs):
+        copies.append(
+            source.numel() * max(source.element_size(), destination.element_size())
+        )
+        return original(destination, source, *args, **kwargs)
+
+    monkeypatch.setattr(torch.Tensor, "copy_", record_copy)
+    list(
+        protocol.export_hf_weights(
+            [model],
+            model.config,
+            None,
+            export_dtype="bfloat16",
+            cpu=True,
+            buffer_max_size_bytes=16,
+        )
+    )
+    assert copies and max(copies) <= 16
+    assert sum(copies) == 128
+
+
+def test_v41_export_preserves_encoded_engram(tmp_path, transformer_engine_import_stub):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
+
+    model, _, _ = _v41_export_model(tmp_path)
+    weight = (
+        torch.arange(64, dtype=torch.float32).reshape(2, 32).to(torch.float8_e4m3fn)
+    )
+    scale = torch.ones(2, 1).to(torch.float8_e8m0fnu)
+    table = EngramTable(weight, scale, trainable=False)
+    model.tensor_bindings['model.engram.embed.weight'] = SimpleNamespace(
+        role='engram_table', tensor=table.weight, owner=table
+    )
+    tensors = dict(
+        protocol.export_hf_weights(
+            [model],
+            model.config,
+            None,
+            export_dtype="bfloat16",
+            cpu=True,
+            buffer_max_size_bytes=16,
+        )
+    )
+    for key, expected in [('weight', weight), ('scale', scale)]:
+        actual = tensors['model.engram.embed.' + key]
+        assert actual.dtype == expected.dtype
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+def test_v41_default_engine_save_into_precreated_directory(
+    tmp_path, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from safetensors.torch import load_file
+
+    model, values, _ = _v41_export_model(tmp_path)
+    destination = tmp_path / "huggingface"
+    destination.mkdir()  # The engine creates this directory before protocol dispatch.
+    protocol.save_hf_weights(
+        [model], destination, model.config, None, export_dtype="bfloat16"
+    )
+    tensors = load_file(destination / 'model.safetensors')
+    assert all(tensors[name].dtype == torch.bfloat16 for name in values)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("cpu", [False, True])
+def test_v41_export_cpu_controls_gpu_tensor_destination(tmp_path, cpu):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    model, values, _ = _v41_export_model(tmp_path)
+    for binding in model.tensor_bindings.values():
+        binding.tensor = binding.tensor.cuda()
+    tensors = dict(
+        protocol.export_hf_weights(
+            [model],
+            model.config,
+            None,
+            export_dtype="bfloat16",
+            cpu=cpu,
+            buffer_max_size_bytes=16,
+        )
+    )
+    assert all(t.device.type == ('cpu' if cpu else 'cuda') for t in tensors.values())
+    for name, expected in values.items():
+        assert tensors[name].dtype == torch.bfloat16
+        assert torch.equal(tensors[name].cpu(), expected.bfloat16())
+
+
+def test_v41_engine_hf_save_keeps_master_checkpoint_with_resync_config(
+    tmp_path, transformer_engine_import_stub, monkeypatch
+):
+    import os
+
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from safetensors.torch import load_file
+
+    transformer_engine_import_stub()
+    source = LITE_ROOT / 'examples/verl/verl_mlite/engine/mlite_engine.py'
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n
+        for n in tree.body
+        if isinstance(n, ast.ClassDef) and n.name == 'MegatronLiteEngine'
+    )
+    method = next(
+        n
+        for n in cls.body
+        if isinstance(n, ast.FunctionDef) and n.name == '_save_hf_checkpoint'
+    )
+    namespace = dict(os=os, dist=dist, Any=object)
+    exec(
+        compile(ast.Module(body=[method], type_ignores=[]), str(source), 'exec'),
+        namespace,
+    )
+    monkeypatch.setattr(dist, 'is_initialized', lambda: False)
+    model, values, archive = _v41_export_model(tmp_path)
+    engine = SimpleNamespace(
+        handle=SimpleNamespace(
+            _model=model,
+            _parallel_state=None,
+            _extras={'protocol': protocol, 'model_cfg': model.config},
+        ),
+        _rank=0,
+        model_config=SimpleNamespace(),
+        engine_config=SimpleNamespace(
+            resync_format='mxfp4',
+            resync_config={'expert_dtype': 'fp4'},
+            export_dtype='bfloat16',
+        ),
+    )
+    save_calls = []
+    save_weights = protocol.save_hf_weights
+
+    def checked_save(*args, **kwargs):
+        save_calls.append(dict(kwargs))
+        # Observe the actual engine call after its resync-kwargs branch executes.
+        assert (
+            not {'target', 'resync_config'} & kwargs.keys()
+        ), 'HF_NATIVE_SAVE_EXCLUDES_DEPLOYMENT_OPTIONS'
+        return save_weights(*args, **kwargs)
+
+    monkeypatch.setattr(protocol, 'save_hf_weights', checked_save)
+    try:
+        namespace['_save_hf_checkpoint'](engine, str(tmp_path / 'checkpoint'))
+    except TypeError as error:
+        pytest.fail(f'HF_ENGINE_NATIVE_SAVE_MUST_ACCEPT_RESYNC_CONFIG: {error}')
+    assert len(save_calls) == 1, 'HF_NATIVE_SAVE_BOUNDARY_EXECUTED'
+    saved = tmp_path / 'checkpoint/huggingface'
+    tensors = {
+        k: v
+        for shard in saved.glob('*.safetensors')
+        for k, v in load_file(shard).items()
+    }
+    assert tensors.keys() == values.keys() | archive.keys(), 'HF_ENGINE_COMPLETE_KEYS'
+    for name, value in values.items():
+        assert torch.equal(tensors[name], value.bfloat16()), 'HF_ENGINE_MASTER_DTYPE'
+    assert torch.equal(
+        tensors['mtp.weight'], archive['mtp.weight']
+    ), 'HF_ENGINE_ARCHIVE_BYTES'

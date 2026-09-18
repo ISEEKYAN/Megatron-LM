@@ -390,9 +390,15 @@ class MegatronLiteEngine(BaseEngine):
             cpu=False,
         )
         if self.engine_config.resync_format is not None:
-            export_kwargs["target"] = self.engine_config.resync_format
-            if self.engine_config.resync_config:
-                export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+            proto = self.handle._extras.get("protocol")
+            if proto is None:
+                raise RuntimeError(
+                    "online weight export with resync_format requires a model protocol"
+                )
+            if getattr(proto, "HF_SAVE_SUPPORTS_RESYNC", True):
+                export_kwargs["target"] = self.engine_config.resync_format
+                if self.engine_config.resync_config:
+                    export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
         elif self._resolve_model_name() == "qwen3_5":
             # Qwen3.5 selects its vLLM checkpoint layout through target=.
             # Qwen3-MoE's HF exporter has no target parameter, so forwarding
@@ -519,7 +525,9 @@ class MegatronLiteEngine(BaseEngine):
             dist.barrier()
 
         save_kwargs: dict[str, Any] = {}
-        if self.engine_config.resync_format is not None:
+        if self.engine_config.resync_format is not None and getattr(
+            proto, "HF_SAVE_SUPPORTS_RESYNC", True
+        ):
             save_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
                 save_kwargs["resync_config"] = dict(self.engine_config.resync_config)
@@ -743,6 +751,12 @@ class MegatronLiteEngine(BaseEngine):
         if batch_num_tokens <= 0:
             raise ValueError(f"batch_num_tokens must be positive, got {batch_num_tokens}.")
         loss_scale = self.get_data_parallel_size() * num_micro_batches / float(batch_num_tokens)
+        if (
+            loss_function is None
+            and self.handle._extras.get("prepare_microbatches") is not None
+        ):
+            # The model prepares the global next-token denominator itself.
+            loss_scale = 1.0
         for micro_idx, micro_batch in enumerate(micro_batches):
             tu.assign_non_tensor(micro_batch, micro_batch_idx=micro_idx)
             micro_batch = micro_batch.to(get_device_id())
@@ -776,23 +790,35 @@ class MegatronLiteEngine(BaseEngine):
             forward_only=forward_only,
             router_replay={"action": "replay"} if replay_enabled else None,
         )
+        # Keep step-wide replay evidence on both the native-loss and VERL collector paths.
+        metrics = {
+            key: (
+                value
+                if isinstance(value, list)
+                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                else [value]
+            )
+            for key, value in result.metrics.items()
+        }
         if reduced_outputs is not None:
-            return postprocess_batch_func(output_lst=reduced_outputs, indices=indices, data=data)
-        metrics = dict(result.metrics)
+            output = postprocess_batch_func(
+                output_lst=reduced_outputs, indices=indices, data=data
+            )
+            replay_metrics = {
+                key: value
+                for key, value in metrics.items()
+                if key.startswith("router_replay/")
+            }
+            if replay_metrics:
+                output.setdefault("metrics", {}).update(replay_metrics)
+            return output
         loss = result.model_output.loss
         losses = [] if loss is None else torch.as_tensor(loss).detach().flatten().cpu().tolist()
         return {
             "model_output": {},
             "loss": losses,
-            # Pass Metric aggregators through unchanged (reduce_metrics folds them);
-            # list-wrap plain scalars as the legacy contract expects.
-            "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
-                for key, value in metrics.items()
-            },
+            # Metric aggregators and legacy scalar lists retain their existing form.
+            "metrics": metrics,
         }
 
     def _make_runtime_batch(self, micro_batch: TensorDict) -> PackedBatch:
@@ -905,9 +931,10 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Build the R3 mask while inputs are still jagged."""
-        return router_replay.build_r3_replay_mask(
-            input_ids, micro_batch["response_mask"]
-        )
+        response_mask = micro_batch.get("response_mask")
+        if response_mask is None:
+            raise ValueError("R3 replay requires micro_batch.response_mask.")
+        return router_replay.build_r3_replay_mask(input_ids, response_mask)
 
     def _build_verl_model_output(
         self,

@@ -663,3 +663,329 @@ def test_runtime_dispatch_creates_mlite_backend():
 def test_runtime_dispatch_unknown_backend_raises():
     with pytest.raises(KeyError):
         create_runtime(RuntimeConfig(backend="nonexistent"))
+
+
+@pytest.mark.parametrize('mode', ['sft', 'external_loss', 'forward_only'])
+def test_pipeline_consumes_prepared_microbatches_like_non_pipeline(mode):
+    from megatron.lite.primitive.parallel import pipeline
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    batches = [
+        PackedBatch(torch.arange(n), torch.arange(n), torch.tensor([n])) for n in (2, 5)
+    ]
+    context = LossContext(source_batch='original', loss_scale=0.5)
+    outputs, gradients = [], []
+    for pp_size in (1, 2):
+        model = nn.Linear(1, 1, bias=False)
+        nn.init.ones_(model.weight)
+        prepared_calls, contexts, consumed = [], [], []
+
+        def prepare(data_iter, count):
+            prepared_calls.append(count)
+            from dataclasses import replace
+
+            items = [next(data_iter) for _ in range(count)]
+            return [
+                (batch, replace(ctx, normalization_denominator=3.5))
+                for batch, ctx in items
+            ]
+
+        def forward(module, batch):
+            ctx = get_loss_context()
+            contexts.append(ctx)
+            consumed.append(batch)
+            denominator = ctx.normalization_denominator or batch.total_tokens
+            return {
+                'loss': module.weight.sum()
+                * batch.total_tokens
+                / denominator
+                * ctx.loss_scale
+            }
+
+        def schedule(forward_fn, chunks, data_iter, config, ps, **kwargs):
+            # Exercise the real runtime PP dispatch/callbacks without CUDA transport.
+            result = []
+            for _ in range(config.num_microbatches):
+                item = next(data_iter)
+                out = forward_fn(chunks[0], item)
+                loss = out['loss']
+                if kwargs['loss_fn'] is not None:
+                    loss, _ = kwargs['loss_fn'](out, item)
+                if not kwargs['forward_only']:
+                    (loss / config.num_microbatches).backward()
+                result.append(out)
+            return result
+
+        handle = ModelHandle(
+            model=model,
+            parallel_state=types.SimpleNamespace(
+                pp_size=pp_size, pp_group=None, pp_global_ranks=None
+            ),
+            _extras={
+                'forward_step': forward,
+                'prepare_microbatches': prepare,
+                'model_cfg': types.SimpleNamespace(hidden_size=1),
+            },
+        )
+        # Only the PP result broadcast payload requests CUDA in this CPU dispatch test.
+        original_tensor = torch.tensor
+
+        def cpu_tensor(*args, **kwargs):
+            if kwargs.get('device') == 'cuda':
+                kwargs['device'] = 'cpu'
+            return original_tensor(*args, **kwargs)
+
+        data = iter([(batch, context) for batch in batches] + [('untouched', context)])
+        with patch.object(
+            pipeline, 'forward_backward_pipelining', schedule
+        ), patch.object(torch, 'tensor', cpu_tensor):
+            result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+                handle,
+                data,
+                (
+                    (lambda out, batch, ctx: (out['loss'], {}))
+                    if mode == 'external_loss'
+                    else None
+                ),
+                num_microbatches=2,
+                forward_only=mode == 'forward_only',
+            )
+        assert prepared_calls == (
+            [2] if mode != 'external_loss' else []
+        ), 'PP must prepare SFT exactly once like non-PP'
+        assert all(
+            a is b for a, b in zip(consumed, batches)
+        ), 'prepared order and first item preserved'
+        assert next(data)[0] == 'untouched', 'prepare consumes exactly num_microbatches'
+        assert all(
+            ctx.source_batch == 'original' and ctx.loss_scale == 0.5 for ctx in contexts
+        )
+        assert [ctx.normalization_denominator for ctx in contexts] == (
+            [3.5] * 2 if mode != 'external_loss' else [None] * 2
+        )
+        outputs.append(result.model_output.loss)
+        gradients.append(model.weight.grad)
+    torch.testing.assert_close(
+        outputs[0], outputs[1], rtol=0, atol=0, msg='PP versus non-PP loss'
+    )
+    if mode != 'forward_only':
+        torch.testing.assert_close(
+            gradients[0], gradients[1], rtol=0, atol=0, msg='PP versus non-PP gradient'
+        )
+
+
+@pytest.mark.parametrize('pp_size', [1, 2])
+@pytest.mark.parametrize('count', [1, 2])
+@pytest.mark.parametrize('policy', ['native', 'external', 'inference'])
+@pytest.mark.parametrize('forward_only', [False, True])
+def test_runtime_microbatch_loss_contract(pp_size, count, policy, forward_only):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.parallel import pipeline
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    model = nn.Linear(1, 1, bias=False)
+    nn.init.ones_(model.weight)
+    # Two and six predicted tokens with respective per-token losses one and three.
+    # The independently weighted reference is (2 * 1 + 6 * 3) / 8 = 2.5,
+    # not the mean of local means (2) or the last local mean (3).
+    batches = [
+        PackedBatch(torch.ones(n), torch.ones(n), torch.tensor([n])) for n in (3, 7)
+    ]
+    if count == 1:
+        batches = [PackedBatch(torch.ones(10), torch.ones(10), torch.tensor([3, 7]))]
+    numerators = iter([20.0] if count == 1 else [2.0, 18.0])
+    consumed, prepared, backward_calls = [], [], []
+
+    def prepare(data_iter, size):
+        prepared.append(size)
+        return protocol.prepare_microbatches(data_iter, size)
+
+    def forward(module, batch):
+        consumed.append(batch)
+        ctx = get_loss_context()
+        # This probe executes after the prepare guard, in the actual model call.
+        if policy == 'native':
+            assert (
+                ctx.normalization_denominator == 8 / count
+            ), 'FWD_ONLY_PREPARED_TOKEN_DENOMINATOR'
+        value = module.weight.sum() * next(numerators)
+
+        def backward(loss):
+            backward_calls.append(True)
+            loss.backward()
+
+        return {
+            'loss': value / (ctx.normalization_denominator or 1),
+            'numerator': value,
+            'backward': backward,
+        }
+
+    def external(out, batch, ctx):
+        # The VERL adapter multiplies a caller-normalized contribution by N.
+        loss = (
+            out['numerator'] * count / 8
+            if policy == 'external'
+            else out['numerator'] * 0
+        )
+        return loss, {'tokens': batch.total_tokens}
+
+    def schedule(forward_fn, chunks, data_iter, config, ps, **kwargs):
+        outputs = []
+        for _ in range(config.num_microbatches):
+            item = next(data_iter)
+            out = forward_fn(chunks[0], item)
+            if kwargs['loss_fn'] is not None:
+                out['loss'], out['metrics'] = kwargs['loss_fn'](out, item)
+            if not kwargs['forward_only']:
+                out['backward'](out['loss'] / config.num_microbatches)
+            # The real PP schedule publishes Python scalar losses, not tensors.
+            outputs.append(pipeline._compact_pipeline_output(out))
+        return outputs
+
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(
+            pp_size=pp_size, pp_group=None, pp_global_ranks=None
+        ),
+        _extras={
+            'forward_step': forward,
+            'prepare_microbatches': prepare,
+            'model_cfg': types.SimpleNamespace(hidden_size=1),
+        },
+    )
+    original_tensor = torch.tensor
+
+    def cpu_tensor(*args, **kwargs):
+        if kwargs.get('device') == 'cuda':
+            kwargs['device'] = 'cpu'
+        return original_tensor(*args, **kwargs)
+
+    items = iter([(b, LossContext(source_batch=b)) for b in batches] + [('tail', None)])
+    with torch.set_grad_enabled(not forward_only), patch.object(
+        pipeline, 'forward_backward_pipelining', schedule
+    ), patch.object(torch, 'tensor', cpu_tensor):
+        result = MegatronLiteRuntime.__new__(MegatronLiteRuntime).forward_backward(
+            handle,
+            items,
+            None if policy == 'native' else external,
+            num_microbatches=count,
+            forward_only=forward_only,
+        )
+    # Post-return sentinel: aggregation was reached after all model calls.
+    assert consumed == batches, 'FWD_ONLY_ALL_MICROBATCHES_EXECUTED'
+    assert next(items) == ('tail', None), 'FWD_ONLY_NO_EXTRA_MICROBATCH_CONSUMED'
+    assert prepared == (
+        [count] if policy == 'native' else []
+    ), 'FWD_ONLY_PREPARE_POLICY'
+    assert len(backward_calls) == (0 if forward_only else count), 'FWD_ONLY_NO_BACKWARD'
+    expected = torch.tensor(0.0 if policy == 'inference' else 2.5)
+    if forward_only:
+        assert torch.equal(
+            result.model_output.loss, expected
+        ), 'FWD_ONLY_MICROBATCH_AGGREGATE'
+        assert model.weight.grad is None, 'FWD_ONLY_NO_PARAMETER_GRADIENT'
+    else:
+        assert torch.equal(
+            model.weight.grad.squeeze(), expected
+        ), 'TRAIN_MICROBATCH_GRADIENT'
+    if policy != 'native':
+        assert result.metrics == {
+            'tokens': [b.total_tokens for b in batches]
+        }, 'FWD_ONLY_METRICS_PRESERVED'
+
+
+@pytest.mark.parametrize('live', [False, True])
+def test_runtime_replay_driver_requires_observed_routes(
+    live, capsys, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive.modules.router import SigmoidTopKRouter
+    from megatron.lite.primitive.modules.router_replay import RouterReplay
+    from megatron.lite.primitive.parallel import ParallelState
+    from megatron.lite.runtime.contracts import PackedBatch
+
+    model = SigmoidTopKRouter(
+        types.SimpleNamespace(
+            num_experts_per_tok=2,
+            n_routed_experts=4,
+            routed_scaling_factor=1.0,
+            hidden_size=4,
+        ),
+        ParallelState(),
+        compute_aux_loss=False,
+    )
+    with torch.no_grad():
+        model.gate.weight.zero_()
+        model.gate.weight[:, 0] = torch.tensor([4.0, 3.0, 2.0, 1.0])
+    batch = PackedBatch(
+        torch.arange(3),
+        None,
+        torch.tensor([3]),
+        routed_experts=torch.tensor([[[[0, 1]], [[0, 1]], [[0, 1]]]]),
+        r3_replay_mask=torch.ones(3, dtype=torch.bool),
+    )
+
+    second = PackedBatch(
+        torch.arange(1),
+        None,
+        torch.tensor([1]),
+        routed_experts=torch.tensor([[[[2, 3]]]]),
+        r3_replay_mask=torch.ones(1, dtype=torch.bool),
+    )
+
+    def forward(module, batch):
+        value = (
+            module(torch.ones(len(batch.input_ids), 4))[0]
+            if live
+            else module.gate.weight
+        )
+        return {'loss': value.sum()}
+
+    handle = ModelHandle(
+        model=model,
+        parallel_state=types.SimpleNamespace(pp_size=1),
+        _extras={'forward_step': forward},
+    )
+    instances = RouterReplay.global_router_replay_instances[:]
+    try:
+        runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+        if live:
+            result = runtime.forward_backward(
+                handle,
+                iter([batch, second]),
+                None,
+                num_microbatches=2,
+                router_replay={'action': 'replay'},
+            )
+            assert 'R3_REPLAY_EVIDENCE calls=1 rows=6' in capsys.readouterr().out
+            assert result.metrics == {
+                'router_replay/calls': 2,
+                'router_replay/rows': 8,
+                'router_replay/changed': 2,
+                'router_replay/changed_frac': 0.25,
+                'router_replay/routers': 1,
+            }, 'R3_STEP_METRICS_SURVIVE_CLEANUP'
+            next_step = runtime.forward_backward(
+                handle, iter([second]), None, router_replay={'action': 'replay'}
+            )
+            assert next_step.metrics == {
+                'router_replay/calls': 1,
+                'router_replay/rows': 2,
+                'router_replay/changed': 2,
+                'router_replay/changed_frac': 1.0,
+                'router_replay/routers': 1,
+            }, 'R3_METRICS_RESET_EACH_STEP'
+            disabled = runtime.forward_backward(handle, iter([second]), None)
+            assert disabled.metrics == {}, 'DISABLED_REPLAY_HAS_NO_EVIDENCE_METRICS'
+        else:
+            with pytest.raises(RuntimeError, match='R3_REPLAY_VOID'):
+                runtime.forward_backward(
+                    handle,
+                    iter([batch]),
+                    None,
+                    num_microbatches=1,
+                    router_replay={'action': 'replay'},
+                )
+    finally:
+        RouterReplay.clear_global_state()
+        RouterReplay.global_router_replay_instances[:] = instances

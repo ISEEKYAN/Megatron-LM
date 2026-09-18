@@ -383,9 +383,25 @@ def _unpack_groupwise_int4(packed: torch.Tensor, shape: torch.Size) -> torch.Ten
 
 
 def _dequantize_block_scaled_tensor(
-    tensor: torch.Tensor, scale: torch.Tensor, target_shape: torch.Size
+    tensor: torch.Tensor,
+    scale: torch.Tensor,
+    target_shape: torch.Size,
+    *,
+    block_shape: tuple[int, ...] | None = None,
 ) -> torch.Tensor:
     target = tuple(int(dim) for dim in target_shape)
+    if block_shape is not None:
+        if len(block_shape) != len(target) or any(block <= 0 for block in block_shape):
+            raise ValueError(
+                "block_shape must have one positive size per target dimension"
+            )
+        expected = tuple(
+            math.ceil(size / block) for size, block in zip(target, block_shape)
+        )
+        if tuple(scale.shape) != expected:
+            raise ValueError(
+                f"scale shape mismatch: {tuple(scale.shape)} != {expected}"
+            )
     while scale.ndim > len(target) and scale.shape[0] == 1:
         scale = scale.squeeze(0)
     while scale.ndim < len(target):
@@ -399,7 +415,12 @@ def _dequantize_block_scaled_tensor(
         scale = scale.float()
     for dim, size in enumerate(target):
         if scale.shape[dim] != size:
-            scale = scale.repeat_interleave(math.ceil(size / scale.shape[dim]), dim=dim)
+            block = (
+                math.ceil(size / scale.shape[dim])
+                if block_shape is None
+                else block_shape[dim]
+            )
+            scale = scale.repeat_interleave(block, dim=dim)
     scale = scale[tuple(slice(0, size) for size in target)]
 
     if (
@@ -469,11 +490,34 @@ def _resolve_export_dtype(export_dtype: str | torch.dtype | None) -> torch.dtype
 
 
 def _cast_export_tensor(
-    tensor: torch.Tensor, export_dtype: torch.dtype | None
+    tensor: torch.Tensor,
+    export_dtype: torch.dtype | None,
+    *,
+    device: torch.device | str | None = None,
+    buffer_max_size_bytes: int | None = None,
 ) -> torch.Tensor:
-    if export_dtype is None or not tensor.is_floating_point():
+    dtype = (
+        export_dtype
+        if export_dtype is not None and tensor.is_floating_point()
+        else tensor.dtype
+    )
+    device = tensor.device if device is None else torch.device(device)
+    if dtype == tensor.dtype and device == tensor.device:
         return tensor
-    return tensor.to(dtype=export_dtype)
+    if buffer_max_size_bytes is None:
+        return tensor.to(device=device, dtype=dtype)
+    count = buffer_max_size_bytes // max(
+        tensor.element_size(), torch.empty((), dtype=dtype).element_size()
+    )
+    if count < 1:
+        raise ValueError(
+            "export buffer must hold at least one source and destination element"
+        )
+    output = torch.empty(tensor.shape, dtype=dtype, device=device)
+    source, destination = tensor.reshape(-1), output.view(-1)
+    for start in range(0, tensor.numel(), count):
+        destination[start : start + count].copy_(source[start : start + count])
+    return output
 
 
 # ======================================================================
