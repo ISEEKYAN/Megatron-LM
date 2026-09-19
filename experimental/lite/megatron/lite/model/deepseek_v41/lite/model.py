@@ -203,6 +203,7 @@ class DeepseekV41Model(nn.Module):
                 FP4Linear,
                 quantized=quantized,
                 fake_quant=CODECS[("index", 32, "e8m0", "e2m1")],
+                activation_fake_quant=CODECS[("linear_activation", 32, "e8m0", "e4m3")],
             )
         )
         return SwiGLUMLP.from_projections(

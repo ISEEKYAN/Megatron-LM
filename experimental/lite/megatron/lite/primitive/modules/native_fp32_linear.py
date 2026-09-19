@@ -46,7 +46,8 @@ class Linear(torch.nn.Module):
         fp8=False,
         dtype=torch.bfloat16,
         fp8_operator=None,
-        fake_quant=None
+        fake_quant=None,
+        activation_fake_quant=None
     ):
         super().__init__()
         self.in_features, self.out_features = input_size, output_size
@@ -56,19 +57,26 @@ class Linear(torch.nn.Module):
         torch.nn.init.kaiming_uniform_(self.weight, a=5**0.5)
         self.fp8 = fp8
         self.fp8_operator, self.fake_quant = fp8_operator, fake_quant
+        self.activation_fake_quant = activation_fake_quant
 
     def forward(self, x):
         weight = self.weight
         if getattr(self, 'quantized', False):
-            x, weight = self.fake_quant(x), self.fake_quant(weight)
+            x = self.activation_fake_quant(x)
+            weight = self.fake_quant(weight)
         if self.fp8:
             return self.fp8_operator(x, weight)
         linear = native_fp32_linear if getattr(self, 'native_fp32', False) else F.linear
         return linear(x, weight)
 
 
-def FP4Linear(input_size, output_size, *, quantized, fake_quant):
-    module = Linear(input_size, output_size, fake_quant=fake_quant)
+def FP4Linear(input_size, output_size, *, quantized, fake_quant, activation_fake_quant):
+    module = Linear(
+        input_size,
+        output_size,
+        fake_quant=fake_quant,
+        activation_fake_quant=activation_fake_quant,
+    )
     module.quantized = quantized
     return module
 

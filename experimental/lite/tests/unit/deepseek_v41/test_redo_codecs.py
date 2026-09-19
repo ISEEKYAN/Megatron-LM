@@ -38,6 +38,44 @@ def test_main_kv_codec_preserves_straight_through_gradient():
     assert torch.equal(x.grad, torch.ones_like(x))
 
 
+@pytest.mark.parametrize(
+    'device', ['cpu', pytest.param('cuda', marks=pytest.mark.gpus(1))]
+)
+def test_routed_expert_pairs_fp8_activations_with_fp4_weights(v41_core_te, device):
+    from types import SimpleNamespace
+
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+
+    expert = DeepseekV41Model._expert(
+        SimpleNamespace(hidden_size=32, moe_intermediate_size=32, swiglu_limit=10),
+        quantized=True,
+        shared=False,
+    ).to(device=device, dtype=torch.float32)
+    # The official mixed FP8 x FP4 GEMM uses row/group32 E8M0 activations.
+    # max=448 fixes the activation scale to 1. These weights are exact E2M1
+    # values with max=6, also fixing their scale to 1. No production encoder
+    # is used to construct the independent forward and STE gradient oracle.
+    x = torch.tensor([225.5, 247.2, 300.0, 448.0], device=device).repeat(8)[None]
+    x.requires_grad_()
+    weight = torch.tensor([0.5, 1.5, 2.0, 3.0, 4.0, 6.0, -1.0, -3.0], device=device)
+    weight = weight.repeat(4)[None].repeat(32, 1)
+    encoded_x = x.detach().to(torch.float8_e4m3fn).float()
+    expected = encoded_x @ weight.T
+    wrong = mxfp4.fake_quant_index(x.detach()) @ weight.T
+    assert not torch.equal(
+        expected, wrong
+    ), 'The oracle must distinguish FP4 activations'
+    for projection in (expert.w1, expert.w2, expert.w3):
+        projection.native_fp32 = True
+        with torch.no_grad():
+            projection.weight.copy_(weight)
+        actual = projection(x)
+        torch.testing.assert_close(actual, expected, atol=0, rtol=0)
+        dx, dw = torch.autograd.grad(actual.sum(), (x, projection.weight))
+        torch.testing.assert_close(dx, weight.sum(0)[None], atol=0, rtol=0)
+        torch.testing.assert_close(dw, encoded_x.repeat(32, 1), atol=0, rtol=0)
+
+
 @pytest.mark.gpus(1)
 @pytest.mark.parametrize('owns_k', [False, True])
 def test_cross_layer_indexer_fp8_projection(v41_core_te, monkeypatch, owns_k):
@@ -45,6 +83,7 @@ def test_cross_layer_indexer_fp8_projection(v41_core_te, monkeypatch, owns_k):
         CrossLayerAttentionConfig,
         CrossLayerIndexer,
     )
+
     assert torch.cuda.is_available(), "FP8 numerical evidence requires CUDA"
     monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
     config = CrossLayerAttentionConfig(dim=32, q_rank=32, index_heads=1, index_dim=32)
