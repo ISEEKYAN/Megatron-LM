@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import os
 import random
+import sys
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -19,9 +20,6 @@ import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
@@ -29,6 +27,8 @@ from megatron.lite.primitive.protocols import (
     default_expert_classifier,
     default_placement_fn,
 )
+from torch.distributed.device_mesh import DeviceMesh  # pyright: ignore[reportMissingImports]
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
 def save_training_checkpoint(
@@ -384,8 +384,11 @@ def _get_cuda_rng_tracker_states() -> dict[str, torch.Tensor]:
     if not torch.cuda.is_initialized():
         return {}
 
-    from megatron.core import tensor_parallel
-
+    # A standalone Lite run never initializes a Core tracker. Importing Core
+    # here would add a dependency and create state that was not used by training.
+    tensor_parallel = sys.modules.get("megatron.core.tensor_parallel")
+    if tensor_parallel is None:
+        return {}
     states = tensor_parallel.get_cuda_rng_tracker().get_states()
     return {name: _cpu_clone(state) for name, state in states.items() if state is not None}
 

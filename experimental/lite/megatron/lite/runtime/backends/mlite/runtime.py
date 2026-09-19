@@ -13,12 +13,12 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
 from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
+from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -522,25 +522,36 @@ class MegatronLiteRuntime(RuntimeBase):
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
             from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
 
-            first_item = next(data_iter)
-            first_batch, _loss_context = split_loss_context(first_item)
-            data_iter = chain([first_item], data_iter)
-            model_cfg = handle._extras.get("model_cfg")
-            # Nominal inter-stage shape for the fixed-shape VPP path. The 1F1B and
-            # forward-only schedules ignore this and use Megatron dynamic shape
-            # exchange (the sender transmits its real per-micro-batch size), so THD
-            # variable-length packing no longer needs a locally-derived shape.
-            tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
-
-            model_chunks = handle._extras.get("model_chunks", [handle._model])
-            pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
-            pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(forward_step, loss_fn)
             try:
+                prepare = handle._extras.get("prepare_microbatches")
+                # Match the non-PP SFT policy before shape inspection and scheduling.
+                if prepare is not None and loss_fn is None:
+                    data_iter = iter(prepare(data_iter, num_microbatches))
+                first_item = next(data_iter)
+                first_batch, _loss_context = split_loss_context(first_item)
+                data_iter = chain([first_item], data_iter)
+                model_cfg = handle._extras.get("model_cfg")
+                # Nominal inter-stage shape for the fixed-shape VPP path. The 1F1B and
+                # forward-only schedules ignore this and use Megatron dynamic shape
+                # exchange (the sender transmits its real per-micro-batch size), so THD
+                # variable-length packing no longer needs a locally-derived shape.
+                tensor_shape = _infer_pipeline_tensor_shape(first_batch, model_cfg, ps)
+
+                model_chunks = handle._extras.get("model_chunks", [handle._model])
+                pipeline_chunks = [unwrap_model(chunk) for chunk in model_chunks]
+                pipeline_forward_step, pipeline_loss_fn = _pipeline_callbacks(
+                    forward_step, loss_fn
+                )
                 outputs = forward_backward_pipelining(
                     pipeline_forward_step,
                     pipeline_chunks,
                     data_iter,
-                    SimpleNamespace(num_microbatches=num_microbatches),
+                    SimpleNamespace(
+                        num_microbatches=num_microbatches,
+                        pipeline_dtype=handle._extras.get(
+                            "pipeline_dtype", torch.bfloat16
+                        ),
+                    ),
                     ps,
                     tensor_shape=tensor_shape,
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
@@ -551,6 +562,21 @@ class MegatronLiteRuntime(RuntimeBase):
                 if replay_driver is not None:
                     replay_driver.end()
             out = _last_loss_output(outputs)
+            if forward_only and out.get("loss") is not None:
+                # Match non-PP validation and the training loss/N contract.
+                out = dict(
+                    out,
+                    loss=sum(
+                        (
+                            item["loss"].detach()
+                            if isinstance(item["loss"], torch.Tensor)
+                            else item["loss"]
+                        )
+                        / num_microbatches
+                        for item in outputs
+                        if item.get("loss") is not None
+                    ),
+                )
             loss_obj = out.get("loss") if out else None
             if isinstance(loss_obj, torch.Tensor):
                 loss_float = float(loss_obj.detach().item())
@@ -573,6 +599,7 @@ class MegatronLiteRuntime(RuntimeBase):
                     forward_step,
                     optimizer=handle._optimizer if not forward_only else None,
                     dist_opt=not forward_only,
+                    prepare_microbatches=handle._extras.get("prepare_microbatches"),
                     pre_forward_hook=handle._extras.get("pre_forward_hook"),
                     loss_fn=loss_fn,
                     forward_only=forward_only,
@@ -594,6 +621,9 @@ class MegatronLiteRuntime(RuntimeBase):
         for row in metric_rows:
             for key, value in row.items():
                 metrics.setdefault(key, []).append(value)
+
+        if replay_driver is not None:
+            metrics.update(replay_driver.metrics)
 
         return ForwardResult(
             model_output=ModelOutputs(

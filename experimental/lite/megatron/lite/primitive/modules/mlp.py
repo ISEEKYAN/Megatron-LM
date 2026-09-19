@@ -18,6 +18,19 @@ class SwiGLUMLP(nn.Module):
         self.down = nn.Linear(intermediate_size, hidden_size, bias=False)
         self.swiglu_limit = float(swiglu_limit or 0.0)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        y = swiglu_with_probs(self.gate_up(x), None, self.swiglu_limit)
-        return self.down(y.to(dtype=x.dtype))
+    @classmethod
+    def from_projections(cls, w1, w2, w3, *, swiglu_limit=0.0):
+        model = cls.__new__(cls)
+        nn.Module.__init__(model)
+        model.w1, model.w2, model.w3 = w1, w2, w3
+        model.swiglu_limit = swiglu_limit
+        return model
+
+    def forward(self, x: torch.Tensor, weights=None) -> torch.Tensor:
+        if hasattr(self, 'gate_up'):
+            gate_up, down = self.gate_up(x), self.down
+        else:
+            gate_up = torch.cat((self.w1(x).float(), self.w3(x).float()), dim=-1)
+            down = self.w2
+        y = swiglu_with_probs(gate_up, weights, self.swiglu_limit)
+        return down(y.to(dtype=x.dtype))
