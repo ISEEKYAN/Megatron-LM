@@ -152,7 +152,6 @@ class DeepseekV41Model(nn.Module):
                 fp8=quantized,
                 fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")],
             ),
-            constructors=memory.MEMORY_FACTORIES,
         )
         for index, module in memories.items():
             self.layers[index].engram = module

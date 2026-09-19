@@ -78,11 +78,7 @@ class DeepseekV41Config:
 
     @classmethod
     def from_hf(cls, path):
-        return cls._from_hf_dict(load_hf_config_dict(path))
-
-    @classmethod
-    def _from_hf_dict(cls, hf):
-        return cls(hf)
+        return cls(load_hf_config_dict(path))
 
     @property
     def hidden_size(self):

@@ -364,14 +364,3 @@ class Engram(nn.Module):
         if token_mask is not None:
             gate = gate.masked_fill(~token_mask.unsqueeze(-1), 0)
         return (h + gate.unsqueeze(-1) * value.float().unsqueeze(-2)).to(hidden.dtype)
-
-
-MEMORY_FACTORIES = (
-    prime_buckets,
-    hash_multipliers,
-    NgramHash,
-    RowLookup,
-    EngramTable,
-    ShardedEngramTable,
-    Engram,
-)

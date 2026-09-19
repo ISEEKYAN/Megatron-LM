@@ -2044,10 +2044,6 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     model.archival_keys = sorted(required_archive)
 
 
-def export_model(model, spec):
-    yield from export_bound_tensors(model, spec)
-
-
 def export_checkpoint(
     model, spec, *, export_dtype=None, cpu=False, buffer_max_size_bytes=5 * 1024**3
 ):
@@ -2061,7 +2057,7 @@ def export_checkpoint(
     if model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
     bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
-    for name, tensor in export_model(model, spec):
+    for name, tensor in export_bound_tensors(model, spec):
         if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3'):
             weight, scale = spec.encode(name, tensor, bindings[name].encoding)
             yield name, weight.cpu() if cpu else weight
@@ -2096,7 +2092,7 @@ def save_bound_model(
     stream_export_to_shards(
         (
             (name, tensor.cpu())
-            for name, tensor in export_model(model, spec)
+            for name, tensor in export_bound_tensors(model, spec)
             if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3')
         ),
         str(Path(path) / 'mlite_masters'),
