@@ -28,14 +28,7 @@ import torch.distributed as dist
 from torch import nn
 
 from .owner_row_transport import OwnerRowTransport as _OwnerRowTransport
-from .owner_row_transport import (
-    _fixed_capacity_all_to_all,
-    _FixedCapacityAllToAll,
-    _gather_rows,
-    _Route,
-)
-
-OwnerRowTransport = _OwnerRowTransport
+from .owner_row_transport import _gather_rows, _Route
 
 
 class RowLookup(object):

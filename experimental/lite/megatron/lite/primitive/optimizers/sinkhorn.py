@@ -197,10 +197,6 @@ class Sinkhorn(torch.optim.Optimizer):
     def _any(self, flag, parameter):
         return _any(flag, parameter.device, self.row_group, self.column_group)
 
-    def agree_skip(self, skip):
-        """OR a publication/skip decision across the logical matrix grid."""
-        return self._any(skip, self.param_groups[0]['params'][0])
-
     def state_dict(self):
         result = self._base_state_dict()
         ranks = tuple(

@@ -58,7 +58,7 @@ def _inputs():
 def test_attention_consumes_the_incoming_pre_mix_not_its_own_coefficients(block):
     hidden, pre_mix = _inputs()
     attn_pre = block.attn_mixes(hidden)[0]
-    block(hidden, pre_mix)
+    block(hidden, pre_mix, None)
 
     handed = block.attn.seen[0]
     assert torch.allclose(handed, block.attn_norm(_mhc()[0](hidden, pre_mix)))
@@ -70,7 +70,7 @@ def test_attention_consumes_the_incoming_pre_mix_not_its_own_coefficients(block)
 def test_ffn_consumes_this_blocks_attention_mix(block):
     hidden, pre_mix = _inputs()
     attn_pre, attn_post, attn_comb = block.attn_mixes(hidden)
-    block(hidden, pre_mix)
+    block(hidden, pre_mix, None)
 
     after_attention = _mhc()[1](
         block.attn.seen[0] * block.attn.gain, hidden, attn_post, attn_comb
@@ -90,7 +90,7 @@ def test_ffn_consumes_this_blocks_attention_mix(block):
 def test_block_hands_the_ffn_mix_to_the_next_block(block):
     hidden, pre_mix = _inputs()
     attn_pre, attn_post, attn_comb = block.attn_mixes(hidden)
-    _, emitted = block(hidden, pre_mix)
+    _, emitted, _ = block(hidden, pre_mix, None)
 
     after_attention = _mhc()[1](
         block.attn.seen[0] * block.attn.gain, hidden, attn_post, attn_comb
@@ -103,7 +103,7 @@ def test_block_hands_the_ffn_mix_to_the_next_block(block):
 def test_stateful_entry_returns_state_as_an_explicit_third_value(block):
     hidden, pre_mix = _inputs()
     sentinel = object()
-    out_hidden, out_pre, state = block.forward_with_state(hidden, pre_mix, sentinel)
+    out_hidden, out_pre, state = block(hidden, pre_mix, sentinel)
     assert out_hidden.shape == hidden.shape
     assert out_pre.shape == pre_mix.shape
     # State is threaded through, never cached on the module.

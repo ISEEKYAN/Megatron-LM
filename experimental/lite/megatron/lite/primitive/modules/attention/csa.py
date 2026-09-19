@@ -508,7 +508,7 @@ class CompressedSparseAttention(nn.Module):
                 )
                 main = main_codec(rotate(latent, cp, c, ratio), enabled=c.main_qat)
                 state = AttentionState(
-                    kv_owner=layer, latent=latent, main_kv=main, index_k=index_k
+                    kv_owner=layer, main_kv=main, index_k=index_k
                 )
             if (
                 state.kv_owner != self.kv_owner
@@ -1359,7 +1359,6 @@ class CrossLayerAttentionConfig:
 class AttentionState:
     kv_owner: int | None = None
     index_owner: int | None = None
-    latent: torch.Tensor | None = None
     main_kv: torch.Tensor | None = None
     index_k: torch.Tensor | None = None
     indices: torch.Tensor | None = None

@@ -327,7 +327,7 @@ class DeepseekV41Model(nn.Module):
                 hidden = layer.engram(
                     hidden, hashes[:, :, self.topology[index].engram_slot], token_mask
                 )
-            hidden, pre, state = layer.forward_with_state(
+            hidden, pre, state = layer.forward(
                 hidden,
                 pre,
                 state,
