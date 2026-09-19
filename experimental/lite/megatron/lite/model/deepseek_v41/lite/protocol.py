@@ -633,6 +633,10 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
         )
     )
     if optimizer is not None and model.training and torch.is_grad_enabled():
+        if 'modality_loads' not in output:
+            raise NotImplementedError(
+                'V4.1_PP_OPTIMIZER_UNSUPPORTED: stage modality loads are unavailable'
+            )
         optimizer.accumulate_modality_loads(output['modality_loads'])
     if model.vision_schedule is not None and model.vision_schedule.stage != 'idle':
         result['backward'] = model.vision_schedule.backward

@@ -122,3 +122,27 @@ def test_malformed_storage_is_rejected(mutate, message):
     )
     with pytest.raises(ValueError, match=message):
         EngramTable(*mutate(weight, scale))
+
+
+def test_owner_transport_preserves_compact_rows_and_backward(monkeypatch):
+    from megatron.lite.primitive.modules.owner_row_transport import (
+        _FixedCapacityAllToAll,
+    )
+
+    group = object()
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda g: 2)
+    calls = []
+
+    def exchange(output, padded, *, group):
+        assert padded.shape == (2, 2, 2)
+        calls.append(group)
+        output.copy_(padded.flip(0))
+
+    monkeypatch.setattr(torch.distributed, 'all_to_all_single', exchange)
+    x = torch.tensor([[1.0, 2.0], [3.0, 4.0], [5.0, 6.0]], requires_grad=True)
+    output = _FixedCapacityAllToAll.apply(x, (1, 2), (2, 1), 2, group)
+    assert torch.equal(output, x.detach()[[1, 2, 0]])
+    gradient = torch.tensor([[2.0, 3.0], [5.0, 7.0], [11.0, 13.0]])
+    output.backward(gradient)
+    assert torch.equal(x.grad, gradient[[2, 0, 1]])
+    assert calls == [group, group]

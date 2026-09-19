@@ -3,7 +3,7 @@ import pytest
 import torch
 from megatron.lite.model.deepseek_v41.codecs import CODECS
 from megatron.lite.primitive.ckpt.hf_weights import _dequantize_block_scaled_tensor
-from megatron.lite.primitive.quantization import mxfp4, nvfp4
+from megatron.lite.primitive.quantization import mxfp4, mxfp8, nvfp4
 from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
 
 
@@ -62,6 +62,7 @@ def test_cross_layer_indexer_fp8_projection(v41_core_te, monkeypatch, owns_k):
     baseline = torch.nn.functional.linear(x, weight)
     actual = indexer.wq_b(x)
     assert torch.equal(actual, expected)
+    assert torch.equal(mxfp8.dynamic_fp8_linear(x, weight), expected)
     assert not torch.equal(actual, baseline), "FP8 was bypassed"
     relative_error = (actual - baseline).norm() / baseline.norm()
     # E4M3 normal rounding <= 1/16 per operand: product error <= 33/256.

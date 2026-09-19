@@ -146,6 +146,25 @@ def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
     assert len(seen) == 1
     assert all(value is None for value in vars(seen[0]).values())
 
+    # Bypass build_model's optimizer guard: the consumer must reject both stages
+    # explicitly instead of indexing a nonexistent modality_loads key.
+    from unittest.mock import Mock
+
+    from megatron.lite.runtime.contracts.data import PackedBatch
+
+    batch = PackedBatch(
+        ids[0], labels=None, seq_lens=torch.tensor([6], device=ids.device)
+    )
+    for stage in pieces:
+        if stage is pieces[1]:
+            stage.set_input_tensor(
+                protocol._forward_step(pieces[0], batch)['hidden_states']
+            )
+        optimizer = Mock()
+        with pytest.raises(NotImplementedError, match='V4.1_PP_OPTIMIZER_UNSUPPORTED'):
+            protocol._forward_step(stage, batch, optimizer=optimizer)
+        optimizer.accumulate_modality_loads.assert_not_called()
+
 
 def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
     import torch.distributed as dist

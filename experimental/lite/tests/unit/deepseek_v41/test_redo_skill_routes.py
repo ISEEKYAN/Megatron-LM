@@ -17,32 +17,35 @@ def test_bound_training_routes_and_skill_contract():
     body = ast.parse(text.split('```python')[2].split('```')[0])
     routes = ast.literal_eval(body.body[0].value)
     required = {
-        'config_fields.py',
-        'ckpt/binding_records.py',
-        'modules/engram_lookup.py',
-        'modules/owner_row_transport.py',
-        'modules/row_memory_build.py',
-        'modules/paired_stream.py',
-        'modules/image_data.py',
-        'modules/vision.py',
-        'modules/vision_training.py',
-        'modules/native_fp32_linear.py',
-        'quantization/mxfp8.py',
-        'quantization/nvfp4.py',
-        'optimizers/headwise_muon.py',
-        'optimizers/owned_groups.py',
-        'optimizers/sinkhorn.py',
-        'optimizers/staged_update.py',
-        'parallel/owned_ddp.py',
+        'config_fields.py': 'test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state',
+        'ckpt/binding_records.py': 'test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory',
+        'modules/engram_lookup.py': 'test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage',
+        'modules/owner_row_transport.py': 'test_redo_engram_residency.py::test_owner_transport_preserves_compact_rows_and_backward',
+        'modules/row_memory_build.py': 'test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state',
+        'modules/paired_stream.py': 'test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state',
+        'modules/image_data.py': 'test_redo_parity.py::test_image_tokens_backpropagate_into_vision_and_aligner',
+        'modules/vision.py': 'test_redo_parity.py::test_image_tokens_backpropagate_into_vision_and_aligner',
+        'modules/vision_training.py': 'test_redo_parity.py::test_image_tokens_backpropagate_into_vision_and_aligner',
+        'modules/native_fp32_linear.py': 'test_redo_codecs.py::test_cross_layer_indexer_fp8_projection',
+        'quantization/mxfp8.py': 'test_redo_codecs.py::test_cross_layer_indexer_fp8_projection',
+        'quantization/mxfp4.py': 'test_redo_codecs.py::test_fp4_codec_rounding_and_surface',
+        'quantization/nvfp4.py': 'test_redo_codecs.py::test_fp4_codec_rounding_and_surface',
+        'optimizers/headwise_muon.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
+        'optimizers/owned_groups.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
+        'optimizers/sinkhorn.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
+        'optimizers/staged_update.py': 'test_redo_parity.py::test_remote_nonfinite_skips_replicated_optimizer',
+        'parallel/owned_ddp.py': 'test_redo_parity.py::test_packed_loss_head_gradient_with_ddp_unused_detection',
     }
-    assert routes.keys() == required
-    for source, test in routes.items():
+    assert routes == {
+        source: 'deepseek_v41/' + target for source, target in required.items()
+    }
+    for source, target in routes.items():
         assert (root / 'megatron/lite/primitive' / source).is_file()
-        tree = ast.parse((root / 'tests/unit' / test).read_text())
-        assert any(
-            isinstance(n, ast.FunctionDef) and n.name.startswith('test_')
-            for n in tree.body
-        )
+        path, function_name = target.split('::')
+        tree = ast.parse((root / 'tests/unit' / path).read_text())
+        assert function_name in {
+            n.name for n in tree.body if isinstance(n, ast.FunctionDef)
+        }
     function = body.body[1]
     assert function.name == 'bound_training'
     assert [a.arg for a in function.args.args] == keywords['inputs']
