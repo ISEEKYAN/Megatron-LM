@@ -47,7 +47,9 @@ def _local_source(target, source):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -626,7 +628,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -923,10 +926,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -1147,8 +1147,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1159,7 +1163,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1171,15 +1177,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1246,8 +1244,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1256,10 +1258,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1334,10 +1333,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1538,9 +1534,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -1898,12 +1894,7 @@ def _local_rows(lookup, tensor):
 
 
 def export_bound_tensors(model, spec):
-    """Yield active numerical masters; immutable inactive bytes stay in the store.
-
-    Plain masters intentionally drop encoded scale siblings, as load_weight's
-    plain-export contract requires. Frozen encoded tables retain their storage dtype.
-    This is a lossless training export, not a quantized deployment conversion.
-    """
+    """Yield numerical masters and frozen storage for encoding or exact resume."""
     if model.local_layer_range != (0, len(model.layers)):
         raise NotImplementedError(
             'Pipeline stage export requires distributed checkpoint assembly'
@@ -1993,6 +1984,8 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     if json.loads((path / 'config.json').read_text()) != model.config.to_hf_dict():
         raise ValueError('Checkpoint config differs from the constructed model')
     reader = SafeTensorReader(str(path))
+    master_path = path / 'mlite_masters'
+    masters = SafeTensorReader(str(master_path)) if master_path.is_dir() else None
     keys = _keys(reader)
     bindings = spec.expand_bindings(
         model, {**model.tensor_bindings, **model.archival_bindings}
@@ -2008,7 +2001,10 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     expected = active | required_archive
     if not expected <= keys or keys - set(bindings):
         raise ValueError('Checkpoint key coverage mismatch')
-    with reader:
+    with reader, ExitStack() as stack:
+        master_keys = _keys(stack.enter_context(masters)) if masters else set()
+        if master_keys - active:
+            raise ValueError('Unexpected training master keys')
         for name, binding in model.tensor_bindings.items():
             if binding.role == 'scale':
                 continue
@@ -2030,7 +2026,12 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
                     destination.copy_(value.to(destination.device))
             else:
                 value = (
-                    load_bound_weight(reader, name, spec, output_dtype=target.dtype)
+                    load_bound_weight(
+                        masters if name in master_keys else reader,
+                        name,
+                        spec,
+                        output_dtype=target.dtype,
+                    )
                     if name.endswith('.weight')
                     else reader._get_raw_tensor(name, torch.device('cpu'))
                 )
@@ -2059,7 +2060,13 @@ def export_checkpoint(
         raise ValueError('Invalid export CPU or buffer option')
     if model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
+    bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
     for name, tensor in export_model(model, spec):
+        if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3'):
+            weight, scale = spec.encode(name, tensor, bindings[name].encoding)
+            yield name, weight.cpu() if cpu else weight
+            yield name[:-6] + 'scale', scale.cpu() if cpu else scale
+            continue
         if tensor.dtype in _PLAIN:
             tensor = _cast_export_tensor(tensor, export_dtype=dtype)
         yield name, tensor.cpu() if cpu else tensor
@@ -2081,6 +2088,18 @@ def save_bound_model(
             buffer_max_size_bytes=buffer_max_size_bytes,
         ),
         str(path),
+        shard_size_bytes=buffer_max_size_bytes,
+    )
+    # Quantized HF weights cannot preserve numerical masters bitwise. Keep
+    # resume tensors outside the HF index and the consumer's root-level glob.
+    bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
+    stream_export_to_shards(
+        (
+            (name, tensor.cpu())
+            for name, tensor in export_model(model, spec)
+            if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3')
+        ),
+        str(Path(path) / 'mlite_masters'),
         shard_size_bytes=buffer_max_size_bytes,
     )
     (Path(path) / 'config.json').write_text(

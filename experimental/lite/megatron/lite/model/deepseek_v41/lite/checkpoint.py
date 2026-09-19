@@ -11,10 +11,7 @@ from megatron.lite.primitive.ckpt.binding_records import (
 from megatron.lite.primitive.ckpt.hf_weights import (
     export_checkpoint as _export_checkpoint,
 )
-from megatron.lite.primitive.ckpt.hf_weights import (
-    load_bound_model,
-    save_bound_model,
-)
+from megatron.lite.primitive.ckpt.hf_weights import load_bound_model, save_bound_model
 from megatron.lite.primitive.modules.engram_lookup import (
     EngramTable,
     ShardedEngramTable,
@@ -34,6 +31,19 @@ class DeepseekV41WeightSpec:
     @staticmethod
     def row_block(name):
         return 1 if name.endswith('.engram.embed.weight') else None
+
+    @staticmethod
+    def encode(name, tensor, encoding):
+        from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+        from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+
+        if encoding == 'I8':
+            return quantize_mxfp4(tensor)
+        return quantize_block_fp8(
+            tensor,
+            (DeepseekV41WeightSpec.row_block(name) or 32, 32),
+            scale_format='e8m0',
+        )
 
     @staticmethod
     def row_shard(owner):
