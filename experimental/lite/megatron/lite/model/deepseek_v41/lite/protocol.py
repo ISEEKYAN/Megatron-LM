@@ -84,73 +84,46 @@ def build_model_config(source, **overrides):
     )
 
 
-UNSUPPORTED = (
-    (
-        lambda c, p: p.pp > 1
-        and (not c.text_only or c.external_vision_device is not None),
-        NotImplementedError,
-        'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training',
-    ),
-    (
-        lambda c, p: p.pp > 1 and c.pipeline_split_layer != 20,
-        NotImplementedError,
-        'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state',
-    ),
-    (
-        lambda c, p: p.pp > 1 and (p.ep != 1 or p.cp != 1),
-        NotImplementedError,
-        'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1',
-    ),
-    (
-        lambda c, p: p.pp > 1 and c.optimizer is not None,
-        NotImplementedError,
-        'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model forward/backward; distributed optimizer training is not validated',
-    ),
-    (
-        lambda c, p: p.pp > 1
-        and (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() != 2
-        ),
-        ValueError,
-        'V4.1_PP_WORLD: PP2 requires an initialized two-rank world',
-    ),
-    (
-        lambda c, p: p.cp != 1 and p.ep != 1,
-        NotImplementedError,
-        'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; use CP-only or EP with CP=1',
-    ),
-    (
-        lambda c, p: type(p.ep) is not int or p.ep < 1,
-        ValueError,
-        'EP size must be a positive integer',
-    ),
-    (
-        lambda c, p: type(p.cp) is not int or p.cp < 1,
-        ValueError,
-        'CP size must be a positive integer',
-    ),
-    (
-        # CP-only is the supported model contract; DP x CP is not enabled here.
-        lambda c, p: p.cp > 1
-        and (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() != p.cp
-        ),
-        ValueError,
-        'CP requires an initialized CP-only world',
-    ),
-    (
-        # EP permits expert replicas: init_parallel forms ep_dp_group per owner.
-        lambda c, p: p.ep > 1
-        and (
-            not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() % p.ep != 0
-        ),
-        ValueError,
-        'EP requires an initialized distributed world divisible by ep',
-    ),
-)
+def _validate_parallel(c, p):
+    if p.pp > 1 and (not c.text_only or c.external_vision_device is not None):
+        raise NotImplementedError(
+            'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training'
+        )
+    if p.pp > 1 and c.pipeline_split_layer != 20:
+        raise NotImplementedError(
+            'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state'
+        )
+    if p.pp > 1 and (p.ep != 1 or p.cp != 1):
+        raise NotImplementedError(
+            'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
+        )
+    if p.pp > 1 and c.optimizer is not None:
+        raise NotImplementedError(
+            'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model forward/backward; distributed optimizer training is not validated'
+        )
+    if p.pp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() != 2
+    ):
+        raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
+    if p.cp != 1 and p.ep != 1:
+        raise NotImplementedError(
+            'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; use CP-only or EP with CP=1'
+        )
+    if type(p.ep) is not int or p.ep < 1:
+        raise ValueError('EP size must be a positive integer')
+    if type(p.cp) is not int or p.cp < 1:
+        raise ValueError('CP size must be a positive integer')
+    if p.cp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() != p.cp
+    ):
+        raise ValueError('CP requires an initialized CP-only world')
+    if p.ep > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() % p.ep != 0
+    ):
+        raise ValueError('EP requires an initialized distributed world divisible by ep')
 
 
 def build_model(model_cfg, *, impl_cfg):
@@ -172,9 +145,7 @@ def build_model(model_cfg, *, impl_cfg):
             'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
-    for invalid, error, message in UNSUPPORTED:
-        if invalid(c, p):
-            raise error(message)
+    _validate_parallel(c, p)
     from .model import DeepseekV41Model
 
     ps = ParallelState()
@@ -493,8 +464,6 @@ def packed_paired_forward(
     consumed in sequence order, exactly as for independent calls. This is a
     correctness path; CP transport and document ownership belong to the primitive.
     """
-    from contextlib import nullcontext
-
     from megatron.lite.primitive.utils.packed_seq import packed_sequence_ranges
 
     if hidden.ndim != 4 or hidden.shape[0] != 1 or pre_mix.shape != hidden.shape[:-1]:
@@ -530,8 +499,6 @@ def packed_paired_forward(
 
 def _validate_replay(model, batch):
     if batch.routed_experts is not None:
-        from megatron.lite.primitive.modules.router_replay import RouterReplayAction
-
         routers = [
             module
             for root in router_replay_roots(model)
@@ -581,10 +548,7 @@ def _forward_step(model, batch, *, optimizer=None, execution_model=None):
 
 
 def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
-    if model.ps.pp_size > 1:
-        _validate_text_batch(batch)
-    else:
-        _validate_text_batch(batch, multimodal=True)
+    _validate_text_batch(batch, multimodal=model.ps.pp_size <= 1)
     _validate_replay(model, batch)
     precision = (
         torch.autocast(device_type=batch.input_ids.device.type, enabled=False)

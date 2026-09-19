@@ -1,18 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Unsupported parallel combinations are rejected by a table, before any setup.
-
-The guards used to be scattered ``raise`` statements inside ``build_model``.
-They are now a declarative table plus one validator loop, so these tests pin the
-three properties that make the table equivalent to what it replaced: every entry
-is reachable, each raises its own error type with its own named message, and the
-whole table is evaluated before the model or the process group is touched.
-"""
+"""Unsupported combinations fail in order before model or process-group setup."""
 
 import pytest
 import torch
 from megatron.lite.model.deepseek_v41.lite.protocol import (
-    UNSUPPORTED,
     ImplConfig,
+    _validate_parallel,
     build_model,
 )
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -22,7 +15,7 @@ def _build(**kwargs):
     return build_model(object(), impl_cfg=ImplConfig(**kwargs))
 
 
-# --- the coarse dimension check, which runs before the table ----------------
+# --- the coarse dimension check, which runs before dependent guards ----------------
 
 
 @pytest.mark.parametrize(
@@ -52,7 +45,7 @@ def test_several_unsupported_dimensions_are_reported_together():
     assert "tp" in head and "vpp" in head
 
 
-# --- the declarative table --------------------------------------------------
+# --- dependent guards --------------------------------------------------
 
 
 @pytest.mark.parametrize(
@@ -84,20 +77,23 @@ def test_cp_and_ep_cannot_be_combined():
         _build(parallel=ParallelConfig(cp=2, ep=2))
 
 
-def test_split_layer_20_is_the_one_accepted_cut():
+def test_split_layer_20_is_the_one_accepted_cut(monkeypatch):
     # The topology table puts every KV owner (2/8/14/20) on the same stage as
     # its readers only when the cut falls on layer 20; the guard encodes that.
-    predicate = next(
-        invalid
-        for invalid, _, message in UNSUPPORTED
-        if message.startswith("V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED")
-    )
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
     parallel = ParallelConfig(pp=2)
-    assert not predicate(ImplConfig(pipeline_split_layer=20), parallel)
+    assert _validate_parallel(ImplConfig(pipeline_split_layer=20), parallel) is None
     for cut in (2, 8, 14, 19, 21, 39):
-        assert predicate(ImplConfig(pipeline_split_layer=cut), parallel), cut
+        with pytest.raises(
+            NotImplementedError, match='V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED'
+        ):
+            _validate_parallel(ImplConfig(pipeline_split_layer=cut), parallel)
     # With PP off the cut is irrelevant and must not be rejected.
-    assert not predicate(ImplConfig(pipeline_split_layer=10), ParallelConfig(pp=1))
+    assert (
+        _validate_parallel(ImplConfig(pipeline_split_layer=10), ParallelConfig(pp=1))
+        is None
+    )
 
 
 def test_guards_run_before_any_distributed_setup(monkeypatch):

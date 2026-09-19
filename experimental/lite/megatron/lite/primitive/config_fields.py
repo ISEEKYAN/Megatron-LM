@@ -11,13 +11,10 @@ def nested_fields(release, model_type, sections):
     return [release[section] for section in sections.split()]
 
 
-def require_fields(fields, fixed, checks):
+def require_fields(fields, fixed):
     for key, expected in fixed.items():
         if fields.get(key) != expected:
             raise ValueError(f'Unsupported {key}: expected {expected}')
-    for invalid, message in checks:
-        if invalid():
-            raise ValueError(message)
 
 
 def project_fields(fields, mapping):

@@ -39,42 +39,25 @@ class DeepseekV41Config:
                 norm_topk_prob=True,
                 topk_method='noaux_tc',
             ),
-            (
-                (
-                    lambda: text['rope_scaling']['rope_type'] != 'yarn',
-                    'Only YaRN rope_scaling is supported',
-                ),
-                (
-                    lambda: text['num_nextn_predict_layers'] != 3,
-                    'The archival DSpark contract requires three layers',
-                ),
-                (
-                    lambda: text['engram_head_dim'] % 32,
-                    'Engram head width must be divisible by 32',
-                ),
-                (
-                    lambda: not 0
-                    < text['num_experts_per_tok']
-                    <= text['n_routed_experts'],
-                    'Invalid num_experts_per_tok',
-                ),
-                (
-                    lambda: text['sliding_window'] <= 0 or text['index_topk'] <= 0,
-                    'Attention windows and Top-K must be positive',
-                ),
-                (
-                    lambda: quantization
-                    != dict(
-                        quant_method='fp8',
-                        activation_scheme='dynamic',
-                        weight_block_size=[32, 32],
-                        scale_fmt='ue8m0',
-                        expert_dtype='fp4',
-                    ),
-                    'Unsupported quantization_config',
-                ),
-            ),
         )
+        if text['rope_scaling']['rope_type'] != 'yarn':
+            raise ValueError('Only YaRN rope_scaling is supported')
+        if text['num_nextn_predict_layers'] != 3:
+            raise ValueError('The archival DSpark contract requires three layers')
+        if text['engram_head_dim'] % 32:
+            raise ValueError('Engram head width must be divisible by 32')
+        if not 0 < text['num_experts_per_tok'] <= text['n_routed_experts']:
+            raise ValueError('Invalid num_experts_per_tok')
+        if text['sliding_window'] <= 0 or text['index_topk'] <= 0:
+            raise ValueError('Attention windows and Top-K must be positive')
+        if quantization != dict(
+            quant_method='fp8',
+            activation_scheme='dynamic',
+            weight_block_size=[32, 32],
+            scale_fmt='ue8m0',
+            expert_dtype='fp4',
+        ):
+            raise ValueError('Unsupported quantization_config')
 
     @classmethod
     def from_hf(cls, path):
