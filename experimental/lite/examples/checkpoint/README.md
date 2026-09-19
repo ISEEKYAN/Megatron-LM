@@ -45,3 +45,9 @@ half the total staging budget to the producer if budgeting their sum.
 The wire format changes the old two whole-table gathers into bounded paired
 broadcasts. Tensor bytes and global row order are preserved; collective counts
 necessarily change. Tests require every rank to execute the same block sequence.
+
+The two-rank Gloo writer test feeds multiple row tables and ordinary tensors
+through the shared writer, checks the actual broadcast trace on both ranks,
+and reads every W/S tensor using the independent safetensors reader. Rank zero
+advances inside the table writer; peers advance in the outer drain loop. Each
+iteration on either rank requests exactly the next producer block.

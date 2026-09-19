@@ -1,36 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Bounded row transport against independent global byte arrays."""
-import weakref
-
 import pytest
 import torch
 from megatron.lite.primitive.ckpt.row_stream import RowReceiver, stream_rows
-from torch.utils._python_dispatch import TorchDispatchMode
-from torch.utils._pytree import tree_leaves
-
-
-class AllocationPeak(TorchDispatchMode):
-    """Observe live ATen output storage bytes, excluding pre-existing inputs."""
-
-    def __init__(self, inputs):
-        self.existing = {x.untyped_storage()._cdata for x in inputs}
-        self.live = {}
-        self.peak = 0
-
-    def __torch_dispatch__(self, func, types, args=(), kwargs=None):
-        result = func(*args, **(kwargs or {}))
-        for tensor in tree_leaves(result):
-            if not isinstance(tensor, torch.Tensor):
-                continue
-            storage = tensor.untyped_storage()
-            key = storage._cdata
-            if key not in self.existing:
-                self.live[key] = (weakref.ref(storage), storage.nbytes())
-        self.live = {
-            key: value for key, value in self.live.items() if value[0]() is not None
-        }
-        self.peak = max(self.peak, sum(size for _, size in self.live.values()))
-        return result
+from tensor_allocations import AllocationPeak
 
 
 @pytest.mark.parametrize('span', [(19, 93), (0, 7), (110, 113), (47, 47)])
@@ -324,11 +297,16 @@ def test_real_nccl_sequence_bytes_and_cuda_peak(tmp_path, master, quantize):
         nprocs=2,
         join=True,
     )
+    import json
+
     for rank in range(2):
-        print(
-            'ROW_STREAM_MEMORY_RESULT '
-            + (tmp_path / f'peak-{master}-{rank}.json').read_text()
+        report = json.loads((tmp_path / f'peak-{master}-{rank}.json').read_text())
+        assert report['rank'] == rank and report['quantize'] == quantize
+        assert all(
+            0 < item['peak'] <= item['budget'] < report['old_peak']
+            for item in report['readings']
         )
+        print('ROW_STREAM_MEMORY_RESULT ' + json.dumps(report))
 
 
 def test_trainable_rows_quantize_with_bounded_workspace_and_external_bytes():
@@ -394,3 +372,85 @@ def test_writer_rejects_missing_tail_and_can_mix_normal_tensors(tmp_path):
         assert torch.equal(
             load_file(str(tmp_path / index['weight_map'][name]))[name], weight
         )
+
+
+def _distributed_writer_worker(rank, rendezvous, path):
+    import json
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
+    from safetensors.torch import load_file
+
+    dist.init_process_group(
+        'gloo',
+        init_method=rendezvous,
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=20),
+    )
+    try:
+        boundaries = (0, 17, 41)
+        all_weight = (torch.arange(41 * 32) % 127).to(torch.uint8).reshape(41, 32)
+        all_scale = (100 + torch.arange(41) % 30).to(torch.uint8).reshape(41, 1)
+        begin, end = boundaries[rank : rank + 2]
+        weight = all_weight[begin:end].view(torch.float8_e4m3fn)
+        scale = all_scale[begin:end].view(torch.float8_e8m0fnu)
+        trace, broadcast = [], dist.broadcast
+
+        def tracked(tensor, *, src, group):
+            trace.append((src, tensor.numel()))
+            return broadcast(tensor, src=src, group=group)
+
+        dist.broadcast = tracked
+
+        def records():
+            yield 'before', torch.tensor([7])
+            for name in ('x.weight', 'y.weight'):
+                yield from stream_rows(
+                    name,
+                    weight,
+                    scale,
+                    boundaries=boundaries,
+                    group=dist.group.WORLD,
+                    buffer_max_size_bytes=512,
+                )
+            yield 'after', torch.tensor([9])
+
+        stream_export_to_shards(records(), path, shard_size_bytes=512)
+        dist.broadcast = broadcast
+        peers = [None, None]
+        dist.all_gather_object(peers, trace)
+        assert peers == [[(0, 495), (0, 66), (1, 495), (1, 297)] * 2] * 2
+        if rank == 0:
+            index = json.loads(Path(path, 'model.safetensors.index.json').read_text())
+            assert list(index['weight_map']) == [
+                'before',
+                'x.weight',
+                'x.scale',
+                'y.weight',
+                'y.scale',
+                'after',
+            ]
+            for name, expected in [
+                ('x.weight', all_weight),
+                ('y.weight', all_weight),
+                ('x.scale', all_scale),
+                ('y.scale', all_scale),
+            ]:
+                actual = load_file(str(Path(path, index['weight_map'][name])))[name]
+                assert torch.equal(actual.view(torch.uint8), expected)
+    finally:
+        dist.destroy_process_group()
+
+
+def test_real_two_rank_writer_drains_the_same_collectives(tmp_path):
+    import torch.multiprocessing as mp
+
+    mp.spawn(
+        _distributed_writer_worker,
+        args=(f'file://{tmp_path}/gloo-init', str(tmp_path / 'checkpoint')),
+        nprocs=2,
+        join=True,
+    )
