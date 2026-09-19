@@ -507,9 +507,7 @@ class CompressedSparseAttention(nn.Module):
                     rotate(index_k, cp, c, ratio), enabled=c.index_qat
                 )
                 main = main_codec(rotate(latent, cp, c, ratio), enabled=c.main_qat)
-                state = AttentionState(
-                    kv_owner=layer, main_kv=main, index_k=index_k
-                )
+                state = AttentionState(kv_owner=layer, main_kv=main, index_k=index_k)
             if (
                 state.kv_owner != self.kv_owner
                 or state.main_kv is None

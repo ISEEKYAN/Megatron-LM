@@ -37,9 +37,6 @@ class RowLookup(object):
         self.group = group
         self.size = 1 if group is None else dist.get_world_size(group)
         self.rank = 0 if group is None else dist.get_rank(group)
-        self.process_group = group
-        self.owner_world_size = self.size
-        self.owner_rank = self.rank
         if (
             len(self.boundaries) != self.size + 1
             or self.boundaries[0] != 0

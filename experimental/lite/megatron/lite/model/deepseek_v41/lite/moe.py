@@ -145,16 +145,13 @@ class DeepseekV41MoE(nn.Module):
             raise ValueError("Provide one expert module per routed expert")
 
     def forward(self, x, *, image_mask=None, load_sink=None):
-        output, stats = self.forward_with_stats(x, image_mask=image_mask)
-        if load_sink is not None:
-            load_sink.append(stats)
-        return output
-
-    def forward_with_stats(self, x, *, image_mask=None):
         flat = x.reshape(-1, x.shape[-1])
         weights, indices, stats = self.gate(flat, image_mask)
         dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
         output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat)
-        return output.reshape_as(x), stats
+        output = output.reshape_as(x)
+        if load_sink is not None:
+            load_sink.append(stats)
+        return output

@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packed input validation and paired residual stream transport."""
 import torch
-from torch.nn import functional as F
 
 
 def validate_input_ids(input_ids):

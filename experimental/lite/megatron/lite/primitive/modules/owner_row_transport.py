@@ -108,7 +108,7 @@ class OwnerRowTransport:
         self, sorted_global_ids: torch.Tensor, send_counts: torch.Tensor
     ) -> tuple[torch.Tensor, tuple[int, ...], tuple[int, ...], int]:
         """Send global row IDs to their contiguous row owners."""
-        if self.process_group is None:
+        if self.group is None:
             counts = (sorted_global_ids.numel(),)
             return sorted_global_ids, counts, counts, sorted_global_ids.numel()
         # Split sizes are Python host metadata used to pack compact segments.
@@ -121,18 +121,12 @@ class OwnerRowTransport:
         # owner reads its column to obtain source-ordered receive splits.  At
         # EP64 this fixed-shape exchange is only 64 * 64 int64 values
         # (32 KiB/rank).
-        gathered_counts = send_counts.new_empty(
-            self.owner_world_size * self.owner_world_size
-        )
-        dist.all_gather_into_tensor(
-            gathered_counts, send_counts, group=self.process_group
-        )
-        count_matrix = gathered_counts.view(
-            self.owner_world_size, self.owner_world_size
-        )
+        gathered_counts = send_counts.new_empty(self.size * self.size)
+        dist.all_gather_into_tensor(gathered_counts, send_counts, group=self.group)
+        count_matrix = gathered_counts.view(self.size, self.size)
 
         local_row_sum_matches = (
-            int(count_matrix[self.owner_rank].sum().item()) == sorted_global_ids.numel()
+            int(count_matrix[self.rank].sum().item()) == sorted_global_ids.numel()
         )
         if not local_row_sum_matches:
             raise RuntimeError(
@@ -140,7 +134,7 @@ class OwnerRowTransport:
                 "refusing to size the fixed-capacity payload exchange"
             )
 
-        receive_counts = count_matrix[:, self.owner_rank].contiguous()
+        receive_counts = count_matrix[:, self.rank].contiguous()
         output_split_sizes = tuple(
             int(count) for count in receive_counts.cpu().tolist()
         )
@@ -150,10 +144,11 @@ class OwnerRowTransport:
             input_split_sizes,
             output_split_sizes,
             capacity,
-            self.process_group,
+            self.group,
             fill_value=-1,
         )
         return received_ids, input_split_sizes, output_split_sizes, capacity
+
 
 @dataclass
 class _Route:

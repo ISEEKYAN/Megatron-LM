@@ -35,6 +35,8 @@ from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
 from .checkpoint import DeferredModule, Rule, TensorBinding, validate_execution
 from .moe import DeepseekV41MoE, ModalityRouter
 
+_FP8_LINEAR = partial(Linear, fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")])
+
 
 class DeepseekV41Model(nn.Module):
 
@@ -147,11 +149,7 @@ class DeepseekV41Model(nn.Module):
             group=self.engram_group,
             group_size=self.ps.dp_cp_size,
             local_range=(start, end),
-            projection=partial(
-                Linear,
-                fp8=quantized,
-                fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")],
-            ),
+            projection=partial(_FP8_LINEAR, fp8=quantized),
         )
         for index, module in memories.items():
             self.layers[index].engram = module
@@ -192,11 +190,7 @@ class DeepseekV41Model(nn.Module):
         width = t.moe_intermediate_size * (t.n_shared_experts if shared else 1)
 
         projection = (
-            partial(
-                Linear,
-                fp8=quantized,
-                fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")],
-            )
+            partial(_FP8_LINEAR, fp8=quantized)
             if shared
             else partial(
                 FP4Linear,
