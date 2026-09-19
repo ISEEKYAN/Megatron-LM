@@ -23,6 +23,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.lite.primitive.ckpt.row_stream import RowChunk, write_row_file
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -47,7 +48,9 @@ def _local_source(target, source):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -582,7 +585,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -879,10 +883,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -1103,8 +1104,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1115,7 +1120,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1127,15 +1134,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1202,8 +1201,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1212,10 +1215,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1290,10 +1290,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1494,9 +1491,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -1723,13 +1720,15 @@ def _gather_expert_etp(
 
 
 def stream_export_to_shards(
-    export_iter: Iterable[tuple[str, torch.Tensor]],
+    export_iter: Iterable[tuple[str, torch.Tensor] | RowChunk],
     path: str,
     *,
     shard_size_bytes: int = 5 * 1024**3,
 ) -> None:
     """Consume ``export_iter`` and write sharded safetensors on rank 0.
 
+    RowChunk tables are written directly at global row offsets without
+    assembling a tensor. Borrowed chunk storage is released before advancing.
     Flushes to disk once a shard reaches ``shard_size_bytes`` (default 5 GiB)
     so rank 0's peak CPU RAM stays at ~one shard instead of the whole model.
     Non-rank-0 still drains the iterator to drive collective communication
@@ -1771,9 +1770,21 @@ def stream_export_to_shards(
         shard = {}
         shard_bytes = 0
 
-    for name, tensor in export_iter:
+    export_iter = iter(export_iter)
+    for item in export_iter:
         if rank != 0:
+            del item
             continue
+        if isinstance(item, RowChunk):
+            _flush()
+            tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+            keys, nbytes = write_row_file(item, export_iter, os.path.join(path, tmp))
+            tmp_names.append(tmp)
+            shard_keys.append(keys)
+            total_size += nbytes
+            del item
+            continue
+        name, tensor = item
         nbytes = _tensor_nbytes(tensor)
         if shard and shard_bytes + nbytes > shard_size_bytes:
             _flush()
