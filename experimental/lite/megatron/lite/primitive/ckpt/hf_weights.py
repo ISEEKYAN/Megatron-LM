@@ -23,7 +23,11 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.ckpt.row_stream import RowChunk, write_row_file
+from megatron.lite.primitive.ckpt.row_stream import (
+    RowChunk,
+    stream_rows,
+    write_row_file,
+)
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -1887,34 +1891,49 @@ def export_raw_tensors(reader, names, *, cpu=True):
         yield name, reader._get_raw_tensor(name, device)
 
 
-def _export_rows(lookup, tensor):
-    if lookup is None:
-        return tensor
-    sizes = [b - a for a, b in zip(lookup.boundaries, lookup.boundaries[1:])]
-    # NCCL transports encoded FP8 storage as bytes. Padding is transport only.
-    value = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
-    padded = value.new_zeros(max(sizes), value.shape[1])
-    padded[: value.shape[0]].copy_(value)
-    chunks = [torch.empty_like(padded) for _ in sizes]
-    _ep_all_gather(chunks, padded, lookup.group)
-    return torch.cat([chunk[:size] for chunk, size in zip(chunks, sizes)]).view(
-        tensor.dtype
-    )
-
-
 def _local_rows(lookup, tensor):
     if lookup is None:
         return tensor
     return tensor[lookup.boundaries[lookup.rank] : lookup.boundaries[lookup.rank + 1]]
 
 
-def export_bound_tensors(model, spec):
+def export_bound_tensors(
+    model,
+    spec,
+    *,
+    row_chunks=False,
+    encode_rows=False,
+    masters_only=False,
+    buffer_max_size_bytes=5 * 1024**3,
+):
     """Yield numerical masters and frozen storage for encoding or exact resume."""
     if model.local_layer_range != (0, len(model.layers)):
         raise NotImplementedError(
             'Pipeline stage export requires distributed checkpoint assembly'
         )
     model.validate_parameter_bindings()
+    if not row_chunks:
+        for name, binding in model.tensor_bindings.items():
+            if binding.role == 'scale':
+                continue
+            lookup = spec.row_shard(binding.owner)
+            if lookup is not None:
+                raise NotImplementedError(
+                    'ROW_STREAM_REQUIRED: use row_chunks=True and a row-aware consumer'
+                )
+            if spec.row_block(name) == 1:
+                tensor = binding.tensor
+                storage = spec.frozen_storage(binding.owner)
+                required = (
+                    64 * tensor.numel() + 8192
+                    if encode_rows and tensor.dtype in _PLAIN
+                    else _tensor_nbytes(tensor)
+                    + (0 if storage is None else _tensor_nbytes(storage[1]))
+                )
+                if required > buffer_max_size_bytes:
+                    raise NotImplementedError(
+                        'ROW_STREAM_REQUIRED: full row tensor exceeds export buffer'
+                    )
     for name, binding in model.tensor_bindings.items():
         if binding.role == 'scale':
             continue
@@ -1923,12 +1942,33 @@ def export_bound_tensors(model, spec):
         tensor = binding.tensor.detach()
         if tensor.is_meta:
             raise ValueError(f'Cannot export unmaterialized parameter: {name}')
-        yield name, _export_rows(spec.row_shard(binding.owner), tensor)
+        if masters_only and (
+            tensor.dtype not in _PLAIN or binding.encoding not in ('I8', 'F8_E4M3')
+        ):
+            continue
+        lookup = spec.row_shard(binding.owner)
         storage = spec.frozen_storage(binding.owner)
-        if storage is not None:
-            yield name[:-6] + 'scale', _export_rows(
-                spec.row_shard(binding.owner), storage[1].detach()
+        if row_chunks and (lookup is not None or spec.row_block(name) == 1):
+            quantize = (
+                encode_rows and tensor.dtype in _PLAIN and binding.encoding is not None
             )
+            if quantize and (
+                binding.encoding != 'F8_E4M3' or spec.row_block(name) != 1
+            ):
+                raise NotImplementedError('Unsupported row streaming encoding')
+            yield from stream_rows(
+                name,
+                tensor,
+                None if storage is None else storage[1].detach(),
+                boundaries=None if lookup is None else lookup.boundaries,
+                group=None if lookup is None else lookup.group,
+                buffer_max_size_bytes=buffer_max_size_bytes,
+                quantize=quantize,
+            )
+            continue
+        yield name, tensor
+        if storage is not None:
+            yield name[:-6] + 'scale', storage[1].detach()
     if model.ps.ep_size > 1:
         import torch.distributed as dist
 
@@ -2060,11 +2100,18 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
 
 
 def export_checkpoint(
-    model, spec, *, export_dtype=None, cpu=False, buffer_max_size_bytes=5 * 1024**3
+    model,
+    spec,
+    *,
+    export_dtype=None,
+    cpu=False,
+    buffer_max_size_bytes=5 * 1024**3,
+    row_chunks=False,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
         type(cpu) is not bool
+        or type(row_chunks) is not bool
         or type(buffer_max_size_bytes) is not int
         or buffer_max_size_bytes < 4
     ):
@@ -2072,7 +2119,24 @@ def export_checkpoint(
     if model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
     bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
-    for name, tensor in export_bound_tensors(model, spec):
+    for item in export_bound_tensors(
+        model,
+        spec,
+        row_chunks=row_chunks,
+        encode_rows=True,
+        buffer_max_size_bytes=buffer_max_size_bytes // (2 if cpu else 1),
+    ):
+        if isinstance(item, RowChunk):
+            yield RowChunk(
+                item.name,
+                item.offset,
+                item.total_rows,
+                item.weight.cpu() if cpu else item.weight,
+                None if item.scale is None else item.scale.cpu() if cpu else item.scale,
+            )
+            del item
+            continue
+        name, tensor = item
         if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3'):
             weight, scale = spec.encode(name, tensor, bindings[name].encoding)
             yield name, weight.cpu() if cpu else weight
@@ -2096,22 +2160,34 @@ def save_bound_model(
             spec,
             export_dtype=export_dtype,
             cpu=True,
-            buffer_max_size_bytes=buffer_max_size_bytes,
+            buffer_max_size_bytes=buffer_max_size_bytes // 2,
+            row_chunks=True,
         ),
         str(path),
-        shard_size_bytes=buffer_max_size_bytes,
+        shard_size_bytes=buffer_max_size_bytes // 2,
     )
+
     # Quantized HF weights cannot preserve numerical masters bitwise. Keep
     # resume tensors outside the HF index and the consumer's root-level glob.
-    bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
+    def masters():
+        for item in export_bound_tensors(
+            model,
+            spec,
+            row_chunks=True,
+            masters_only=True,
+            buffer_max_size_bytes=buffer_max_size_bytes // 4,
+        ):
+            if isinstance(item, RowChunk):
+                yield item
+            else:
+                name, tensor = item
+                yield name, tensor.cpu()
+            del item
+
     stream_export_to_shards(
-        (
-            (name, tensor.cpu())
-            for name, tensor in export_bound_tensors(model, spec)
-            if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3')
-        ),
+        masters(),
         str(Path(path) / 'mlite_masters'),
-        shard_size_bytes=buffer_max_size_bytes,
+        shard_size_bytes=buffer_max_size_bytes // 2,
     )
     (Path(path) / 'config.json').write_text(
         json.dumps(model.config.to_hf_dict(), indent=2) + '\n'
