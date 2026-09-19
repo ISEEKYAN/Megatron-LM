@@ -33,13 +33,20 @@ ROUTES = {
     "optimizers/sinkhorn.py": "deepseek_v41/test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction",
     "optimizers/staged_update.py": "deepseek_v41/test_redo_parity.py::test_remote_nonfinite_skips_replicated_optimizer",
     "parallel/owned_ddp.py": "deepseek_v41/test_redo_parity.py::test_packed_loss_head_gradient_with_ddp_unused_detection",
+    "modules/attention/cp.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
+    "parallel/cp.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
+    "train_step.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
+    "modules/experts.py": "deepseek_v41/test_redo_moe_dual_bias.py::test_dispatch_option_reaches_model_and_preserves_local_moe",
 }
 
 
 def bound_training(task, files, reference, budget):
-    routes = select_matching_paths(files, ROUTES)
+    files = {str(path).removeprefix("experimental/lite/megatron/lite/primitive/") for path in files}
+    routes = sorted(files & ROUTES.keys())
     if not routes:
-        return out_of_scope("no bound training primitive touched")
+        return out_of_scope("no bound training primitive touched", evidence=sorted(files))
+    if files - ROUTES.keys():
+        return blocked("uncovered files require their own validation route", evidence=sorted(files - ROUTES.keys()))
     if reference is None:
         return blocked("require independent numerical or ownership reference")
     invariants = [

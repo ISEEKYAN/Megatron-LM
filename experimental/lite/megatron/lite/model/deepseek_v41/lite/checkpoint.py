@@ -95,13 +95,11 @@ def export_hf_weights(
         )
     if len(chunks) != 1:
         raise NotImplementedError('Export requires a single complete chunk')
-    include_mtp_only = kwargs.pop('include_mtp_only', False)
-    kwargs.pop('include_local_prefixes', None)
+    if kwargs.pop('include_mtp_only', False):
+        raise NotImplementedError('V4.1_HF_EXPORT_MTP_ONLY_UNSUPPORTED')
+    if kwargs.pop('include_local_prefixes', None) is not None:
+        raise NotImplementedError('V4.1_HF_EXPORT_LOCAL_PREFIXES_UNSUPPORTED')
     limit = kwargs.pop('limit', None)
-    if include_mtp_only:
-        if kwargs:
-            raise TypeError('MTP-only export does not accept additional options')
-        return
     for count, pair in enumerate(export_checkpoint(chunks[0], **kwargs), 1):
         yield pair
         if limit is not None and count >= limit:

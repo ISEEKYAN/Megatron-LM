@@ -37,6 +37,11 @@ def test_hf_export_obeys_external_quantized_storage(
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.fill_(1.3)
+        if not trainable_engram:
+            # Independent E4M3/E8M0 bytes: frozen rows must survive unchanged.
+            table = model.layers[1].engram.embed
+            table.weight.view(torch.uint8).fill_(0x7A)
+            table.scale.view(torch.uint8).fill_(119)
     # VL's upstream mapper drops mtp.*. Preserve opaque inactive bytes here;
     # the assertions below concern the externally consumed active backbone.
     archive = tmp_path / 'archive'
@@ -80,8 +85,6 @@ def test_hf_export_obeys_external_quantized_storage(
         assert scale is not None, name
         assert scale.dtype == torch.float8_e8m0fnu, name
         assert tuple(scale.shape) == scale_shape, name
-        if name.endswith('embed') and not trainable_engram:
-            continue
         # Independent wire bytes for 1.3: FP8 320 * 2^-8 = 1.25;
         # E2M1 6 * 2^-2 = 1.5. No production quantizer builds the expected data.
         byte, exponent = (0x77, 125) if dtype == torch.int8 else (0x7A, 119)

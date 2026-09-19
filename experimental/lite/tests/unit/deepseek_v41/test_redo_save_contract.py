@@ -45,3 +45,36 @@ def test_save_preserves_supported_export_options(monkeypatch, tmp_path):
     writer.assert_called_once_with(
         model, tmp_path, export_dtype=torch.float32, buffer_max_size_bytes=4096
     )
+
+
+@pytest.mark.parametrize(
+    'options, code',
+    [
+        ({'include_mtp_only': True}, 'MTP_ONLY'),
+        ({'include_local_prefixes': ['layers.0.']}, 'LOCAL_PREFIXES'),
+        ({'include_local_prefixes': []}, 'LOCAL_PREFIXES'),
+    ],
+)
+def test_export_rejects_unsupported_selection_before_reading(
+    monkeypatch, options, code
+):
+    exporter = Mock(return_value=iter([('weight', torch.ones(1))]))
+    monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
+    with pytest.raises(NotImplementedError, match=f'V4.1_HF_EXPORT_{code}_UNSUPPORTED'):
+        list(protocol.export_hf_weights([object()], None, None, **options))
+    exporter.assert_not_called()
+
+
+def test_export_default_selection_preserves_tensors(monkeypatch):
+    weight = torch.tensor([2.0, 3.0])
+    exporter = Mock(return_value=iter([('weight', weight)]))
+    monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
+    model = object()
+    result = list(
+        protocol.export_hf_weights(
+            [model], None, None, include_mtp_only=False, include_local_prefixes=None
+        )
+    )
+    assert len(result) == 1 and result[0][0] == 'weight'
+    assert torch.equal(result[0][1], weight)
+    exporter.assert_called_once_with(model)
