@@ -71,3 +71,8 @@ ordinary non-row codecs, archival tensors, or arbitrary consumer copies. Large
 or distributed row tables reject the legacy full-tensor iterator with
 `ROW_STREAM_REQUIRED` before emitting tensors; small unsharded calls remain
 compatible. A rollout loader still needs the explicit row-offset adapter.
+
+Call `save_bound_model` on **every distributed rank**, including ranks that do
+not write files: each drains the row collectives and the final writer barrier.
+Calling it only on rank zero cannot complete. The standalone example uses one
+owner; the two-rank tests pass explicit `boundaries` and the real process group.
