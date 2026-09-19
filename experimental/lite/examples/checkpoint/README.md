@@ -51,3 +51,23 @@ through the shared writer, checks the actual broadcast trace on both ranks,
 and reads every W/S tensor using the independent safetensors reader. Rank zero
 advances inside the table writer; peers advance in the outer drain loop. Each
 iteration on either rank requests exactly the next producer block.
+
+Bound checkpoint integration opts into this protocol explicitly:
+
+```python
+# The model's checkpoint policy supplies binding, row ownership and codec metadata.
+save_bound_model(model, output, spec, buffer_max_size_bytes=256 * 1024)
+# Direct transport consumers must understand RowChunk and drain every rank.
+for record in export_checkpoint(model, spec, row_chunks=True,
+                                buffer_max_size_bytes=256 * 1024):
+    consume(record)
+```
+
+The bound saver streams both frozen storage and trainable row quantization;
+its separate `mlite_masters` files stream exact FP32 resume rows. It reserves
+one quarter of the buffer for row production and the remainder for host staging
+and the ordinary shard. The budget bounds row staging, not the resident model,
+ordinary non-row codecs, archival tensors, or arbitrary consumer copies. Large
+or distributed row tables reject the legacy full-tensor iterator with
+`ROW_STREAM_REQUIRED` before emitting tensors; small unsharded calls remain
+compatible. A rollout loader still needs the explicit row-offset adapter.
