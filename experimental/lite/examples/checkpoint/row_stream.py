@@ -20,7 +20,10 @@ def main():
     receiver = RowReceiver('table.weight', 4096, 991, weight, scales)
     # A rollout shard owns global rows [991,1094), not the sender's partition.
     for chunk in stream_rows(
-        'table.weight', master, quantize=True, buffer_max_size_bytes=args.buffer_bytes
+        'table.weight',
+        master,
+        quantize=True,
+        buffer_max_size_bytes=args.buffer_bytes // 2,
     ):
         receiver.copy(chunk)
     receiver.finish()
@@ -30,7 +33,7 @@ def main():
             'table.weight',
             master,
             quantize=True,
-            buffer_max_size_bytes=args.buffer_bytes,
+            buffer_max_size_bytes=args.buffer_bytes // 2,
         ),
         args.output,
         shard_size_bytes=args.buffer_bytes,
