@@ -23,6 +23,7 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.lite.primitive.ckpt.row_stream import RowChunk, write_row_file
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -1763,13 +1764,15 @@ def _gather_expert_etp(
 
 
 def stream_export_to_shards(
-    export_iter: Iterable[tuple[str, torch.Tensor]],
+    export_iter: Iterable[tuple[str, torch.Tensor] | RowChunk],
     path: str,
     *,
     shard_size_bytes: int = 5 * 1024**3,
 ) -> None:
     """Consume ``export_iter`` and write sharded safetensors on rank 0.
 
+    RowChunk tables are written directly at global row offsets without
+    assembling a tensor. Borrowed chunk storage is released before advancing.
     Flushes to disk once a shard reaches ``shard_size_bytes`` (default 5 GiB)
     so rank 0's peak CPU RAM stays at ~one shard instead of the whole model.
     Non-rank-0 still drains the iterator to drive collective communication
@@ -1811,9 +1814,21 @@ def stream_export_to_shards(
         shard = {}
         shard_bytes = 0
 
-    for name, tensor in export_iter:
+    export_iter = iter(export_iter)
+    for item in export_iter:
         if rank != 0:
+            del item
             continue
+        if isinstance(item, RowChunk):
+            _flush()
+            tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+            keys, nbytes = write_row_file(item, export_iter, os.path.join(path, tmp))
+            tmp_names.append(tmp)
+            shard_keys.append(keys)
+            total_size += nbytes
+            del item
+            continue
+        name, tensor = item
         nbytes = _tensor_nbytes(tensor)
         if shard and shard_bytes + nbytes > shard_size_bytes:
             _flush()
