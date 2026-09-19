@@ -44,12 +44,8 @@ def release_config():
 
 
 @pytest.fixture
-def bundle(transformer_engine_import_stub):
+def bundle(v41_core_te):
     from megatron.lite.model.deepseek_v41.lite import protocol
-    import megatron.core.fp8_utils
-    import megatron.core.transformer.hyper_connection
-    import megatron.core.transformer.experimental_attention_variant.csa
-    transformer_engine_import_stub()
     torch.manual_seed(351)
     impl = protocol.ImplConfig(device='cpu', dtype=torch.float32, quantized=False,
                                token_map=list(range(64)), trainable_engram=True)

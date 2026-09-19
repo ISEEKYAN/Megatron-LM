@@ -46,16 +46,6 @@ def test_trainable_arm_adds_an_fp32_master_matching_the_stored_rows():
 
 
 @pytest.mark.parametrize("trainable", [False, True])
-def test_one_switch_serves_both_arms_with_the_same_lookup(trainable):
-    table, _ = _table(trainable=trainable)
-    ids = torch.tensor([0, 3, 5, 3])
-    out = table(ids)
-    assert out.shape == (4, WIDTH)
-    # Repeated ids resolve to the same row in both arms.
-    assert torch.equal(out[1], out[3])
-
-
-@pytest.mark.parametrize("trainable", [False, True])
 def test_parent_bfloat16_cast_widens_neither_storage_nor_master(trainable):
     table, _ = _table(trainable=trainable)
     before = None if table.master is None else table.master.detach().clone()

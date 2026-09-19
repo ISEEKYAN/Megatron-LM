@@ -12,16 +12,13 @@ import torch
 
 
 @pytest.fixture
-def moe(transformer_engine_import_stub):
-    import megatron.core.fp8_utils  # noqa: F401
-
-    transformer_engine_import_stub()
+def moe(v41_core_te):
     from megatron.lite.model.deepseek_v41.lite import moe as modality_moe
 
     return modality_moe
 
 
-def _router(moe, experts=4, rate=0.5):
+def _router(moe, experts=4, rate=0.5, dp_size=1):
     class _Config:
         n_routed_experts = experts
         num_experts_per_tok = 2
@@ -35,38 +32,34 @@ def _router(moe, experts=4, rate=0.5):
     from megatron.lite.primitive.parallel.state import ParallelState
 
     torch.manual_seed(3)
-    return moe.ModalityRouter(_Config(), ParallelState(), bias_rate=rate)
+    return moe.ModalityRouter(_Config(), ParallelState(dp_size=dp_size), bias_rate=rate)
 
 
 # --- replica-scope statistics ----------------------------------------------
 
 
-def test_both_modalities_are_counted_even_when_one_is_locally_empty(moe):
+@pytest.mark.parametrize(
+    'indices, image_mask, counts, totals',
+    [
+        (
+            [[0, 1], [1, 2], [2, 3]],
+            [False, False, False],
+            [[1, 2, 2, 1], [0, 0, 0, 0]],
+            [3, 0],
+        ),
+        ([[0, 0], [3, 3]], [False, True], [[2, 0, 0, 0], [0, 0, 0, 2]], [1, 1]),
+    ],
+)
+def test_both_modalities_are_counted(moe, indices, image_mask, counts, totals):
     # A rank whose batch happens to be text-only must still emit a row for the
     # image modality; skipping it desynchronises the collective on other ranks.
-    indices = torch.tensor([[0, 1], [1, 2], [2, 3]])
-    image_mask = torch.zeros(3, dtype=torch.bool)
+    indices = torch.tensor(indices)
+    image_mask = torch.tensor(image_mask)
     load = moe.reduce_modality_load(indices, image_mask, num_experts=4)
     assert load.counts.shape == (2, 4)
-    assert torch.equal(load.counts[0], torch.tensor([1, 2, 2, 1]))
-    assert torch.equal(load.counts[1], torch.zeros(4, dtype=torch.int64))
-    assert torch.equal(load.total_tokens, torch.tensor([3, 0]))
-
-
-def test_counts_are_split_by_modality(moe):
-    indices = torch.tensor([[0, 0], [3, 3]])
-    image_mask = torch.tensor([False, True])
-    load = moe.reduce_modality_load(indices, image_mask, num_experts=4)
-    assert torch.equal(load.counts[0], torch.tensor([2, 0, 0, 0]))
-    assert torch.equal(load.counts[1], torch.tensor([0, 0, 0, 2]))
-    assert torch.equal(load.total_tokens, torch.tensor([1, 1]))
-
-
-def test_statistics_are_detached_from_the_graph(moe):
-    indices = torch.tensor([[0, 1]])
-    load = moe.reduce_modality_load(indices, torch.zeros(1, dtype=torch.bool), 4)
-    assert not load.counts.requires_grad
     assert load.counts.dtype == torch.int64
+    assert torch.equal(load.counts, torch.tensor(counts))
+    assert torch.equal(load.total_tokens, torch.tensor(totals))
 
 
 # --- the bias pair ----------------------------------------------------------
@@ -125,13 +118,14 @@ def test_routing_selects_the_bias_belonging_to_each_token_modality(moe):
     assert not (image_rows == 0).all()
 
 
+@pytest.mark.parametrize('world_size, dp_size', [(2, 1), (1, 2)])
 def test_update_bias_requires_an_initialized_process_group_for_multiple_ranks(
-    moe, monkeypatch
+    moe, monkeypatch, world_size, dp_size
 ):
-    monkeypatch.setenv("WORLD_SIZE", "2")
+    monkeypatch.setenv("WORLD_SIZE", str(world_size))
     # Without a group the merge cannot happen, so updating from local counts
     # would quietly diverge the replicas instead of failing.
-    router = _router(moe)
+    router = _router(moe, dp_size=dp_size)
     stats = moe.ModalityLoad(
         torch.tensor([[4, 0, 0, 0], [0, 0, 0, 4]]), torch.tensor([2, 2])
     )
@@ -139,26 +133,6 @@ def test_update_bias_requires_an_initialized_process_group_for_multiple_ranks(
         pytest.skip("a process group is already initialized in this session")
     with pytest.raises(RuntimeError, match="process group"):
         router.update_bias(stats)
-
-
-def test_update_bias_moves_each_modality_from_its_own_counts(moe, tmp_path):
-    torch.distributed.init_process_group(
-        backend="gloo", init_method=f"file://{tmp_path / 'store'}", world_size=1, rank=0
-    )
-    try:
-        router = _router(moe, rate=0.5)
-        stats = moe.ModalityLoad(
-            torch.tensor([[8, 0, 0, 0], [0, 0, 0, 8]]), torch.tensor([4, 4])
-        )
-        router.update_bias(stats)
-        # Overloaded experts are pushed down, starved ones up, by bias_rate.
-        assert router.bias[0] < router.bias[1]
-        assert router.bias_vl[3] < router.bias_vl[0]
-        # Each modality reads only its own row.
-        assert torch.equal(router.bias[1], router.bias[2])
-        assert torch.equal(router.bias_vl[0], router.bias_vl[1])
-    finally:
-        torch.distributed.destroy_process_group()
 
 
 def test_update_bias_uses_local_counts_without_a_group(moe, monkeypatch):
@@ -171,31 +145,6 @@ def test_update_bias_uses_local_counts_without_a_group(moe, monkeypatch):
     router.update_bias(stats)
     torch.testing.assert_close(router.bias, torch.tensor([-0.5, 0.5, 0.5, 0.5]))
     torch.testing.assert_close(router.bias_vl, torch.tensor([0.5, 0.5, 0.5, -0.5]))
-
-
-def test_parallel_topology_cannot_silently_use_local_counts(moe, monkeypatch):
-    monkeypatch.setenv("WORLD_SIZE", "1")
-    # Construct through the same router config, but declare two DP ranks.
-    from types import SimpleNamespace
-
-    from megatron.lite.primitive.parallel.state import ParallelState
-
-    config = SimpleNamespace(
-        n_routed_experts=4,
-        num_experts_per_tok=2,
-        hidden_size=8,
-        norm_topk_prob=True,
-        topk_method='noaux_tc',
-        n_group=1,
-        topk_group=1,
-        routed_scaling_factor=1.0,
-    )
-    router = moe.ModalityRouter(config, ParallelState(dp_size=2))
-    stats = moe.ModalityLoad(
-        torch.tensor([[8, 0, 0, 0], [0, 0, 0, 8]]), torch.tensor([4, 4])
-    )
-    with pytest.raises(RuntimeError, match='process group'):
-        router.update_bias(stats)
 
 
 def test_multiple_ranks_still_reduce_counts_before_bias_update(

@@ -13,11 +13,8 @@ from megatron.lite.runtime.contracts.loss import use_loss_context
 @pytest.mark.parametrize('equal_tokens', [False, True])
 @pytest.mark.parametrize('microbatches', [1, 2])
 def test_cp_loss_matches_global_token_weighted_ce(
-    monkeypatch, transformer_engine_import_stub, equal_tokens, microbatches
+    monkeypatch, v41_core_te, equal_tokens, microbatches
 ):
-    import megatron.core.fp8_utils
-
-    transformer_engine_import_stub()
     from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
 
     # Two DP replicas, each split over two CP ranks; masks also exercise
@@ -121,12 +118,8 @@ def test_cp_loss_matches_global_token_weighted_ce(
 
 @pytest.mark.parametrize('cp_size', [1, 2])
 def test_protocol_preparation_uses_the_ddp_reduction_domain(
-    monkeypatch, transformer_engine_import_stub, cp_size
+    monkeypatch, v41_core_te, cp_size
 ):
-    import megatron.core.fp8_utils
-    import megatron.core.transformer.hyper_connection
-
-    transformer_engine_import_stub()
     from megatron.lite.model.deepseek_v41.lite import model, protocol
     from megatron.lite.primitive.modules import native_fp32_linear
     from megatron.lite.runtime.contracts import ParallelConfig

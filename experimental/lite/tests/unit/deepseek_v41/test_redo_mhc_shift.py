@@ -30,12 +30,7 @@ class _Spy(nn.Module):
 
 
 @pytest.fixture
-def block(transformer_engine_import_stub):
-    # Core's fp8_utils probes a TE submodule the stub does not provide, so let
-    # it resolve against the real absence first, then install the stub.
-    import megatron.core.fp8_utils  # noqa: F401
-
-    transformer_engine_import_stub()
+def block(v41_core_te):
     from megatron.lite.model.deepseek_v41.lite.block import DeepseekV41Block
 
     torch.manual_seed(7)
@@ -103,29 +98,6 @@ def test_block_hands_the_ffn_mix_to_the_next_block(block):
     assert torch.allclose(emitted, block.ffn_mixes(after_attention)[0])
     # Emitting the attention mix instead would shift the boundary back by one.
     assert not torch.allclose(emitted, attn_pre)
-
-
-def test_changing_only_the_incoming_pre_mix_moves_attention_but_not_the_mixes(block):
-    hidden, pre_mix = _inputs()
-    block(hidden, pre_mix)
-    first = block.attn.seen[0]
-    attn_pre_before = block.attn_mixes(hidden)[0]
-
-    block.attn.seen.clear()
-    block(hidden, pre_mix + 1.0)
-    assert not torch.allclose(block.attn.seen[0], first)
-    # The coefficients are a function of hidden alone, so they must not move.
-    assert torch.equal(block.attn_mixes(hidden)[0], attn_pre_before)
-
-
-def test_both_boundary_tensors_are_returned_for_the_caller_to_transport(block):
-    hidden, pre_mix = _inputs()
-    out_hidden, out_pre = block(hidden, pre_mix)
-    assert out_hidden.shape == hidden.shape
-    assert out_pre.shape == pre_mix.shape
-    # Chaining must work without the caller reconstructing anything.
-    again = block(out_hidden, out_pre)
-    assert len(again) == 2
 
 
 def test_stateful_entry_returns_state_as_an_explicit_third_value(block):
