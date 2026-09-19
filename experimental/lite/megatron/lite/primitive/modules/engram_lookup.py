@@ -151,9 +151,6 @@ class RowLookup(object):
         route = self.route(ids)
         return tuple(_gather_rows(t, ids, route) for t in (values, scales, master))
 
-    def raw_rows(self, values, scales, ids):
-        return self.fetch(values, scales, ids)[:2]
-
     transport_label = "Row lookup"
     _exchange_ids = _OwnerRowTransport._exchange_ids
 
@@ -236,9 +233,7 @@ class ShardedEngramTable(EngramTable):
     def __init__(
         self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16
     ):
-        super().__init__(
-            weight, scale, trainable=trainable, output_dtype=output_dtype
-        )
+        super().__init__(weight, scale, trainable=trainable, output_dtype=output_dtype)
         expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
         if weight.shape[0] != expected:
             raise ValueError("Table rows do not match lookup ownership interval")
@@ -246,6 +241,7 @@ class ShardedEngramTable(EngramTable):
 
     def lookup_fp8(self, ids):
         return self.lookup.fetch(self.weight, self.scale, ids, self.master)
+
 
 def hash_multipliers(layer_ids, max_ngram_size, vocab_size):
     if vocab_size < 1 or max_ngram_size < 2:

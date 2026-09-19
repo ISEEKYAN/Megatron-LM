@@ -38,7 +38,7 @@ _RULES = {
 
 def parameter_groups(model, *, lr, vision_policy=None):
     builder = OwnedParameterGroups(model, _RULES, lr)
-    add, route, visual_linear = builder.add, builder.route, builder.visual_linear
+    route = builder.route
     bindings, seen = builder.bindings, builder.seen
     route(model, 'embed.weight', 'embedding')
     route(model, 'head.weight', 'head')
@@ -110,7 +110,7 @@ def V41Optimizer(model, config, *, dp_group=None, ps=None):
         raise TypeError('V4.1 requires an explicit model OptimizerConfig')
     from .moe import ModalityLoad
 
-    optimizer = MixedOptimizer(
+    return MixedOptimizer(
         model,
         config,
         dp_group=dp_group,
@@ -122,4 +122,3 @@ def V41Optimizer(model, config, *, dp_group=None, ps=None):
         stats_factory=ModalityLoad,
         rebuild=lambda: V41Optimizer(model, config, dp_group=dp_group, ps=ps),
     )
-    return optimizer

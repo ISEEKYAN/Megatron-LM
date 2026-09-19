@@ -219,7 +219,6 @@ class MixedOptimizer:
             raise ValueError('Invalid gradient clipping threshold')
         groups = group_builder()
         self._rebuild = rebuild
-        self._group_builder, self._owners = group_builder, owners
         self.model = model
         self.dp_group = dp_group
         self.ps = ps
@@ -381,19 +380,7 @@ class MixedOptimizer:
         previous = self.model.vision_trainability
         try:
             mask.apply(self.model)
-            candidate = (
-                self._rebuild()
-                if self._rebuild is not None
-                else type(self)(
-                    self.model,
-                    self.config,
-                    dp_group=self.dp_group,
-                    ps=self.ps,
-                    group_builder=self._group_builder,
-                    owners=self._owners,
-                    stats_factory=self._stats_factory,
-                )
-            )
+            candidate = self._rebuild()
         except Exception:
             previous.apply(self.model)
             raise

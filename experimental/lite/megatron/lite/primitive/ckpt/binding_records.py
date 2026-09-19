@@ -14,9 +14,6 @@ class TensorBinding:
     role: str
     head_count: int | None = None
     encoding: str | None = None
-    header: object = None
-    store: object = None
-    matrix_shape: tuple | None = None
 
     @property
     def tensor(self):
@@ -59,17 +56,14 @@ def initialize_bindings(self, layer_range, count):
     self.tensor_bindings = {}
     self.archival_bindings = {}
     self.archival_store = None
-    self.checkpoint_bindings = None
     return start, end
 
 
-def _bind(
-    self, key, owner, attribute, role, head_count=None, encoding=None, matrix_shape=None
-):
+def _bind(self, key, owner, attribute, role, head_count=None, encoding=None):
     if key in self.tensor_bindings:
         raise ValueError(f'duplicate binding: {key}')
     self.tensor_bindings[key] = TensorBinding(
-        key, owner, attribute, role, head_count, encoding, matrix_shape=matrix_shape
+        key, owner, attribute, role, head_count, encoding
     )
     sibling = self._scale_binding(key, owner, attribute, role, encoding)
     if sibling is not None:
@@ -93,7 +87,6 @@ def bind_rules(self, rules, extra_rules):
                     parent=path.rsplit('.', 1)[0],
                     grandparent=path.rsplit('.', 2)[0],
                 )
-                axes = tuple(tensor.shape) if shape is None else shape
                 self._bind(
                     name,
                     owner,
@@ -101,5 +94,4 @@ def bind_rules(self, rules, extra_rules):
                     role,
                     None if shape is None else shape[0],
                     encoding,
-                    axes,
                 )
