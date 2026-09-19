@@ -82,13 +82,13 @@ _ENGINE_EXPORT_KWARGS = {
 
 
 @pytest.mark.parametrize(
-    "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4"]
+    "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4", "deepseek_v41"]
 )
 def test_hf_save_protocols_accept_engine_export_kwargs(
     model_name: str, monkeypatch: pytest.MonkeyPatch, transformer_engine_import_stub
 ) -> None:
     transformer_engine_import_stub()
-    if model_name == "deepseek_v4":
+    if model_name in ("deepseek_v4", "deepseek_v41"):
         # DS4 protocol drags in megatron.core via the CSA module at import time.
         pytest.importorskip(
             "megatron.core",
@@ -104,6 +104,26 @@ def test_hf_save_protocols_accept_engine_export_kwargs(
 
     def _record(*args, **kwargs):
         calls.append((args, kwargs))
+
+    if model_name == "deepseek_v41":
+        monkeypatch.setattr(protocol, "save_model", _record)
+        monkeypatch.setattr(checkpoint, "export_checkpoint", _record)
+        with pytest.raises(
+            NotImplementedError, match="V4.1_HF_SAVE_RESYNC_UNSUPPORTED"
+        ):
+            protocol.save_hf_weights(
+                [object()], "/tmp/hf-save-kwargs", None, None, **_ENGINE_EXPORT_KWARGS
+            )
+        with pytest.raises(
+            NotImplementedError, match="V4.1_HF_SAVE_RESYNC_UNSUPPORTED"
+        ):
+            list(
+                protocol.export_hf_weights(
+                    [object()], None, None, **_ENGINE_EXPORT_KWARGS
+                )
+            )
+        assert calls == []
+        return
 
     # kimi_k2 / qwen3_moe use function-local imports of the checkpoint
     # writer; qwen3_5 aliases it at module load as ``_save_hf_weights_impl``.

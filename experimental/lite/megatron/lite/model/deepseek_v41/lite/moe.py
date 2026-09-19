@@ -117,7 +117,9 @@ class ModalityRouter(nn.Module):
 class DeepseekV41MoE(nn.Module):
     """Global expert slots with local owners and primitive token transport."""
 
-    def __init__(self, router, experts, shared_experts=None, *, ps=None):
+    def __init__(
+        self, router, experts, shared_experts=None, *, ps=None, use_deepep=False
+    ):
         super().__init__()
         self.gate = router
         self.experts = Experts.from_modules(experts)
@@ -129,8 +131,16 @@ class DeepseekV41MoE(nn.Module):
             router.router.num_experts,
             router.router.gate.in_features,
             ps or ParallelState(),
-            use_deepep=False,
+            use_deepep=use_deepep,
         )
+        if (
+            use_deepep
+            and self.dispatcher.ep_size > 1
+            and not self.dispatcher.use_deepep
+        ):
+            raise RuntimeError(
+                'V4.1_DEEPEP_UNAVAILABLE: requested DeepEP is not installed'
+            )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
 

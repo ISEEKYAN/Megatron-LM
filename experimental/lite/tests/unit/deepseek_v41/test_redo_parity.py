@@ -13,25 +13,62 @@ import torch
 def release_config():
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
     text = dict(
-        vocab_size=64, hidden_size=32, num_hidden_layers=40,
-        num_attention_heads=1, num_key_value_heads=1, head_dim=32,
-        qk_rope_head_dim=4, q_lora_rank=32, o_lora_rank=8, o_groups=1,
-        index_n_heads=1, index_head_dim=32, index_topk=2, sliding_window=4,
-        candidate_topk_blocks=2, candidate_block_size=2, candidate_source_layer_id=20,
-        kv_source_layer_ids=[2,8,14,20], index_source_layer_ids=[2,8,14,20,24,28,32,36],
-        compress_ratios=[0,0]+[2]*18+[1]*20+[0]*3,
-        hidden_act='silu', attention_bias=False, attention_dropout=0.0,
-        tie_word_embeddings=False, norm_topk_prob=True, topk_method='noaux_tc',
-        rope_theta=10000, compress_rope_theta=160000,
-        rope_scaling=dict(rope_type='yarn', factor=16, beta_fast=32, beta_slow=1,
-                          original_max_position_embeddings=65536),
-        n_routed_experts=2, n_shared_experts=1, num_experts_per_tok=1,
-        moe_intermediate_size=32, scoring_func='sqrtsoftplus', routed_scaling_factor=1.5,
-        swiglu_limit=10.0, rms_norm_eps=1e-20, hc_mult=2, hc_sinkhorn_iters=20, hc_eps=1e-6,
-        engram_layer_ids=[1,14], engram_max_ngram_size=3, engram_n_heads=1,
-        engram_vocab_size=7, engram_num_embeddings=[18,30], engram_head_dim=32,
-        engram_compressed_vocab_size=64, engram_pad_token_id=0,
-        num_nextn_predict_layers=3, dspark_n_routed_experts=2,
+        vocab_size=64,
+        hidden_size=32,
+        num_hidden_layers=40,
+        num_attention_heads=1,
+        num_key_value_heads=1,
+        head_dim=32,
+        qk_rope_head_dim=4,
+        q_lora_rank=32,
+        o_lora_rank=32,
+        o_groups=1,
+        index_n_heads=1,
+        index_head_dim=32,
+        index_topk=2,
+        sliding_window=4,
+        candidate_topk_blocks=2,
+        candidate_block_size=2,
+        candidate_source_layer_id=20,
+        kv_source_layer_ids=[2, 8, 14, 20],
+        index_source_layer_ids=[2, 8, 14, 20, 24, 28, 32, 36],
+        compress_ratios=[0, 0] + [2] * 18 + [1] * 20 + [0] * 3,
+        hidden_act='silu',
+        attention_bias=False,
+        attention_dropout=0.0,
+        tie_word_embeddings=False,
+        norm_topk_prob=True,
+        topk_method='noaux_tc',
+        rope_theta=10000,
+        compress_rope_theta=160000,
+        rope_scaling=dict(
+            rope_type='yarn',
+            factor=16,
+            beta_fast=32,
+            beta_slow=1,
+            original_max_position_embeddings=65536,
+        ),
+        n_routed_experts=2,
+        n_shared_experts=1,
+        num_experts_per_tok=1,
+        moe_intermediate_size=32,
+        scoring_func='sqrtsoftplus',
+        routed_scaling_factor=1.5,
+        swiglu_limit=10.0,
+        rms_norm_eps=1e-20,
+        hc_mult=2,
+        hc_sinkhorn_iters=20,
+        hc_eps=1e-6,
+        engram_layer_ids=[1, 14],
+        engram_max_ngram_size=3,
+        engram_n_heads=1,
+        engram_vocab_size=7,
+        engram_num_embeddings=[18, 30],
+        engram_head_dim=32,
+        engram_compressed_vocab_size=64,
+        engram_pad_token_id=0,
+        num_nextn_predict_layers=3,
+        dspark_n_routed_experts=2,
     )
     return DeepseekV41Config(dict(
         model_type='deepseek_v41', text_config=text,
@@ -43,12 +80,23 @@ def release_config():
     ))
 
 
-@pytest.fixture
-def bundle(v41_core_te):
+@pytest.fixture(
+    params=[False, pytest.param(True, marks=pytest.mark.gpus(1))],
+    ids=['floating', 'default_quantized'],
+)
+def bundle(v41_core_te, request, monkeypatch):
     from megatron.lite.model.deepseek_v41.lite import protocol
     torch.manual_seed(351)
-    impl = protocol.ImplConfig(device='cpu', dtype=torch.float32, quantized=False,
-                               token_map=list(range(64)), trainable_engram=True)
+    monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
+    impl = protocol.ImplConfig(
+        device='cuda' if request.param else 'cpu',
+        dtype=torch.float32,
+        token_map=list(range(64)),
+        trainable_engram=True,
+    )
+    assert impl.quantized is True
+    if not request.param:
+        impl = replace(impl, quantized=False)
     return protocol.build_model(release_config(), impl_cfg=impl), impl
 
 
@@ -58,7 +106,7 @@ def compare_execution(reference, candidates, execute):
         owned = candidate.state_dict()
         candidate.load_state_dict({k: v for k, v in reference.state_dict().items() if k in owned})
     expected, actual = execute(reference, candidates)
-    torch.testing.assert_close(actual, expected, rtol=0, atol=0)
+    assert torch.equal(actual, expected)
     expected.square().sum().backward()
     actual.square().sum().backward()
     originals = dict(reference.named_parameters())
@@ -67,7 +115,7 @@ def compare_execution(reference, candidates, execute):
             wanted = originals[name].grad
             assert (wanted is None) == (value.grad is None), name
             if wanted is not None:
-                torch.testing.assert_close(value.grad, wanted, rtol=0, atol=0, msg=name)
+                assert torch.equal(value.grad, wanted), name
 
 
 def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
@@ -87,7 +135,7 @@ def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
                 impl_cfg=replace(impl, parallel=ParallelConfig(pp=2))).chunks[0])
     seen = []
     pieces[1].layers[20].attn.register_forward_pre_hook(lambda _, args: seen.append(args[1]))
-    ids = torch.tensor([[2, 3, 9, 4, 11, 7]])
+    ids = torch.tensor([[2, 3, 9, 4, 11, 7]], device=reference.head.weight.device)
     def execute(full, stages):
         expected = full(ids)['logits']
         outgoing = stages[0](ids)['hidden_states']
@@ -106,13 +154,15 @@ def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
     full, _ = bundle
     model = full.chunks[0]
     optimizer = V41Optimizer(model, OptimizerConfig(lr=1e-4, ns_steps=2, coefficient_type='quintic'))
-    ids = torch.tensor([[1, 8, 3, 6]])
+    ids = torch.tensor([[1, 8, 3, 6]], device=model.head.weight.device)
+    initial = {n: p.detach().clone() for n, p in model.named_parameters()}
     for _ in range(2):
         optimizer.zero_grad()
         output = model(ids)
         optimizer.accumulate_modality_loads(output['modality_loads'])
         output['logits'].square().mean().backward()
         assert optimizer.step()[0]
+    assert any(not torch.equal(p, initial[n]) for n, p in model.named_parameters())
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
     next(p for p in model.parameters() if p.grad is not None).grad.flatten()[0] = float('nan')
     assert not optimizer.step()[0]
@@ -142,7 +192,7 @@ def test_archival_export_is_byte_preserving_and_reloadable(bundle, tmp_path):
     checkpoint.load_model(loaded, tmp_path/'saved')
     for name, parameter in model.named_parameters():
         assert torch.equal(parameter, dict(loaded.named_parameters())[name]), name
-    ids = torch.tensor([[2,4,7,3]])
+    ids = torch.tensor([[2, 4, 7, 3]], device=model.head.weight.device)
     assert torch.equal(model(ids)['logits'], loaded(ids)['logits'])
 
 
@@ -153,7 +203,7 @@ def test_packed_loss_head_gradient_with_ddp_unused_detection(bundle, tmp_path):
     from torch.nn.parallel import DistributedDataParallel
 
     model = bundle[0].chunks[0]
-    ids = torch.tensor([2, 4, 7, 3])
+    ids = torch.tensor([2, 4, 7, 3], device=model.head.weight.device)
     batch = PackedBatch(ids, ids.clone(), torch.tensor([4], dtype=torch.int32))
     protocol._forward_step(model, batch)['loss'].backward()
     expected = model.head.weight.grad.clone()
@@ -167,7 +217,7 @@ def test_packed_loss_head_gradient_with_ddp_unused_detection(bundle, tmp_path):
         for _ in range(2):
             model.zero_grad(set_to_none=True)
             protocol._forward_step(model, batch, execution_model=ddp)['loss'].backward()
-            torch.testing.assert_close(model.head.weight.grad, expected, rtol=0, atol=0)
+            assert torch.equal(model.head.weight.grad, expected)
     finally:
         dist.destroy_process_group()
 
@@ -185,7 +235,7 @@ def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parall
         dp_group=group,
         ps=replace(model.ps, **parallel),
     )
-    output = model(torch.tensor([[1, 3, 5, 7]]))
+    output = model(torch.tensor([[1, 3, 5, 7]], device=model.head.weight.device))
     opt.accumulate_modality_loads(output['modality_loads'])
     output['logits'].square().mean().backward()
     before = {n: p.detach().clone() for n, p in model.named_parameters()}
@@ -204,3 +254,24 @@ def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parall
     assert all(
         torch.equal(b.ffn.gate.bias, old) for b, old in zip(model.layers, biases)
     )
+
+
+def test_image_tokens_backpropagate_into_vision_and_aligner(bundle):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.modules.image_data import ImageInput, image_token_types
+    from megatron.lite.primitive.modules.vision_training import VisionTrainability
+
+    impl = replace(
+        bundle[1],
+        text_only=False,
+        vision_trainability=VisionTrainability(True, True, True, True),
+    )
+    model = protocol.build_model(release_config(), impl_cfg=impl).chunks[0]
+    ids = torch.arange(8, device=impl.device)[None]
+    types = image_token_types(1, 1).to(impl.device)
+    image = ImageInput(1, torch.randn(4, 3, 2, 2, device=impl.device), 2, 2, types)
+    model(ids, images=[[image]])['logits'].square().sum().backward()
+    for module in (model.vision, model.aligner):
+        gradients = [p.grad for p in module.parameters() if p.grad is not None]
+        assert gradients and all(torch.isfinite(g).all() for g in gradients)
+        assert any(torch.count_nonzero(g) > 0 for g in gradients)

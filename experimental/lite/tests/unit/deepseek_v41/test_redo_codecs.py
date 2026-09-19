@@ -38,27 +38,35 @@ def test_main_kv_codec_preserves_straight_through_gradient():
     assert torch.equal(x.grad, torch.ones_like(x))
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.parametrize('owns_k', [False, True])
 def test_cross_layer_indexer_fp8_projection(v41_core_te, monkeypatch, owns_k):
     from megatron.lite.primitive.modules.attention.csa import (
         CrossLayerAttentionConfig,
         CrossLayerIndexer,
     )
-    from megatron.lite.primitive.quantization import mxfp8
-
-    calls = []
-
-    def operator(x, weight):
-        calls.append(weight)
-        return torch.nn.functional.linear(x, weight)
-
-    monkeypatch.setattr(mxfp8, 'dynamic_fp8_linear', operator)
+    assert torch.cuda.is_available(), "FP8 numerical evidence requires CUDA"
+    monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
     config = CrossLayerAttentionConfig(dim=32, q_rank=32, index_heads=1, index_dim=32)
-    indexer = CrossLayerIndexer(config, owns_k)
-    x = torch.randn(2, 32, dtype=torch.bfloat16)
-    expected = torch.nn.functional.linear(x, indexer.wq_b.weight)
-    assert torch.equal(indexer.wq_b(x), expected)
-    assert len(calls) == 1 and calls[0] is indexer.wq_b.weight
+    indexer = CrossLayerIndexer(config, owns_k).cuda().float()
+    # Every row/block has max in (224, 448], hence its E8M0 scale is exactly 1.
+    # All decoded products are integers; sums stay below 2**24, so FP32
+    # accumulation is exact regardless of GEMM reduction order.
+    x = torch.linspace(225, 300, 32, device='cuda').repeat(16, 1)
+    weight = torch.linspace(225, 350, 1024, device='cuda').reshape(32, 32)
+    with torch.no_grad():
+        indexer.wq_b.weight.copy_(weight)
+    expected = (
+        x.to(torch.float8_e4m3fn).float() @ weight.to(torch.float8_e4m3fn).float().T
+    )
+    baseline = torch.nn.functional.linear(x, weight)
+    actual = indexer.wq_b(x)
+    assert torch.equal(actual, expected)
+    assert not torch.equal(actual, baseline), "FP8 was bypassed"
+    relative_error = (actual - baseline).norm() / baseline.norm()
+    # E4M3 normal rounding <= 1/16 per operand: product error <= 33/256.
+    bound = (33 / 256) * (x.abs() @ weight.abs().T).norm() / baseline.norm()
+    assert 0 < relative_error <= bound
 
 
 def test_tail_block_uses_declared_32_instead_of_65_div_3():

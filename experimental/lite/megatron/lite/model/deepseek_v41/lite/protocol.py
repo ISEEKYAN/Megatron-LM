@@ -49,6 +49,7 @@ class ImplConfig:
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
+    use_deepep: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
     shard_engram: bool = True
@@ -130,6 +131,7 @@ UNSUPPORTED = (
         'CP size must be a positive integer',
     ),
     (
+        # CP-only is the supported model contract; DP x CP is not enabled here.
         lambda c, p: p.cp > 1
         and (
             not torch.distributed.is_initialized()
@@ -139,13 +141,14 @@ UNSUPPORTED = (
         'CP requires an initialized CP-only world',
     ),
     (
+        # EP permits expert replicas: init_parallel forms ep_dp_group per owner.
         lambda c, p: p.ep > 1
         and (
             not torch.distributed.is_initialized()
-            or torch.distributed.get_world_size() < p.ep
+            or torch.distributed.get_world_size() % p.ep != 0
         ),
         ValueError,
-        'EP requires an initialized distributed world of at least ep ranks',
+        'EP requires an initialized distributed world divisible by ep',
     ),
 )
 
@@ -206,7 +209,7 @@ def build_model(model_cfg, *, impl_cfg):
             layer_range=layer_range,
             **project_fields(
                 vars(c),
-                'token_map quantized trainable_engram shard_engram '
+                'token_map quantized use_deepep trainable_engram shard_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )
@@ -364,6 +367,10 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
         raise ValueError("Labels must match packed input shape")
     if batch.loss_mask is not None and batch.loss_mask.shape != batch.labels.shape:
         raise ValueError("Loss mask must match packed input shape")
+    if cp_context is not None and (
+        context is None or context.normalization_denominator is None
+    ):
+        raise ValueError('V4.1_CP_NORMALIZATION_REQUIRED: use prepare_microbatches')
     labels, mask, denominator = _cp_targets(batch, cp_context)
     log_probs, entropy = linear_cross_entropy(
         hidden, weight, labels, temperature, tp_group
@@ -373,10 +380,6 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
         if not math.isfinite(denominator) or denominator <= 0:
             raise ValueError("Loss denominator must be finite and positive")
     loss = -(log_probs * mask).sum() / denominator
-    if cp_context is not None and (
-        context is None or context.normalization_denominator is None
-    ):
-        loss = loss * cp_context.size
     result = {"loss": loss * (1.0 if context is None else context.loss_scale)}
     if context is None or context.return_log_probs:
         result["log_probs"] = log_probs

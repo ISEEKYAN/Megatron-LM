@@ -177,3 +177,60 @@ def test_multiple_ranks_still_reduce_counts_before_bias_update(
         torch.testing.assert_close(router.bias_vl, router.bias)
     finally:
         torch.distributed.destroy_process_group()
+
+
+@pytest.mark.parametrize('use_deepep', [False, True])
+def test_dispatch_option_reaches_model_and_preserves_local_moe(
+    moe, monkeypatch, use_deepep
+):
+    from test_redo_parity import release_config
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.primitive.modules import dispatcher
+
+    original, selected = dispatcher.TokenDispatcher, []
+
+    def capture(*args, **kwargs):
+        selected.append(kwargs['use_deepep'])
+        return original(*args, **kwargs)
+
+    monkeypatch.setattr(dispatcher, 'TokenDispatcher', capture)
+    impl = protocol.ImplConfig(device='cpu', quantized=False, use_deepep=use_deepep)
+    model = protocol.build_model(release_config(), impl_cfg=impl).chunks[0]
+    assert selected == [use_deepep] * 40
+    assert protocol.ImplConfig().use_deepep is False
+    torch.manual_seed(417)
+    module = model.layers[0].ffn.float()
+    x = torch.randn(5, 32, requires_grad=True)
+    weights, indices, _ = module.gate(x)
+    # Independent gather/scatter oracle: route first, then apply weighted SwiGLU
+    # before the down projection, avoiding a different FP32 reduction order.
+    expected = torch.zeros_like(x)
+    for slot in range(indices.shape[1]):
+        for expert_id, expert in enumerate(module.experts):
+            rows = torch.where(indices[:, slot] == expert_id)[0]
+            gate = torch.nn.functional.linear(x[rows], expert.w1.weight).clamp(max=10)
+            up = torch.nn.functional.linear(x[rows], expert.w3.weight).clamp(-10, 10)
+            hidden = torch.nn.functional.silu(gate) * up * weights[rows, slot, None]
+            expected = expected.index_add(
+                0, rows, torch.nn.functional.linear(hidden, expert.w2.weight)
+            )
+    expected = expected + module.shared_experts(x)
+    actual = module(x)
+    torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-7)
+    wanted = torch.autograd.grad(expected.sum(), x)[0]
+    actual.sum().backward()
+    torch.testing.assert_close(x.grad, wanted, rtol=1e-6, atol=1e-7)
+
+
+def test_requested_deepep_never_silently_falls_back(moe, monkeypatch):
+    from megatron.lite.primitive.modules import dispatcher
+    from megatron.lite.primitive.parallel.state import ParallelState
+
+    monkeypatch.setattr(dispatcher, 'deep_ep', None)
+    with pytest.raises(RuntimeError, match='V4.1_DEEPEP_UNAVAILABLE'):
+        moe.DeepseekV41MoE(
+            _router(moe),
+            [torch.nn.Identity()] * 4,
+            ps=ParallelState(ep_size=2),
+            use_deepep=True,
+        )

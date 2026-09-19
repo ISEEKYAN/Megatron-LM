@@ -37,12 +37,14 @@ from .moe import DeepseekV41MoE, ModalityRouter
 
 
 class DeepseekV41Model(nn.Module):
+
     def __init__(
         self,
         config,
         *,
         token_map=None,
         quantized=True,
+        use_deepep=False,
         trainable_engram=False,
         shard_engram=True,
         gate_temperature=1.0,
@@ -116,7 +118,9 @@ class DeepseekV41Model(nn.Module):
             shared = (
                 self._expert(t, quantized, shared=True) if t.n_shared_experts else None
             )
-            ffn = DeepseekV41MoE(router, experts, shared, ps=self.ps)
+            ffn = DeepseekV41MoE(
+                router, experts, shared, ps=self.ps, use_deepep=use_deepep
+            )
             block = DeepseekV41Block(
                 dim,
                 copies,
