@@ -138,7 +138,8 @@ def test_remaining_table_guards_through_build_model(
 
 @pytest.mark.parametrize('rank', range(4))
 def test_ep_replicas_use_independent_expert_dp_groups(monkeypatch, v41_core_te, rank):
-    from megatron.lite.model.deepseek_v41.lite import model
+    from megatron.lite.model.deepseek_v41.lite import model, optimizer_groups
+    from megatron.lite.primitive.modules import native_fp32_linear
 
     monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
     monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 4)
@@ -153,8 +154,30 @@ def test_ep_replicas_use_independent_expert_dp_groups(monkeypatch, v41_core_te, 
         assert parallel_state.ep_dp_group == ((0, 2) if rank % 2 == 0 else (1, 3))
         assert parallel_state.dp_group == (0, 1, 2, 3)
         assert parallel_state.expert_dp_size == 2
-        raise RuntimeError('group decomposition verified before allocation')
+        chunk = torch.nn.Module()
+        chunk.engram_hash = None
+        chunk.parameter_bindings = lambda: []
+        return chunk
+
+    def inspect_optimizer(*args, dp_group, ps, **kwargs):
+        # Follow the real protocol -> V41Optimizer -> MixedOptimizer wiring.
+        # Router counts use dense DP (all ranks), never expert-DP replicas.
+        assert dp_group is ps.dp_group
+        assert dp_group == tuple(range(torch.distributed.get_world_size()))
+        assert dp_group != ps.ep_dp_group
+        raise RuntimeError('optimizer count scope verified before allocation')
 
     monkeypatch.setattr(model, 'DeepseekV41Model', inspect_groups)
-    with pytest.raises(RuntimeError, match='group decomposition verified'):
-        _build(device='cpu', parallel=ParallelConfig(ep=2))
+    monkeypatch.setattr(optimizer_groups, 'MixedOptimizer', inspect_optimizer)
+    monkeypatch.setattr(
+        native_fp32_linear, 'configure_residual_projections', lambda *args: None
+    )
+    with pytest.raises(RuntimeError, match='optimizer count scope verified'):
+        _build(
+            device='cpu',
+            parallel=ParallelConfig(ep=2),
+            optimizer='muon',
+            optimizer_config=optimizer_groups.OptimizerConfig(
+                lr=0.001, ns_steps=5, coefficient_type='quintic'
+            ),
+        )
