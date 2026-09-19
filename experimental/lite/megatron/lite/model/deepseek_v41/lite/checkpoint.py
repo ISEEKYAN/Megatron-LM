@@ -75,7 +75,14 @@ def load_model(model, path, *, allow_missing_mtp=False):
     return load_bound_model(model, path, _SPEC, allow_missing_archive=allow_missing_mtp)
 
 
-def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+def export_hf_weights(
+    chunks, model_cfg, ps, *, target=None, resync_config=None, **kwargs
+):
+    if target is not None or resync_config is not None:
+        raise NotImplementedError(
+            'V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require '
+            'a resync exporter; this entry point only exports archival HF weights'
+        )
     if len(chunks) != 1:
         raise NotImplementedError('Export requires a single complete chunk')
     include_mtp_only = kwargs.pop('include_mtp_only', False)
