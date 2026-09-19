@@ -623,7 +623,7 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
         if 'hidden_states' in output
         else text_output(
             output['head_hidden'][0],
-            model.head.weight.float(),
+            output['head_weight'],
             batch,
             cp_context=cp_context,
             tp_group=model.ps.tp_group,

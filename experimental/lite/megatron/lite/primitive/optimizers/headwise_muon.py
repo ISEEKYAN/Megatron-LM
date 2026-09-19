@@ -307,7 +307,9 @@ class MixedOptimizer:
         return (dense + expert + row).sqrt()
 
     def _all_finite(self, valid):
-        if self.ps is None or (self.ps.ep_size == 1 and self.row_group is None):
+        if self.dp_group is None and (
+            self.ps is None or (self.ps.ep_size == 1 and self.row_group is None)
+        ):
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
         torch.distributed.all_reduce(

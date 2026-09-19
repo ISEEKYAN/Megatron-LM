@@ -405,7 +405,11 @@ class DeepseekV41Model(nn.Module):
             return {'hidden_states': stream.pack_pair(hidden, pre)}
         head_hidden = self.norm(contract_hc(hidden, pre)).float()
         result = (
-            {'head_hidden': head_hidden}
+            {
+                'head_hidden': head_hidden,
+                # A view gives DDP's unused-parameter traversal a grad_fn root.
+                'head_weight': self.head.weight.view_as(self.head.weight).float(),
+            }
             if return_head_hidden
             else {
                 'logits': torch.nn.functional.linear(

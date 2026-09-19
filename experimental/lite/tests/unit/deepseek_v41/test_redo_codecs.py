@@ -38,6 +38,29 @@ def test_main_kv_codec_preserves_straight_through_gradient():
     assert torch.equal(x.grad, torch.ones_like(x))
 
 
+@pytest.mark.parametrize('owns_k', [False, True])
+def test_cross_layer_indexer_fp8_projection(v41_core_te, monkeypatch, owns_k):
+    from megatron.lite.primitive.modules.attention.csa import (
+        CrossLayerAttentionConfig,
+        CrossLayerIndexer,
+    )
+    from megatron.lite.primitive.quantization import mxfp8
+
+    calls = []
+
+    def operator(x, weight):
+        calls.append(weight)
+        return torch.nn.functional.linear(x, weight)
+
+    monkeypatch.setattr(mxfp8, 'dynamic_fp8_linear', operator)
+    config = CrossLayerAttentionConfig(dim=32, q_rank=32, index_heads=1, index_dim=32)
+    indexer = CrossLayerIndexer(config, owns_k)
+    x = torch.randn(2, 32, dtype=torch.bfloat16)
+    expected = torch.nn.functional.linear(x, indexer.wq_b.weight)
+    assert torch.equal(indexer.wq_b(x), expected)
+    assert len(calls) == 1 and calls[0] is indexer.wq_b.weight
+
+
 def test_tail_block_uses_declared_32_instead_of_65_div_3():
     x = torch.ones(65, 65)
     scales = torch.arange(1, 10).reshape(3, 3).float()

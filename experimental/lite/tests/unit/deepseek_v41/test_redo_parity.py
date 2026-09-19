@@ -144,3 +144,63 @@ def test_archival_export_is_byte_preserving_and_reloadable(bundle, tmp_path):
         assert torch.equal(parameter, dict(loaded.named_parameters())[name]), name
     ids = torch.tensor([[2,4,7,3]])
     assert torch.equal(model(ids)['logits'], loaded(ids)['logits'])
+
+
+def test_packed_loss_head_gradient_with_ddp_unused_detection(bundle, tmp_path):
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite import protocol
+    from megatron.lite.runtime.contracts.data import PackedBatch
+    from torch.nn.parallel import DistributedDataParallel
+
+    model = bundle[0].chunks[0]
+    ids = torch.tensor([2, 4, 7, 3])
+    batch = PackedBatch(ids, ids.clone(), torch.tensor([4], dtype=torch.int32))
+    protocol._forward_step(model, batch)['loss'].backward()
+    expected = model.head.weight.grad.clone()
+    dist.init_process_group(
+        'gloo', init_method=f'file://{tmp_path}/ddp', rank=0, world_size=1
+    )
+    try:
+        ddp = DistributedDataParallel(
+            model, broadcast_buffers=False, find_unused_parameters=True
+        )
+        for _ in range(2):
+            model.zero_grad(set_to_none=True)
+            protocol._forward_step(model, batch, execution_model=ddp)['loss'].backward()
+            torch.testing.assert_close(model.head.weight.grad, expected, rtol=0, atol=0)
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('parallel', [dict(cp_size=2), dict(dp_size=2)])
+def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parallel):
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import V41Optimizer
+    from megatron.lite.model.deepseek_v41.vision_config import OptimizerConfig
+
+    model = bundle[0].chunks[0]
+    group, seen = object(), []
+    opt = V41Optimizer(
+        model,
+        OptimizerConfig(lr=1e-3, ns_steps=2, coefficient_type='quintic'),
+        dp_group=group,
+        ps=replace(model.ps, **parallel),
+    )
+    output = model(torch.tensor([[1, 3, 5, 7]]))
+    opt.accumulate_modality_loads(output['modality_loads'])
+    output['logits'].square().mean().backward()
+    before = {n: p.detach().clone() for n, p in model.named_parameters()}
+    biases = [block.ffn.gate.bias.clone() for block in model.layers]
+
+    def remote_nan(flag, *, op=None, group):
+        assert flag.numel() == 1 and op == torch.distributed.ReduceOp.MIN
+        assert flag.item() == 1
+        seen.append(group)
+        flag.zero_()
+
+    monkeypatch.setattr(torch.distributed, 'all_reduce', remote_nan)
+    assert not opt.step()[0]
+    assert seen == [group]
+    assert all(torch.equal(p, before[n]) for n, p in model.named_parameters())
+    assert all(
+        torch.equal(b.ffn.gate.bias, old) for b, old in zip(model.layers, biases)
+    )

@@ -1413,7 +1413,10 @@ class CrossLayerIndexer(nn.Module):
     def __init__(self, config, owns_k):
         super().__init__()
         self.wq_b = Linear(
-            config.q_rank, config.index_heads * config.index_dim, fp8=config.linear_fp8
+            config.q_rank,
+            config.index_heads * config.index_dim,
+            fp8=config.linear_fp8,
+            fp8_operator=mxfp8.dynamic_fp8_linear,
         )
         self.weights_proj = Linear(config.dim, config.index_heads)
         if owns_k:
