@@ -114,7 +114,7 @@ def test_routing_selects_the_bias_belonging_to_each_token_modality(moe):
     assert (text_rows == 0).any(dim=-1).all(), "text tokens ignored self.bias"
     assert (image_rows == 3).any(dim=-1).all(), "image tokens ignored self.bias_vl"
     # And the two modalities must not collapse onto the same expert set.
-    assert not (text_rows == 3).all()
+    assert indices.is_contiguous() and not (text_rows == 3).all()
     assert not (image_rows == 0).all()
 
 

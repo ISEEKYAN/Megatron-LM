@@ -85,7 +85,7 @@ class ModalityRouter(nn.Module):
         stats = reduce_modality_load(
             indices, image_mask, self.router.num_experts, self.router._aux_loss_group
         )
-        return weights, indices, stats
+        return weights, indices.contiguous(), stats
 
     @torch.no_grad()
     def update_bias(self, stats):
