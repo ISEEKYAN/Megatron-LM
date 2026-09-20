@@ -1,7 +1,9 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Real EP2/EP4 x expert-DP2 transport and finalization against one global loss."""
 
+import runpy
 from datetime import timedelta
+from pathlib import Path
 from types import SimpleNamespace as NS
 from unittest.mock import patch
 
@@ -22,6 +24,14 @@ class _LinearExpert(torch.nn.Module):
 
 
 def _ep_finalize_worker(rank, ep, directory):
+    # Spawn avoids inheriting a CUDA/autograd thread pool from earlier tests.
+    # Each clean process installs the same optional-TE import fixture.
+    fixtures = runpy.run_path(str(Path(__file__).parents[2] / 'conftest.py'))
+    import megatron.core.fp8_utils  # noqa: F401
+    import megatron.core.transformer.experimental_attention_variant.csa  # noqa: F401
+    import megatron.core.transformer.hyper_connection  # noqa: F401
+
+    fixtures['transformer_engine_import_stub'].__wrapped__(pytest.MonkeyPatch())()
     from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE, ModalityRouter
     from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
     from megatron.lite.primitive.parallel.state import init_parallel
@@ -94,15 +104,11 @@ def _ep_finalize_worker(rank, ep, directory):
 
 @pytest.mark.parametrize('ep', [2, 4])
 def test_ep_finalize_matches_single_global_batch(v41_core_te, tmp_path, ep):
-    # Import before fork: the CPU-only worker inherits the optional-TE fixture.
-    from megatron.lite.model.deepseek_v41.lite import moe  # noqa: F401
-    from megatron.lite.primitive.optimizers import headwise_muon  # noqa: F401
-
     torch.set_num_threads(1)
     mp.start_processes(
         _ep_finalize_worker,
         args=(ep, str(tmp_path)),
         nprocs=ep * 2,
         join=True,
-        start_method='fork',
+        start_method='spawn',
     )
