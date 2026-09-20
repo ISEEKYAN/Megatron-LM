@@ -262,8 +262,9 @@ def build_model(model_cfg, *, impl_cfg):
 
 
 def load_hf_weights(chunk, hf_path, model_cfg, ps):
-    if hf_path:
-        load_model(chunk, hf_path)
+    if not hf_path:
+        raise ValueError('V4.1_HF_PATH_REQUIRED: provide a checkpoint directory')
+    load_model(chunk, hf_path)
 
 
 export_hf_weights = _export_hf_weights_impl

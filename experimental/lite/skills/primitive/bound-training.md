@@ -16,6 +16,8 @@ schema = Skill(
 # Paths are relative to megatron/lite/primitive and tests/unit, respectively.
 ROUTES = {
     "config_fields.py": "deepseek_v41/test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state",
+    "ckpt/row_stream.py": "deepseek_v41/test_bound_row_export.py::test_bound_save_streams_rows_and_exact_masters_under_budget",
+    "ckpt/hf_weights.py": "deepseek_v41/test_redo_export_contract.py::test_hf_export_obeys_external_quantized_storage",
     "ckpt/binding_records.py": "deepseek_v41/test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory",
     "modules/engram_lookup.py": "deepseek_v41/test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage",
     "modules/owner_row_transport.py": "deepseek_v41/test_redo_engram_residency.py::test_owner_transport_preserves_compact_rows_and_backward",
@@ -28,7 +30,7 @@ ROUTES = {
     "quantization/mxfp8.py": "deepseek_v41/test_redo_codecs.py::test_cross_layer_indexer_fp8_projection",
     "quantization/mxfp4.py": "deepseek_v41/test_redo_codecs.py::test_fp4_codec_rounding_and_surface",
     "quantization/nvfp4.py": "deepseek_v41/test_redo_codecs.py::test_fp4_codec_rounding_and_surface",
-    "optimizers/headwise_muon.py": "deepseek_v41/test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction",
+    "optimizers/headwise_muon.py": "deepseek_v41/test_redo_ep_finalize.py::test_ep_finalize_matches_single_global_batch",
     "optimizers/owned_groups.py": "deepseek_v41/test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction",
     "optimizers/sinkhorn.py": "deepseek_v41/test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction",
     "optimizers/staged_update.py": "deepseek_v41/test_redo_parity.py::test_remote_nonfinite_skips_replicated_optimizer",
@@ -70,3 +72,13 @@ def bound_training(task, files, reference, budget):
         return blocked("GPU composition smoke failed", evidence=smoke)
     return done(routes=routes, validation=validation, risks=["unit tests alone do not certify engine e2e"])
 ```
+
+This is an orchestration specification, not a standalone executable validator.
+`load_source_and_tests` and `require_real_gpu_smoke` are host-supplied, undefined
+here. The mocked control-flow unit tests certify routing and failure propagation
+only; their `done` does not certify numerical checks, GPU execution, or engine e2e.
+An actual run needs independent test results and non-skipped GPU smoke evidence.
+
+V4.1 release notes: archival HF save/export deliberately reject resync options;
+CP loss deliberately fails without the prepared global normalization denominator.
+Neither unsupported request is treated as a successful no-op.

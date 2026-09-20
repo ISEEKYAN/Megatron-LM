@@ -78,3 +78,12 @@ def test_export_default_selection_preserves_tensors(monkeypatch):
     assert len(result) == 1 and result[0][0] == 'weight'
     assert torch.equal(result[0][1], weight)
     exporter.assert_called_once_with(model)
+
+
+@pytest.mark.parametrize('path', [None, '', False])
+def test_load_rejects_missing_path_before_reading(monkeypatch, path):
+    loader = Mock(side_effect=AssertionError('Missing path reached loader'))
+    monkeypatch.setattr(protocol, 'load_model', loader)
+    with pytest.raises(ValueError, match='V4.1_HF_PATH_REQUIRED'):
+        protocol.load_hf_weights(object(), path, None, None)
+    loader.assert_not_called()

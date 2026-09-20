@@ -22,6 +22,8 @@ def test_bound_training_routes_and_skill_contract():
     routes = ast.literal_eval(body.body[0].value)
     required = {
         'config_fields.py': 'test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state',
+        'ckpt/row_stream.py': 'test_bound_row_export.py::test_bound_save_streams_rows_and_exact_masters_under_budget',
+        'ckpt/hf_weights.py': 'test_redo_export_contract.py::test_hf_export_obeys_external_quantized_storage',
         'ckpt/binding_records.py': 'test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory',
         'modules/engram_lookup.py': 'test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage',
         'modules/owner_row_transport.py': 'test_redo_engram_residency.py::test_owner_transport_preserves_compact_rows_and_backward',
@@ -34,7 +36,7 @@ def test_bound_training_routes_and_skill_contract():
         'quantization/mxfp8.py': 'test_redo_codecs.py::test_cross_layer_indexer_fp8_projection',
         'quantization/mxfp4.py': 'test_redo_codecs.py::test_fp4_codec_rounding_and_surface',
         'quantization/nvfp4.py': 'test_redo_codecs.py::test_fp4_codec_rounding_and_surface',
-        'optimizers/headwise_muon.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
+        'optimizers/headwise_muon.py': 'test_redo_ep_finalize.py::test_ep_finalize_matches_single_global_batch',
         'optimizers/owned_groups.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
         'optimizers/sinkhorn.py': 'test_redo_parity.py::test_optimizer_two_steps_and_nonfinite_transaction',
         'optimizers/staged_update.py': 'test_redo_parity.py::test_remote_nonfinite_skips_replicated_optimizer',
@@ -46,6 +48,21 @@ def test_bound_training_routes_and_skill_contract():
     }
     assert routes == {
         source: 'deepseek_v41/' + target for source, target in required.items()
+    }
+    # Closed inventory: adding a checkpoint primitive requires a route or an
+    # explicit review of this legacy non-bound checkpoint surface.
+    legacy = {
+        '__init__.py',
+        'dcp.py',
+        'distckpt.py',
+        'weight_sync_fingerprint.py',
+        'weight_sync_probe.py',
+    }
+    checkpoint_files = {
+        p.name for p in (root / 'megatron/lite/primitive/ckpt').glob('*.py')
+    }
+    assert checkpoint_files == legacy | {
+        Path(source).name for source in routes if source.startswith('ckpt/')
     }
     for source, target in routes.items():
         assert (root / 'megatron/lite/primitive' / source).is_file()
@@ -83,7 +100,7 @@ def skill_body(name):
 
 
 def execute_skill(name, **dependencies):
-    # Execute the checked-in body; only orchestration I/O is substituted.
+    # Execute the specification with fake host I/O; done is not GPU evidence.
     exits = {
         status: (
             lambda *args, status=status, **kw: NS(
@@ -103,6 +120,7 @@ def execute_skill(name, **dependencies):
         ('complete', 'done'),
         ('duplicate', 'done'),
         ('repository_path', 'done'),
+        ('checkpoint', 'done'),
         ('empty', 'out_of_scope'),
         ('unmapped', 'out_of_scope'),
         ('mixed', 'blocked'),
@@ -113,7 +131,11 @@ def execute_skill(name, **dependencies):
     ],
 )
 def test_bound_training_executes_complete_coverage_contract(case, expected):
-    files = ['train_step.py', 'modules/experts.py']
+    files = (
+        ['ckpt/row_stream.py', 'ckpt/hf_weights.py']
+        if case == 'checkpoint'
+        else ['train_step.py', 'modules/experts.py']
+    )
     if case == 'duplicate':
         files.append(files[0])
     if case == 'repository_path':
@@ -141,10 +163,12 @@ def test_bound_training_executes_complete_coverage_contract(case, expected):
         assert result.evidence == ['uncovered.py']
         validate.assert_not_called()
     if expected == 'done':
-        assert [c.kwargs['primitive'] for c in validate.call_args_list] == [
-            'modules/experts.py',
-            'train_step.py',
-        ]
+        assert [c.kwargs['primitive'] for c in validate.call_args_list] == sorted(
+            {
+                f.removeprefix('experimental/lite/megatron/lite/primitive/')
+                for f in files
+            }
+        )
         smoke.assert_called_once_with(
             'task',
             cases=['multimodal', 'quantized', 'ep2', 'cp2'],
