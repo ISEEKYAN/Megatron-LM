@@ -301,11 +301,34 @@ export_hf_weights = _export_hf_weights_impl
 def save_hf_weights(
     chunks, path, model_cfg, ps, *, target=None, resync_config=None, **kwargs
 ):
-    if target is not None or resync_config is not None:
-        raise NotImplementedError(
-            "V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require "
-            "a resync exporter; this entry point only saves archival HF weights"
+    from .resync import decoded_weights, validate_target
+
+    if validate_target(target, resync_config):
+        import json
+        from pathlib import Path
+
+        from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
+
+        budget = kwargs.pop('buffer_max_size_bytes', 5 * 1024**3)
+        if type(budget) is not int or budget <= 0:
+            raise ValueError('Invalid resync buffer budget')
+        weights = export_hf_weights(
+            chunks,
+            model_cfg,
+            ps,
+            target=target,
+            resync_config=resync_config,
+            buffer_max_size_bytes=budget,
+            **kwargs,
         )
+        stream_export_to_shards(
+            decoded_weights(weights), str(path), shard_size_bytes=budget // 4
+        )
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            (Path(path) / 'config.json').write_text(
+                json.dumps(chunks[0].config.to_hf_dict(), indent=2) + '\n'
+            )
+        return
     if len(chunks) != 1:
         raise NotImplementedError('Single-rank V4.1 export requires one chunk')
     save_model(chunks[0], path, **kwargs)

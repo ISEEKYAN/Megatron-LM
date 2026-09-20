@@ -3,6 +3,7 @@
 from dataclasses import replace
 from functools import partial
 
+import torch
 from megatron.lite.primitive.ckpt.binding_records import (
     DeferredModule,
     Rule,
@@ -88,11 +89,9 @@ def load_model(model, path, *, allow_missing_mtp=False):
 def export_hf_weights(
     chunks, model_cfg, ps, *, target=None, resync_config=None, **kwargs
 ):
-    if target is not None or resync_config is not None:
-        raise NotImplementedError(
-            'V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require '
-            'a resync exporter; this entry point only exports archival HF weights'
-        )
+    from .resync import transport_weights, validate_target
+
+    deployment = validate_target(target, resync_config)
     if len(chunks) != 1:
         raise NotImplementedError('Export requires a single complete chunk')
     if kwargs.pop('include_mtp_only', False):
@@ -100,7 +99,44 @@ def export_hf_weights(
     if kwargs.pop('include_local_prefixes', None) is not None:
         raise NotImplementedError('V4.1_HF_EXPORT_LOCAL_PREFIXES_UNSUPPORTED')
     limit = kwargs.pop('limit', None)
-    for count, pair in enumerate(export_checkpoint(chunks[0], **kwargs), 1):
+    if deployment and limit is not None:
+        raise ValueError('DS4.1 resync requires a complete generation, without limit')
+    if deployment:
+        if kwargs.pop('row_chunks', True) is not True:
+            raise ValueError('DS4.1 resync requires bounded row chunks')
+        budget = kwargs.get('buffer_max_size_bytes', 5 * 1024**3)
+        if type(budget) is not int or budget <= 0:
+            raise ValueError('Invalid resync buffer budget')
+        # Non-row codecs operate on a matrix. Refuse one whose conservative
+        # workspace bound cannot fit; never silently exceed a small budget.
+        for name, binding in chunks[0].tensor_bindings.items():
+            if (
+                binding.role != 'scale'
+                and _SPEC.row_block(name) != 1
+                and binding.encoding in ('I8', 'F8_E4M3')
+                and binding.tensor.dtype
+                in (torch.float32, torch.bfloat16, torch.float16)
+                and binding.tensor.numel() * (64 if binding.encoding == 'I8' else 32)
+                + 8192
+                > budget // 2
+            ):
+                raise ValueError(f'Resync buffer too small for matrix codec: {name}')
+        # Reserve source, packed payload, and overlapping iterator handoff views.
+        kwargs['buffer_max_size_bytes'] = (
+            kwargs.get('buffer_max_size_bytes', 5 * 1024**3) // 4
+        )
+        kwargs['row_chunks'] = True
+        if kwargs.pop('export_dtype', None) not in (
+            None,
+            'bf16',
+            'bfloat16',
+            torch.bfloat16,
+        ):
+            raise ValueError('DS4.1 resync uses official mixed FP32/BF16 dtypes')
+    weights = export_checkpoint(chunks[0], **kwargs)
+    if deployment:
+        weights = transport_weights(weights, deployment=True)
+    for count, pair in enumerate(weights, 1):
         yield pair
         if limit is not None and count >= limit:
             break
