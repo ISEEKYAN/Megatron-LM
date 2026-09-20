@@ -34,7 +34,7 @@ class DeferredModule(nn.Module):
 
 
 Rule = namedtuple(
-    'Rule', 'attributes role encoding shape key', defaults=(None, None, None)
+    'Rule', 'attributes role encoding head_count key', defaults=(None, None, None)
 )
 
 
@@ -76,7 +76,7 @@ def bind_rules(self, rules, extra_rules):
             rule for pattern, rule in rules.items() if fnmatchcase(path, pattern)
         ]
         entries.extend(extra_rules(path, owner))
-        for attributes, role, encoding, shape, key in entries:
+        for attributes, role, encoding, head_count, key in entries:
             for attribute in attributes.split():
                 tensor = getattr(owner, attribute, None)
                 if tensor is None:
@@ -92,6 +92,6 @@ def bind_rules(self, rules, extra_rules):
                     owner,
                     attribute,
                     role,
-                    None if shape is None else shape[0],
+                    head_count,
                     encoding,
                 )

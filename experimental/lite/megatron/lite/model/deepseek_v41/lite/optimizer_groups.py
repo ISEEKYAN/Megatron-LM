@@ -19,20 +19,16 @@ from ..vision_config import OptimizerConfig, VisionOptimizerConfig
 # Roles are validated against an independently enumerated object inventory below.
 _RULES = {
     **dict.fromkeys(
-        'wq_a wq_b wkv wo_a wo_b router expert shared_expert compressor'.split(),
+        'wq_a wq_b wkv wo_a wo_b router expert shared_expert compressor vision aligner'.split(),
         ('muon', 0.1, 0.1, 1),
     ),
-    'embedding': ('sinkhorn', 0, 0, 1),
-    'head': ('sinkhorn', 0, 0, 1),
+    **dict.fromkeys(('embedding', 'head'), ('sinkhorn', 0, 0, 1)),
     'norm': ('adamw', 0.1, 0.1, 1),
-    'attention_sink': ('adamw', 0, 0, 1),
+    **dict.fromkeys(('attention_sink', 'image_delimiter'), ('adamw', 0, 0, 1)),
     'hyper_connection': ('muon', 0.1, 0, 1),
     'engram_table': ('sinkhorn', 0, 0, 5),
     'engram_projection': ('muon', 0.1, 0.1, 5),
     'engram_norm': ('adamw', 0.1, 0.1, 5),
-    'vision': ('muon', 0.1, 0.1, 1),
-    'aligner': ('muon', 0.1, 0.1, 1),
-    'image_delimiter': ('adamw', 0, 0, 1),
 }
 
 
