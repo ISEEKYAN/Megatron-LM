@@ -19,6 +19,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     custom_backend_module: str | None = "verl_mlite.engine.mlite_engine"
     model_name: str = "auto"
     impl: str = "lite"
+    grad_offload: bool = False
 
     tp: int = 1
     etp: int | None = None
@@ -40,6 +41,10 @@ class MegatronLiteEngineConfig(EngineConfig):
 
     def __post_init__(self) -> None:
         super().__post_init__()
+        if self.grad_offload:
+            raise ValueError(
+                "Independent gradient offload is unsupported; use param_offload"
+            )
         if self.strategy != "mlite":
             raise ValueError(
                 f"MegatronLiteEngineConfig expects strategy='mlite', got {self.strategy!r}"

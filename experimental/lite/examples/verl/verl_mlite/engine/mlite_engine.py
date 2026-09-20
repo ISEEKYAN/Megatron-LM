@@ -99,8 +99,10 @@ class _MegatronLiteLRScheduler:
         wd_incr_style: str,
         wsd_decay_steps: int | None,
         lr_wsd_decay_style: str,
+        group_policy=None,
     ):
         self.optimizer = optimizer
+        self.group_policy = group_policy
         self.init_lr = init_lr
         self.max_lr = max_lr
         self.min_lr = min_lr
@@ -133,10 +135,11 @@ class _MegatronLiteLRScheduler:
     def _apply(self) -> None:
         lr = self._get_lr()
         wd = self._get_wd()
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            policy = None if self.group_policy is None else self.group_policy[index]
+            param_group["lr"] = lr if policy is None else lr * policy[0]
             if param_group.get("weight_decay", None) is not None:
-                param_group["weight_decay"] = wd
+                param_group["weight_decay"] = wd if policy is None else policy[1]
 
     def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
@@ -190,7 +193,9 @@ class _MegatronLiteLRScheduler:
         raise ValueError(f"Unsupported scheduler decay style: {style!r}")
 
 
-def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
+def _build_lr_scheduler(
+    optimizer, opt: MegatronLiteOptimizerConfig, *, preserve_group_policy=False
+):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
@@ -207,6 +212,15 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         if param_group.get("min_lr") is None:
             param_group["min_lr"] = min_lr
 
+    group_policy = None
+    if preserve_group_policy:
+        if opt.lr <= 0 or opt.weight_decay_incr_style != "constant":
+            raise ValueError(
+                "Model-owned optimizer policy requires positive base LR and constant decay"
+            )
+        group_policy = [
+            (g["lr"] / opt.lr, g.get("weight_decay")) for g in optimizer.param_groups
+        ]
     return _MegatronLiteLRScheduler(
         optimizer,
         init_lr=opt.lr_warmup_init,
@@ -221,6 +235,7 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         wd_incr_style=opt.weight_decay_incr_style,
         wsd_decay_steps=opt.lr_wsd_decay_steps,
         lr_wsd_decay_style=opt.lr_wsd_decay_style,
+        group_policy=group_policy,
     )
 
 
@@ -270,6 +285,7 @@ class MegatronLiteEngine(BaseEngine):
         self.device_name = get_device_name()
         self.runtime = None
         self.handle = None
+        self._optimizer_step_succeeded = True
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
@@ -325,13 +341,16 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
-        _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        self._optimizer_step_succeeded, grad_norm, _ = self.runtime.optimizer_step(
+            self.handle
+        )
         return grad_norm
 
     def lr_scheduler_step(self):
         self._require_initialized()
         if self.handle._lr_scheduler is not None:
-            self.handle._lr_scheduler.step(1)
+            if self._optimizer_step_succeeded:
+                self.handle._lr_scheduler.step(1)
             return self.handle._optimizer.param_groups[0]["lr"]
         return 0.0
 

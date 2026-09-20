@@ -305,3 +305,54 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+def test_nonfinite_update_does_not_advance_lr_scheduler():
+    engine = _engine(engine_config=_engine_config())
+    scheduler = SimpleNamespace(num_steps=0)
+
+    def step(_):
+        scheduler.num_steps += 1
+
+    scheduler.step = step
+    engine.handle = SimpleNamespace(
+        _optimizer=SimpleNamespace(param_groups=[{"lr": 0.01}]), _lr_scheduler=scheduler
+    )
+    engine.runtime = SimpleNamespace(optimizer_step=lambda _: (False, float("nan"), 0))
+    engine.optimizer_step()
+    assert engine.lr_scheduler_step() == 0.01
+    assert scheduler.num_steps == 0
+    engine.runtime.optimizer_step = lambda _: (True, 1.0, 0)
+    engine.optimizer_step()
+    engine.lr_scheduler_step()
+    assert scheduler.num_steps == 1
+
+
+def test_model_owned_scheduler_preserves_group_rates_and_decay():
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+    from verl_mlite.engine.mlite_engine import _build_lr_scheduler
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"lr": 0.01, "weight_decay": 0.0},
+            {"lr": 0.05, "weight_decay": 0.1},
+        ]
+    )
+    config = OptimizerConfig(lr=0.01, total_training_steps=8, lr_decay_style="constant")
+    scheduler = _build_lr_scheduler(optimizer, config, preserve_group_policy=True)
+    scheduler.step()
+    assert [g["lr"] for g in optimizer.param_groups] == [0.01, 0.05]
+    assert [g["weight_decay"] for g in optimizer.param_groups] == [0.0, 0.1]
+
+
+def test_shipped_engine_yaml_instantiates_with_current_verl():
+    from hydra.utils import instantiate
+    from omegaconf import OmegaConf
+
+    config = instantiate(
+        OmegaConf.load(VERL_EXAMPLE_ROOT / "verl_mlite/config/engine/mlite.yaml")
+    )
+    assert config.strategy == "mlite"
+    assert config.grad_offload is False
+    with pytest.raises(ValueError, match="Independent gradient offload"):
+        _engine_config(grad_offload=True)

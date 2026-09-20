@@ -72,10 +72,16 @@ def _register_opaque_hf_config() -> bool:
 
     from transformers import AutoConfig, PretrainedConfig
 
+    def init(self, **kwargs):
+        text_config = kwargs.get("text_config")
+        if isinstance(text_config, dict):
+            kwargs["text_config"] = PretrainedConfig(**text_config)
+        PretrainedConfig.__init__(self, **kwargs)
+
     config_cls = type(
         "MLiteOpaqueConfig",
         (PretrainedConfig,),
-        {"model_type": model_type},
+        {"model_type": model_type, "__init__": init},
     )
     try:
         AutoConfig.register(model_type, config_cls)
