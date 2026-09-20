@@ -288,6 +288,7 @@ def _resync_rows_worker(rank, rendezvous, output, trainable):
 @pytest.mark.parametrize('trainable', [False, True])
 def test_resync_real_two_rank_rows_and_second_generation(tmp_path, trainable):
     import json
+
     import torch.multiprocessing as mp
 
     mp.spawn(
