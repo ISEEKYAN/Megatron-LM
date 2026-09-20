@@ -317,7 +317,11 @@ class MegatronLiteEngine(BaseEngine):
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
-                self.handle._optimizer, self._mlite_config.optimizer
+                self.handle._optimizer,
+                self._mlite_config.optimizer,
+                preserve_group_policy=getattr(
+                    self.handle._optimizer, "owns_param_group_policy", False
+                ),
             )
 
         self.to(

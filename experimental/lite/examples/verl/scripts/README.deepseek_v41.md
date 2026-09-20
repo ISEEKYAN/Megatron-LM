@@ -1,7 +1,8 @@
 # DeepSeek V4.1 SFT through verl
 
 Requires a checkout with the `deepseek_v41` MLite registry and protocol installed
-(the model implementation is delivered separately). This preset configures verl's existing
+(the model implementation is delivered separately), with its optimizer declaring
+`owns_param_group_policy=True`. Older producers retain legacy scheduling. This preset configures verl's existing
 `SFTTrainer` and MLite engine extension with the model-owned Muon optimizer.
 It adds no engine capability; `++engine.impl_cfg.optimizer=muon` uses the
 existing generic override path. Scheduler/config fixes are shared connector fixes.
@@ -22,7 +23,8 @@ template. `DRY_RUN=1` prints the resolved launch command without training.
 
 The model retains its per-group learning-rate ratios and weight decay under the
 shared scheduler; rejected optimizer updates do not advance that scheduler.
-The model-owned policy currently requires constant weight decay. Residual dtype,
+The model-owned policy requires positive base LR and constant weight decay.
+Use `LR` to set both recipe LR fields; overriding only one field is not the recipe. Residual dtype,
 quantization, and model options can be supplied as Hydra overrides after the
 script name, for example `+engine.impl_cfg.quantized=False`.
 

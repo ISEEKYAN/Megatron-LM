@@ -356,3 +356,50 @@ def test_shipped_engine_yaml_instantiates_with_current_verl():
     assert config.grad_offload is False
     with pytest.raises(ValueError, match="Independent gradient offload"):
         _engine_config(grad_offload=True)
+
+
+@pytest.mark.parametrize("optimizer_name", ["muon", "another_optimizer"])
+@pytest.mark.parametrize("owns_policy", [False, True])
+def test_initialize_consumes_group_ownership_not_optimizer_name(
+    monkeypatch, optimizer_name, owns_policy
+):
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+    from verl_mlite.engine import mlite_engine
+
+    params = [torch.nn.Parameter(torch.ones(())) for _ in range(2)]
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [params[0]], "lr": 0.01, "weight_decay": 0.0},
+            {"params": [params[1]], "lr": 0.05, "weight_decay": 0.1},
+        ]
+    )
+    optimizer.owns_param_group_policy = owns_policy
+    config = _optimizer_config()
+    config.lr, config.total_training_steps, config.lr_warmup_steps = 0.01, 8, 2
+    engine = _engine(
+        engine_config=_engine_config(impl_cfg={"optimizer": optimizer_name}),
+        optimizer_config=config,
+    )
+    handle = ModelHandle(model=torch.nn.Linear(1, 1), optimizer=optimizer)
+    monkeypatch.setattr(
+        mlite_engine,
+        "create_runtime",
+        lambda _: SimpleNamespace(build_model=lambda: handle),
+    )
+    monkeypatch.setattr(engine, "to", lambda **_: None)
+    engine.initialize()
+    scheduler = handle._lr_scheduler
+    assert [g["lr"] for g in optimizer.param_groups] == [0.0, 0.0]
+    scheduler.step()
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(
+        [0.005, 0.025] if owns_policy else [0.005, 0.005]
+    )
+    assert [g["weight_decay"] for g in optimizer.param_groups] == (
+        [0.0, 0.1] if owns_policy else [0.1, 0.1]
+    )
+    state = scheduler.state_dict()
+    scheduler.step()
+    scheduler.load_state_dict(state)
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(
+        [0.005, 0.025] if owns_policy else [0.005, 0.005]
+    )
