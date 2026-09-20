@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import shlex
 import subprocess
 from pathlib import Path
 
@@ -83,3 +84,39 @@ def test_verl_sft_dynamic_cp_acceptance_requires_full_cp_size_coverage(tmp_path)
         "+engine.impl_cfg.runtime_plugins.dynamic_context_parallel.enabled=True"
         in command
     )
+
+
+def test_deepseek_v41_launcher_selects_native_optimizer_and_wandb(tmp_path):
+    env = dict(
+        os.environ,
+        MODEL_PATH="/tmp/mlite-model",
+        TRAIN_FILES="/tmp/train.parquet",
+        OUTPUT_ROOT=str(tmp_path),
+        DRY_RUN="1",
+    )
+    for key in ("NUM_GPUS", "NPROC_PER_NODE", "LR", "MIN_LR"):
+        env.pop(key, None)
+    script = SFT_SCRIPT.with_name("run_deepseek_v41_sft.sh")
+    result = subprocess.run(
+        [str(script)], env=env, text=True, capture_output=True, check=True
+    )
+    for expected in (
+        "engine.model_name=deepseek_v41",
+        "++engine.impl_cfg.optimizer=muon",
+        "engine.optimizer_offload=False",
+        "trainer.total_training_steps=8",
+        "wandb",
+        "coefficient_type:quintic",
+    ):
+        assert expected in result.stdout
+
+    from hydra import compose, initialize
+
+    overrides = [
+        arg
+        for arg in shlex.split(result.stdout)
+        if arg.lstrip("+").startswith("engine.impl_cfg.optimizer=")
+    ]
+    with initialize(version_base=None, config_path=None):
+        config = compose(config_name=None, overrides=overrides)
+    assert config.engine.impl_cfg.optimizer == "muon"
