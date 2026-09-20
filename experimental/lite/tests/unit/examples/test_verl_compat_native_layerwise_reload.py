@@ -17,11 +17,15 @@ from verl_mlite import compat
 pytestmark = pytest.mark.optional
 
 
-def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
+@pytest.mark.parametrize("fail_initialize", [False, True])
+def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch, fail_initialize) -> None:
     events = []
     fp8_utils = ModuleType("verl.utils.vllm.vllm_fp8_utils")
     fp8_utils.prepare_quanted_weights_for_loading = (
-        lambda runner: events.append("legacy-prepare") or False
+        lambda runner: events.append(
+            ("legacy-prepare", reload_meta.SKIP_TENSORS.copy())
+        )
+        or False
     )
     fp8_utils.process_quanted_weights_after_loading = (
         lambda runner, state: events.append(("legacy-process", state))
@@ -36,7 +40,8 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     reload_api = ModuleType("vllm.model_executor.model_loader.reload")
     reload_meta = ModuleType("vllm.model_executor.model_loader.reload.meta")
     rollout_utils = ModuleType("verl.workers.rollout.vllm_rollout.utils")
-    reload_meta.SKIP_TENSORS = {"existing"}
+    reload_meta.SKIP_TENSORS = {"existing", "attn_sink"}
+    original_skip = reload_meta.SKIP_TENSORS
 
     @contextmanager
     def set_current_vllm_config(config):
@@ -47,9 +52,20 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
             events.append(("exit-config", config))
 
     vllm_config.set_current_vllm_config = set_current_vllm_config
-    reload_api.initialize_layerwise_reload = (
-        lambda model: events.append(("initialize", model))
-    )
+
+    def initialize(model):
+        assert reload_meta.SKIP_TENSORS == {
+            "existing",
+            "tid2eid",
+            "expert_bias",
+            "e_score_correction_bias",
+            "attn_sink",
+        }
+        events.append(("initialize", model))
+        if fail_initialize:
+            raise RuntimeError("initialization failed")
+
+    reload_api.initialize_layerwise_reload = initialize
     reload_api.finalize_layerwise_processing = (
         lambda model, config: events.append(("finalize", model, config))
     )
@@ -76,8 +92,19 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     config = SimpleNamespace(model_config=object())
     runner = SimpleNamespace(model=model, vllm_config=config)
     assert compat._patch_verl_dsv4_native_layerwise_reload()
+    if fail_initialize:
+        with pytest.raises(RuntimeError, match="initialization failed"):
+            fp8_utils.prepare_quanted_weights_for_loading(runner)
+        assert reload_meta.SKIP_TENSORS is original_skip
+        assert original_skip == {"existing", "attn_sink"}
+        model.is_ds4 = False
+        assert fp8_utils.prepare_quanted_weights_for_loading(runner) is False
+        assert events[-1] == ("legacy-prepare", {"existing", "attn_sink"})
+        return
     state = fp8_utils.prepare_quanted_weights_for_loading(runner)
     assert state is compat._DSV4_LAYERWISE_RELOAD_STATE
+    assert reload_meta.SKIP_TENSORS is original_skip
+    assert original_skip == {"existing", "attn_sink"}
     source = torch.arange(4)
     assert rollout_utils.load_quanted_weights([("weight", source)], runner) == "loaded"
     assert captured_weights[0][1].data_ptr() != source.data_ptr()
@@ -96,13 +123,10 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
         ("restore-attention", model),
         "empty-device-cache",
     ]
-    assert reload_meta.SKIP_TENSORS == {
-        "existing",
-        "tid2eid",
-        "expert_bias",
-        "e_score_correction_bias",
-        "attn_sink",
-    }
+    model.is_ds4 = False
+    assert fp8_utils.prepare_quanted_weights_for_loading(runner) is False
+    assert events[-1] == ("legacy-prepare", {"existing", "attn_sink"})
+    assert reload_meta.SKIP_TENSORS is original_skip
 
 
 def test_non_ds4_keeps_verl_reload_path(monkeypatch) -> None:

@@ -83,6 +83,7 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
 
 
 class _MegatronLiteLRScheduler:
+
     def __init__(
         self,
         optimizer,
@@ -881,46 +882,32 @@ class MegatronLiteEngine(BaseEngine):
         loss_mask = micro_batch[mask_key]
         input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
-            # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
-            # nested tensor (shape ``[bsz, response_len]``), while ``input_ids`` is
-            # the full ``[prompt; response]`` packed sequence. Returning it as-is
-            # left the packed loss_mask (sum of response lengths) shorter than the
-            # ``input_ids`` seq_lens, so ``_nested_from_packed_tensor`` narrowed a
-            # full-length slice out of a response-only buffer and crashed the
-            # actor-update step. Expand it here to the full sequence the same way
-            # the native Megatron path does (``_build_mtp_loss_mask_nested``):
-            # left-pad each row with prompt zeros and keep the whole valid response
-            # span (response_mask may carry internal zeros for tool outputs).
-            resp_offsets = loss_mask.offsets().tolist()
-            resp_values = loss_mask.values()
-            rows = []
-            for i, total in enumerate(input_lengths):
-                start, end = resp_offsets[i], resp_offsets[i + 1]
-                response_piece = resp_values[start:end]
-                prompt_len = total - (end - start)
-                if prompt_len < 0:
-                    raise ValueError(
-                        f"response loss mask has {end - start} tokens but packed input "
-                        f"sequence has {total} tokens"
-                    )
-                prompt_pad = torch.zeros(
-                    prompt_len, dtype=response_piece.dtype, device=response_piece.device
-                )
-                rows.append(torch.cat([prompt_pad, response_piece], dim=0))
-            return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-
-        rows = []
-        for seq_ids, row_mask in zip(input_ids.unbind(0), loss_mask, strict=True):
-            seq_len = seq_ids.numel()
-            response_tokens = int(row_mask.sum().item())
-            if response_tokens > seq_len:
+            responses = loss_mask.unbind()
+        else:
+            # V0 retains full attention_mask: supervision zeros are not padding.
+            attention = micro_batch.get("attention_mask")
+            if (
+                attention is None
+                or attention.ndim != 2
+                or loss_mask.ndim != 2
+                or attention.shape[1] < loss_mask.shape[1]
+                or attention.sum(-1).tolist() != input_lengths
+            ):
                 raise ValueError(
-                    f"response loss mask has {response_tokens} tokens but packed input sequence has {seq_len} tokens"
+                    "Dense loss mask requires matching full attention_mask"
                 )
-            full_mask = torch.zeros(seq_len, dtype=row_mask.dtype, device=row_mask.device)
-            if response_tokens:
-                full_mask[-response_tokens:] = row_mask[:response_tokens]
-            rows.append(full_mask)
+            valid = attention[:, attention.shape[1] - loss_mask.shape[1] :].bool()
+            responses = [row[keep] for row, keep in zip(loss_mask, valid, strict=True)]
+        rows = []
+        for total, response in zip(input_lengths, responses, strict=True):
+            prompt_len = total - response.numel()
+            if prompt_len < 0:
+                raise ValueError(
+                    f"response loss mask has {response.numel()} tokens but packed input "
+                    f"sequence has {total} tokens"
+                )
+            prompt = response.new_zeros(prompt_len)
+            rows.append(torch.cat([prompt, response]))
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
     @staticmethod
