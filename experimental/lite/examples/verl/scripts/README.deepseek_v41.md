@@ -31,3 +31,18 @@ script name, for example `+engine.impl_cfg.quantized=False`.
 For synthetic reduced models, the fused verl loss kernel requires hidden size
 to be divisible by 128. The engine uses parameter offload to move parameters
 and gradients together; independent `GRAD_OFFLOAD=True` is unsupported.
+
+Validation limits: this example has no `application.verl` →
+`basic.align_e2e_precision` SFT comparison chain; the default eight-update smoke
+is not an e2e precision substitute. The `owns_param_group_policy` validation
+surface is real engine initialization (name × ownership), per-group LR/WD through
+warmup and scheduler reload, and successful/rejected optimizer transactions.
+`router_aux_loss_coef=None` intentionally means `0.0`, matching the RL default.
+
+Opt-in weight fingerprints sample about 1/16 of ordinary tensors (plus selected
+important tensors), at most 256 bytes each; stream SHA equality is not full-byte
+or bitwise equality. Layerwise reload observability is stderr-only; receiver
+fingerprints currently label rank zero. DRY_RUN tests inspect stdout substrings;
+Hydra composition checks configuration, not runtime behavior. Missing opaque
+registration configuration logs `VERL_MLITE_OPAQUE_CONFIG disabled` and returns
+False; existing Transformers registrations still take precedence.
