@@ -64,6 +64,10 @@ class ResyncReceiver:
             )
         if getattr(model_config, 'cpu_offload_gb', 0):
             raise NotImplementedError('DS4.1 resync CPU offload is not supported')
+        if any(getattr(m, 'use_mega_moe', False) for m in model.modules()):
+            raise NotImplementedError(
+                'DS4.1 resync currently requires FusedMoE, not MegaMoE'
+            )
         self.model, self.model_config = model, model_config
         self.rows, self.hooks = {}, []
         self.expected_tables = {

@@ -43,4 +43,4 @@ separate from the exporter staging budget.
 Validation scope is reported in the PR: payloads and scaled row proxies do not
 establish full-size rollout quality. Multi-node, large EP, CUDA graph refit,
 CPU offload, speculative drafting, LoRA, and alternative expert kernels require
-separate validation. The extension rejects drafting and adapter-only sync.
+separate validation. The extension rejects MegaMoE, drafting and adapter-only sync; use a FusedMoE backend.

@@ -4,11 +4,11 @@
 from __future__ import annotations
 
 import importlib
+from types import SimpleNamespace
 
 import pytest
-
+import torch
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
-
 
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
 
@@ -32,19 +32,9 @@ def test_new_hf_save_protocols_delegate_all_arguments(
     )
     chunks, model_cfg, parallel_state = object(), object(), object()
 
-    protocol.save_hf_weights(
-        chunks,
-        "/tmp/hf-save-contract",
-        model_cfg,
-        parallel_state,
-    )
+    protocol.save_hf_weights(chunks, "/tmp/hf-save-contract", model_cfg, parallel_state)
 
-    assert calls == [
-        (
-            (chunks, "/tmp/hf-save-contract", model_cfg, parallel_state),
-            {},
-        )
-    ]
+    assert calls == [((chunks, "/tmp/hf-save-contract", model_cfg, parallel_state), {})]
 
 
 # Engine-side ``save_contents=['hf_model']`` unconditionally forwards
@@ -65,6 +55,7 @@ _ENGINE_EXPORT_KWARGS = {
 def test_registered_protocol_honors_engine_export_kwargs(
     runtime_name: str,
     module_name: str,
+    tmp_path,
     monkeypatch: pytest.MonkeyPatch,
     transformer_engine_import_stub,
 ) -> None:
@@ -77,23 +68,36 @@ def test_registered_protocol_honors_engine_export_kwargs(
         calls.append((args, kwargs))
 
     if runtime_name == "deepseek_v41":
-        monkeypatch.setattr(protocol, "save_model", _record)
-        monkeypatch.setattr(checkpoint, "export_checkpoint", _record)
-        with pytest.raises(
-            NotImplementedError, match="V4.1_HF_SAVE_RESYNC_UNSUPPORTED"
-        ):
-            protocol.save_hf_weights(
-                [object()], "/tmp/hf-save-kwargs", None, None, **_ENGINE_EXPORT_KWARGS
+        from megatron.lite.model.deepseek_v41.lite.resync import decoded_weights
+        from megatron.lite.primitive.ckpt import hf_weights
+
+        tensor = torch.ones(2, dtype=torch.bfloat16)
+
+        def export(model, **kwargs):
+            calls.append((model, kwargs))
+            yield 'embed.weight', tensor
+
+        saved = []
+        monkeypatch.setattr(checkpoint, "export_checkpoint", export)
+        monkeypatch.setattr(
+            hf_weights,
+            "stream_export_to_shards",
+            lambda weights, *args, **kwargs: saved.extend(weights),
+        )
+        model = SimpleNamespace(
+            tensor_bindings={}, config=SimpleNamespace(to_hf_dict=lambda: {})
+        )
+        protocol.save_hf_weights([model], tmp_path, None, None, **_ENGINE_EXPORT_KWARGS)
+        online = list(
+            decoded_weights(
+                protocol.export_hf_weights([model], None, None, **_ENGINE_EXPORT_KWARGS)
             )
-        with pytest.raises(
-            NotImplementedError, match="V4.1_HF_SAVE_RESYNC_UNSUPPORTED"
-        ):
-            list(
-                protocol.export_hf_weights(
-                    [object()], None, None, **_ENGINE_EXPORT_KWARGS
-                )
-            )
-        assert calls == []
+        )
+        assert len(saved) == len(online) == 1
+        assert saved[0][0] == online[0][0] == 'embed.weight'
+        assert torch.equal(saved[0][1], tensor) and torch.equal(online[0][1], tensor)
+        assert len(calls) == 2 and calls[0] == calls[1]
+        assert calls[0][1]['row_chunks'] is True
         return
 
     # kimi_k2 / qwen3_moe use function-local imports of the checkpoint
