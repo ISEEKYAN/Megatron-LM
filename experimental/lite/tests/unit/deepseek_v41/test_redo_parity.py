@@ -173,6 +173,7 @@ def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
     full, _ = bundle
     model = full.chunks[0]
     optimizer = V41Optimizer(model, OptimizerConfig(lr=1e-4, ns_steps=2, coefficient_type='quintic'))
+    assert optimizer.owns_param_group_policy is True
     ids = torch.tensor([[1, 8, 3, 6]], device=model.head.weight.device)
     initial = {n: p.detach().clone() for n, p in model.named_parameters()}
     for _ in range(2):

@@ -203,6 +203,9 @@ class MixedOptimizer:
     owned by the parallel integration rather than silently approximated here.
     """
 
+    # The model's group_builder owns LR ratios and fixed weight decay.
+    owns_param_group_policy = True
+
     def __init__(
         self,
         model,
