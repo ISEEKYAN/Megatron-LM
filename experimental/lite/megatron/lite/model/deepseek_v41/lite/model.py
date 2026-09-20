@@ -212,7 +212,9 @@ class DeepseekV41Model(nn.Module):
             'norm': Rule('weight', 'norm'),
             'head': Rule('weight', 'head'),
             'layers.*.attn.wq_b': Rule('weight', 'wq_b', fp8, t.num_attention_heads),
-            'layers.*.attn.indexer.wq_b': Rule('weight', 'indexer', fp8, t.index_n_heads),
+            'layers.*.attn.indexer.wq_b': Rule(
+                'weight', 'indexer', fp8, t.index_n_heads
+            ),
             'layers.*.attn': Rule('attn_sink', 'attention_sink'),
             'layers.*.ffn.gate': Rule('bias bias_vl', 'router_bias'),
             'layers.*.ffn.gate.router.gate': Rule(

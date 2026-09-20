@@ -87,11 +87,4 @@ def bind_rules(self, rules, extra_rules):
                     parent=path.rsplit('.', 1)[0],
                     grandparent=path.rsplit('.', 2)[0],
                 )
-                self._bind(
-                    name,
-                    owner,
-                    attribute,
-                    role,
-                    head_count,
-                    encoding,
-                )
+                self._bind(name, owner, attribute, role, head_count, encoding)
