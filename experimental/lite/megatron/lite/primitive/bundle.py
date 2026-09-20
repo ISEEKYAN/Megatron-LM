@@ -18,6 +18,13 @@ class ModelBundle:
 
     Returned by protocol.build_model(). Model owns the construction
     of all fields — runtime just consumes them.
+
+    An optimizer may declare ``owns_param_group_policy = True``: its initial
+    per-group LR ratios (relative to the configured base LR) and weight decay
+    belong to the model. A connector scheduler must preserve those ratios and
+    fixed decay, regardless of optimizer name. The base LR must be positive;
+    nonconstant weight-decay scheduling is unsupported for this policy.
+    Missing/False retains the connector's legacy scheduling policy.
     """
 
     chunks: list[nn.Module]

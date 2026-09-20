@@ -111,24 +111,53 @@ def test_full_length_nested_loss_mask_is_unchanged():
     _assert_packs_to_full(packed, input_ids, full_lengths, response_lengths)
 
 
-def test_dense_response_loss_mask_expands_to_full_length():
-    """The dense (V0 left_right_2_no_padding) path stays full-length too."""
-    full_lengths = [206, 130, 40]
-    response_lengths = [78, 30, 20]
-    input_ids = _full_input_ids(full_lengths)
-    max_response = max(response_lengths)
-    dense = torch.zeros(len(response_lengths), max_response, dtype=torch.float32)
-    for i, r in enumerate(response_lengths):
-        dense[i, :r] = torch.ones(r, dtype=torch.float32)
-    micro_batch = _tensor_dict(
-        {"input_ids": input_ids, "loss_mask": dense}, batch_size=[len(full_lengths)]
-    )
+def test_dense_and_nested_masks_match_with_unsupervised_response_tokens():
+    from verl.workers.utils.padding import left_right_2_no_padding
 
-    packed = _loss_mask_for_packing(micro_batch, input_ids)
-    seq_lens = input_ids.offsets().diff().to(torch.int64)
-    assert int(packed.values().numel()) == sum(full_lengths)
-    # Must not overflow when packed against the full seq_lens.
-    _nested_from_packed_tensor(packed.values().contiguous(), seq_lens)
+    full_lengths, response_lengths = [206, 130, 40, 7], [78, 30, 20, 0]
+    width, prompt_width = 206, 128
+    attention = torch.zeros(4, width, dtype=torch.long)
+    dense = torch.zeros(4, width - prompt_width)
+    responses = [_response_mask_row(n) for n in response_lengths]
+    responses[0][-1] = 0  # A real trailing token, not right padding.
+    responses[1].zero_()  # Entirely unsupervised response still has a length.
+    for i, (total, n) in enumerate(zip(full_lengths, response_lengths, strict=True)):
+        attention[i, prompt_width - (total - n) : prompt_width + n] = 1
+        dense[i, :n] = responses[i]
+    batch = left_right_2_no_padding(
+        _tensor_dict(
+            {
+                "input_ids": torch.arange(width).repeat(4, 1),
+                "position_ids": torch.arange(width).repeat(4, 1),
+                "attention_mask": attention,
+                "response_mask": dense,
+            },
+            batch_size=[4],
+        )
+    )
+    packed_dense = _loss_mask_for_packing(batch, batch["input_ids"])
+    batch["loss_mask"] = torch.nested.as_nested_tensor(responses, layout=torch.jagged)
+    packed_nested = _loss_mask_for_packing(batch, batch["input_ids"])
+    assert torch.equal(packed_dense.offsets(), packed_nested.offsets())
+    assert torch.equal(packed_dense.values(), packed_nested.values())
+    for row, total, response in zip(
+        packed_dense.unbind(), full_lengths, responses, strict=True
+    ):
+        assert torch.equal(
+            row, torch.cat([response.new_zeros(total - response.numel()), response])
+        )
+
+
+@pytest.mark.parametrize("attention", [None, torch.ones(1, 6), torch.ones(1, 3)])
+def test_dense_mask_rejects_missing_or_mismatched_attention(attention):
+    ids = _full_input_ids([5])
+    batch = _tensor_dict({"loss_mask": torch.tensor([[1.0, 0.0, 1.0, 0.0]])}, [1])
+    if attention is not None:
+        batch["attention_mask"] = attention
+    with pytest.raises(
+        ValueError, match="Dense loss mask requires matching full attention_mask"
+    ):
+        _loss_mask_for_packing(batch, ids)
 
 
 def test_response_longer_than_input_is_rejected():

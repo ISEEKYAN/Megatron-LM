@@ -67,15 +67,26 @@ def _vllm_importable() -> bool:
 def _register_opaque_hf_config() -> bool:
     """Let VERL preserve config fields for an MLite-owned model type."""
     model_type = os.environ.get("VERL_MLITE_HF_CONFIG_MODEL_TYPE", "").strip()
-    if not model_type or model_type in _REGISTERED_HF_CONFIG_TYPES:
+    if not model_type:
+        sys.stderr.write(
+            "VERL_MLITE_OPAQUE_CONFIG disabled: VERL_MLITE_HF_CONFIG_MODEL_TYPE is unset\n"
+        )
+        return False
+    if model_type in _REGISTERED_HF_CONFIG_TYPES:
         return False
 
     from transformers import AutoConfig, PretrainedConfig
 
+    def init(self, **kwargs):
+        text_config = kwargs.get("text_config")
+        if isinstance(text_config, dict):
+            kwargs["text_config"] = PretrainedConfig(**text_config)
+        PretrainedConfig.__init__(self, **kwargs)
+
     config_cls = type(
         "MLiteOpaqueConfig",
         (PretrainedConfig,),
-        {"model_type": model_type},
+        {"model_type": model_type, "__init__": init},
     )
     try:
         AutoConfig.register(model_type, config_cls)
@@ -804,15 +815,18 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
         from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
         from vllm.model_executor.model_loader.reload.meta import SKIP_TENSORS
 
-        # These DS4 buffers already live in kernel/runtime layout and are
-        # updated directly by VERL's buffer path (or restored below).  Keeping
-        # them out of the meta restore prevents ``copy_`` into a meta buffer
-        # from silently discarding router state between IPC buckets.
-        SKIP_TENSORS.update(
-            {"tid2eid", "expert_bias", "e_score_correction_bias", "attn_sink"}
-        )
-        with set_current_vllm_config(model_runner.vllm_config):
-            initialize_layerwise_reload(model)
+        # Preserve DS4 runtime buffers during meta restore, without leaking to
+        # the next model's reload (including when initialization raises).
+        previous_skip = SKIP_TENSORS.copy()
+        try:
+            SKIP_TENSORS.update(
+                {"tid2eid", "expert_bias", "e_score_correction_bias", "attn_sink"}
+            )
+            with set_current_vllm_config(model_runner.vllm_config):
+                initialize_layerwise_reload(model)
+        finally:
+            SKIP_TENSORS.clear()
+            SKIP_TENSORS.update(previous_skip)
         model._verl_mlite_ds4_layerwise_reload_active = True
         sys.stderr.write(
             "VERL_MLITE_DSV4_LAYERWISE_RELOAD initialized native vLLM reload\n"

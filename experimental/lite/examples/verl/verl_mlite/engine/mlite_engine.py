@@ -83,6 +83,7 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
 
 
 class _MegatronLiteLRScheduler:
+
     def __init__(
         self,
         optimizer,
@@ -99,8 +100,10 @@ class _MegatronLiteLRScheduler:
         wd_incr_style: str,
         wsd_decay_steps: int | None,
         lr_wsd_decay_style: str,
+        group_policy=None,
     ):
         self.optimizer = optimizer
+        self.group_policy = group_policy
         self.init_lr = init_lr
         self.max_lr = max_lr
         self.min_lr = min_lr
@@ -133,10 +136,11 @@ class _MegatronLiteLRScheduler:
     def _apply(self) -> None:
         lr = self._get_lr()
         wd = self._get_wd()
-        for param_group in self.optimizer.param_groups:
-            param_group["lr"] = lr
+        for index, param_group in enumerate(self.optimizer.param_groups):
+            policy = None if self.group_policy is None else self.group_policy[index]
+            param_group["lr"] = lr if policy is None else lr * policy[0]
             if param_group.get("weight_decay", None) is not None:
-                param_group["weight_decay"] = wd
+                param_group["weight_decay"] = wd if policy is None else policy[1]
 
     def _get_lr(self) -> float:
         if self.lr_warmup_steps > 0 and self.num_steps <= self.lr_warmup_steps:
@@ -190,7 +194,9 @@ class _MegatronLiteLRScheduler:
         raise ValueError(f"Unsupported scheduler decay style: {style!r}")
 
 
-def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
+def _build_lr_scheduler(
+    optimizer, opt: MegatronLiteOptimizerConfig, *, preserve_group_policy=False
+):
     """Build a Megatron-style LR scheduler for Megatron Lite's optimizer."""
     total_steps = opt.total_training_steps
     if total_steps <= 0:
@@ -207,6 +213,15 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         if param_group.get("min_lr") is None:
             param_group["min_lr"] = min_lr
 
+    group_policy = None
+    if preserve_group_policy:
+        if opt.lr <= 0 or opt.weight_decay_incr_style != "constant":
+            raise ValueError(
+                "Model-owned optimizer policy requires positive base LR and constant decay"
+            )
+        group_policy = [
+            (g["lr"] / opt.lr, g.get("weight_decay")) for g in optimizer.param_groups
+        ]
     return _MegatronLiteLRScheduler(
         optimizer,
         init_lr=opt.lr_warmup_init,
@@ -221,6 +236,7 @@ def _build_lr_scheduler(optimizer, opt: MegatronLiteOptimizerConfig):
         wd_incr_style=opt.weight_decay_incr_style,
         wsd_decay_steps=opt.lr_wsd_decay_steps,
         lr_wsd_decay_style=opt.lr_wsd_decay_style,
+        group_policy=group_policy,
     )
 
 
@@ -270,6 +286,7 @@ class MegatronLiteEngine(BaseEngine):
         self.device_name = get_device_name()
         self.runtime = None
         self.handle = None
+        self._optimizer_step_succeeded = True
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
@@ -301,7 +318,11 @@ class MegatronLiteEngine(BaseEngine):
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(
-                self.handle._optimizer, self._mlite_config.optimizer
+                self.handle._optimizer,
+                self._mlite_config.optimizer,
+                preserve_group_policy=getattr(
+                    self.handle._optimizer, "owns_param_group_policy", False
+                ),
             )
 
         self.to(
@@ -325,13 +346,16 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
-        _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        self._optimizer_step_succeeded, grad_norm, _ = self.runtime.optimizer_step(
+            self.handle
+        )
         return grad_norm
 
     def lr_scheduler_step(self):
         self._require_initialized()
         if self.handle._lr_scheduler is not None:
-            self.handle._lr_scheduler.step(1)
+            if self._optimizer_step_succeeded:
+                self.handle._lr_scheduler.step(1)
             return self.handle._optimizer.param_groups[0]["lr"]
         return 0.0
 
@@ -858,46 +882,32 @@ class MegatronLiteEngine(BaseEngine):
         loss_mask = micro_batch[mask_key]
         input_lengths = input_ids.offsets().diff().tolist()
         if getattr(loss_mask, "is_nested", False):
-            # VERL delivers ``response_mask`` / ``loss_mask`` as a *response-only*
-            # nested tensor (shape ``[bsz, response_len]``), while ``input_ids`` is
-            # the full ``[prompt; response]`` packed sequence. Returning it as-is
-            # left the packed loss_mask (sum of response lengths) shorter than the
-            # ``input_ids`` seq_lens, so ``_nested_from_packed_tensor`` narrowed a
-            # full-length slice out of a response-only buffer and crashed the
-            # actor-update step. Expand it here to the full sequence the same way
-            # the native Megatron path does (``_build_mtp_loss_mask_nested``):
-            # left-pad each row with prompt zeros and keep the whole valid response
-            # span (response_mask may carry internal zeros for tool outputs).
-            resp_offsets = loss_mask.offsets().tolist()
-            resp_values = loss_mask.values()
-            rows = []
-            for i, total in enumerate(input_lengths):
-                start, end = resp_offsets[i], resp_offsets[i + 1]
-                response_piece = resp_values[start:end]
-                prompt_len = total - (end - start)
-                if prompt_len < 0:
-                    raise ValueError(
-                        f"response loss mask has {end - start} tokens but packed input "
-                        f"sequence has {total} tokens"
-                    )
-                prompt_pad = torch.zeros(
-                    prompt_len, dtype=response_piece.dtype, device=response_piece.device
-                )
-                rows.append(torch.cat([prompt_pad, response_piece], dim=0))
-            return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-
-        rows = []
-        for seq_ids, row_mask in zip(input_ids.unbind(0), loss_mask, strict=True):
-            seq_len = seq_ids.numel()
-            response_tokens = int(row_mask.sum().item())
-            if response_tokens > seq_len:
+            responses = loss_mask.unbind()
+        else:
+            # V0 retains full attention_mask: supervision zeros are not padding.
+            attention = micro_batch.get("attention_mask")
+            if (
+                attention is None
+                or attention.ndim != 2
+                or loss_mask.ndim != 2
+                or attention.shape[1] < loss_mask.shape[1]
+                or attention.sum(-1).tolist() != input_lengths
+            ):
                 raise ValueError(
-                    f"response loss mask has {response_tokens} tokens but packed input sequence has {seq_len} tokens"
+                    "Dense loss mask requires matching full attention_mask"
                 )
-            full_mask = torch.zeros(seq_len, dtype=row_mask.dtype, device=row_mask.device)
-            if response_tokens:
-                full_mask[-response_tokens:] = row_mask[:response_tokens]
-            rows.append(full_mask)
+            valid = attention[:, attention.shape[1] - loss_mask.shape[1] :].bool()
+            responses = [row[keep] for row, keep in zip(loss_mask, valid, strict=True)]
+        rows = []
+        for total, response in zip(input_lengths, responses, strict=True):
+            prompt_len = total - response.numel()
+            if prompt_len < 0:
+                raise ValueError(
+                    f"response loss mask has {response.numel()} tokens but packed input "
+                    f"sequence has {total} tokens"
+                )
+            prompt = response.new_zeros(prompt_len)
+            rows.append(torch.cat([prompt, response]))
         return torch.nested.as_nested_tensor(rows, layout=torch.jagged)
 
     @staticmethod
