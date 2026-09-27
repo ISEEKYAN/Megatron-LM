@@ -61,6 +61,16 @@ def _assert_state_equal(actual, expected) -> None:
         assert actual == expected
 
 
+def test_dcp_expert_key_does_not_depend_on_parameter_representation() -> None:
+    ps = SimpleNamespace(ep_size=32, ep_rank=0)
+    name = "layers.0.mlp.experts.fc1.weight0"
+    parameter = torch.nn.Parameter(torch.zeros(1))
+
+    assert dcp._model_checkpoint_key(
+        "model", name, parameter, ps, default_expert_classifier
+    ) == f"model_ep32_rank0.{name}"
+
+
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
     import os
@@ -100,12 +110,31 @@ def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
             model, None, path[0], config=object(), ps=ps, load_rng=False, load_optimizer=False
         )
         assert torch.equal(model.experts.weight0.to_local(), local)
+        model.experts.weight0 = torch.nn.Parameter(torch.zeros_like(local))
+        dcp.load_training_checkpoint(
+            model,
+            None,
+            path[0],
+            config=object(),
+            ps=ps,
+            get_placements=lambda name: [Replicate(), Shard(0)],
+            load_rng=False,
+            load_optimizer=False,
+        )
+        assert torch.equal(model.experts.weight0, local)
         ps.ep_size = 4
         with pytest.raises(torch.distributed.checkpoint.CheckpointException):
             dcp.load_training_checkpoint(
-                model, None, path[0], config=object(), ps=ps, load_rng=False, load_optimizer=False
+                model,
+                None,
+                path[0],
+                config=object(),
+                ps=ps,
+                get_placements=lambda name: [Replicate(), Shard(0)],
+                load_rng=False,
+                load_optimizer=False,
             )
-        assert torch.equal(model.experts.weight0.to_local(), local)
+        assert torch.equal(model.experts.weight0, local)
     finally:
         if owned_group:
             dist.destroy_process_group()

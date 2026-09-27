@@ -334,10 +334,10 @@ def _is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def _model_checkpoint_key(prefix, name, param, ps, is_expert):
+def _model_checkpoint_key(prefix, name, _param, ps, is_expert):
     # FSDP DTensors describe the DP shard, not the identity of EP-local experts.
     # Include EP size so incompatible topologies cannot silently restore a subset.
-    if ps.ep_size > 1 and is_expert(name) and _is_dtensor_like(param):
+    if ps.ep_size > 1 and is_expert(name):
         prefix = f"{prefix}_ep{ps.ep_size}_rank{ps.ep_rank}"
     return f"{prefix}.{name}"
 
