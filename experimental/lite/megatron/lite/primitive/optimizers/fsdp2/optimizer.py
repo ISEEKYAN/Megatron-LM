@@ -275,6 +275,10 @@ class FSDP2Optimizer:
             if not isinstance(child, (torch.optim.Adam, torch.optim.AdamW)):
                 continue
             for param, state in child.state.items():
+                step = state.get("step")
+                if isinstance(step, torch.Tensor) and step.device.type == "cpu":
+                    # A tiny counter must not retain the entire checkpoint mmap.
+                    state["step"] = step.clone()
                 if not is_dtensor_like(param):
                     continue
                 for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
