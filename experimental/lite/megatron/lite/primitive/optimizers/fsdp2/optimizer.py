@@ -16,9 +16,12 @@ import torch.nn as nn
 from megatron.lite.primitive.optimizers.fsdp2.adamw import (
     all_reduce_grad_,
     build_adamw_optimizer,
+    dtensor_from_local,
     fsdp2_model_param_dtype,
     get_bool_opt,
     has_dtensor_grad_or_param,
+    is_dtensor_like,
+    iter_torch_optimizers,
     local_grad_sq_sum,
 )
 from megatron.lite.primitive.optimizers.fsdp2.grad_clip import (
@@ -266,6 +269,28 @@ class FSDP2Optimizer:
 
     def load_state_dict(self, state_dict: dict[str, Any]) -> None:
         self.optimizer.load_state_dict(state_dict)
+        self._cpu_offloaded_state.clear()
+        # Offloaded checkpoints contain local Adam moments, not DTensors.
+        for child in iter_torch_optimizers(self.optimizer):
+            if not isinstance(child, (torch.optim.Adam, torch.optim.AdamW)):
+                continue
+            for param, state in child.state.items():
+                step = state.get("step")
+                if isinstance(step, torch.Tensor) and step.device.type == "cpu":
+                    # A tiny counter must not retain the entire checkpoint mmap.
+                    state["step"] = step.clone()
+                if not is_dtensor_like(param):
+                    continue
+                for key in ("exp_avg", "exp_avg_sq", "max_exp_avg_sq"):
+                    value = state.get(key)
+                    if isinstance(value, torch.Tensor) and not is_dtensor_like(value):
+                        state[key] = dtensor_from_local(
+                            value,
+                            param.device_mesh,
+                            param.placements,
+                            shape=tuple(param.shape),
+                            stride=tuple(param.stride()),
+                        )
 
     def reload_model_params(self) -> None:
         reload_model_params = getattr(self.optimizer, "reload_model_params", None)

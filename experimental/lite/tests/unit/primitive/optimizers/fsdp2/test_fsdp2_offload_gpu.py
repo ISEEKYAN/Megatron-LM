@@ -159,7 +159,7 @@ def _build_fsdp2_model(dtype: torch.dtype = torch.bfloat16) -> tuple[nn.Module, 
     return wrap_fsdp2(model, ps, config, mesh=mesh), ps
 
 
-def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: float):
+def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: float, use_fp32_master=True):
     return build_fsdp2_adamw(
         [model],
         SimpleNamespace(
@@ -173,7 +173,7 @@ def _build_optimizer(model: nn.Module, ps: ParallelState, *, offload_fraction: f
             offload_fraction=offload_fraction,
         ),
         ps,
-        use_fp32_master=True,
+        use_fp32_master=use_fp32_master,
     )
 
 
@@ -191,6 +191,37 @@ def _optimizer_state_devices(optimizer) -> set[str]:
                 if isinstance(value, torch.Tensor):
                     devices.add(to_local_tensor(value).device.type)
     return devices
+
+
+@pytest.mark.parametrize("use_fp32_master", [False, True])
+def test_offloaded_adam_checkpoint_can_resume_dtensor_step(tmp_path, use_fp32_master):
+    """CPU checkpoint moments must recover the parameter's distributed layout."""
+    model, ps = _build_fsdp2_model()
+    optimizer = _build_optimizer(model, ps, offload_fraction=0.0, use_fp32_master=use_fp32_master)
+    x = torch.ones(4, 8, device="cuda", dtype=torch.bfloat16)
+    model(x).float().sum().backward()
+    assert optimizer.step()[0]
+    optimizer.zero_grad()
+    optimizer.offload_state_to_cpu()
+    path = tmp_path / "optimizer.pt"
+    torch.save(optimizer.state_dict(), path)
+    saved_params = [to_local_tensor(p).detach().clone() for p in model.parameters()]
+    optimizer.load_state_to_device()
+    model(x).float().sum().backward()
+    assert optimizer.step()[0]
+    expected = [to_local_tensor(p).detach().clone() for p in model.parameters()]
+    optimizer.zero_grad()
+    with torch.no_grad():
+        for param, saved in zip(model.parameters(), saved_params):
+            to_local_tensor(param).copy_(saved)
+    resumed = _build_optimizer(model, ps, offload_fraction=0.0, use_fp32_master=use_fp32_master)
+    resumed.load_state_dict(torch.load(path, map_location="cpu", weights_only=False))
+    resumed.offload_state_to_cpu()
+    resumed.load_state_to_device()
+    model(x).float().sum().backward()
+    assert resumed.step()[0]
+    for param, reference in zip(model.parameters(), expected):
+        torch.testing.assert_close(to_local_tensor(param), reference, rtol=0, atol=0)
 
 
 def test_fsdp2_runtime_model_and_optimizer_offload_roundtrip_single_gpu():

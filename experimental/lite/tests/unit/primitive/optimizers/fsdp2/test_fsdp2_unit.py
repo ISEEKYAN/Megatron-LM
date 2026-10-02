@@ -268,6 +268,34 @@ def test_fsdp2_optimizer_offloads_dtensor_state_without_extra_knob(monkeypatch):
     assert not hasattr(optimizer, "optimizer_offload_dtensor_state")
 
 
+@pytest.mark.parametrize("optimizer_cls", [torch.optim.Adam, torch.optim.AdamW])
+def test_fsdp2_load_detaches_mmap_step_without_changing_next_update(tmp_path, optimizer_cls):
+    param = nn.Parameter(torch.tensor([1.0, -2.0]))
+    reference = optimizer_cls([param], lr=0.01)
+    param.grad = torch.tensor([0.25, -0.5])
+    reference.step()
+    path = tmp_path / "optimizer.pt"
+    torch.save(reference.state_dict(), path)
+    saved = torch.load(path, mmap=True, weights_only=True)
+    saved_step = saved["state"][0]["step"]
+
+    restored_param = nn.Parameter(param.detach().clone())
+    restored = optimizer_cls([restored_param], lr=0.01)
+    FSDP2Optimizer(restored, [restored_param]).load_state_dict(saved)
+    step = restored.state[restored_param]["step"]
+    torch.testing.assert_close(step, saved_step, rtol=0, atol=0)
+    assert step.data_ptr() != saved_step.data_ptr()  # Must not pin the whole mmap.
+
+    param.grad = torch.tensor([-0.125, 0.375])
+    restored_param.grad = param.grad.clone()
+    reference.step()
+    restored.step()
+    torch.testing.assert_close(restored_param, param, rtol=0, atol=0)
+    for key, value in reference.state[param].items():
+        torch.testing.assert_close(restored.state[restored_param][key], value, rtol=0, atol=0)
+    assert saved_step.item() == 1
+
+
 def test_fsdp2_shard_placement_prefers_first_divisible_dimension():
     placement_for_two = build_fsdp2_shard_placement_fn(2)
     placement_for_three = build_fsdp2_shard_placement_fn(3)
