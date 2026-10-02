@@ -704,8 +704,13 @@ class MegatronLiteEngine(BaseEngine):
             if dist.is_initialized():
                 dist.barrier()
         finally:
-            if reload_params_for_load:
-                self.to(device="cpu", model=True, optimizer=False, grad=False)
+            if reload_params_for_load or self.is_optimizer_offload_enabled:
+                self.to(
+                    device="cpu",
+                    model=reload_params_for_load,
+                    optimizer=self.is_optimizer_offload_enabled,
+                    grad=False,
+                )
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:
