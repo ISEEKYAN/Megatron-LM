@@ -101,13 +101,16 @@ def test_optimizer_checkpoint_load_uses_mmap(monkeypatch, tmp_path) -> None:
     assert load_kwargs["mmap"] is True
 
 
-def test_dcp_local_stage_publishes_completed_shard(tmp_path) -> None:
+@pytest.mark.parametrize("writer_closes_stream", [False, True])
+def test_dcp_local_stage_publishes_completed_shard(tmp_path, writer_closes_stream) -> None:
     stage_root = tmp_path / "stage"
     destination = tmp_path / "checkpoint" / "__0_0.distcp"
     filesystem = dcp._NodeLocalStagingFileSystem(stage_root)
 
     with filesystem.create_stream(str(destination), "wb") as stream:
         stream.write(b"checkpoint bytes")
+        if writer_closes_stream:
+            stream.close()
 
     assert destination.read_bytes() == b"checkpoint bytes"
     assert not list(stage_root.rglob("*.stage"))
