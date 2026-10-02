@@ -61,6 +61,75 @@ def _assert_state_equal(actual, expected) -> None:
         assert actual == expected
 
 
+@pytest.mark.parametrize("device", ["cpu", "cuda"])
+def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
+    import os
+
+    import torch.distributed as dist
+    from torch.distributed.device_mesh import init_device_mesh
+    from torch.distributed.tensor import DTensor
+
+    world = int(os.environ.get("WORLD_SIZE", "1"))
+    if world not in (2, 4):
+        pytest.skip("Run with torchrun using 2 or 4 ranks")
+    if device == "cuda":
+        if not torch.cuda.is_available():
+            pytest.skip("CUDA required")
+        torch.cuda.set_device(int(os.environ["LOCAL_RANK"]))
+    owned_group = not dist.is_initialized()
+    if owned_group:
+        dist.init_process_group("nccl" if device == "cuda" else "gloo")
+    try:
+        rank = dist.get_rank()
+        dp = world // 2
+        mesh = init_device_mesh(device, (2, dp), mesh_dim_names=("ep", "dp"))
+        model = torch.nn.Module()
+        model.experts = torch.nn.Module()
+        local = torch.full((2, 4), float(rank + 1), device=device)
+        model.experts.weight0 = torch.nn.Parameter(DTensor.from_local(local.clone(), mesh["dp"], [Shard(0)]))
+        ps = SimpleNamespace(pp_size=1, pp_rank=0, ep_size=2, ep_rank=rank // dp)
+        monkeypatch.setattr(dcp, "_build_meshes", lambda config: (mesh, mesh))
+        path = [str(tmp_path) if rank == 0 else None]
+        dist.broadcast_object_list(path)
+        dcp.save_training_checkpoint(
+            model, None, 1, path[0], config=object(), ps=ps, save_rng=False, save_optimizer=False
+        )
+        with torch.no_grad():
+            model.experts.weight0.to_local().zero_()
+        dcp.load_training_checkpoint(
+            model, None, path[0], config=object(), ps=ps, load_rng=False, load_optimizer=False
+        )
+        assert torch.equal(model.experts.weight0.to_local(), local)
+        model.experts.weight0 = torch.nn.Parameter(torch.zeros_like(local))
+        dcp.load_training_checkpoint(
+            model,
+            None,
+            path[0],
+            config=object(),
+            ps=ps,
+            get_placements=lambda name: [Replicate(), Shard(0)],
+            load_rng=False,
+            load_optimizer=False,
+        )
+        assert torch.equal(model.experts.weight0, local)
+        ps.ep_size = 4
+        with pytest.raises(torch.distributed.checkpoint.CheckpointException):
+            dcp.load_training_checkpoint(
+                model,
+                None,
+                path[0],
+                config=object(),
+                ps=ps,
+                get_placements=lambda name: [Replicate(), Shard(0)],
+                load_rng=False,
+                load_optimizer=False,
+            )
+        assert torch.equal(model.experts.weight0, local)
+    finally:
+        if owned_group:
+            dist.destroy_process_group()
+
+
 def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
     model = torch.nn.Linear(4, 2)
     optimizer = torch.optim.AdamW(model.parameters(), lr=0.01)

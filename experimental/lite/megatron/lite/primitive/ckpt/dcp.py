@@ -91,7 +91,8 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _dcp_tensor_from_param(param, mesh, placements)
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
+            state_dict[key] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
     os.makedirs(ckpt_path, exist_ok=True)
@@ -160,15 +161,14 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            state_dict[f"{model_prefix}.{name}"] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
-            )
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
+            state_dict[key] = _empty_dcp_tensor_like_param(param, mesh, placements)
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
         for name, param in model.named_parameters():
-            key = f"{model_prefix}.{name}"
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():
@@ -330,6 +330,14 @@ def _is_dtensor_like(tensor: Any) -> bool:
         and hasattr(tensor, "device_mesh")
         and hasattr(tensor, "placements")
     )
+
+
+def _model_checkpoint_key(prefix, name, ps, is_expert):
+    # FSDP DTensors describe the DP shard, not the identity of EP-local experts.
+    # Include EP size so incompatible topologies cannot silently restore a subset.
+    if ps.ep_size > 1 and is_expert(name):
+        prefix = f"{prefix}_ep{ps.ep_size}_rank{ps.ep_rank}"
+    return f"{prefix}.{name}"
 
 
 def _dcp_tensor_from_param(param: torch.Tensor, mesh: DeviceMesh, placements: list) -> DTensor:
