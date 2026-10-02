@@ -52,8 +52,6 @@ class NodeLocalStagingFileSystem(FileSystem):
         try:
             with stage_path.open("wb", buffering=0) as stream:
                 yield stream
-                stream.flush()
-                os.fsync(stream.fileno())
             publish_staged_file(stage_path, destination)
         finally:
             stage_path.unlink(missing_ok=True)
