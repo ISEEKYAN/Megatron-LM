@@ -91,7 +91,7 @@ def save_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            key = _model_checkpoint_key(model_prefix, name, param, ps, is_expert)
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
             state_dict[key] = _dcp_tensor_from_param(param, mesh, placements)
 
     ckpt_path = os.path.join(path, f"step_{step}")
@@ -161,16 +161,14 @@ def load_training_checkpoint(
         for name, param in model.named_parameters():
             placements = get_placements(name)
             mesh = expert_mesh if is_expert(name) else dense_mesh
-            key = _model_checkpoint_key(model_prefix, name, param, ps, is_expert)
-            state_dict[key] = _empty_dcp_tensor_like_param(
-                param, mesh, placements
-            )
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
+            state_dict[key] = _empty_dcp_tensor_like_param(param, mesh, placements)
 
     dcp.load(state_dict, checkpoint_id=ckpt_path)
 
     if load_model:
         for name, param in model.named_parameters():
-            key = _model_checkpoint_key(model_prefix, name, param, ps, is_expert)
+            key = _model_checkpoint_key(model_prefix, name, ps, is_expert)
             if key in state_dict:
                 t = state_dict[key]
                 with torch.no_grad():
@@ -334,7 +332,7 @@ def _is_dtensor_like(tensor: Any) -> bool:
     )
 
 
-def _model_checkpoint_key(prefix, name, _param, ps, is_expert):
+def _model_checkpoint_key(prefix, name, ps, is_expert):
     # FSDP DTensors describe the DP shard, not the identity of EP-local experts.
     # Include EP size so incompatible topologies cannot silently restore a subset.
     if ps.ep_size > 1 and is_expert(name):

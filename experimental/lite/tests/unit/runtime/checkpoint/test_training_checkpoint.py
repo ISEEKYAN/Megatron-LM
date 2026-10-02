@@ -61,16 +61,6 @@ def _assert_state_equal(actual, expected) -> None:
         assert actual == expected
 
 
-def test_dcp_expert_key_does_not_depend_on_parameter_representation() -> None:
-    ps = SimpleNamespace(ep_size=32, ep_rank=0)
-    name = "layers.0.mlp.experts.fc1.weight0"
-    parameter = torch.nn.Parameter(torch.zeros(1))
-
-    assert dcp._model_checkpoint_key(
-        "model", name, parameter, ps, default_expert_classifier
-    ) == f"model_ep32_rank0.{name}"
-
-
 @pytest.mark.parametrize("device", ["cpu", "cuda"])
 def test_dcp_preserves_ep_local_dtensor_experts(monkeypatch, tmp_path, device):
     import os
