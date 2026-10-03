@@ -76,15 +76,15 @@ def test_enabled_experts_run_the_w4a8_primitive_on_master_weights(experts_cls):
     from megatron.lite.primitive.quantization.w4a8_experts import w4a8_expert_mlp
 
     experts = _experts(experts_cls)
-    x, tokens_per_expert, probs = _routed_tokens()
-    default_out = experts(x, tokens_per_expert, probs)
+    x, tokens_per_expert, _ = _routed_tokens()
+    default_out = experts(x, tokens_per_expert)
 
     assert enable_w4a8_experts([experts], _spec()) == 1
-    out = experts(x, tokens_per_expert, probs)
+    out = experts(x, tokens_per_expert)
 
     fc1 = [getattr(experts.fc1, f"weight{i}") for i in range(3)]
     fc2 = [getattr(experts.fc2, f"weight{i}") for i in range(3)]
-    expected = w4a8_expert_mlp(x, fc1, fc2, [4, 0, 9], probs.unsqueeze(-1))
+    expected = w4a8_expert_mlp(x, fc1, fc2, [4, 0, 9])
     assert torch.equal(out, expected)
     assert not torch.equal(out, default_out)
 
@@ -94,8 +94,8 @@ def test_w4a8_experts_train_the_bf16_master_weights(experts_cls):
 
     experts = _experts(experts_cls)
     enable_w4a8_experts([experts], _spec())
-    x, tokens_per_expert, probs = _routed_tokens()
-    experts(x, tokens_per_expert, probs).float().square().sum().backward()
+    x, tokens_per_expert, _ = _routed_tokens()
+    experts(x, tokens_per_expert).float().square().sum().backward()
 
     for index, has_tokens in enumerate((True, False, True)):
         for linear in (experts.fc1, experts.fc2):
@@ -161,6 +161,27 @@ def test_enable_rejects_k_dims_the_a8_groups_cannot_tile(
         enable_w4a8_experts([supported, unsupported], _spec())
     # Rejected at enable time, before any module is switched.
     assert supported.w4a8 is False and unsupported.w4a8 is False
+
+
+def test_enable_rejects_expert_parallelism(experts_cls):
+    from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+
+    supported = _experts(experts_cls)
+    expert_parallel = experts_cls(_CONFIG, ParallelState(ep_size=3))
+
+    with pytest.raises(ValueError, match="EP=3 .* multi-GPU validation"):
+        enable_w4a8_experts([supported, expert_parallel], _spec())
+    assert supported.w4a8 is False and expert_parallel.w4a8 is False
+
+
+def test_w4a8_experts_reject_router_weighted_rows(experts_cls):
+    from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+
+    experts = _experts(experts_cls)
+    enable_w4a8_experts([experts], _spec())
+    x, tokens_per_expert, probs = _routed_tokens()
+    with pytest.raises(ValueError, match="unweighted"):
+        experts(x, tokens_per_expert, probs)
 
 
 def _build(monkeypatch, experts_cls, qat):
@@ -457,18 +478,33 @@ def test_w4a8_moe_layer_matches_vllm_combine_bitwise_qwen3_30b_topk8(
 
     # The expert rows themselves are pinned bit for bit to the rollout's FC2
     # output elsewhere; here they must be unweighted and summed as vLLM does.
-    indices, scores, rows = seen["indices"], seen["scores"], seen["rows"]
-    m_splits = seen["tpe"].tolist()
+    # Expected rows are recomputed from x and the master weights, not taken
+    # from the layer, so rows weighted before the combine cannot match.
+    from megatron.lite.primitive.quantization.w4a8_experts import w4a8_expert_mlp
+
+    indices, scores = seen["indices"], seen["scores"]
+    routed = [
+        (expert, (indices == expert).any(-1).nonzero()[:, 0])  # unfused order
+        for expert in range(config.num_experts)
+    ]
+    row_token = torch.cat([tokens for _, tokens in routed])
+    m_splits = [len(tokens) for _, tokens in routed]
+    weights = [
+        layer.experts._expert_weights(linear)
+        for linear in (layer.experts.fc1, layer.experts.fc2)
+    ]
+    with torch.no_grad():
+        rows = w4a8_expert_mlp(x[row_token], *weights, m_splits)
+    assert m_splits == seen["tpe"].tolist()
+    assert torch.equal(seen["rows"], rows)
+
     rows_tk = torch.empty(
         len(x), indices.shape[1], config.hidden_size, dtype=rows.dtype
     )
-    start = 0
-    for expert, count in enumerate(m_splits):
-        tokens = (indices == expert).any(-1).nonzero()[:, 0]  # unfused order
-        assert len(tokens) == count
-        for row, token in zip(rows[start : start + count], tokens.tolist()):
-            rows_tk[token, indices[token].tolist().index(expert)] = row
-        start += count
+    for (expert, token), row in zip(
+        [(e, t) for e, tokens in routed for t in tokens.tolist()], rows
+    ):
+        rows_tk[token, indices[token].tolist().index(expert)] = row
     expected = _primitive_test_helpers()._vllm_ep_gather(rows_tk, scores)
 
     assert indices.shape[1] == 8
@@ -570,7 +606,7 @@ def test_default_experts_forward_never_imports_w4a8_module():
             "experts(x, torch.tensor([2, 3]), torch.rand(5))",
             f"assert {W4A8_MODULE!r} not in sys.modules",
             "experts.w4a8 = True",
-            "experts(x, torch.tensor([2, 3]), torch.rand(5))",
+            "experts(x, torch.tensor([2, 3]))",
             f"assert {W4A8_MODULE!r} in sys.modules",
         ]
     )

@@ -92,7 +92,9 @@ so there is no observer or cross-rank amax state. The routed experts must
 not use FP8 padding, `moe_act` recompute or expert LoRA; those raise. Hidden and
 per-rank intermediate sizes must be multiples of 128; `build_model` rejects
 other shapes (including an ETP split whose per-rank intermediate size is not a
-multiple of 128) before training starts. Only the Qwen3 MoE protocol wires the
+multiple of 128) before training starts. Expert parallelism (EP>1) is also
+rejected at enable time: the all-to-all return of the unreduced top-k rows has
+not been validated on multiple GPUs yet. Only the Qwen3 MoE protocol wires the
 W4A8 experts; the other protocols reject `activation_bits`.
 
 **Parity with the rollout.** Measured on GB200 against vLLM's own

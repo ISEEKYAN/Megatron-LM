@@ -262,7 +262,6 @@ def w4a8_expert_mlp(
     fc1_weights: Sequence[torch.Tensor],
     fc2_weights: Sequence[torch.Tensor],
     m_splits: Sequence[int],
-    probs: torch.Tensor | None,
     swiglu_limit: float = 0.0,
     *,
     backend: str | None = None,
@@ -270,9 +269,9 @@ def w4a8_expert_mlp(
     """Routed-expert MLP in the rollout's W4A8 order of operations.
 
     FC1 (``[gate, up]`` halves) -> SwiGLU computed in float32 and rounded once
-    to BF16 -> FC2 -> multiply by the router probability in float32. With
-    ``swiglu_limit > 0`` the gate is clamped from above and ``up`` symmetrically
-    before the activation, as in the rollout kernel.
+    to BF16 -> FC2. The rows are unweighted; the router weights are applied by
+    :func:`topk_fma_combine`. With ``swiglu_limit > 0`` the gate is clamped from
+    above and ``up`` symmetrically before the activation, as in the rollout kernel.
     """
     fc1_out = w4a8_grouped_gemm(x, fc1_weights, m_splits, backend=backend)
     gate, up = fc1_out.float().chunk(2, dim=-1)
@@ -280,10 +279,7 @@ def w4a8_expert_mlp(
         gate = gate.clamp(max=swiglu_limit)
         up = up.clamp(-swiglu_limit, swiglu_limit)
     hidden = (torch.nn.functional.silu(gate) * up).to(fc1_out.dtype)
-    out = w4a8_grouped_gemm(hidden, fc2_weights, m_splits, backend=backend)
-    if probs is not None:
-        out = (out.float() * probs.float()).to(out.dtype)
-    return out
+    return w4a8_grouped_gemm(hidden, fc2_weights, m_splits, backend=backend)
 
 
 def _fma_f32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:

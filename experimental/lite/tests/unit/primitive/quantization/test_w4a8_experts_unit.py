@@ -10,6 +10,7 @@ generic kernels), compared byte for byte.
 from __future__ import annotations
 
 import importlib.util
+import inspect
 import math
 import subprocess
 import sys
@@ -291,21 +292,16 @@ def test_expert_mlp_follows_rollout_operation_order():
     x = torch.randn(9, 128).to(torch.bfloat16)
     fc1 = [(torch.randn(256, 128) * 0.1).to(torch.bfloat16) for _ in m_splits]
     fc2 = [(torch.randn(128, 128) * 0.1).to(torch.bfloat16) for _ in m_splits]
-    probs = torch.rand(9, 1)
 
-    out = w4a8_expert_mlp(x, fc1, fc2, m_splits, probs, backend="reference")
+    out = w4a8_expert_mlp(x, fc1, fc2, m_splits, backend="reference")
 
     fc1_out = w4a8_grouped_gemm(x, fc1, m_splits, backend="reference")
     gate, up = fc1_out.float().chunk(2, dim=-1)
     hidden = (torch.nn.functional.silu(gate) * up).to(torch.bfloat16)
-    fc2_out = w4a8_grouped_gemm(hidden, fc2, m_splits, backend="reference")
-    expected = (fc2_out.float() * probs).to(torch.bfloat16)
+    expected = w4a8_grouped_gemm(hidden, fc2, m_splits, backend="reference")
     assert torch.equal(out, expected)
-
-    # Applying the router weight before FC2 (the BF16 path) is a different contract.
-    weighted_hidden = (torch.nn.functional.silu(gate) * up * probs).to(torch.bfloat16)
-    probs_first = w4a8_grouped_gemm(weighted_hidden, fc2, m_splits, backend="reference")
-    assert not torch.equal(out, probs_first)
+    # The rows are unweighted: the router weight is applied by topk_fma_combine.
+    assert "probs" not in inspect.signature(w4a8_expert_mlp).parameters
 
 
 def test_expert_mlp_swiglu_limit_clamps_gate_and_up():
@@ -313,7 +309,7 @@ def test_expert_mlp_swiglu_limit_clamps_gate_and_up():
     x = (torch.randn(4, 128) * 4).to(torch.bfloat16)
     fc1 = [torch.randn(256, 128).to(torch.bfloat16)]
     fc2 = [(torch.randn(128, 128) * 0.1).to(torch.bfloat16)]
-    limited = w4a8_expert_mlp(x, fc1, fc2, [4], None, 1.0, backend="reference")
+    limited = w4a8_expert_mlp(x, fc1, fc2, [4], 1.0, backend="reference")
 
     gate, up = w4a8_grouped_gemm(x, fc1, [4], backend="reference").float().chunk(2, -1)
     hidden = (torch.nn.functional.silu(gate.clamp(max=1.0)) * up.clamp(-1.0, 1.0)).to(
@@ -321,18 +317,17 @@ def test_expert_mlp_swiglu_limit_clamps_gate_and_up():
     )
     expected = w4a8_grouped_gemm(hidden, fc2, [4], backend="reference")
     assert torch.equal(limited, expected)
-    assert not torch.equal(limited, w4a8_expert_mlp(x, fc1, fc2, [4], None))
+    assert not torch.equal(limited, w4a8_expert_mlp(x, fc1, fc2, [4]))
 
 
-def test_expert_mlp_gradients_reach_input_weights_and_probs():
+def test_expert_mlp_gradients_reach_input_and_weights():
     torch.manual_seed(7)
     x = torch.randn(6, 128).to(torch.bfloat16).requires_grad_()
     fc1 = [(torch.randn(256, 128) * 0.1).to(torch.bfloat16).requires_grad_()]
     fc2 = [(torch.randn(128, 128) * 0.1).to(torch.bfloat16).requires_grad_()]
-    probs = torch.rand(6, 1, requires_grad=True)
-    w4a8_expert_mlp(x, fc1, fc2, [6], probs).float().square().sum().backward()
+    w4a8_expert_mlp(x, fc1, fc2, [6]).float().square().sum().backward()
 
-    for tensor in (x, fc1[0], fc2[0], probs):
+    for tensor in (x, fc1[0], fc2[0]):
         assert tensor.grad is not None and torch.count_nonzero(tensor.grad) > 0
 
 
@@ -517,7 +512,7 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
     row_expert = torch.repeat_interleave(
         torch.arange(experts, device="cuda"), routed.sum(0)
     )
-    rows = w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits, None)
+    rows = w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits)
     training = topk_fma_combine(
         rows, row_token, row_expert, topk_ids.long(), topk_weights
     )

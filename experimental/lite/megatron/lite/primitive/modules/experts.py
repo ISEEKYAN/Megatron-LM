@@ -81,6 +81,7 @@ class Experts(nn.Module):
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
+        self.ep_size = ps.ep_size
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
@@ -186,12 +187,16 @@ class Experts(nn.Module):
                     w4a8_expert_mlp,
                 )
 
+                # The router weights are applied in the caller's top-k combine.
+                if probs is not None:
+                    raise ValueError(
+                        "W4A8 experts return unweighted rows; pass probs=None."
+                    )
                 out = w4a8_expert_mlp(
                     x,
                     self._expert_weights(self.fc1),
                     self._expert_weights(self.fc2),
                     m_splits,
-                    probs,
                     self.swiglu_limit,
                 )
             elif self.moe_act_recompute and probs is not None:
@@ -272,6 +277,13 @@ def enable_w4a8_experts(chunks, spec) -> int:
                 )
             if module.fc1_lora is not None or module.fc2_lora is not None:
                 raise ValueError(f"{name}: W4A8 experts cannot be combined with LoRA.")
+            # The EP all-to-all return of the unreduced top-k rows has no
+            # multi-GPU parity evidence yet.
+            if module.ep_size > 1:
+                raise ValueError(
+                    f"{name}: W4A8 experts are not supported with EP={module.ep_size} "
+                    "until the expert-parallel combine has multi-GPU validation; use EP=1."
+                )
             # K of each GEMM is the weight's input dim on this rank (FC2's is the
             # ETP-sharded intermediate size).
             for label, linear in (("FC1", module.fc1), ("FC2", module.fc2)):
