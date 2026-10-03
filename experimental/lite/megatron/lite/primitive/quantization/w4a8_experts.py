@@ -29,6 +29,7 @@ scale rule satisfies ``amax / scale <= 6`` by construction.
 
 from __future__ import annotations
 
+import importlib
 from collections.abc import Sequence
 
 import torch
@@ -112,14 +113,49 @@ def _reference_gemm(x_codes, x_scale, w_codes, w_scale, m_splits) -> torch.Tenso
     return out.to(torch.bfloat16)
 
 
+_DEEP_GEMM_MODULES = ("deep_gemm", "vllm.third_party.deep_gemm")
+
+
+def _import_deep_gemm():
+    """Resolve DeepGEMM in vLLM's order: an installed ``deep_gemm``, then the
+    copy vendored in the vLLM wheel. Both are the same kernel library; nothing
+    else is accepted."""
+    for name in _DEEP_GEMM_MODULES:
+        try:
+            return importlib.import_module(name)
+        except ImportError:
+            continue
+    raise RuntimeError(
+        "W4A8 experts on CUDA require DeepGEMM (m_grouped_fp8_fp4_gemm_nt_contiguous) "
+        f"from one of {_DEEP_GEMM_MODULES}; refusing to fall back to a different GEMM."
+    )
+
+
+def _deep_gemm_weight_scales(deep_gemm, w_scale: torch.Tensor, k: int) -> torch.Tensor:
+    """MXFP4 E8M0 scales ``[E, N, K // 32]`` in the layout the rollout hands DeepGEMM.
+
+    Same steps as vLLM's MXFP4 weight loading for this backend
+    (``deepgemm_post_process_weight_scale_block``): the exponent byte goes into
+    the float32 exponent field (byte 0 becomes 0.0, not the denormal 2^-127 that
+    ``float8_e8m0fnu.float()`` gives), then DeepGEMM packs it into int32 UE8M0.
+    The CPU reference and the backward still dequantize byte 0 as 2^-127; that
+    only matters for nonzero codes under byte 0 (|w| below ~3.5e-38), which
+    the MXFP4 scale rule produces only for blocks that are entirely zero.
+    """
+    sf = (w_scale.view(torch.uint8).to(torch.int32) << 23).view(torch.float32)
+    return deep_gemm.transform_sf_into_required_layout(
+        sf=sf,
+        mn=w_scale.shape[1],
+        k=k,
+        recipe=(1, 1, MXFP4_BLOCK_SIZE),
+        num_groups=w_scale.shape[0],
+        is_sfa=False,
+        disable_ue8m0_cast=False,
+    )
+
+
 def _deep_gemm_grouped(x_codes, x_scale, w_codes, w_scale, m_splits) -> torch.Tensor:
-    try:
-        import deep_gemm  # pyright: ignore[reportMissingImports]
-    except ImportError as exc:
-        raise RuntimeError(
-            "W4A8 experts on CUDA require DeepGEMM (m_grouped_fp8_fp4_gemm_nt_contiguous); "
-            "refusing to fall back to a different GEMM."
-        ) from exc
+    deep_gemm = _import_deep_gemm()
     alignment = deep_gemm.get_mk_alignment_for_contiguous_layout()
     device = x_codes.device
     real_rows, layout, padded = [], [], 0
@@ -143,7 +179,7 @@ def _deep_gemm_grouped(x_codes, x_scale, w_codes, w_scale, m_splits) -> torch.Te
     out = torch.empty((padded, w_codes.shape[1]), dtype=torch.bfloat16, device=device)
     deep_gemm.m_grouped_fp8_fp4_gemm_nt_contiguous(
         (a_codes.view(torch.float8_e4m3fn), a_scale),
-        (w_codes, w_scale.float()),
+        (w_codes, _deep_gemm_weight_scales(deep_gemm, w_scale, x_codes.shape[1])),
         out,
         grouped_layout,
         recipe_a=(1, FP8_ACT_GROUP_SIZE),

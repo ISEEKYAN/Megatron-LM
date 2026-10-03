@@ -14,6 +14,7 @@ import math
 import subprocess
 import sys
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -257,12 +258,27 @@ def test_grouped_gemm_validates_inputs():
         w4a8_grouped_gemm(x, weights, m_splits, backend="bf16")
 
 
-def test_deep_gemm_backend_fails_closed_without_kernel():
-    if importlib.util.find_spec("deep_gemm") is not None:
-        pytest.skip("DeepGEMM is installed; the fail-closed path is not reachable")
+def test_deep_gemm_backend_fails_closed_without_kernel(monkeypatch):
+    """Both DeepGEMM sources unimportable -> error, never another GEMM.
+
+    The import failure is injected, so this runs whether or not DeepGEMM is
+    installed in the test environment.
+    """
+    from megatron.lite.primitive.quantization import w4a8_experts
+
+    tried = []
+
+    def unavailable(name):
+        tried.append(name)
+        raise ImportError(name)
+
+    monkeypatch.setattr(
+        w4a8_experts, "importlib", SimpleNamespace(import_module=unavailable)
+    )
     x, weights, m_splits = _problem()
     with pytest.raises(RuntimeError, match="require DeepGEMM"):
         w4a8_grouped_gemm(x, weights, m_splits, backend="deep_gemm")
+    assert tried == ["deep_gemm", "vllm.third_party.deep_gemm"]
 
 
 # --- expert MLP ---------------------------------------------------------------
@@ -354,21 +370,133 @@ def test_quantization_package_does_not_import_w4a8_module():
     subprocess.run([sys.executable, "-c", code], cwd=LITE_ROOT, check=True)
 
 
+def _require_deep_gemm():
+    from megatron.lite.primitive.quantization import w4a8_experts
+
+    try:
+        w4a8_experts._import_deep_gemm()
+    except RuntimeError:
+        pytest.skip("DeepGEMM (installed or vLLM-vendored) is not available")
+
+
 @pytest.mark.gpus(1, min_architecture="blackwell")
 def test_deep_gemm_matches_reference_on_identical_operands():
-    """Same quantized operands through DeepGEMM and the reference GEMM.
+    """Same quantized operands through DeepGEMM and the FP32 reference GEMM.
 
-    Operands and scales are bit-identical by construction; only the GEMM
-    accumulation order differs, so the outputs agree to BF16 rounding.
+    Bitwise: E4M3 x E2M1 products carry at most 6 significant bits, so the
+    FP32 partial sums are exact here and the BF16 outputs coincide (measured on
+    GB200 with vLLM 0979892's DeepGEMM). Includes an all-zero MXFP4 block
+    (scale byte 0), which crashed the kernel when passed as a 2^-127 denormal.
     """
-    pytest.importorskip("deep_gemm")
+    _require_deep_gemm()
     x, weights, m_splits = _problem(m_splits=(130, 0, 7, 300), n=256, k=512)
+    weights[0][:, :32] = 0.0
     x, weights = x.cuda(), [w.cuda() for w in weights]
     out = w4a8_grouped_gemm(x, weights, m_splits, backend="deep_gemm")
     ref = w4a8_grouped_gemm(x, weights, m_splits, backend="reference")
 
     assert out.shape == ref.shape and out.dtype == torch.bfloat16
-    torch.testing.assert_close(out, ref, rtol=1.6e-2, atol=1e-2)
+    assert torch.equal(out.cpu(), ref.cpu())
+
+
+@pytest.mark.gpus(1, min_architecture="blackwell")
+def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
+    """Training W4A8 expert MLP vs the rollout's ``DeepGemmFP4Experts.apply``.
+
+    The rollout side is vLLM's own code end to end: A1 quantization as its
+    prepare step does it, MXFP4 weight-scale packing as its weight loading does
+    it, then permute, FC1, fused SiLU+A2 quantization, FC2 and the FP32 top-k
+    gather. With top-k 1 there is no cross-expert sum, so the outputs must be
+    bitwise equal (top-k > 1 differs by the documented BF16 combine).
+    """
+    _require_deep_gemm()
+    vllm_moe = pytest.importorskip(
+        "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe"
+    )
+    from vllm.model_executor.layers.fused_moe.activation import MoEActivation
+    from vllm.model_executor.layers.fused_moe.deep_gemm_utils import (
+        compute_aligned_M_and_alignment,
+    )
+    from vllm.model_executor.layers.fused_moe.oracle.mxfp4 import (
+        _pack_deepgemm_mxfp4_scales,
+    )
+    from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
+    from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
+
+    experts, hidden, inter, tokens = 4, 512, 256, 300
+    torch.manual_seed(9)
+    x = torch.randn(tokens, hidden).to(torch.bfloat16).cuda()
+    fc1 = [
+        (torch.randn(2 * inter, hidden) * 0.05).to(torch.bfloat16).cuda()
+        for _ in range(experts)
+    ]
+    fc2 = [
+        (torch.randn(hidden, inter) * 0.05).to(torch.bfloat16).cuda()
+        for _ in range(experts)
+    ]
+    fc1[3][:, :32] = 0.0
+    topk_ids = torch.tensor([0, 1, 3]).repeat(tokens)[:tokens, None].int().cuda()
+    topk_weights = torch.rand(tokens, 1).cuda()
+
+    # Rollout: vLLM DeepGemmFP4Experts.apply on the same BF16 tensors.
+    packed1 = [quantize_mxfp4(w) for w in fc1]
+    packed2 = [quantize_mxfp4(w) for w in fc2]
+    w1 = torch.stack([codes for codes, _ in packed1])
+    w2 = torch.stack([codes for codes, _ in packed2])
+    w1_scale, w2_scale = _pack_deepgemm_mxfp4_scales(
+        w1,
+        w2,
+        torch.stack([s for _, s in packed1]),
+        torch.stack([s for _, s in packed2]),
+    )
+    a1q, a1q_scale = moe_kernel_quantize_input(
+        x, None, torch.float8_e4m3fn, False, [128, 128]
+    )
+    m_sum, _ = compute_aligned_M_and_alignment(
+        M=tokens,
+        num_topk=1,
+        local_num_experts=experts,
+        alignment=get_mk_alignment_for_contiguous_layout()[0],
+        expert_tokens_meta=None,
+    )
+    impl = vllm_moe.DeepGemmFP4Experts
+    rollout_self = SimpleNamespace(
+        w1_scale=w1_scale,
+        w2_scale=w2_scale,
+        gemm1_clamp_limit=None,
+        _ACT_BLOCK_K=impl._ACT_BLOCK_K,
+        _WEIGHT_BLOCK_K=impl._WEIGHT_BLOCK_K,
+        adjust_N_for_activation=impl.adjust_N_for_activation,
+    )
+    rollout_self._act_mul_quant = impl._act_mul_quant.__get__(rollout_self)
+    rollout = torch.zeros_like(x)
+    impl.apply(
+        rollout_self,
+        output=rollout,
+        hidden_states=a1q,
+        w1=w1,
+        w2=w2,
+        topk_weights=topk_weights,
+        topk_ids=topk_ids,
+        activation=MoEActivation.SILU,
+        global_num_experts=experts,
+        expert_map=None,
+        a1q_scale=a1q_scale,
+        a2_scale=None,
+        workspace13=torch.zeros(m_sum, 2 * inter, dtype=torch.bfloat16, device="cuda"),
+        workspace2=torch.zeros(m_sum, 2 * inter, dtype=torch.bfloat16, device="cuda"),
+        expert_tokens_meta=None,
+        apply_router_weight_on_input=False,
+    )
+
+    # Training: expert-sorted tokens through the W4A8 expert MLP, scattered back.
+    order = torch.argsort(topk_ids[:, 0], stable=True)
+    m_splits = torch.bincount(topk_ids[:, 0], minlength=experts).tolist()
+    rows = w4a8_expert_mlp(x[order], fc1, fc2, m_splits, topk_weights[order])
+    training = torch.zeros_like(x).index_copy_(0, order, rows)
+
+    assert m_splits[2] == 0
+    assert torch.equal(training.cpu(), rollout.cpu())
 
 
 @pytest.mark.gpus(1, min_architecture="blackwell")
