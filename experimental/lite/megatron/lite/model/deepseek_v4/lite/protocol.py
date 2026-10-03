@@ -23,6 +23,10 @@ from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
+from megatron.lite.primitive.modules.native_fp32_linear import (
+    linear_provider,
+    restore_fp32_masters,
+)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
@@ -68,6 +72,9 @@ class ImplConfig:
     num_nextn_predict_layers: int | None = None
     mtp_loss_scaling_factor: float = 0.1
     qat: QATSpec | dict | None = None
+    # CSA wq_a/wq_b/wkv/wo_b provider: "default" (BF16 nn.Linear), or FP32-master
+    # "native_fp32" / "block32_fp8" (dynamic FP8 GEMM) with native FP32 wgrad.
+    attention_linear: str = "default"
 
 
 MODULE_MAP = {
@@ -367,11 +374,23 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
         )
 
 
+def _attention_linear_provider(impl_cfg: ImplConfig):
+    provider = linear_provider(impl_cfg.attention_linear)
+    if impl_cfg.attention_linear == "default":
+        return None
+    if normalize_qat_spec(impl_cfg.qat).enabled:
+        raise ValueError("attention_linear providers cannot be combined with QAT")
+    if _optimizer_backend_name(impl_cfg.optimizer) == "fsdp2":
+        raise ValueError("attention_linear FP32 masters are not supported with fsdp2")
+    return provider
+
+
 def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBundle:
     from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Model
 
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
+    attention_linear = _attention_linear_provider(impl_cfg)
     _apply_mtp_config(model_cfg, impl_cfg)
     mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
@@ -389,7 +408,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     )
 
     def _chunk(i: int | None = None):
-        return (
+        model = (
             DeepseekV4Model(
                 model_cfg,
                 train_cfg,
@@ -402,10 +421,13 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 mtp_enable=mtp_enable,
                 mtp_enable_train=mtp_enable_train,
                 mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
+                attention_linear_provider=attention_linear,
             )
             .to(torch.bfloat16)
             .cuda()
         )
+        # Provider masters return to FP32 after the module-wide BF16 cast.
+        return restore_fp32_masters(model)
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
