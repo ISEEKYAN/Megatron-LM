@@ -30,6 +30,7 @@ decisions required for MXFP4: whether QAT is enabled and which format to use.
 | `symmetric` | Integer formats only: selects symmetric rather than affine quantization. FP8 and MXFP4 do not consume it. |
 | `ste_clip` | Integer and FP8 formats: controls the saturation gradient mask. MXFP4 does not consume it because its saturation mask is always true. |
 | `ignore_patterns` | Exact, case-insensitive dotted Megatron path components to skip. |
+| `activation_bits` | `None` (weight-only) or `8` with `format="mxfp4"`: Qwen3 MoE routed experts run the W4A8 forward described below. Other values, and other models, raise. |
 
 The format evidence is intentionally separated:
 
@@ -46,6 +47,57 @@ The 99,090,432-element parity result is a one-off offline validation whose envir
 MXFP4 is the validated delivery in this change: it has ModelOpt parity over real
 weights and end-to-end RL evidence. The other format code paths exist but have
 not received end-to-end validation.
+
+## W4A8 routed experts (opt-in)
+
+`activation_bits=8` with `format="mxfp4"` makes Qwen3 MoE run its routed
+experts with the operand contract of the rollout's DeepGEMM FP8 x MXFP4 MoE
+path (vLLM `DeepGemmFP4Experts`). The routed-expert forward itself becomes the
+quantized computation; it is not a fake-quantized BF16 GEMM:
+
+| Step | Contract |
+|---|---|
+| FC1/FC2 input | Dynamic per-token FP8 E4M3, one UE8M0 scale per 128 K values: `scale = ceil_ue8m0(max(amax / 448, 1e-10))`. |
+| FC1/FC2 weight | MXFP4 bytes from `quantize_mxfp4` on the BF16 master, the same bytes the exporter streams to the rollout. |
+| GEMM | DeepGEMM `m_grouped_fp8_fp4_gemm_nt_contiguous` on CUDA (an error if unavailable); a CPU reference on the same dequantized operands. |
+| Activation | FC1 output BF16, SwiGLU in FP32 rounded once to BF16, then requantized to FP8. |
+| Router weight | Applied to the BF16 FC2 output in FP32, after FC2. |
+| Backward | Straight-through estimator on both operands into the BF16 master weights. |
+
+```python
+impl_cfg = ImplConfig(
+    qat=QATSpec(
+        enabled=True,
+        format="mxfp4",
+        activation_bits=8,
+        # Quantize routed experts only; keep attention linears in BF16.
+        ignore_patterns=(
+            "lm_head", "head", "output_layer", "gate", "router",
+            "embedding", "embed", "word_embeddings", "attn",
+        ),
+    )
+)
+```
+
+The same switch from a verl launcher:
+
+```bash
+++actor_rollout_ref.actor.engine.impl_cfg.qat.enabled=true
+++actor_rollout_ref.actor.engine.impl_cfg.qat.format=mxfp4
+++actor_rollout_ref.actor.engine.impl_cfg.qat.activation_bits=8
+```
+
+Limits: the activation scale is recomputed from the live tensor on every call,
+so there is no observer or cross-rank amax state. The routed experts must
+not use FP8 padding, `moe_act` recompute or expert LoRA; those raise. Hidden and
+per-rank intermediate sizes must be multiples of 128. Only the Qwen3 MoE
+protocol wires the W4A8 experts; the other protocols reject `activation_bits`.
+
+The training side only matches a rollout that serves the routed experts with
+the same contract: MXFP4 expert weights and dynamic FP8 activations on vLLM's
+DeepGEMM MoE backend. The four-arm script below is a W4A16 rollout
+(`mxfp4-pack-quantized`, BF16 activations) and does **not** match W4A8; this
+change does not provide a W4A8 rollout configuration.
 
 ## Safe training exclusions
 

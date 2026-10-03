@@ -22,7 +22,7 @@ from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
-__all__ = ["Experts", "_AllReduceETP"]
+__all__ = ["Experts", "_AllReduceETP", "enable_w4a8_experts"]
 
 
 @contextmanager
@@ -85,6 +85,8 @@ class Experts(nn.Module):
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        # Opt-in W4A8 forward; set only by ``enable_w4a8_experts``.
+        self.w4a8 = False
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
@@ -179,7 +181,20 @@ class Experts(nn.Module):
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
-            if self.moe_act_recompute and probs is not None:
+            if self.w4a8:
+                from megatron.lite.primitive.quantization.w4a8_experts import (
+                    w4a8_expert_mlp,
+                )
+
+                out = w4a8_expert_mlp(
+                    x,
+                    self._expert_weights(self.fc1),
+                    self._expert_weights(self.fc2),
+                    m_splits,
+                    probs,
+                    self.swiglu_limit,
+                )
+            elif self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
@@ -206,6 +221,12 @@ class Experts(nn.Module):
             out = out[pad_mask]
         return out
 
+    def _expert_weights(self, grouped_linear: nn.Module) -> list[torch.Tensor]:
+        return [
+            getattr(grouped_linear, f"weight{index}")
+            for index in range(self.num_local_experts)
+        ]
+
     @staticmethod
     def _fp8_pad(x, permuted_probs, m_splits):
         padded = [(s + 15) // 16 * 16 for s in m_splits]
@@ -227,3 +248,26 @@ class Experts(nn.Module):
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask
+
+
+def enable_w4a8_experts(chunks, spec) -> int:
+    """Switch every targeted ``Experts`` module to the W4A8 forward.
+
+    ``spec`` is the model's ``QATSpec``; modules whose path it ignores are left
+    unchanged. Returns the number of modules switched. Combinations whose
+    numerics the W4A8 forward does not reproduce are rejected.
+    """
+    enabled = 0
+    for chunk in chunks:
+        for name, module in chunk.named_modules():
+            if not isinstance(module, Experts) or not spec.targets_module(name):
+                continue
+            if module.fp8 or module.moe_act_recompute:
+                raise ValueError(
+                    f"{name}: W4A8 experts cannot be combined with fp8 or moe_act recompute."
+                )
+            if module.fc1_lora is not None or module.fc2_lora is not None:
+                raise ValueError(f"{name}: W4A8 experts cannot be combined with LoRA.")
+            module.w4a8 = True
+            enabled += 1
+    return enabled

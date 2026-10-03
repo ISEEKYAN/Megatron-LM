@@ -15,6 +15,10 @@ of formats share one STE + three-state skeleton:
 NVFP4 (W4A16 / W4A4, NVIDIA per-block FP8 scale) stays deferred as a second
 FP4 option and is rejected loudly, never aliased onto MXFP4.
 
+The only activation quantization is the opt-in W4A8 routed-expert forward
+(``activation_bits=8`` with ``mxfp4``), implemented in
+``primitive.quantization.w4a8_experts`` and enabled by the model's expert module.
+
 The primitive enforces the three-state separation mandated by the design:
 
 1. **Master weight** — the trainable parameter stays the original (BF16) weight.
@@ -154,9 +158,10 @@ class QATSpec:
     ignore_patterns: tuple[str, ...] = field(
         default_factory=lambda: _DEFAULT_IGNORE_PATTERNS
     )
-    activation_bits: int | None = (
-        None  # weight-only in phase 1; W*A* is gated separately
-    )
+    # None = weight-only. 8 (with format="mxfp4") opts the model's routed-expert
+    # GEMMs into dynamic FP8 activations (W4A8, see ``quantization.w4a8_experts``);
+    # dense linears stay weight-only. Other values are rejected.
+    activation_bits: int | None = None
     learnable_scales: bool = False  # LSQ future work; must be False in phase 1
 
     def __post_init__(self) -> None:
@@ -183,10 +188,14 @@ class QATSpec:
             raise ValueError(
                 f"Unknown QAT format {self.format!r}; supported: {sorted(_FORMAT_BITS)}."
             )
-        if self.activation_bits is not None:
+        if self.activation_bits is not None and not (
+            self.activation_bits == 8 and self.format == "mxfp4"
+        ):
             raise ValueError(
-                "activation quantization (W*A*) is not supported here; it needs a "
-                "calibration/observer-freeze protocol and cross-DP amax sync before enabling."
+                "activation quantization (W*A*) is only supported as activation_bits=8 "
+                "with format='mxfp4' (W4A8 routed experts, dynamic per-token FP8); static "
+                "activation formats need a calibration/observer-freeze protocol and "
+                "cross-DP amax sync before enabling."
             )
         if self.learnable_scales:
             raise ValueError(
@@ -713,7 +722,7 @@ def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
 
 
 def apply_qat_to_chunks(
-    chunks, spec: QATSpec | dict[str, Any] | None
+    chunks, spec: QATSpec | dict[str, Any] | None, *, w4a8_experts: bool = False
 ) -> dict[str, int]:
     """Apply weight-only QAT to every eligible linear in the model chunks.
 
@@ -728,11 +737,20 @@ def apply_qat_to_chunks(
     after load (``reload_model_params``). The persistent ``amax`` buffer is
     recomputed from the real weight on the first forward, so ordering never
     poisons the quantizer statistic. Routers / lm_head / embeddings are skipped.
+
+    ``activation_bits`` is rejected unless the caller passes ``w4a8_experts=True``,
+    declaring that it switches its routed experts to the W4A8 forward itself;
+    otherwise the request would silently train weight-only.
     """
     spec = normalize_qat_spec(spec)
     stats = {"quantized_modules": 0, "skipped_ignored": 0, "skipped_no_weight": 0}
     if not spec.enabled:
         return stats
+    if spec.activation_bits is not None and not w4a8_experts:
+        raise ValueError(
+            "QAT activation_bits=8 requires a model that wires W4A8 routed experts; "
+            "this model supports weight-only QAT."
+        )
     for chunk in chunks:
         for name, module in chunk.named_modules():
             if _quantizable_weight_owner(module) is None:
