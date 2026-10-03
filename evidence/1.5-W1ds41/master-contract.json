@@ -1,0 +1,13 @@
+{
+  "torch": "2.12.1+cpu",
+  "device": "cpu",
+  "validation": {
+    "torch.float32": "accepted",
+    "torch.bfloat16": "Muon requires a contiguous FP32 master matching its logical shape"
+  },
+  "fp32_packed_byte": 114,
+  "bf16_packed_byte": 113,
+  "scale_byte": 127,
+  "native_weight_gradient_dtype": "torch.float32",
+  "native_bf16_rejection": "Native wgrad requires an FP32 master"
+}
