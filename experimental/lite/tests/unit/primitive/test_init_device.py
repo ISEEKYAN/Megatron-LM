@@ -27,7 +27,7 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
     monkeypatch.setattr(protocol, "normalize_lora_config", lambda _cfg: SimpleNamespace(enabled=False))
     monkeypatch.setattr(protocol, "parse_recompute_spec", lambda _cfg: [])
     monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
-    monkeypatch.setattr(protocol, "apply_qat_to_chunks", lambda *_args: None)
+    monkeypatch.setattr(protocol, "apply_qat_to_chunks", lambda *_args, **_kwargs: None)
     monkeypatch.setattr(nn.Module, "cuda", lambda self: self)
     cfg = SimpleNamespace(num_nextn_predict_layers=0)
     bundle = protocol.build_model(cfg, impl_cfg=protocol.ImplConfig(optimizer="fsdp2"))
