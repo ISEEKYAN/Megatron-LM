@@ -90,8 +90,26 @@ The same switch from a verl launcher:
 Limits: the activation scale is recomputed from the live tensor on every call,
 so there is no observer or cross-rank amax state. The routed experts must
 not use FP8 padding, `moe_act` recompute or expert LoRA; those raise. Hidden and
-per-rank intermediate sizes must be multiples of 128. Only the Qwen3 MoE
-protocol wires the W4A8 experts; the other protocols reject `activation_bits`.
+per-rank intermediate sizes must be multiples of 128; `build_model` rejects
+other shapes (including an ETP split whose per-rank intermediate size is not a
+multiple of 128) before training starts. Only the Qwen3 MoE protocol wires the
+W4A8 experts; the other protocols reject `activation_bits`.
+
+**Known gap: top-k combine precision.** Each expert row is multiplied by its
+router weight in FP32 and rounded to BF16 inside the expert MLP. The dispatcher
+then sums the top-k BF16 rows per token. vLLM's DeepGEMM path instead
+accumulates `fp32(fc2_row) * weight` over the top-k in FP32 (`ep_gather`, an
+FMA in Triton) and rounds once. Everything up to the FC2 output matches the
+rollout bit for bit. That includes A1/A2 codes and scales, FC1, the SwiGLU
+requantization and FC2, measured on GB200 against `DeepGemmFP4Experts`. With
+top-k 1 the MoE output is also bitwise identical. With top-k > 1 it is not:
+on Qwen3-30B-A3B expert shapes at top-k 8, 58% of output elements differ, by
+at most one BF16 ulp of the largest output magnitude. Accumulating unrounded
+rows with an FMA in FP32 removes the difference entirely. That FP32 combine is
+not implemented, so W4A8 training is not zero-diff with the rollout for
+top-k > 1. The match also assumes the rollout's default
+`VLLM_USE_DEEP_GEMM_E8M0=1`. With it off, vLLM quantizes activations with
+float32 scales, which is a different contract.
 
 The training side only matches a rollout that serves the routed experts with
 the same contract: MXFP4 expert weights and dynamic FP8 activations on vLLM's

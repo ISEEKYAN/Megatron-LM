@@ -286,9 +286,13 @@ def enable_w4a8_experts(chunks, spec) -> int:
 
     ``spec`` is the model's ``QATSpec``; modules whose path it ignores are left
     unchanged. Returns the number of modules switched. Combinations whose
-    numerics the W4A8 forward does not reproduce are rejected.
+    numerics the W4A8 forward does not reproduce, and per-rank GEMM shapes the
+    A8 activation groups cannot tile, are rejected here, before any module is
+    switched, rather than at the first forward.
     """
-    enabled = 0
+    from megatron.lite.primitive.quantization.w4a8_experts import FP8_ACT_GROUP_SIZE
+
+    targets = []
     for chunk in chunks:
         for name, module in chunk.named_modules():
             if not isinstance(module, Experts) or not spec.targets_module(name):
@@ -299,6 +303,16 @@ def enable_w4a8_experts(chunks, spec) -> int:
                 )
             if module.fc1_lora is not None or module.fc2_lora is not None:
                 raise ValueError(f"{name}: W4A8 experts cannot be combined with LoRA.")
-            module.w4a8 = True
-            enabled += 1
-    return enabled
+            # K of each GEMM is the weight's input dim on this rank (FC2's is the
+            # ETP-sharded intermediate size).
+            for label, linear in (("FC1", module.fc1), ("FC2", module.fc2)):
+                k = module._expert_weights(linear)[0].shape[1]
+                if k % FP8_ACT_GROUP_SIZE:
+                    raise ValueError(
+                        f"{name}: W4A8 experts need the {label} GEMM K dimension "
+                        f"({k} per rank) to be divisible by {FP8_ACT_GROUP_SIZE}."
+                    )
+            targets.append(module)
+    for module in targets:
+        module.w4a8 = True
+    return len(targets)
