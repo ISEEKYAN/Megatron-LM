@@ -8,15 +8,23 @@ needs are stubbed; RMSNorm becomes ``torch.nn.RMSNorm``. No forward runs on CPU.
 
 from __future__ import annotations
 
+import copy
+import hashlib
+import importlib.util
+import os
+import subprocess
 import sys
 import types
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 import torch
 from torch import nn
+from torch.nn import functional as F
 
 from megatron.lite.primitive.modules import native_fp32_linear as nfl
+from megatron.lite.primitive.quantization import mxfp8
 
 _PROJECTIONS = ("wq_a", "wq_b", "wkv", "wo_b")
 _CORE_SYMBOLS = {
@@ -174,13 +182,112 @@ def test_protocol_selects_provider_opt_in_and_rejects_unsupported(v4):
     assert select(ImplConfig(qat={"enabled": True})) is None
 
 
-@pytest.mark.gpus(1)
-def test_csa_forward_backward_calls_fp8_gemm_with_fp32_wgrad(v4, monkeypatch):
-    # Not run yet: fused BSHD CSA setup follows test_csa_thd_cp.py, which also
-    # initializes a single-rank NCCL group before calling the fused kernels.
+@pytest.fixture
+def single_rank_nccl(tmp_path):
+    import torch.distributed as dist
+
+    torch.cuda.set_device(int(os.environ.get("LOCAL_RANK", "0")))
+    created = not dist.is_initialized()
+    if created:
+        dist.init_process_group(
+            "nccl", init_method=f"file://{tmp_path / 'nccl'}", rank=0, world_size=1
+        )
+    assert dist.get_world_size() == 1
+    try:
+        yield dist.group.WORLD
+    finally:
+        if created:
+            dist.destroy_process_group()
+
+
+def _cuda_config():
     config = _config()
     config.num_attention_heads, config.head_dim = 64, 512
     config.qk_rope_head_dim, config.index_head_dim, config.index_n_heads = 64, 128, 64
+    config.sliding_window, config.index_topk = 4, 4
+    return config
+
+
+class _DecodedLinear(nn.Module):
+    """Independent FP64 block sums and decoded FP32 autograd with identity STE.
+
+    Does not call the provider's forward or backward. Autograd differentiates
+    the FP32 matmul directly, returning FP32 dW and activation-dtype dX.
+    """
+
+    def __init__(self, weight):
+        super().__init__()
+        self.weight = nn.Parameter(weight.detach().clone())
+
+    def forward(self, x):
+        flat = x.reshape(-1, x.shape[-1])
+        activation = mxfp8.quantize_block32(flat)
+        weight = mxfp8.quantize_block32(self.weight, mxfp8.WEIGHT_BLOCK)
+        # Exact FP64 sums of E4M3 products independently check each real FP8
+        # GEMM, followed by the specified FP32 scaling and block accumulation.
+        value = torch.zeros(
+            flat.shape[0], self.weight.shape[0], device=x.device, dtype=torch.float32
+        )
+        for block, start in enumerate(range(0, flat.shape[1], 32)):
+            product = (
+                activation.values[:, start : start + 32].double()
+                @ weight.values[:, start : start + 32].double().T
+            ).float()
+            value += (
+                product
+                * activation.scale[:, block].float()[:, None]
+                * weight.scale[:, block].float().repeat_interleave(32)[None, :]
+            )
+        decoded_x = activation.decoded.float()
+        decoded_w = weight.decoded.float()
+        x_ste = flat.float() + (decoded_x - flat.float()).detach()
+        w_ste = self.weight + (decoded_w - self.weight).detach()
+        surrogate = F.linear(x_ste, w_ste)
+        # Use the independent block result in forward and ordinary PyTorch
+        # matmul autograd for the native FP32 derivative contract.
+        result = value.detach() + (surrogate - surrogate.detach())
+        return result.reshape(*x.shape[:-1], self.weight.shape[0]).to(x.dtype)
+
+
+def _assert_consumer_close(actual, expected):
+    # Real FP8 tensor-core accumulation differs from exact FP64 block sums.
+    # BF16 rounding and subsequent block quantization can amplify that error.
+    # The consumer contract bounds BOTH relative L2 error (2%) and maximum
+    # absolute error / reference maximum (5%), for output, dX and every dW.
+    # Normalizing max error by the tensor scale avoids a vacuous large absolute
+    # tolerance for tiny gradients, and unstable relative errors near zero.
+    assert actual.dtype == expected.dtype and actual.shape == expected.shape
+    assert torch.isfinite(actual).all() and torch.isfinite(expected).all()
+    expected = expected.detach().float()
+    delta = actual.detach().float() - expected
+    assert expected.norm() > 0 and expected.abs().max() > 0
+    assert delta.norm() <= 0.02 * expected.norm()
+    assert delta.abs().max() <= 0.05 * expected.abs().max()
+
+
+@pytest.mark.gpus(1)
+def test_csa_forward_backward_calls_fp8_gemm_with_fp32_wgrad(
+    single_rank_nccl, monkeypatch
+):
+    # Real TE and fused DSA kernels: no import or RMSNorm stubs on CUDA.
+    from megatron.lite.primitive.modules.attention.csa import CompressedSparseAttention
+
+    torch.manual_seed(17)
+    config = _cuda_config()
+    ps = _ps()
+    ps.cp_group = single_rank_nccl
+    module = CompressedSparseAttention(
+        config, layer_idx=0, ps=ps, linear_provider=nfl.linear_provider("block32_fp8")
+    )
+    module = nfl.restore_fp32_masters(module.to(device="cuda", dtype=torch.bfloat16))
+    module.attention_backend = "flash"
+    module.apply_dsa_kernel_fusion = True
+    # Eval suppresses the indexer auxiliary training loss, but retains autograd.
+    module.eval()
+    # ProcessGroup is not picklable; both consumers use the same single rank.
+    reference = copy.deepcopy(module, memo={id(ps): ps})
+    for name in _PROJECTIONS:
+        setattr(reference, name, _DecodedLinear(getattr(module, name).weight))
     calls = []
     scaled_mm = torch._scaled_mm
 
@@ -189,16 +296,114 @@ def test_csa_forward_backward_calls_fp8_gemm_with_fp32_wgrad(v4, monkeypatch):
         return scaled_mm(*args, **kwargs)
 
     monkeypatch.setattr(torch, "_scaled_mm", spy)
-    provider = nfl.linear_provider("block32_fp8")
-    module = v4.model.CompressedSparseAttention(
-        config, layer_idx=0, ps=_ps(), linear_provider=provider
+    x = torch.randn(
+        1,
+        8,
+        config.hidden_size,
+        device="cuda",
+        dtype=torch.bfloat16,
+        requires_grad=True,
     )
-    module = nfl.restore_fp32_masters(module.to(device="cuda", dtype=torch.bfloat16))
-    module.attention_backend = "flash"
-    x = torch.randn(1, 8, config.hidden_size, device="cuda", dtype=torch.bfloat16)
-    out = module(x, position_ids=torch.arange(8, device="cuda").unsqueeze(0))
-    out.float().sum().backward()
-    assert calls and torch.isfinite(out).all()
+    ref_x = x.detach().clone().requires_grad_()
+    positions = torch.arange(8, device="cuda").unsqueeze(0)
+    out = module(x, position_ids=positions)
+    expected = reference(ref_x, position_ids=positions)
+    assert calls
+    _assert_consumer_close(out, expected)
+    grad = torch.randn_like(out)
+    out.backward(grad)
+    expected.backward(grad)
+    _assert_consumer_close(x.grad, ref_x.grad)
     for name in _PROJECTIONS:
-        grad = getattr(module, name).weight.grad
-        assert grad.dtype == torch.float32 and torch.isfinite(grad).all()
+        actual = getattr(module, name).weight.grad
+        wanted = getattr(reference, name).weight.grad
+        assert actual.dtype == wanted.dtype == torch.float32
+        assert torch.count_nonzero(wanted) > 0
+        _assert_consumer_close(actual, wanted)
+
+
+# Pin the pre-provider main sources, not a second construction of HEAD. Only
+# these three existing production files differ from main in this feature.
+_MAIN_REVISION = "d8e010069fef5c6da3690d008b899d480864a8de"
+_MAIN_BLOBS = {
+    "megatron.lite.primitive.modules.attention.csa": "2f6be962a418f5e23a2012777bd469358b8cb328",
+    "megatron.lite.model.deepseek_v4.lite.model": "dc22977213fd439db1dabb088e2957c1ce0a6d76",
+    "megatron.lite.model.deepseek_v4.lite.protocol": "5d0441ad00e0839e1f07720c8b44461e1f0e2295",
+}
+
+
+def _main_source(name):
+    relative = "experimental/lite/" + name.replace(".", "/") + ".py"
+    # An exported main tree supports GPU runners without a Git checkout.
+    exported = os.environ.get("MLITE_MAIN_REFERENCE")
+    if exported:
+        source = (Path(exported) / relative).read_bytes()
+    else:
+        source = subprocess.check_output(
+            ["git", "show", f"{_MAIN_REVISION}:{relative}"],
+            cwd=Path(__file__).resolve().parents[7],
+        )
+    blob = b"blob " + str(len(source)).encode() + b"\0" + source
+    assert hashlib.sha1(blob).hexdigest() == _MAIN_BLOBS[name]
+    return source
+
+
+def _bytes(tensor):
+    return tensor.detach().cpu().contiguous().view(torch.uint8)
+
+
+@pytest.mark.gpus(1)
+def test_default_build_model_is_byte_identical_to_main(single_rank_nccl, monkeypatch):
+    from megatron.lite.model.deepseek_v4.lite import protocol
+
+    config = _cuda_config()
+    config.vocab_size = 32
+    config.moe_intermediate_size = 32
+    config.n_routed_experts = 2
+    config.num_experts_per_tok = 1
+    config.num_nextn_predict_layers = 0
+    ids = torch.tensor([[1, 2, 3, 4, 5, 6, 7, 8]], device="cuda")
+
+    def run(implementation):
+        torch.manual_seed(29)
+        bundle = implementation.build_model(
+            copy.deepcopy(config),
+            impl_cfg=implementation.ImplConfig(
+                optimizer=None, mtp_enable=False, attention_backend_override="flash"
+            ),
+        )
+        model = bundle.chunks[0].eval()
+        with torch.no_grad():
+            outputs = model(input_ids=ids, enable_mtp=False)
+        assert set(outputs) == {"hidden_states", "logits"}
+        assert all(torch.isfinite(value).all() for value in outputs.values())
+        return (
+            {
+                key: (value.dtype, value.shape, _bytes(value))
+                for key, value in model.state_dict().items()
+            },
+            {
+                key: (value.dtype, value.shape, _bytes(value))
+                for key, value in outputs.items()
+                if isinstance(value, torch.Tensor)
+            },
+        )
+
+    actual = run(protocol)
+    # Load the pinned main CSA -> model -> protocol in dependency order. All
+    # unrelated primitives and real GPU kernels are shared by the two runs.
+    with monkeypatch.context() as patch:
+        for name in _MAIN_BLOBS:
+            spec = importlib.util.spec_from_loader(name, loader=None)
+            module = importlib.util.module_from_spec(spec)
+            patch.setitem(sys.modules, name, module)
+            exec(compile(_main_source(name), f"main:{name}", "exec"), module.__dict__)
+        expected = run(module)
+    for actual_group, expected_group in zip(actual, expected):
+        assert actual_group.keys() == expected_group.keys()
+        assert actual_group
+        for key in expected_group:
+            dtype, shape, data = actual_group[key]
+            ref_dtype, ref_shape, ref_data = expected_group[key]
+            assert (dtype, shape) == (ref_dtype, ref_shape), key
+            assert torch.equal(data, ref_data), key

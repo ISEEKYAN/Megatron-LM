@@ -211,3 +211,8 @@ def test_cuda_scaled_mm_matches_diagnostic_on_exact_operands(monkeypatch):
     assert torch.equal(real, mxfp8.dynamic_fp8_linear(x, w, diagnostic=True))
     real.float().sum().backward()
     assert layer.weight.grad.dtype == torch.float32
+    decoded_x = mxfp8.quantize_block32(x.detach().reshape(-1, 96)).decoded.float()
+    decoded_w = mxfp8.quantize_block32(w.detach(), mxfp8.WEIGHT_BLOCK).decoded
+    grad = torch.ones_like(real).reshape(-1, 64).float()
+    assert torch.equal(layer.weight.grad, grad.T @ decoded_x)
+    assert torch.equal(x.grad, (grad @ decoded_w).reshape(x.shape).bfloat16())

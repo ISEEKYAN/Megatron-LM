@@ -61,4 +61,4 @@ followed by one FP32 GEMM on the decoded operands. It also runs on CPU.
 - The FP8 GEMM is a correctness provider: K/32 separate `_scaled_mm` calls, not a fused blockwise kernel.
 - With FP32 masters, HF export emits these four weights as FP32 unless the caller passes `export_dtype="bf16"`. The block-FP8 resync quantizes from FP32 directly.
 - Random initialization still passes through the module-wide BF16 cast before the FP32 restore; weights loaded from HF are unaffected.
-- The CUDA `_scaled_mm` path and the dist_opt FP32-parameter path are covered by GPU-marked tests only.
+- Real CUDA `_scaled_mm` has GPU numerical coverage. The `dist_opt` mixed BF16/FP32 parameter path has not been validated on GPU.
