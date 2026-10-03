@@ -7,10 +7,71 @@ Engram tables remain resident: only each shard's intersecting rows are copied.
 from contextlib import contextmanager
 from copy import copy
 from functools import wraps
+from types import MethodType
 
 import torch
 from megatron.lite.model.deepseek_v41.lite.resync import decode_transport
 from megatron.lite.primitive.ckpt.row_stream import RowChunk, RowReceiver
+
+
+def _initialize_mxfp4_parameter(param):
+    # Native Mxfp4MoEMethod.create_weights initializes W and scale to zero.
+    # Reload materializes with empty_strided; native loaders only fill the
+    # checkpoint slice. Initialize once per new raw Parameter, not per expert.
+    # Metadata is captured before cold load, so it does not inherit this flag.
+    if not param.is_meta and not getattr(param, '_ds41_mxfp4_initialized', False):
+        param.data.zero_()
+        param._ds41_mxfp4_initialized = True
+
+
+def _mxfp4_initialized_loader(loader):
+    if getattr(loader, '_ds41_mxfp4_initializer', False):
+        return loader
+    if isinstance(loader, MethodType):
+        original = loader.__func__
+
+        @wraps(original)
+        def load(self, param, *args, **kwargs):
+            _initialize_mxfp4_parameter(param)
+            return original(self, param, *args, **kwargs)
+
+        load._ds41_mxfp4_initializer = True
+        # Keep a bound method so native metadata can sanitize/rebind its owner.
+        return MethodType(load, loader.__self__)
+
+    @wraps(loader)
+    def load(param, *args, **kwargs):
+        _initialize_mxfp4_parameter(param)
+        return loader(param, *args, **kwargs)
+
+    load._ds41_mxfp4_initializer = True
+    return load
+
+
+def restore_attn_sink_parameters(model, layerwise):
+    """Expose direct-copy sinks to the unchanged native checkpoint loader.
+
+    Attention owns only this direct parameter; child projections remain in
+    native layerwise reload. Restore the constructor's padding initializer,
+    then let native load_weights select the TP slice. No layout is duplicated.
+    """
+    names = set()
+    for name, layer in model.named_modules():
+        initializer = getattr(layer, '_ds41_attn_sink_initializer', None)
+        if initializer is None:
+            continue
+        info = layerwise.get_layerwise_info(layer)
+        params, buffers = info.kernel_tensors
+        if set(params) != {'attn_sink'} or buffers:
+            raise NotImplementedError(
+                'DS4.1 direct sink must be the only parent tensor'
+            )
+        layerwise._place_kernel_tensors(layer, info)
+        layer.attn_sink.data.copy_(initializer)
+        info.reset()
+        layerwise.LOADING_LAYERS.discard(layer)
+        names.add(name + '.attn_sink')
+    return names
 
 
 def set_mxfp4_load_numel(model):
@@ -45,6 +106,8 @@ def set_mxfp4_load_numel(model):
             if parameter.numel() > target.numel():
                 raise ValueError('DS4.1 MXFP4 checkpoint exceeds padded parameter')
             target.weight_loader_numel = parameter.numel()
+            if parameter.numel() < target.numel():
+                target.weight_loader = _mxfp4_initialized_loader(target.weight_loader)
 
 
 class StagingBudget:
@@ -186,6 +249,11 @@ def install_reload_metadata_hook():
         model = original(self, vllm_config, model_config, prefix)
         if getattr(model_config.hf_config, 'model_type', '') == 'deepseek_v41':
             set_mxfp4_load_numel(model)
+            for layer in model.modules():
+                if type(layer).__name__ == 'DeepseekV4MegaAttnAttention':
+                    layer._ds41_attn_sink_initializer = (
+                        layer.attn_sink.detach().cpu().clone()
+                    )
             with _without_tables(model):
                 reload.record_metadata_for_reloading(model)
             model._ds41_reload_metadata = True
@@ -239,6 +307,8 @@ class ResyncReceiver:
                 module.process_weights_after_loading = lambda: None
         with _without_tables(model):
             reload.initialize_layerwise_reload(model)
+        self.expected_sinks = restore_attn_sink_parameters(model, layerwise)
+        self.received_sinks = set()
         self.mega_attn = MegaAttnReload(model)
 
     @torch.no_grad()
@@ -282,7 +352,11 @@ class ResyncReceiver:
                     tensor = tensor.view(torch.uint8)
                 try:
                     self.staging.check(tensor.numel() * tensor.element_size())
-                    self.model.load_weights([(name, tensor.clone())])
+                    loaded = self.model.load_weights([(name, tensor.clone())])
+                    if loaded is not None:
+                        self.received_sinks.update(
+                            self.expected_sinks.intersection(loaded)
+                        )
                     self.staging.refresh()
                 except BaseException:
                     self.abort()
@@ -319,6 +393,8 @@ class ResyncReceiver:
             raise ValueError('DS4.1 resync incomplete generation')
         if self.received_tables != self.expected_tables:
             raise ValueError('DS4.1 resync missing Engram tables')
+        if self.received_sinks != self.expected_sinks:
+            raise ValueError('DS4.1 resync missing attention sinks')
         for receiver in self.rows.values():
             receiver.finish()
         try:
