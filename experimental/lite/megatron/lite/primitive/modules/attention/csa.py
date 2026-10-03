@@ -344,6 +344,7 @@ class CompressedSparseAttention(nn.Module):
         dsa_indexer_loss_coeff: float = 0.0,
         dsa_indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
+        linear_provider=None,
     ):
         super().__init__()
         self.config = config
@@ -372,17 +373,24 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = config.compress_ratios[_cr_idx]
         else:
             self.compress_ratio = 0
-        self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
+        # ``linear_provider`` (default ``nn.Linear``) builds the four dense
+        # projections; e.g. ``native_fp32_linear.linear_provider("block32_fp8")``.
+        linear = linear_provider or nn.Linear
+        self.wq_a = linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
-        self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
+        self.wq_b = linear(
+            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
+        self.wkv = linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
             self.num_heads_per_group * self.head_dim,
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = linear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
