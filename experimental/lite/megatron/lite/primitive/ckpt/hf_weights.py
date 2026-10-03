@@ -1999,6 +1999,57 @@ def export_bound_tensors(
 _PLAIN = (torch.float32, torch.bfloat16, torch.float16)
 
 
+def plan_matrix_codec(
+    spec, name, tensor, encoding, buffer_max_size_bytes, *, strict=True
+):
+    """Rows per codec tile whose workspace plus the whole encoded output fit.
+
+    The spec bounds bytes per source element for codec workspace and for the
+    encoded weight plus scale, and the row alignment of its scale blocks.
+    Without strict, an unfit matrix uses its smallest aligned tile.
+    """
+    align, workspace, output = spec.codec_tile(name, encoding)
+    rows = tensor.shape[0] if tensor.ndim == 2 else 1
+    if rows % align:
+        align = rows  # Untileable: the whole tensor is one tile.
+    width = tensor.numel() // rows
+    available = buffer_max_size_bytes - output * tensor.numel() - 8192
+    tile = min(max(available, 0) // (workspace * width) // align * align, rows)
+    if tile > 0:
+        return tile
+    if strict:
+        raise ValueError(f'Export buffer too small for matrix codec: {name}')
+    return align
+
+
+def encode_matrix(spec, name, tensor, encoding, buffer_max_size_bytes):
+    """Encode block-row-aligned tiles into preallocated outputs.
+
+    Release codecs scale each block independently, so the bytes equal one
+    whole-matrix encode while workspace stays bounded by a single tile.
+    Deployment callers refuse unfit budgets before streaming.
+    """
+    tile = plan_matrix_codec(
+        spec, name, tensor, encoding, buffer_max_size_bytes, strict=False
+    )
+    rows = tensor.shape[0] if tensor.ndim == 2 else 1
+    if tile == rows:
+        return spec.encode(name, tensor, encoding)
+    outputs = None
+    for start in range(0, rows, tile):
+        parts = spec.encode(name, tensor[start : start + tile], encoding)
+        if outputs is None:
+            outputs = [
+                part.new_empty((part.shape[0] * rows // tile, *part.shape[1:]))
+                for part in parts
+            ]
+        for output, part in zip(outputs, parts):
+            offset = start * output.shape[0] // rows
+            output[offset : offset + part.shape[0]].copy_(part)
+        del parts
+    return tuple(outputs)
+
+
 def _keys(reader):
     if reader.index:
         return set(reader.index)
@@ -2142,7 +2193,9 @@ def export_checkpoint(
             continue
         name, tensor = item
         if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3'):
-            weight, scale = spec.encode(name, tensor, bindings[name].encoding)
+            weight, scale = encode_matrix(
+                spec, name, tensor, bindings[name].encoding, buffer_max_size_bytes
+            )
             yield name, weight.cpu() if cpu else weight
             yield name[:-6] + 'scale', scale.cpu() if cpu else scale
             continue

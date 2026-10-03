@@ -386,7 +386,7 @@ class MegatronLiteEngine(BaseEngine):
             if key in kwargs
         }
         export_kwargs.update(
-            buffer_max_size_bytes=2 * 1024**3,
+            buffer_max_size_bytes=self.engine_config.export_buffer_max_size_bytes,
             cpu=False,
         )
         if self.engine_config.resync_format is not None:

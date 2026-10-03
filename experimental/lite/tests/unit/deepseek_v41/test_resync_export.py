@@ -123,6 +123,97 @@ def test_both_entries_reject_partial_or_incompatible_deployment(
                 )
 
 
+@pytest.mark.parametrize(
+    'name, encoding, shape, tile',
+    [
+        ('layers.0.attn.wq_b.weight', 'F8_E4M3', (160, 96), 64),
+        ('layers.0.ffn.experts.0.w1.weight', 'I8', (37, 64), 8),
+    ],
+)
+def test_tiled_matrix_codec_is_whole_matrix_bytes_within_budget(
+    v41_core_te, name, encoding, shape, tile
+):
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import _SPEC
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    rows, width = shape
+    generator = torch.Generator().manual_seed(7)
+    # Row magnitudes span many binades so every scale block differs.
+    tensor = (
+        torch.randn(shape, generator=generator)
+        * 2.0 ** (torch.arange(rows) % 23 - 11)[:, None]
+    ).bfloat16()
+    align, workspace, output = _SPEC.codec_tile(name, encoding)
+    budget = output * tensor.numel() + 8192 + workspace * tile * width
+    assert hf_weights.plan_matrix_codec(_SPEC, name, tensor, encoding, budget) == tile
+    with AllocationPeak([tensor]) as meter:
+        tiled = hf_weights.encode_matrix(_SPEC, name, tensor, encoding, budget)
+    assert meter.peak <= budget, (meter.peak, budget)
+    whole = _SPEC.encode(name, tensor, encoding)
+    assert rows % tile and len(tiled) == len(whole) == 2
+    for actual, expected in zip(tiled, whole):
+        assert actual.dtype == expected.dtype and actual.shape == expected.shape
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+    smallest = output * tensor.numel() + 8192 + workspace * align * width
+    assert (
+        hf_weights.plan_matrix_codec(_SPEC, name, tensor, encoding, smallest) == align
+    )
+    with pytest.raises(ValueError, match='matrix codec'):
+        hf_weights.plan_matrix_codec(_SPEC, name, tensor, encoding, smallest - 1)
+    # Non-deployment saves keep their old acceptance with the smallest tile.
+    fallback = hf_weights.encode_matrix(_SPEC, name, tensor, encoding, 0)
+    for actual, expected in zip(fallback, whole):
+        assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize('trainable', [False, True])
+def test_smallest_accepted_budget_streams_and_one_byte_less_is_refused(
+    v41_core_te, tmp_path, trainable
+):
+    from megatron.lite.model.deepseek_v41.lite import checkpoint, protocol
+
+    model = make_model(tmp_path / 'archive', trainable)
+    low, high = 4, 524288
+    while low < high:
+        middle = (low + high) // 2
+        try:
+            checkpoint.validate_resync_budget(model, middle)
+            high = middle
+        except ValueError:
+            low = middle + 1
+    budget = low
+    opts = dict(target='mxfp4', resync_config={'expert_dtype': 'fp4'})
+    peaks = {}
+    for size, expected in ((budget - 1, pytest.raises(ValueError)), (budget, None)):
+        for entry in ('save', 'online'):
+            inputs = list(model.parameters()) + list(model.buffers())
+            with expected or AllocationPeak(inputs) as meter:
+                if entry == 'save':
+                    protocol.save_hf_weights(
+                        [model],
+                        tmp_path / f'save-{size}',
+                        model.config,
+                        model.ps,
+                        buffer_max_size_bytes=size,
+                        **opts,
+                    )
+                else:
+                    for pair in protocol.export_hf_weights(
+                        [model],
+                        model.config,
+                        model.ps,
+                        buffer_max_size_bytes=size,
+                        **opts,
+                    ):
+                        del pair
+            if expected is None:
+                peaks[entry] = meter.peak
+    # Save adds a budget // 4 shard buffer beside the row stream; the codec
+    # guard bounds the online stream, which must stay within the budget.
+    assert peaks['online'] <= budget, (peaks, budget)
+    print(f'RESYNC_MIN_BUDGET trainable={trainable} budget={budget} peaks={peaks}')
+
+
 def test_transport_preserves_all_integer_and_exponent_bytes():
     from megatron.lite.model.deepseek_v41.lite.resync import (
         decode_transport,

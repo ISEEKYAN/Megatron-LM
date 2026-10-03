@@ -36,7 +36,12 @@ for the latter.
 
 All exporting ranks must drain the stream. Consumers must copy borrowed row
 payloads before advancing. The export budget includes row packing and iterator
-handoff overlap; a non-row matrix whose codec workspace cannot fit is rejected.
+handoff overlap; non-row FP8/FP4 matrices are encoded in scale-block-aligned
+row tiles (byte-identical to one whole-matrix encode), and a matrix whose
+encoded output plus one tile cannot fit in a quarter of the budget is rejected
+before the first tensor is yielded. The online budget is the engine option
+`export_buffer_max_size_bytes` (default 2 GiB, which covers every release-size
+matrix).
 The receiver's resident weights and per-layer vLLM repacking allocations are
 separate from the exporter staging budget.
 
@@ -68,6 +73,4 @@ repacking, full-size inference logits, or an end-to-end RL update. The stream
 terminator and Engram census reject incomplete row generations; ordinary dense
 weight completeness relies on the exporter inventory and reliable transport.
 Failed reloads require restarting the worker; transactional rollback is absent.
-Large non-row matrices still require a sufficient codec budget and may be
-rejected by the current engine's fixed 2-GiB online budget. These results cover
-the reduced model and transport contracts, not the full release-sized engine.
+These results cover the reduced model and transport contracts, not the full release-sized engine.

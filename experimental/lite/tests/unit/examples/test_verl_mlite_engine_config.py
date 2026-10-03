@@ -206,6 +206,36 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
     }
 
 
+def test_online_weight_export_budget_is_configurable() -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            export_buffer_max_size_bytes=3 * 1024**3, resync_format="mxfp4"
+        )
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    engine.get_per_tensor_param()
+
+    assert captured["buffer_max_size_bytes"] == 3 * 1024**3
+    assert captured["target"] == "mxfp4"
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 2.0, "2147483648", None])
+def test_online_weight_export_budget_rejects_non_positive_int(budget) -> None:
+    with pytest.raises(ValueError, match="export_buffer_max_size_bytes"):
+        _engine_config(export_buffer_max_size_bytes=budget)
+
+
 def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:
     engine = _engine(engine_config=_engine_config())
     engine.model_config.hf_config = {"model_type": "qwen3_moe"}
