@@ -61,7 +61,7 @@ quantized computation; it is not a fake-quantized BF16 GEMM:
 | FC1/FC2 weight | MXFP4 bytes from `quantize_mxfp4` on the BF16 master, the same bytes the exporter streams to the rollout. |
 | GEMM | DeepGEMM `m_grouped_fp8_fp4_gemm_nt_contiguous` on CUDA (an error if unavailable); a CPU reference on the same dequantized operands. |
 | Activation | FC1 output BF16, SwiGLU in FP32 rounded once to BF16, then requantized to FP8. |
-| Router weight | Applied to the BF16 FC2 output in FP32, after FC2. |
+| Top-k combine | The unweighted BF16 FC2 rows of each token are accumulated in FP32 in router top-k slot order, `acc = fma(row, weight, acc)`, then rounded once to BF16, as vLLM's `ep_gather` does. |
 | Backward | Straight-through estimator on both operands into the BF16 master weights. |
 
 ```python
@@ -95,21 +95,22 @@ other shapes (including an ETP split whose per-rank intermediate size is not a
 multiple of 128) before training starts. Only the Qwen3 MoE protocol wires the
 W4A8 experts; the other protocols reject `activation_bits`.
 
-**Known gap: top-k combine precision.** Each expert row is multiplied by its
-router weight in FP32 and rounded to BF16 inside the expert MLP. The dispatcher
-then sums the top-k BF16 rows per token. vLLM's DeepGEMM path instead
-accumulates `fp32(fc2_row) * weight` over the top-k in FP32 (`ep_gather`, an
-FMA in Triton) and rounds once. Everything up to the FC2 output matches the
-rollout bit for bit. That includes A1/A2 codes and scales, FC1, the SwiGLU
-requantization and FC2, measured on GB200 against `DeepGemmFP4Experts`. With
-top-k 1 the MoE output is also bitwise identical. With top-k > 1 it is not:
-on Qwen3-30B-A3B expert shapes at top-k 8, 58% of output elements differ, by
-at most one BF16 ulp of the largest output magnitude. Accumulating unrounded
-rows with an FMA in FP32 removes the difference entirely. That FP32 combine is
-not implemented, so W4A8 training is not zero-diff with the rollout for
-top-k > 1. The match also assumes the rollout's default
-`VLLM_USE_DEEP_GEMM_E8M0=1`. With it off, vLLM quantizes activations with
-float32 scales, which is a different contract.
+**Parity with the rollout.** Measured on GB200 against vLLM's own
+`DeepGemmFP4Experts` path, the routed-expert output is bit-identical to the
+rollout. That covers A1/A2 codes and scales, FC1, the SwiGLU requantization,
+FC2, and the top-k sum, at Qwen3-30B-A3B expert shapes with top-k 8. The
+Qwen3 MoE layer, including dispatch and combine, is also checked bit for bit
+on CPU against an exact transcription of `ep_gather`. Conditions:
+
+- The combine reads the unfused dispatch layout. `build_model` rejects W4A8
+  experts with `MEGATRON_LITE_MOE_PERMUTE_FUSION=1` or DeepEP.
+- The router weights are taken as the training router returns them. Router
+  parity (dtype and slot order) is not part of this contract.
+- The rollout must use vLLM's default `VLLM_USE_DEEP_GEMM_E8M0=1`. With it
+  off, vLLM quantizes activations with float32 scales, which is a different
+  contract.
+
+The default (non-W4A8) path keeps the BF16 per-row weighting and BF16 sum.
 
 The training side only matches a rollout that serves the routed experts with
 the same contract: MXFP4 expert weights and dynamic FP8 activations on vLLM's

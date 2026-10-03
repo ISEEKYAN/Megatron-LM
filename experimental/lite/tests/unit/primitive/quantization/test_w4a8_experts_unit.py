@@ -13,6 +13,7 @@ import importlib.util
 import math
 import subprocess
 import sys
+from fractions import Fraction
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -400,15 +401,26 @@ def test_deep_gemm_matches_reference_on_identical_operands():
 
 
 @pytest.mark.gpus(1, min_architecture="blackwell")
-def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
-    """Training W4A8 expert MLP vs the rollout's ``DeepGemmFP4Experts.apply``.
+@pytest.mark.parametrize(
+    "experts, hidden, inter, tokens, topk",
+    [
+        (4, 512, 256, 300, 1),
+        (16, 2048, 768, 256, 8),  # Qwen3-30B-A3B expert dims, 16 of 128 experts
+    ],
+)
+def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
+    experts, hidden, inter, tokens, topk
+):
+    """Training W4A8 experts + top-k combine vs the rollout's ``DeepGemmFP4Experts``.
 
     The rollout side is vLLM's own code end to end: A1 quantization as its
     prepare step does it, MXFP4 weight-scale packing as its weight loading does
     it, then permute, FC1, fused SiLU+A2 quantization, FC2 and the FP32 top-k
-    gather. With top-k 1 there is no cross-expert sum, so the outputs must be
-    bitwise equal (top-k > 1 differs by the documented BF16 combine).
+    gather. The training side is the unweighted W4A8 expert MLP in MLite's
+    unfused dispatch order followed by ``topk_fma_combine``. Bitwise equal.
     """
+    from megatron.lite.primitive.quantization.w4a8_experts import topk_fma_combine
+
     _require_deep_gemm()
     vllm_moe = pytest.importorskip(
         "vllm.model_executor.layers.fused_moe.experts.deep_gemm_moe"
@@ -423,7 +435,6 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
     from vllm.model_executor.layers.fused_moe.utils import moe_kernel_quantize_input
     from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 
-    experts, hidden, inter, tokens = 4, 512, 256, 300
     torch.manual_seed(9)
     x = torch.randn(tokens, hidden).to(torch.bfloat16).cuda()
     fc1 = [
@@ -435,8 +446,12 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
         for _ in range(experts)
     ]
     fc1[3][:, :32] = 0.0
-    topk_ids = torch.tensor([0, 1, 3]).repeat(tokens)[:tokens, None].int().cuda()
-    topk_weights = torch.rand(tokens, 1).cuda()
+    routable = torch.tensor([e for e in range(experts) if e != 2])  # expert 2 idle
+    topk_ids = torch.stack(
+        [routable[torch.randperm(len(routable))[:topk]] for _ in range(tokens)]
+    )
+    topk_ids = topk_ids.int().cuda()
+    topk_weights = torch.rand(tokens, topk).cuda()
 
     # Rollout: vLLM DeepGemmFP4Experts.apply on the same BF16 tensors.
     packed1 = [quantize_mxfp4(w) for w in fc1]
@@ -454,7 +469,7 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
     )
     m_sum, _ = compute_aligned_M_and_alignment(
         M=tokens,
-        num_topk=1,
+        num_topk=topk,
         local_num_experts=experts,
         alignment=get_mk_alignment_for_contiguous_layout()[0],
         expert_tokens_meta=None,
@@ -483,17 +498,29 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise():
         expert_map=None,
         a1q_scale=a1q_scale,
         a2_scale=None,
-        workspace13=torch.zeros(m_sum, 2 * inter, dtype=torch.bfloat16, device="cuda"),
-        workspace2=torch.zeros(m_sum, 2 * inter, dtype=torch.bfloat16, device="cuda"),
+        workspace13=torch.zeros(
+            m_sum, max(2 * inter, hidden), dtype=torch.bfloat16, device="cuda"
+        ),
+        workspace2=torch.zeros(
+            m_sum, max(2 * inter, hidden), dtype=torch.bfloat16, device="cuda"
+        ),
         expert_tokens_meta=None,
         apply_router_weight_on_input=False,
     )
 
-    # Training: expert-sorted tokens through the W4A8 expert MLP, scattered back.
-    order = torch.argsort(topk_ids[:, 0], stable=True)
-    m_splits = torch.bincount(topk_ids[:, 0], minlength=experts).tolist()
-    rows = w4a8_expert_mlp(x[order], fc1, fc2, m_splits, topk_weights[order])
-    training = torch.zeros_like(x).index_copy_(0, order, rows)
+    # Training: MLite's unfused dispatch order (expert-major, tokens ascending),
+    # unweighted expert rows, then the FP32 top-k combine.
+    routed = torch.zeros(tokens, experts, dtype=torch.bool, device="cuda")
+    routed.scatter_(1, topk_ids.long(), True)
+    row_token = torch.cat([routed[:, e].nonzero()[:, 0] for e in range(experts)])
+    m_splits = routed.sum(0).tolist()
+    row_expert = torch.repeat_interleave(
+        torch.arange(experts, device="cuda"), routed.sum(0)
+    )
+    rows = w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits, None)
+    training = topk_fma_combine(
+        rows, row_token, row_expert, topk_ids.long(), topk_weights
+    )
 
     assert m_splits[2] == 0
     assert torch.equal(training.cpu(), rollout.cpu())
@@ -513,3 +540,101 @@ def test_fp8_act_matches_installed_vllm_kernel():
 
     assert torch.equal(codes.view(torch.uint8), ref_codes.view(torch.uint8))
     assert torch.equal(scale, ref_scale.contiguous())
+
+
+# --- top-k FP32 combine (vLLM ep_gather) ------------------------------------------
+
+
+def _round_f32(value: Fraction) -> float:
+    """Exact float32 round-to-nearest-even of a rational (normal/subnormal range)."""
+    if value == 0:
+        return 0.0
+    exponent = math.frexp(float(value))[1] - 1
+    while abs(value) >= Fraction(2) ** (exponent + 1):
+        exponent += 1
+    while abs(value) < Fraction(2) ** exponent:
+        exponent -= 1
+    quantum = Fraction(2) ** (max(exponent, -126) - 23)
+    return float(round(value / quantum) * quantum)  # Fraction round: half to even
+
+
+def _fma_f32_exact(a: float, b: float, c: float) -> float:
+    return _round_f32(Fraction(a) * Fraction(b) + Fraction(c))
+
+
+def _vllm_ep_gather(rows_tk: torch.Tensor, weights: torch.Tensor) -> torch.Tensor:
+    """``_fwd_kernel_ep_gather``: ``acc = 0; acc += fp32(row) * w`` per top-k slot
+    (contracted to an FMA by Triton), stored to BF16. Exact rational arithmetic."""
+    tokens, topk, hidden = rows_tk.shape
+    rows = rows_tk.float().tolist()
+    w = weights.float().tolist()
+    out = torch.empty(tokens, hidden, dtype=torch.float32)
+    for t in range(tokens):
+        for h in range(hidden):
+            acc = 0.0
+            for k in range(topk):
+                acc = _fma_f32_exact(rows[t][k][h], w[t][k], acc)
+            out[t, h] = acc
+    return out.to(torch.bfloat16)
+
+
+def test_fma_f32_is_correctly_rounded():
+    from megatron.lite.primitive.quantization.w4a8_experts import _fma_f32
+
+    torch.manual_seed(11)
+    a = torch.randn(4000) * torch.exp2(torch.randint(-20, 20, (4000,)).float())
+    b = torch.rand(4000)
+    c = torch.randn(4000) * torch.exp2(torch.randint(-20, 20, (4000,)).float())
+    # c + a*b = (1 + 2^-23) + 2^-24 - 2^-54: the float64 sum lands exactly on a
+    # float32 midpoint and only the dropped 2^-54 decides the rounding (down).
+    tie = (
+        torch.tensor([2.0**-12 * (1 + 2.0**-15)]),
+        torch.tensor([2.0**-12 * (1 - 2.0**-15)]),
+        torch.tensor([1 + 2.0**-23]),
+    )
+    a, b, c = (torch.cat([u, v]) for u, v in zip((a, b, c), tie))
+
+    got = _fma_f32(a, b, c)
+    expected = [_fma_f32_exact(*abc) for abc in zip(a.tolist(), b.tolist(), c.tolist())]
+    assert got.tolist() == expected
+    assert got[-1].item() == 1 + 2.0**-23
+    assert (c[-1:].double() + a[-1:].double() * b[-1:].double()).float().item() != (
+        1 + 2.0**-23
+    )  # plain float64 then float32 double-rounds this case the wrong way
+
+
+def test_topk_fma_combine_is_the_rollout_gather_and_differentiates():
+    from megatron.lite.primitive.quantization.w4a8_experts import topk_fma_combine
+
+    torch.manual_seed(12)
+    tokens, experts, topk, hidden = 5, 6, 3, 64
+    indices = torch.stack([torch.randperm(experts)[:topk] for _ in range(tokens)])
+    scores = torch.rand(tokens, topk).to(torch.bfloat16).requires_grad_()
+    # Rows in the unfused dispatch order: expert-major, tokens ascending.
+    row_token = torch.cat(
+        [(indices == e).any(-1).nonzero()[:, 0] for e in range(experts)]
+    )
+    row_expert = torch.cat(
+        [torch.full(((indices == e).any(-1).sum(),), e) for e in range(experts)]
+    )
+    rows = (
+        (torch.randn(len(row_token), hidden) * 100).to(torch.bfloat16).requires_grad_()
+    )
+
+    out = topk_fma_combine(rows, row_token, row_expert, indices, scores)
+
+    rows_tk = torch.empty(tokens, topk, hidden, dtype=torch.bfloat16)
+    for i, (t, e) in enumerate(zip(row_token.tolist(), row_expert.tolist())):
+        rows_tk[t, indices[t].tolist().index(e)] = rows[i].detach()
+    assert torch.equal(out, _vllm_ep_gather(rows_tk, scores.detach()))
+
+    out.float().sum().backward()
+    slot = [
+        indices[t].tolist().index(e)
+        for t, e in zip(row_token.tolist(), row_expert.tolist())
+    ]
+    expected_row_grad = scores.detach().float()[row_token, slot].unsqueeze(-1)
+    assert torch.equal(rows.grad, expected_row_grad.expand_as(rows).to(torch.bfloat16))
+    expected_score_grad = torch.zeros(tokens, topk)
+    expected_score_grad[row_token, slot] = rows.detach().float().sum(-1)
+    assert torch.allclose(scores.grad.float(), expected_score_grad, rtol=1e-2)
