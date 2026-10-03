@@ -15,7 +15,7 @@ import functools
 import torch
 from torch.nn import functional as F
 
-from megatron.lite.primitive.quantization.mxfp8 import BLOCK, dynamic_fp8_linear
+from megatron.lite.primitive.quantization.block32_fp8 import BLOCK, dynamic_fp8_linear
 
 LINEAR_PROVIDERS = ("default", "native_fp32", "block32_fp8")
 

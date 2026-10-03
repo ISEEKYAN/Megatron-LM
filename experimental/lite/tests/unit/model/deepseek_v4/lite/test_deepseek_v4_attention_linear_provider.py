@@ -24,7 +24,7 @@ from torch import nn
 from torch.nn import functional as F
 
 from megatron.lite.primitive.modules import native_fp32_linear as nfl
-from megatron.lite.primitive.quantization import mxfp8
+from megatron.lite.primitive.quantization import block32_fp8
 
 _PROJECTIONS = ("wq_a", "wq_b", "wkv", "wo_b")
 _CORE_SYMBOLS = {
@@ -221,8 +221,8 @@ class _DecodedLinear(nn.Module):
 
     def forward(self, x):
         flat = x.reshape(-1, x.shape[-1])
-        activation = mxfp8.quantize_block32(flat)
-        weight = mxfp8.quantize_block32(self.weight, mxfp8.WEIGHT_BLOCK)
+        activation = block32_fp8.quantize_block32(flat)
+        weight = block32_fp8.quantize_block32(self.weight, block32_fp8.WEIGHT_BLOCK)
         # Exact FP64 sums of E4M3 products independently check each real FP8
         # GEMM, followed by the specified FP32 scaling and block accumulation.
         value = torch.zeros(
@@ -407,3 +407,19 @@ def test_default_build_model_is_byte_identical_to_main(single_rank_nccl, monkeyp
             ref_dtype, ref_shape, ref_data = expected_group[key]
             assert (dtype, shape) == (ref_dtype, ref_shape), key
             assert torch.equal(data, ref_data), key
+
+
+def test_default_protocol_does_not_import_fp8_primitive():
+    source = """
+import sys
+import types
+from pathlib import Path
+package = types.ModuleType('megatron.lite.model.deepseek_v4.lite')
+package.__path__ = [str(Path('megatron/lite/model/deepseek_v4/lite').resolve())]
+sys.modules[package.__name__] = package
+from megatron.lite.model.deepseek_v4.lite.protocol import ImplConfig, _attention_linear_provider
+assert _attention_linear_provider(ImplConfig()) is None
+assert 'megatron.lite.primitive.modules.native_fp32_linear' not in sys.modules
+assert 'megatron.lite.primitive.quantization.block32_fp8' not in sys.modules
+"""
+    subprocess.run([sys.executable, "-c", source], check=True)

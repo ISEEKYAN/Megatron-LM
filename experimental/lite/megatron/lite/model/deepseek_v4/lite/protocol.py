@@ -23,10 +23,6 @@ from megatron.lite.model.protocol_utils import (
     router_replay_roots as router_replay_roots,
 )
 from megatron.lite.primitive.bundle import ModelBundle
-from megatron.lite.primitive.modules.native_fp32_linear import (
-    linear_provider,
-    restore_fp32_masters,
-)
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.cp import (
     contiguous_position_ids_for_cp,
@@ -132,16 +128,14 @@ def _as_batch_row(tensor):
     return tensor
 
 
-def _infer_cp_local_seq_len(
-    *,
-    input_ids,
-    position_ids,
-    cp_size,
-):
+def _infer_cp_local_seq_len(*, input_ids, position_ids, cp_size):
     seq_len = input_ids.size(1)
     if cp_size <= 1:
         return seq_len
-    if position_ids is not None and position_ids.size(-1) in (seq_len, seq_len * cp_size):
+    if position_ids is not None and position_ids.size(-1) in (
+        seq_len,
+        seq_len * cp_size,
+    ):
         return seq_len
     return seq_len // cp_size if seq_len % cp_size == 0 else seq_len
 
@@ -201,7 +195,9 @@ def _prepare_packed_contiguous_cp_kwargs(model, kwargs):
     for key in ("input_ids", "labels", "loss_mask", "position_ids"):
         tensor = kwargs.get(key)
         if tensor is not None:
-            kwargs[key] = contiguous_slice_for_cp(tensor, ps.cp_rank, ps.cp_size, seq_dim=1)
+            kwargs[key] = contiguous_slice_for_cp(
+                tensor, ps.cp_rank, ps.cp_size, seq_dim=1
+            )
     return kwargs
 
 
@@ -254,7 +250,9 @@ def _prepare_model_forward_kwargs(model, batch: PackedBatch):
     # split per row under contiguous CP, where contiguous_position_ids_for_cp rebuilds
     # the per-rank global position ids.
     input_ids = batch.input_ids
-    is_thd_packed = input_ids.dim() == 1 or (input_ids.dim() == 2 and input_ids.size(0) == 1)
+    is_thd_packed = input_ids.dim() == 1 or (
+        input_ids.dim() == 2 and input_ids.size(0) == 1
+    )
     if is_thd_packed:
         return _prepare_packed_batch_kwargs(model, batch)
     kwargs = _base_model_forward_kwargs(batch)
@@ -301,11 +299,15 @@ def _apply_mtp_config(model_cfg: DeepseekV4Config, impl_cfg: ImplConfig) -> None
         override = impl_cfg.mtp_num_layers
     if override is not None:
         if override < 0:
-            raise ValueError(f"DeepSeek V4 MTP layer count must be >=0, got {override}.")
+            raise ValueError(
+                f"DeepSeek V4 MTP layer count must be >=0, got {override}."
+            )
         model_cfg.num_nextn_predict_layers = int(override)
     if impl_cfg.mtp_enable:
         if model_cfg.num_nextn_predict_layers <= 0:
-            raise ValueError("mtp_enable=True but DeepSeek V4 config has no MTP layers.")
+            raise ValueError(
+                "mtp_enable=True but DeepSeek V4 config has no MTP layers."
+            )
         model_cfg.mtp_loss_scaling_factor = impl_cfg.mtp_loss_scaling_factor
     else:
         model_cfg.num_nextn_predict_layers = 0
@@ -337,7 +339,9 @@ def _optimizer_backend_name(optimizer: Any) -> str | None:
     return optimizer
 
 
-def _configure_attention_backend(chunks: list[nn.Module], *, backend: str | None) -> None:
+def _configure_attention_backend(
+    chunks: list[nn.Module], *, backend: str | None
+) -> None:
     backend_name = backend or "torch"
     for chunk in chunks:
         for module in chunk.modules():
@@ -375,9 +379,11 @@ def _validate_parallel_scope(p: ParallelConfig) -> None:
 
 
 def _attention_linear_provider(impl_cfg: ImplConfig):
-    provider = linear_provider(impl_cfg.attention_linear)
     if impl_cfg.attention_linear == "default":
         return None
+    from megatron.lite.primitive.modules.native_fp32_linear import linear_provider
+
+    provider = linear_provider(impl_cfg.attention_linear)
     if normalize_qat_spec(impl_cfg.qat).enabled:
         raise ValueError("attention_linear providers cannot be combined with QAT")
     if _optimizer_backend_name(impl_cfg.optimizer) == "fsdp2":
@@ -426,8 +432,14 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
             .to(torch.bfloat16)
             .cuda()
         )
-        # Provider masters return to FP32 after the module-wide BF16 cast.
-        return restore_fp32_masters(model)
+        if attention_linear is not None:
+            # Provider masters return to FP32 after the module-wide BF16 cast.
+            from megatron.lite.primitive.modules.native_fp32_linear import (
+                restore_fp32_masters,
+            )
+
+            return restore_fp32_masters(model)
+        return model
 
     chunks = [_chunk(i) for i in range(vpp)] if vpp is not None else [_chunk()]
     _configure_attention_backend(chunks, backend=impl_cfg.attention_backend_override)
@@ -477,7 +489,9 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
 
         def _post_model_load_hook():
             from megatron.lite.model.deepseek_v4.lite.model import DeepseekV4Layer
-            from megatron.lite.primitive.optimizers.fsdp2 import build_fsdp2_training_optimizer
+            from megatron.lite.primitive.optimizers.fsdp2 import (
+                build_fsdp2_training_optimizer,
+            )
 
             return {
                 "optimizer": build_fsdp2_training_optimizer(
@@ -529,7 +543,11 @@ def export_hf_weights(
 
 
 def save_hf_weights(
-    chunks: list[nn.Module], path: str, model_cfg: DeepseekV4Config, ps: ParallelState, **kwargs
+    chunks: list[nn.Module],
+    path: str,
+    model_cfg: DeepseekV4Config,
+    ps: ParallelState,
+    **kwargs,
 ) -> None:
     _save_hf_weights_impl(chunks, path, model_cfg, ps, **kwargs)
 

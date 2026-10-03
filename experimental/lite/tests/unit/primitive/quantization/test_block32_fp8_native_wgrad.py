@@ -13,7 +13,7 @@ import torch
 from torch.nn import functional as F
 
 from megatron.lite.primitive.modules import native_fp32_linear as nfl
-from megatron.lite.primitive.quantization import mxfp8
+from megatron.lite.primitive.quantization import block32_fp8
 from megatron.lite.primitive.quantization.block_fp8 import (
     dequantize_block_fp8,
     quantize_block_fp8,
@@ -26,7 +26,7 @@ def scaled_mm_calls(monkeypatch):
 
     def emulate(a, b, scale_a, scale_b, *, out_dtype):
         assert a.dtype == b.dtype == torch.float8_e4m3fn
-        assert a.shape[1] == b.shape[0] == mxfp8.BLOCK and b.stride(0) == 1
+        assert a.shape[1] == b.shape[0] == block32_fp8.BLOCK and b.stride(0) == 1
         assert out_dtype == torch.float32
         assert scale_a.item() == scale_b.item() == 1.0
         calls.append((tuple(a.shape), tuple(b.shape)))
@@ -48,23 +48,25 @@ def _integer_operands(rows=8, out=64, k=96, dtype=torch.bfloat16):
 @pytest.mark.parametrize("dtype", [torch.float32, torch.bfloat16])
 def test_block32_codec_reuses_block_fp8_e8m0(dtype):
     x = torch.randn(4, 3, 64, generator=torch.Generator().manual_seed(1)).to(dtype)
-    got = mxfp8.quantize_block32(x)
+    got = block32_fp8.quantize_block32(x)
     values, scale = quantize_block_fp8(x, (1, 32), scale_format="e8m0")
     assert got.scale.dtype == torch.float8_e8m0fnu and got.scale.shape == (4, 3, 2)
     assert torch.equal(got.values.view(torch.uint8), values.view(torch.uint8))
     assert torch.equal(got.scale.view(torch.uint8), scale.view(torch.uint8))
     decoded = dequantize_block_fp8(values, scale, (1, 32)).to(dtype)
     assert got.decoded.dtype == dtype and torch.equal(got.decoded, decoded)
-    weight = mxfp8.quantize_block32(x[0, :, :].repeat(32, 1), mxfp8.WEIGHT_BLOCK)
+    weight = block32_fp8.quantize_block32(
+        x[0, :, :].repeat(32, 1), block32_fp8.WEIGHT_BLOCK
+    )
     assert weight.scale.shape == (3, 2)
 
 
 def test_fp8_gemm_calls_scaled_mm_per_k_block_with_fp32_scales(scaled_mm_calls):
     x, w = _integer_operands()
     flat = x.reshape(-1, x.shape[-1])
-    a = mxfp8.quantize_block32(flat)
-    b = mxfp8.quantize_block32(w, mxfp8.WEIGHT_BLOCK)
-    out = mxfp8._fp8_gemm(a.values, a.scale, b.values, b.scale)
+    a = block32_fp8.quantize_block32(flat)
+    b = block32_fp8.quantize_block32(w, block32_fp8.WEIGHT_BLOCK)
+    out = block32_fp8._fp8_gemm(a.values, a.scale, b.values, b.scale)
     assert scaled_mm_calls == [((16, 32), (32, 64))] * 3
     assert out.dtype == torch.float32
     assert torch.equal(out, flat.double().matmul(w.double().T).float())
@@ -74,8 +76,8 @@ def test_real_and_diagnostic_paths_share_codec_and_differ_from_floating(
     scaled_mm_calls,
 ):
     x, w = _integer_operands()
-    real = mxfp8._DynamicFP8Linear.apply(x, w, False)  # bypasses the CUDA guard
-    diagnostic = mxfp8.dynamic_fp8_linear(x, w, diagnostic=True)
+    real = block32_fp8._DynamicFP8Linear.apply(x, w, False)  # bypasses the CUDA guard
+    diagnostic = block32_fp8.dynamic_fp8_linear(x, w, diagnostic=True)
     assert len(scaled_mm_calls) == 3 and real.dtype == torch.bfloat16
     assert torch.equal(real, diagnostic)
 
@@ -84,9 +86,9 @@ def test_real_and_diagnostic_paths_share_codec_and_differ_from_floating(
     gen = torch.Generator().manual_seed(2)
     x = torch.randn(5, 64, generator=gen).bfloat16()
     w = torch.randn(32, 64, generator=gen)
-    decoded_x = mxfp8.quantize_block32(x).decoded.float()
-    decoded_w = mxfp8.quantize_block32(w, mxfp8.WEIGHT_BLOCK).decoded
-    diagnostic = mxfp8.dynamic_fp8_linear(x, w, diagnostic=True)
+    decoded_x = block32_fp8.quantize_block32(x).decoded.float()
+    decoded_w = block32_fp8.quantize_block32(w, block32_fp8.WEIGHT_BLOCK).decoded
+    diagnostic = block32_fp8.dynamic_fp8_linear(x, w, diagnostic=True)
     assert torch.equal(diagnostic, F.linear(decoded_x, decoded_w).bfloat16())
     assert not torch.equal(diagnostic, F.linear(x.float(), w).bfloat16())
 
@@ -96,9 +98,11 @@ def test_fp8_backward_is_native_fp32_wgrad():
     x = torch.randn(2, 3, 64, generator=gen).bfloat16().requires_grad_()
     w = torch.randn(32, 64, generator=gen).requires_grad_()
     grad = torch.randn(2, 3, 32, generator=gen).bfloat16()
-    mxfp8.dynamic_fp8_linear(x, w, diagnostic=True).backward(grad)
-    decoded_x = mxfp8.quantize_block32(x.detach().reshape(-1, 64)).decoded
-    decoded_w = mxfp8.quantize_block32(w.detach(), mxfp8.WEIGHT_BLOCK).decoded
+    block32_fp8.dynamic_fp8_linear(x, w, diagnostic=True).backward(grad)
+    decoded_x = block32_fp8.quantize_block32(x.detach().reshape(-1, 64)).decoded
+    decoded_w = block32_fp8.quantize_block32(
+        w.detach(), block32_fp8.WEIGHT_BLOCK
+    ).decoded
     flat = grad.reshape(-1, 32).float()
     assert w.grad.dtype == torch.float32 and x.grad.dtype == torch.bfloat16
     assert torch.equal(w.grad, flat.T @ decoded_x.float())
@@ -151,27 +155,33 @@ def test_provider_registry_and_fp32_master_restore():
             ),
             TypeError,
         ),
-        (lambda: mxfp8.quantize_block32(torch.ones(2, 48)), ValueError),
+        (lambda: block32_fp8.quantize_block32(torch.ones(2, 48)), ValueError),
         (
-            lambda: mxfp8.quantize_block32(torch.ones(2, 32, dtype=torch.int32)),
+            lambda: block32_fp8.quantize_block32(torch.ones(2, 32, dtype=torch.int32)),
             TypeError,
         ),
         (
-            lambda: mxfp8.dynamic_fp8_linear(torch.ones(2, 32), torch.ones(48, 32)),
+            lambda: block32_fp8.dynamic_fp8_linear(
+                torch.ones(2, 32), torch.ones(48, 32)
+            ),
             ValueError,
         ),
         (
-            lambda: mxfp8.dynamic_fp8_linear(torch.ones(2, 64), torch.ones(32, 32)),
+            lambda: block32_fp8.dynamic_fp8_linear(
+                torch.ones(2, 64), torch.ones(32, 32)
+            ),
             ValueError,
         ),
         (
-            lambda: mxfp8.dynamic_fp8_linear(
+            lambda: block32_fp8.dynamic_fp8_linear(
                 torch.ones(2, 32).half(), torch.ones(32, 32).bfloat16()
             ),
             TypeError,
         ),
         (
-            lambda: mxfp8.dynamic_fp8_linear(torch.ones(2, 32), torch.ones(32, 32)),
+            lambda: block32_fp8.dynamic_fp8_linear(
+                torch.ones(2, 32), torch.ones(32, 32)
+            ),
             RuntimeError,
         ),
         (
@@ -208,11 +218,13 @@ def test_cuda_scaled_mm_matches_diagnostic_on_exact_operands(monkeypatch):
         layer.weight.copy_(w)
     real = layer(x)
     assert len(calls) == 3
-    assert torch.equal(real, mxfp8.dynamic_fp8_linear(x, w, diagnostic=True))
+    assert torch.equal(real, block32_fp8.dynamic_fp8_linear(x, w, diagnostic=True))
     real.float().sum().backward()
     assert layer.weight.grad.dtype == torch.float32
-    decoded_x = mxfp8.quantize_block32(x.detach().reshape(-1, 96)).decoded.float()
-    decoded_w = mxfp8.quantize_block32(w.detach(), mxfp8.WEIGHT_BLOCK).decoded
+    decoded_x = block32_fp8.quantize_block32(x.detach().reshape(-1, 96)).decoded.float()
+    decoded_w = block32_fp8.quantize_block32(
+        w.detach(), block32_fp8.WEIGHT_BLOCK
+    ).decoded
     grad = torch.ones_like(real).reshape(-1, 64).float()
     assert torch.equal(layer.weight.grad, grad.T @ decoded_x)
     assert torch.equal(x.grad, (grad @ decoded_w).reshape(x.shape).bfloat16())
