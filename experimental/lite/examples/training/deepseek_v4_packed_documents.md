@@ -86,10 +86,11 @@ hold their own target snapshots; pending driver queues are cleared by driver end
 This V4 adapter requires TP=ETP=CP=PP=EP=VPP=1 and no activation offload, and either no recompute or `recompute=["full"]`.
 Full recompute means **whole-document** checkpointing; it requires packed
 metadata. Submodule recompute selections are rejected. EP needs a shared cross-rank
-document schedule, which this local executor does not provide. Packed execution disables
-MTP at construction: it skips MTP configuration overrides and creates no MTP
-weights, even when `mtp_enable` retains its default `True`. Non-packed calls with no
-recompute retain the ordinary model path. The default model/MTP path is unchanged.
+document schedule, which this local executor does not provide.
+Packed builds reject `mtp_enable=True`, MTP training
+options, MTP overrides, and nonzero model `num_nextn_predict_layers`. Set
+`mtp_enable=False` and model `num_nextn_predict_layers=0` without MTP overrides.
+Non-packed calls with no recompute retain the ordinary model path. The default model/MTP path is unchanged.
 When no attention override is supplied, the opt-in adapter selects the existing
 `flash` sparse backend; the default adapter retains its `torch` selection.
 The resolved backend also configures TE environment flags before construction;

@@ -22,14 +22,16 @@ def packed_objective(
 ):
     """Reduce already-aligned targets; denominator may cover multiple shards/batches.
 
-    Without labels, logits retain their local vocabulary partition. With labels,
+    Without labels, logits are unscaled and retain their local vocabulary partition.
+    Temperature applies only to the labeled objective. With labels,
     a missing mask means every token counts; an all-zero mask produces zero loss.
     """
     if not math.isfinite(temperature) or temperature <= 0:
         raise ValueError("Temperature must be finite and positive")
     if denominator is not None and (not math.isfinite(denominator) or denominator <= 0):
         raise ValueError("Loss denominator must be finite and positive")
-    logits = logits / temperature
+    if labels is not None:
+        logits = logits / temperature
     result = {}
     if calculate_entropy:
         result["entropy"] = vocab_parallel_entropy(logits, tp_group)

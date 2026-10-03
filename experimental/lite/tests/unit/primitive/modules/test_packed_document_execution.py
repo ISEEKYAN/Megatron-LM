@@ -42,7 +42,7 @@ def test_objective_mask_temperature_entropy_and_denominator():
     )
     assert packed_objective(logits.detach(), labels, mask * 0)['loss'] == 0
     inference = packed_objective(torch.tensor([[[2.0, -2.0]]]), temperature=2.0)
-    assert torch.equal(inference['logits'], torch.tensor([[[1.0, -1.0]]]))
+    assert torch.equal(inference['logits'], torch.tensor([[[2.0, -2.0]]]))
 
 
 @pytest.mark.parametrize(

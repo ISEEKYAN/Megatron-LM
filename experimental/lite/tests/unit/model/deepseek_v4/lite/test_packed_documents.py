@@ -567,23 +567,69 @@ def test_opt_in_selects_working_sparse_backend_when_omitted(cpu_v4):
 
 
 @pytest.mark.parametrize('mtp_layers', [0, 1])
-def test_packed_build_skips_mtp_configuration(cpu_v4, mtp_layers):
+@pytest.mark.parametrize(
+    'mtp_options',
+    [
+        {},
+        {'mtp_enable': True},
+        {'mtp_enable': False, 'mtp_enable_train': True},
+        {'mtp_enable': False, 'mtp_detach_encoder': True},
+        {'mtp_enable': False, 'mtp_num_layers': 3},
+        {'mtp_enable': False, 'num_nextn_predict_layers': 2},
+        {'mtp_enable': False, 'mtp_loss_scaling_factor': 0.7},
+    ],
+)
+def test_packed_build_rejects_mtp_configuration(
+    cpu_v4, monkeypatch, mtp_layers, mtp_options
+):
     config = _config(mtp=bool(mtp_layers))
     original = vars(config).copy()
-    model = cpu_v4.protocol.build_model(
-        config,
-        impl_cfg=cpu_v4.protocol.ImplConfig(
-            optimizer=None,
-            packed_documents=True,
-            mtp_enable_train=True,
-            mtp_num_layers=3,
-            mtp_loss_scaling_factor=0.7,
-        ),
-    ).chunks[0]
+
+    def unexpected_init(_):
+        pytest.fail('MTP must be rejected before parallel initialization')
+
+    monkeypatch.setattr(cpu_v4.protocol, 'init_parallel', unexpected_init)
+    with pytest.raises(ValueError, match='packed.*MTP'):
+        cpu_v4.protocol.build_model(
+            config,
+            impl_cfg=cpu_v4.protocol.ImplConfig(
+                optimizer=None, packed_documents=True, **mtp_options
+            ),
+        )
     assert vars(config) == original
-    assert not model.mtp_enable_train
-    assert not list(model.mtp)
-    assert not any(name.startswith('mtp.') for name in model.state_dict())
+
+
+def test_packed_build_rejects_model_mtp_layers(cpu_v4):
+    with pytest.raises(ValueError, match='packed.*MTP'):
+        cpu_v4.protocol.build_model(
+            _config(mtp=True),
+            impl_cfg=cpu_v4.protocol.ImplConfig(
+                optimizer=None, packed_documents=True, mtp_enable=False
+            ),
+        )
+
+
+@pytest.mark.parametrize('temperature', [0.5, 2.0])
+@pytest.mark.parametrize('recompute', [False, True])
+def test_packed_logits_only_matches_parent_bytes(cpu_v4, temperature, recompute):
+    from megatron.lite.primitive.utils.packed_seq import PackedSeqParams
+
+    parent = _build(cpu_v4.protocol)
+    packed = _build(cpu_v4.protocol, packed=True, recompute=recompute)
+    ids = torch.tensor([[1, 2, 3, 4, 5]])
+    params = PackedSeqParams.from_cu_seqlens(
+        torch.tensor([0, 2, 5], dtype=torch.int32), 3
+    )
+    expected = torch.cat(
+        [
+            parent(input_ids=part, temperature=temperature)['logits']
+            for part in ids.split([2, 3], dim=1)
+        ],
+        dim=1,
+    )
+    actual = packed(input_ids=ids, packed_seq_params=params, temperature=temperature)
+    _equal(actual['logits'], expected)
+    assert 'loss' not in actual
 
 
 @pytest.mark.parametrize('packed', [False, True])

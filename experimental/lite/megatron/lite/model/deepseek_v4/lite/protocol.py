@@ -390,6 +390,20 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     if impl_cfg.packed_documents:
         from megatron.lite.model.deepseek_v4.lite.packed import PackedDeepseekV4Model
 
+        if (
+            impl_cfg.mtp_enable
+            or impl_cfg.mtp_enable_train
+            or impl_cfg.mtp_detach_encoder
+            or impl_cfg.mtp_num_layers is not None
+            or impl_cfg.num_nextn_predict_layers is not None
+            or impl_cfg.mtp_loss_scaling_factor != ImplConfig.mtp_loss_scaling_factor
+            or model_cfg.num_nextn_predict_layers > 0
+        ):
+            raise ValueError(
+                "V4 packed document execution does not support MTP configuration; "
+                "set mtp_enable=False, num_nextn_predict_layers=0 in the model "
+                "config, and remove MTP training options and overrides"
+            )
         scope = impl_cfg.parallel
         # EP ranks need a shared document schedule; this local executor has none.
         if (scope.cp, scope.pp, scope.ep, scope.vpp) != (
