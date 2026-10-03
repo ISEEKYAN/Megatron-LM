@@ -5,11 +5,91 @@ Requires vLLM's layerwise reload metadata recorded before initial processing.
 Engram tables remain resident: only each shard's intersecting rows are copied.
 """
 from contextlib import contextmanager
+from copy import copy
 from functools import wraps
 
 import torch
 from megatron.lite.model.deepseek_v41.lite.resync import decode_transport
 from megatron.lite.primitive.ckpt.row_stream import RowChunk, RowReceiver
+
+
+def set_mxfp4_load_numel(model):
+    """Use native MXFP4 creation for checkpoint-sized reload thresholds.
+
+    Reuse the same layout as cold loading/export, before metadata capture.
+    Only the disposable method copy is mutated; no kernel tensors are changed.
+    """
+    for layer in model.modules():
+        method = getattr(layer, 'quant_method', None)
+        if type(method).__name__ != 'Mxfp4MoEMethod':
+            continue
+        config = layer.moe_config
+        tp = config.moe_parallel_config.tp_size
+        intermediate = config.intermediate_size
+        if config.tp_shard_with_padding or intermediate % (tp * 32):
+            raise NotImplementedError(
+                'DS4.1 MXFP4 reload requires evenly sharded group32 checkpoints'
+            )
+        template = torch.nn.Module()
+        with torch.device('meta'):
+            copy(method).create_weights(
+                template,
+                num_experts=layer.w13_weight.shape[0],
+                hidden_size=config.hidden_dim_unpadded,
+                intermediate_size_per_partition=intermediate // tp,
+                params_dtype=layer.w13_weight.dtype,
+                weight_loader=layer.w13_weight.weight_loader,
+            )
+        for name, parameter in template.named_parameters(recurse=False):
+            target = layer.get_parameter(name)
+            if parameter.numel() > target.numel():
+                raise ValueError('DS4.1 MXFP4 checkpoint exceeds padded parameter')
+            target.weight_loader_numel = parameter.numel()
+
+
+class StagingBudget:
+    """Count actual retained input storage, including aliases, across all layers.
+
+    Separate from exporter/transport workspace and resident kernel weights.
+    Check before cloning, so a missing completion cannot grow without bound.
+    """
+
+    def __init__(self, infos, budget_bytes):
+        if type(budget_bytes) is not int or budget_bytes <= 0:
+            raise ValueError('Invalid DS4.1 receiver staging budget')
+        self.infos, self.budget_bytes = infos, budget_bytes
+        self.current_bytes = self.peak_bytes = 0
+
+    def refresh(self):
+        storages = {}
+
+        def visit(value):
+            if isinstance(value, torch.Tensor) and value.device.type != 'meta':
+                storage = value.untyped_storage()
+                storages[(value.device, storage.data_ptr())] = storage.nbytes()
+            elif isinstance(value, dict):
+                for child in value.values():
+                    visit(child)
+            elif isinstance(value, (tuple, list)):
+                for child in value:
+                    visit(child)
+
+        for info in self.infos:
+            for _, bound in info.loaded_weights:
+                for name, value in bound.arguments.items():
+                    if name != 'param':
+                        visit(value)
+        self.current_bytes = sum(storages.values())
+        self.peak_bytes = max(self.peak_bytes, self.current_bytes)
+        return self.current_bytes
+
+    def check(self, incoming_bytes):
+        total = self.refresh() + incoming_bytes
+        if total > self.budget_bytes:
+            raise RuntimeError(
+                f'DS4.1 receiver staging {total} exceeds budget {self.budget_bytes}'
+            )
+        self.peak_bytes = max(self.peak_bytes, total)
 
 
 @contextmanager
@@ -32,8 +112,8 @@ def _without_tables(model):
 
 def install_reload_metadata_hook():
     """Install in the rollout worker before its loader creates the model."""
+    from vllm.model_executor.model_loader import reload
     from vllm.model_executor.model_loader.base_loader import BaseModelLoader
-    from vllm.model_executor.model_loader.reload import record_metadata_for_reloading
 
     original = BaseModelLoader.create_model
     if getattr(original, '_ds41_metadata_hook', False):
@@ -43,8 +123,9 @@ def install_reload_metadata_hook():
     def create(self, vllm_config, model_config, prefix=''):
         model = original(self, vllm_config, model_config, prefix)
         if getattr(model_config.hf_config, 'model_type', '') == 'deepseek_v41':
+            set_mxfp4_load_numel(model)
             with _without_tables(model):
-                record_metadata_for_reloading(model)
+                reload.record_metadata_for_reloading(model)
             model._ds41_reload_metadata = True
         return model
 
@@ -55,8 +136,9 @@ def install_reload_metadata_hook():
 class ResyncReceiver:
     """One complete generation; bucket boundaries do not finalize the model."""
 
-    def __init__(self, model, model_config):
-        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+    def __init__(self, model, model_config, staging_budget_bytes=16 * 1024**3):
+        from vllm.model_executor.model_loader import reload
+        from vllm.model_executor.model_loader.reload import layerwise
 
         if not getattr(model, '_ds41_reload_metadata', False):
             raise RuntimeError(
@@ -69,6 +151,10 @@ class ResyncReceiver:
                 'DS4.1 resync currently requires FusedMoE, not MegaMoE'
             )
         self.model, self.model_config = model, model_config
+        self.staging = StagingBudget(
+            [layerwise.get_layerwise_info(m) for m in model.modules()],
+            staging_budget_bytes,
+        )
         self.rows, self.hooks = {}, []
         self.expected_tables = {
             n
@@ -90,7 +176,7 @@ class ResyncReceiver:
                 self.hooks.append((module, module.process_weights_after_loading))
                 module.process_weights_after_loading = lambda: None
         with _without_tables(model):
-            initialize_layerwise_reload(model)
+            reload.initialize_layerwise_reload(model)
 
     @torch.no_grad()
     def receive(self, weights):
@@ -131,10 +217,37 @@ class ResyncReceiver:
                 # module is complete; IPC storage is borrowed only until return.
                 if tensor.dtype == torch.int8:
                     tensor = tensor.view(torch.uint8)
-                self.model.load_weights([(name, tensor.clone())])
+                try:
+                    self.staging.check(tensor.numel() * tensor.element_size())
+                    self.model.load_weights([(name, tensor.clone())])
+                    self.staging.refresh()
+                except BaseException:
+                    self.abort()
+                    raise
+
+    def abort(self):
+        """Release unconsumed inputs and restore hooks after a failed refit.
+
+        The partially updated generation must be discarded by the caller.
+        Do not repack an incomplete layer during error cleanup.
+        """
+        from vllm.model_executor.model_loader.reload import layerwise
+
+        for layer in self.model.modules():
+            info = layerwise.get_layerwise_info(layer)
+            if info.can_load() and info.kernel_tensors is not None:
+                layerwise._place_kernel_tensors(layer, info)
+            info.reset()
+            layerwise.LOADING_LAYERS.discard(layer)
+        for module, hook in self.hooks:
+            module.process_weights_after_loading = hook
+        if hasattr(self.model, '_original_do_torchao_reload'):
+            self.model._do_torchao_reload = self.model._original_do_torchao_reload
+        self.staging.refresh()
+        self.finished = True
 
     def finish(self):
-        from vllm.model_executor.model_loader.reload import finalize_layerwise_reload
+        from vllm.model_executor.model_loader import reload
 
         if self.finished:
             raise RuntimeError('DS4.1 resync generation already finalized')
@@ -145,19 +258,21 @@ class ResyncReceiver:
         for receiver in self.rows.values():
             receiver.finish()
         with _without_tables(self.model):
-            finalize_layerwise_reload(self.model, self.model_config)
+            reload.finalize_layerwise_reload(self.model, self.model_config)
         for module, hook in self.hooks:
             module.process_weights_after_loading = hook
         if hasattr(self.model, '_weights_finalized'):
             self.model._weights_finalized = False
         self.model.process_weights_after_loading()
+        self.staging.refresh()
         self.finished = True
 
 
 def worker_extension():
-    from verl.workers.rollout.vllm_rollout.utils import vLLMColocateWorkerExtension
+    import verl.workers.rollout.vllm_rollout.utils as utils
+    from verl.workers.rollout.vllm_rollout import bucketed_weight_transfer
 
-    class DeepseekV41WorkerExtension(vLLMColocateWorkerExtension):
+    class DeepseekV41WorkerExtension(utils.vLLMColocateWorkerExtension):
         def __new__(cls, **kwargs):
             install_reload_metadata_hook()
             return super().__new__(cls, **kwargs)
@@ -165,10 +280,6 @@ def worker_extension():
         def update_weights_from_ipc(
             self, peft_config=None, base_sync_done=False, use_shm=False
         ):
-            from verl.workers.rollout.vllm_rollout.bucketed_weight_transfer import (
-                BucketedWeightReceiver,
-            )
-
             if (
                 peft_config
                 or self.model_runner.vllm_config.speculative_config is not None
@@ -179,7 +290,7 @@ def worker_extension():
             receiver = ResyncReceiver(
                 self.model_runner.model, self.model_runner.vllm_config.model_config
             )
-            transport = BucketedWeightReceiver(
+            transport = bucketed_weight_transfer.BucketedWeightReceiver(
                 zmq_handle=self._get_zmq_handle(), device=self.device, use_shm=use_shm
             )
             transport.receive_weights(
