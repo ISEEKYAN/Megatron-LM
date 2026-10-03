@@ -94,7 +94,7 @@ def tiny_qwen3_moe(transformer_engine_import_stub, monkeypatch):
         num_attention_heads=4,
         num_key_value_heads=2,
         head_dim=32,
-        vocab_size=64,
+        vocab_size=128,
         num_experts=_EXPERTS,
         num_experts_per_tok=2,
         moe_intermediate_size=_INTERMEDIATE,
@@ -153,6 +153,73 @@ def test_mxfp4_qat_expert_load_targets_resolve_to_master(tiny_qwen3_moe):
                 logical = f"layers.{layer_idx}.moe.experts.{fc}.weight{expert}"
                 actual = _resolve_param_name(logical, state)
                 assert actual.endswith(f"parametrizations.weight{expert}.original")
+
+
+def test_mxfp4_qat_checkpoint_save_load_restores_expert_masters(
+    tiny_qwen3_moe, tmp_path
+):
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import (
+        Qwen3MoEWeightSpec,
+        export_hf_weights,
+    )
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        load_hf_weights,
+        save_safetensors,
+    )
+    from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
+
+    build, config, ps = tiny_qwen3_moe
+    source = build()
+    apply_qat_to_chunks([source], QATSpec(enabled=True, format="mxfp4"))
+    with torch.no_grad():
+        for i, fc in enumerate(_grouped_linears(source)):
+            for expert, name in enumerate(_expert_weight_names(fc)):
+                master = fc.parametrizations[name].original
+                master.copy_(torch.full_like(master, (i + 1) * 10 + expert))
+
+    save_safetensors(dict(export_hf_weights(source, config, ps)), str(tmp_path))
+
+    target = build()
+    apply_qat_to_chunks([target], QATSpec(enabled=True, format="mxfp4"))
+    load_hf_weights(target, str(tmp_path), Qwen3MoEWeightSpec(config), ps)
+
+    for source_fc, target_fc in zip(
+        _grouped_linears(source), _grouped_linears(target), strict=True
+    ):
+        for name in _expert_weight_names(source_fc):
+            source_master = source_fc.parametrizations[name].original
+            target_master = target_fc.parametrizations[name].original
+            assert torch.equal(source_master, target_master), name
+
+
+def test_qat_disabled_qwen3_moe_matches_undeclared_main_behavior(
+    tiny_qwen3_moe, monkeypatch
+):
+    from megatron.lite.primitive.modules import experts as experts_module
+    from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
+
+    build, _config, _ps = tiny_qwen3_moe
+    declare = experts_module.declare_qat_weights
+    monkeypatch.setattr(experts_module, "declare_qat_weights", lambda *_args: None)
+    main_model = build()
+    monkeypatch.setattr(experts_module, "declare_qat_weights", declare)
+    model = build()
+    stats = apply_qat_to_chunks([model], QATSpec(enabled=False, format="mxfp4"))
+
+    main_state = main_model.state_dict()
+    state = model.state_dict()
+    assert state.keys() == main_state.keys()
+    assert all(torch.equal(state[name], main_state[name]) for name in state)
+    assert stats["quantized_modules"] == 0
+
+    tokens_per_expert = torch.tensor([3, 0, 5, 2])
+    torch.manual_seed(7)
+    x = torch.randn(int(tokens_per_expert.sum()), _HIDDEN, dtype=torch.bfloat16)
+    probs = torch.rand(x.shape[0])
+    for model_layer, main_layer in zip(model.layers, main_model.layers, strict=True):
+        output = model_layer.moe.experts(x, tokens_per_expert, probs)
+        main_output = main_layer.moe.experts(x, tokens_per_expert, probs)
+        assert torch.equal(output, main_output)
 
 
 def test_mxfp4_qat_expert_forward_matches_w4a16_reference(tiny_qwen3_moe):
