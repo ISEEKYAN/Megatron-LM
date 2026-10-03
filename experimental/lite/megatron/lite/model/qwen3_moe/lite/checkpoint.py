@@ -23,7 +23,6 @@ from megatron.lite.primitive.quantization.mxfp4 import MXFP4_BLOCK_SIZE, quantiz
 from megatron.lite.runtime.contracts.weights import ResyncFormat
 from torch.distributed.tensor import Replicate, Shard
 
-
 logger = logging.getLogger(__name__)
 
 
@@ -269,9 +268,27 @@ class Qwen3MoEWeightSpec:
 # ---------------------------------------------------------------------------
 
 
-def load_hf_weights(model, path: str, config: Qwen3MoEConfig, ps) -> None:
+def load_hf_weights(
+    model,
+    path: str,
+    config: Qwen3MoEConfig,
+    ps,
+    *,
+    bounded=False,
+    target="hf",
+    buffer_max_size_bytes=2 * 1024**3,
+) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
 
+    if bounded:
+        from megatron.lite.primitive.ckpt.hf_weights import load_bound_model
+
+        return load_bound_model(
+            model,
+            path,
+            Qwen3MoEBoundSpec(config, ps, target),
+            buffer_max_size_bytes=buffer_max_size_bytes,
+        )
     _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
 
 
@@ -280,12 +297,17 @@ def export_hf_weights(model, config: Qwen3MoEConfig, ps, **kwargs):
 
     target = kwargs.pop("target", "hf")
     resync_config = kwargs.pop("resync_config", None)
+    if kwargs.pop("bounded", False):
+        from megatron.lite.primitive.ckpt.hf_weights import export_bound_tensors
+
+        if resync_config:
+            raise ValueError("Bound Qwen export does not accept resync_config")
+        yield from export_bound_tensors(
+            model, Qwen3MoEBoundSpec(config, ps, target), **kwargs
+        )
+        return
     weights = _export(
-        model,
-        Qwen3MoEWeightSpec(config),
-        ps,
-        vocab_size=config.vocab_size,
-        **kwargs,
+        model, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size, **kwargs
     )
     if target in {"hf", ResyncFormat.BF16.value}:
         if resync_config:
@@ -327,6 +349,17 @@ def _export_mxfp4_weights(weights):
 def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps, **kwargs) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import save_hf_weights as _save
 
+    if kwargs.pop("bounded", False):
+        from megatron.lite.primitive.ckpt.hf_weights import save_bound_model
+
+        if isinstance(model, list):
+            if len(model) != 1:
+                raise NotImplementedError(
+                    "Bound Qwen checkpoints require one complete chunk"
+                )
+            model = model[0]
+        spec = Qwen3MoEBoundSpec(config, ps, kwargs.pop("target", "hf"))
+        return save_bound_model(model, path, spec, **kwargs)
     # Qwen3-MoE has no MXFP4/block-FP8 save-time resync path, so the engine-level
     # export kwargs are accepted for signature-compatibility but not consumed.
     if kwargs:
@@ -334,6 +367,99 @@ def save_hf_weights(model, path: str, config: Qwen3MoEConfig, ps, **kwargs) -> N
             "Qwen3-MoE save_hf_weights ignoring unsupported kwargs: %s", kwargs
         )
     _save(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
+
+
+class Qwen3MoEBoundSpec(Qwen3MoEWeightSpec):
+    """Opt-in full-model checkpoint contract; DP replicas drain the same stream.
+
+    TP/EP/PP/DTensor assembly is deliberately rejected before I/O. The ordinary
+    WeightSpec path continues to support its existing parallel configurations.
+    """
+
+    def __init__(self, config, ps, target="hf"):
+        super().__init__(config)
+        if any(
+            getattr(ps, axis + "_size", 1) != 1
+            for axis in ("tp", "ep", "etp", "pp", "cp")
+        ):
+            raise NotImplementedError(
+                "Bound Qwen checkpoints require TP=EP=ETP=PP=CP=1"
+            )
+        if config.num_nextn_predict_layers:
+            raise NotImplementedError("Bound Qwen checkpoints do not yet support MTP")
+        if target not in ("hf", "bf16", "mxfp4"):
+            raise ValueError(f"Unsupported bound Qwen export target: {target}")
+        self.target = target
+
+    def native_to_hf(self, name, tensor):
+        if self.is_expert(name):
+            name = self.expert_local_name(name, self.expert_global_id(name))
+        return super().native_to_hf(name, tensor)
+
+    def bindings(self, model):
+        from megatron.lite.primitive.ckpt.binding_records import TensorBinding
+        from megatron.lite.primitive.ckpt.hf_weights import resolve_param_name
+
+        parameters = dict(model.named_parameters())
+        bindings = []
+        for name, sources in self.weight_map().items():
+            actual = (
+                self.expert_local_name(name, self.expert_global_id(name))
+                if self.is_expert(name)
+                else name
+            )
+            actual = resolve_param_name(actual, parameters)
+            if actual is None:
+                raise ValueError(f"Missing Qwen checkpoint owner: {name}")
+            path, attribute = actual.rsplit(".", 1)
+            row = (
+                sources[0]
+                if name in ("embed.embedding.weight", "head.col.linear.weight")
+                else None
+            )
+            bindings.append(
+                TensorBinding(
+                    name, model.get_submodule(path), attribute, tuple(sources), row
+                )
+            )
+        return bindings
+
+    def encode(self, name, tensor):
+        ignored = name in (
+            "model.embed_tokens.weight",
+            "lm_head.weight",
+        ) or name.endswith(".mlp.gate.weight")
+        if self.target != "mxfp4" or ignored:
+            return tensor, None, None
+        weight, scale = quantize_mxfp4(tensor)
+        return (
+            weight.view(torch.uint8),
+            scale.view(torch.uint8),
+            name[:-7] + ".weight_scale",
+        )
+
+    def validate_keys(self, keys, expected):
+        optional = {
+            key[:-7] + ".weight_scale"
+            for key in expected
+            if key.endswith("_proj.weight")
+        }
+        if not expected <= keys or keys - expected - optional:
+            raise ValueError("Qwen HF checkpoint key coverage mismatch")
+
+    def decode(self, reader, name, budget):
+        from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+        value = reader.read(name, budget)
+        scale_name = name[:-7] + ".weight_scale"
+        if value.dtype == torch.uint8:
+            return dequantize_mxfp4(
+                value.view(torch.int8),
+                reader.read(scale_name, budget).view(torch.float8_e8m0fnu),
+            )
+        if scale_name in reader.keys():
+            raise ValueError(f"Unexpected Qwen scale for plain tensor: {name}")
+        return value
 
 
 def EXPERT_CLASSIFIER(name: str) -> bool:

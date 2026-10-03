@@ -23,6 +23,16 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
+from megatron.lite.primitive.ckpt.binding_records import (
+    TensorBinding,
+    validate_parameter_bindings,
+)
+from megatron.lite.primitive.ckpt.row_stream import (
+    RowChunk,
+    RowReceiver,
+    stream_rows,
+    write_row_file,
+)
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -47,7 +57,9 @@ def _local_source(target, source):
         shape, offset = compute_local_shape_and_global_offset(
             target.shape, target.device_mesh, target.placements
         )
-        return source[tuple(slice(start, start + size) for start, size in zip(offset, shape))]
+        return source[
+            tuple(slice(start, start + size) for start, size in zip(offset, shape))
+        ]
     return source
 
 
@@ -161,6 +173,34 @@ class HFWeights(Protocol):
 
     def expert_local_name(self, native_name: str, local_idx: int) -> str:
         """Synthetic expert name → actual model param name."""
+        ...
+
+
+class BoundHFWeights(HFWeights, Protocol):
+    """Additional contract required by bound load, export and save.
+
+    Bindings cover every live parameter once. Row keys bypass layout conversion;
+    other bindings use HFWeights.hf_to_native/native_to_hf within size limits.
+    """
+
+    def bindings(self, model: nn.Module) -> list[TensorBinding]:
+        """Return live owners and source keys, including original QAT masters."""
+        ...
+
+    def encode(
+        self, name: str, tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
+        """Encode rows as weight plus optional scale plane and explicit scale key."""
+        ...
+
+    def decode(
+        self, reader: BoundedTensorReader, name: str, budget: int
+    ) -> torch.Tensor:
+        """Read/decode one complete non-row source within the supplied byte allowance."""
+        ...
+
+    def validate_keys(self, keys: set[str], expected: set[str]) -> None:
+        """Reject missing/unexpected release keys, allowing codec companion keys."""
         ...
 
 
@@ -582,7 +622,8 @@ def bucketed_all_gather_into_tensor(
                 tensor,
                 [
                     recv_buffer[
-                        rank * total_numel + offsets[idx] : rank * total_numel
+                        rank * total_numel
+                        + offsets[idx] : rank * total_numel
                         + offsets[idx]
                         + numel_per_tensor[idx]
                     ].view_as(tensor)
@@ -879,10 +920,7 @@ def gather_gate_up(
 
 
 def _load_weight_map_for_model(
-    base_model: nn.Module,
-    spec: HFWeights,
-    ps,
-    state: dict[str, torch.Tensor],
+    base_model: nn.Module, spec: HFWeights, ps, state: dict[str, torch.Tensor]
 ) -> dict[str, list[str]]:
     """Build the one native-to-HF plan shared by load and export."""
     logical_state_keys = tuple(
@@ -1103,8 +1141,12 @@ def load_hf_weights(
                             tensor, ps.etp_rank, ps.etp_size, dim=split_d
                         )
 
-            converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-            (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+            converted = _local_source(target, tensor).to(
+                device=target.device, dtype=target.dtype
+            )
+            (
+                target.to_local().data if isinstance(target, DTensor) else target.data
+            ).copy_(converted)
             if replica_ranks is not None:
                 assert source_global_rank is not None
                 dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1115,7 +1157,9 @@ def load_hf_weights(
         if name in loaded_names or "lora" in name.lower() or "adapter" in name.lower():
             continue
         elif getattr(base_model, "_mlite_meta_init", False):
-            raise RuntimeError(f"Deferred parameter {name!r} was not filled by the checkpoint")
+            raise RuntimeError(
+                f"Deferred parameter {name!r} was not filled by the checkpoint"
+            )
         else:
             log_rank0(f"WARNING: {name} not loaded from checkpoint")
     missing_expected_buffers = required_buffers.keys() - loaded_names
@@ -1127,15 +1171,7 @@ def load_hf_weights(
 
 
 def _load_expert_weight(
-    native_name,
-    hf_names,
-    reader,
-    spec,
-    ps,
-    state,
-    targets,
-    expert_gid,
-    expert_shard,
+    native_name, hf_names, reader, spec, ps, state, targets, expert_gid, expert_shard
 ) -> str | None:
     if expert_shard is None:
         raise RuntimeError(
@@ -1174,8 +1210,7 @@ def _load_expert_weight(
         source_group_rank = source_hook(native_name, ps) if callable(source_hook) else 0
         if not 0 <= source_group_rank < len(replica_ranks):
             raise ValueError(
-                f"source_group_rank={source_group_rank} is outside "
-                f"group size {len(replica_ranks)}"
+                f"source_group_rank={source_group_rank} is outside group size {len(replica_ranks)}"
             )
         source_global_rank = replica_ranks[source_group_rank]
         if dist.get_rank() != source_global_rank:
@@ -1202,8 +1237,12 @@ def _load_expert_weight(
             else:
                 tensor = split_dim(tensor, ps.etp_rank, ps.etp_size, dim=split_d)
 
-    converted = _local_source(target, tensor).to(device=target.device, dtype=target.dtype)
-    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(converted)
+    converted = _local_source(target, tensor).to(
+        device=target.device, dtype=target.dtype
+    )
+    (target.to_local().data if isinstance(target, DTensor) else target.data).copy_(
+        converted
+    )
     if replica_ranks is not None:
         assert source_global_rank is not None
         dist.broadcast(target.data, src=source_global_rank, group=replica_group)
@@ -1212,10 +1251,7 @@ def _load_expert_weight(
 
 
 def _handle_missing_hf_tensors(
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
-    error: KeyError,
+    spec: HFWeights, native_name: str, hf_names: list[str], error: KeyError
 ) -> None:
     """Fail on required HF sources and explain every optional fallback.
 
@@ -1290,10 +1326,7 @@ def _read_hf_tensors(
 
 
 def _present_hf_sources(
-    reader: SafeTensorReader,
-    spec: HFWeights,
-    native_name: str,
-    hf_names: list[str],
+    reader: SafeTensorReader, spec: HFWeights, native_name: str, hf_names: list[str]
 ) -> list[str]:
     """Return mapped checkpoint sources that exist without loading payloads."""
     resolve = getattr(reader, "first_available", None)
@@ -1312,6 +1345,11 @@ def _present_hf_sources(
         except KeyError:
             continue
     return present
+
+
+def resolve_param_name(name: str, state_dict: dict) -> str | None:
+    """Resolve a logical checkpoint key to live storage, including QAT wrappers."""
+    return _resolve_param_name(name, state_dict)
 
 
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
@@ -1494,9 +1532,9 @@ def export_hf_weights(
                     if packed_name is None:
                         yield from _iter_mapped({global_name: export_shard})
                         continue
-                    packed_expert_buffers.setdefault(packed_name, {})[global_idx] = (
-                        export_shard
-                    )
+                    packed_expert_buffers.setdefault(packed_name, {})[
+                        global_idx
+                    ] = export_shard
                 if packed_name is not None:
                     packed = packed_expert_buffers[packed_name]
                     if len(packed) == spec.num_experts:
@@ -1582,8 +1620,7 @@ def export_hf_weights(
                 for packed_name, packed in sorted(packed_expert_buffers.items())
             )
             raise RuntimeError(
-                f"{type(spec).__name__} has incomplete packed expert export "
-                f"group(s): {incomplete}"
+                f"{type(spec).__name__} has incomplete packed expert export group(s): {incomplete}"
             )
         return
 
@@ -1723,7 +1760,7 @@ def _gather_expert_etp(
 
 
 def stream_export_to_shards(
-    export_iter: Iterable[tuple[str, torch.Tensor]],
+    export_iter: Iterable[tuple[str, torch.Tensor] | RowChunk],
     path: str,
     *,
     shard_size_bytes: int = 5 * 1024**3,
@@ -1771,9 +1808,21 @@ def stream_export_to_shards(
         shard = {}
         shard_bytes = 0
 
-    for name, tensor in export_iter:
+    export_iter = iter(export_iter)
+    for item in export_iter:
         if rank != 0:
+            del item
             continue
+        if isinstance(item, RowChunk):
+            _flush()
+            tmp = f".model-shard-{len(tmp_names) + 1:05d}.safetensors"
+            keys, nbytes = write_row_file(item, export_iter, os.path.join(path, tmp))
+            tmp_names.append(tmp)
+            shard_keys.append(keys)
+            total_size += nbytes
+            del item
+            continue
+        name, tensor = item
         nbytes = _tensor_nbytes(tensor)
         if shard and shard_bytes + nbytes > shard_size_bytes:
             _flush()
@@ -1823,3 +1872,210 @@ def save_hf_weights(
         hf_path,
         shard_size_bytes=shard_size_bytes,
     )
+
+
+class BoundedTensorReader(SafeTensorReader):
+    """Copy slices and close each mmap; retained mappings would grow host RSS.
+
+    Raw bytes are preserved. Decoding and release naming belong to the Spec.
+    Scratch excludes resident model/output tensors and is independent of rows.
+    """
+
+    def _file(self, name):
+        return self.path / (self.index[name] if self.index else "model.safetensors")
+
+    def keys(self):
+        if self.index:
+            return set(self.index)
+        with safe_open(str(self.path / "model.safetensors"), framework="pt") as f:
+            return set(f.keys())
+
+    def shape(self, name):
+        with safe_open(str(self._file(name)), framework="pt") as f:
+            return tuple(f.get_slice(name).get_shape())
+
+    def read(self, name, budget, rows=None):
+        with safe_open(str(self._file(name)), framework="pt") as f:
+            source = f.get_slice(name)
+            shape = source.get_shape()
+            # Eight bytes per element bounds every supported checkpoint dtype.
+            count = math.prod(
+                shape if rows is None else [rows[1] - rows[0], *shape[1:]]
+            )
+            if count * 8 > budget:
+                raise ValueError(f"Tensor exceeds buffer; use row streaming: {name}")
+            value = f.get_tensor(name) if rows is None else source[rows[0] : rows[1]]
+            return value.clone()
+
+    def rows(self, name, budget):
+        shape = self.shape(name)
+        if len(shape) != 2:
+            raise ValueError("Expected 2D rows")
+        count = budget // (32 * shape[1])
+        if count < 1 or shape[0] == 0:
+            raise ValueError("Buffer must hold at least one nonempty row")
+        for start in range(0, shape[0], count):
+            span = (start, min(shape[0], start + count))
+            weight = self.read(name, budget // 2, span)
+            yield RowChunk(name, start, shape[0], weight)
+            del weight
+
+
+def _bound_inventory(model, spec: BoundHFWeights):
+    bindings = validate_parameter_bindings(model, spec.bindings(model))
+    for binding in bindings:
+        if binding.tensor.is_meta or (
+            DTensor is not None and isinstance(binding.tensor, DTensor)
+        ):
+            raise ValueError("Bound checkpoints require materialized local tensors")
+    return bindings
+
+
+def export_bound_tensors(
+    model,
+    spec: BoundHFWeights,
+    *,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    masters_only=False,
+):
+    """Stream explicit owners; Spec supplies release mapping and paired codecs.
+
+    Non-row transforms must fit the budget. They never silently fall back to
+    unbounded gather or conversion. Row payloads must be consumed immediately.
+    """
+    budget = buffer_max_size_bytes
+    if type(budget) is not int or budget < 1024:
+        raise ValueError("Bound checkpoint buffer must be at least 1024 bytes")
+    for binding in _bound_inventory(model, spec):
+        tensor = binding.tensor.detach()
+        if (masters_only or binding.row_key is not None) and not tensor.is_contiguous():
+            raise ValueError(f"Row storage must be contiguous: {binding.name}")
+        if masters_only:
+            mapped = [(binding.name, tensor)]
+        elif binding.row_key is not None:
+            mapped = [(binding.row_key, tensor)]
+        else:
+            if tensor.numel() * 64 > budget:
+                raise ValueError(f"Non-row transform exceeds buffer: {binding.name}")
+            mapped = spec.native_to_hf(binding.name, tensor)
+        for name, value in mapped:
+            if value.ndim != 2:
+                if value.numel() * 64 > budget:
+                    raise ValueError(f"Non-row tensor exceeds buffer: {name}")
+                yield name, value.cpu().contiguous()
+                continue
+            # Covers codec intermediates, contiguous copies and CPU staging.
+            for chunk in stream_rows(
+                name, value.contiguous(), buffer_max_size_bytes=budget // 64
+            ):
+                weight, scale, scale_name = (
+                    (chunk.weight, None, None)
+                    if masters_only
+                    else spec.encode(name, chunk.weight)
+                )
+                yield RowChunk(
+                    name,
+                    chunk.offset,
+                    chunk.total_rows,
+                    weight.cpu(),
+                    None if scale is None else scale.cpu(),
+                    scale_name,
+                )
+                del weight, scale, chunk
+        del mapped, tensor
+
+
+@torch.no_grad()
+def load_bound_model(
+    model,
+    path,
+    spec: BoundHFWeights,
+    *,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+):
+    """Load row bindings or exact native masters in chunks.
+
+    Only release row bindings bypass full layout conversion.
+    Non-row sources are read and decoded whole under per-source size checks;
+    multiple decoded sources may coexist during native layout assembly.
+    """
+    budget = buffer_max_size_bytes
+    if type(budget) is not int or budget < 1024:
+        raise ValueError("Bound checkpoint buffer must be at least 1024 bytes")
+    bindings = _bound_inventory(model, spec)
+    reader = BoundedTensorReader(str(path))
+    keys = reader.keys()
+    expected = {name for binding in bindings for name in binding.sources}
+    spec.validate_keys(keys, expected)
+    master_path = Path(path) / "mlite_masters"
+    masters = BoundedTensorReader(str(master_path)) if master_path.is_dir() else None
+    if masters is not None and masters.keys() != {b.name for b in bindings}:
+        raise ValueError("Training master inventory mismatch")
+    for binding in bindings:
+        target = binding.tensor
+        source = masters if masters is not None else reader
+        name = binding.name if masters is not None else binding.row_key
+        if name is not None and target.ndim == 2:
+            if source.shape(name) != tuple(target.shape):
+                raise ValueError(f"Row shape mismatch: {name}")
+            receiver = RowReceiver(name, target)
+            for chunk in source.rows(name, budget):
+                if masters is not None and chunk.weight.dtype != target.dtype:
+                    raise ValueError(f"Training master dtype mismatch: {name}")
+                if masters is None:
+                    chunk = RowChunk(
+                        name,
+                        chunk.offset,
+                        chunk.total_rows,
+                        chunk.weight.to(target.dtype),
+                    )
+                receiver.copy(chunk)
+                del chunk
+            receiver.finish()
+        else:
+            value = (
+                source.read(binding.name, budget // 8)
+                if masters is not None
+                else spec.hf_to_native(
+                    binding.name,
+                    [
+                        spec.decode(reader, key, budget // (8 * len(binding.sources)))
+                        for key in binding.sources
+                    ],
+                )
+            )
+            if value.shape != target.shape or (
+                masters is not None and value.dtype != target.dtype
+            ):
+                raise ValueError(
+                    f"Training tensor shape/dtype mismatch: {binding.name}"
+                )
+            target.copy_(value)
+            del value
+
+
+def save_bound_model(
+    model,
+    path,
+    spec: BoundHFWeights,
+    *,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    save_masters=True,
+):
+    """Save release tensors, optionally with a complete native-master sidecar."""
+    for masters, destination in (
+        (False, Path(path)),
+        (True, Path(path) / "mlite_masters"),
+    ):
+        if masters and not save_masters:
+            continue
+        stream_export_to_shards(
+            export_bound_tensors(
+                model,
+                spec,
+                buffer_max_size_bytes=buffer_max_size_bytes // 2,
+                masters_only=masters,
+            ),
+            str(destination),
+            shard_size_bytes=buffer_max_size_bytes // 2,
+        )

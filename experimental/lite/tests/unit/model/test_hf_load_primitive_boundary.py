@@ -44,3 +44,56 @@ def test_model_hf_loaders_only_configure_the_primitive(relative_path: str) -> No
         "StreamingStateLoader",
         "TensorLoadSink",
     }.intersection(source)
+
+
+def test_qwen_bounded_contract_and_public_primitive_boundary():
+    import inspect
+
+    from megatron.lite.primitive.ckpt import hf_weights
+    from megatron.lite.primitive.ckpt.binding_records import TensorBinding
+    from megatron.lite.primitive.ckpt.row_stream import stream_rows
+
+    assert not hasattr(hf_weights, "export_raw_tensors")
+    assert "role" not in TensorBinding.__dataclass_fields__
+    assert "boundaries" not in inspect.signature(stream_rows).parameters
+    for method in ("bindings", "encode", "decode", "validate_keys"):
+        assert callable(getattr(hf_weights.BoundHFWeights, method))
+    path = (
+        Path(__file__).resolve().parents[3]
+        / "megatron/lite/model/qwen3_moe/lite/checkpoint.py"
+    )
+    tree = ast.parse(path.read_text())
+    primitive = "megatron.lite.primitive.ckpt.hf_weights"
+    imports = {
+        alias.asname or alias.name: alias.name
+        for node in ast.walk(tree)
+        if isinstance(node, ast.ImportFrom) and node.module == primitive
+        for alias in node.names
+    }
+    assert not any(name.startswith("_") for name in imports.values())
+    for function, bounded, ordinary in (
+        ("load_hf_weights", "load_bound_model", "load_hf_weights"),
+        ("export_hf_weights", "export_bound_tensors", "export_hf_weights"),
+        ("save_hf_weights", "save_bound_model", "save_hf_weights"),
+    ):
+        node = next(
+            n
+            for n in tree.body
+            if isinstance(n, ast.FunctionDef) and n.name == function
+        )
+        branch = next(
+            n
+            for n in node.body
+            if isinstance(n, ast.If) and "bounded" in ast.unparse(n.test)
+        )
+        calls = lambda nodes: {
+            imports.get(n.func.id)
+            for statement in nodes
+            for n in ast.walk(statement)
+            if isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+        }
+        assert bounded in calls(branch.body)
+        assert ordinary in calls([n for n in node.body if n is not branch])
+        assert not any(
+            isinstance(n, (ast.For, ast.While, ast.With)) for n in ast.walk(branch)
+        )
