@@ -260,6 +260,20 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
         if enable_w4a8_experts(chunks, qat_spec) == 0:
             raise ValueError("QAT activation_bits=8 matched no routed-expert module.")
+        # The W4A8 top-k FP32 combine reads the unfused dispatch row layout.
+        for chunk in chunks:
+            for name, module in chunk.named_modules():
+                dispatcher = getattr(module, "dispatcher", None)
+                experts = getattr(module, "experts", None)
+                if (
+                    getattr(experts, "w4a8", False)
+                    and dispatcher is not None
+                    and (dispatcher.use_deepep or dispatcher.moe_permute_fusion)
+                ):
+                    raise ValueError(
+                        f"{name}: W4A8 experts need the unfused MoE permute and no DeepEP "
+                        "(MEGATRON_LITE_MOE_PERMUTE_FUSION=0, use_deepep=False)."
+                    )
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None

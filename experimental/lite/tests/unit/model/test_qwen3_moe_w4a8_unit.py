@@ -395,6 +395,158 @@ def test_real_qwen3_moe_w4a8_build_model_trains_one_step_on_cpu(
         assert (not torch.equal(weight.detach(), old)) == has_tokens
 
 
+def _primitive_test_helpers():
+    """The exact vLLM ``ep_gather`` transcription lives with the primitive tests."""
+    import importlib.util
+
+    path = LITE_ROOT / "tests/unit/primitive/quantization/test_w4a8_experts_unit.py"
+    spec = importlib.util.spec_from_file_location("_w4a8_primitive_tests", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _moe_layer(experts_cls, **overrides):
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+    from megatron.lite.model.qwen3_moe.lite.model import MoELayer
+
+    # Qwen3-30B-A3B expert dims (hidden 2048, moe_intermediate 768, top-k 8);
+    # 10 of its 128 experts to keep the CPU test small.
+    fields = dict(
+        hidden_size=2048,
+        moe_intermediate_size=768,
+        num_experts=10,
+        num_experts_per_tok=8,
+    )
+    torch.manual_seed(13)
+    config = Qwen3MoEConfig(**{**fields, **overrides})
+    layer = MoELayer(config, ParallelState(), use_deepep=False).to(torch.bfloat16)
+    return layer, config
+
+
+def _capture(layer):
+    seen = {}
+    layer.router.register_forward_hook(
+        lambda _m, _a, out: seen.update(scores=out[0], indices=out[1])
+    )
+    layer.experts.register_forward_hook(
+        lambda _m, args, out: seen.update(dispatched=args[0], tpe=args[1], rows=out)
+    )
+    return seen
+
+
+def test_w4a8_moe_layer_matches_vllm_combine_bitwise_qwen3_30b_topk8(
+    monkeypatch, experts_cls
+):
+    """Full MoE layer output == rollout contract, including the top-k sum.
+
+    Expert rows are the W4A8 FC2 outputs without router weights; vLLM's
+    ``ep_gather`` then accumulates ``fp32(row) * w`` per token in top-k slot
+    order with an FMA and rounds once to BF16. Transcribed exactly here.
+    """
+    monkeypatch.setenv("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0")
+    from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+
+    layer, config = _moe_layer(experts_cls)
+    assert enable_w4a8_experts([layer], _spec()) == 1
+    seen = _capture(layer)
+    torch.manual_seed(14)
+    x = torch.randn(4, config.hidden_size).to(torch.bfloat16)
+    with torch.no_grad():
+        out = layer(x)
+
+    # The expert rows themselves are pinned bit for bit to the rollout's FC2
+    # output elsewhere; here they must be unweighted and summed as vLLM does.
+    indices, scores, rows = seen["indices"], seen["scores"], seen["rows"]
+    m_splits = seen["tpe"].tolist()
+    rows_tk = torch.empty(
+        len(x), indices.shape[1], config.hidden_size, dtype=rows.dtype
+    )
+    start = 0
+    for expert, count in enumerate(m_splits):
+        tokens = (indices == expert).any(-1).nonzero()[:, 0]  # unfused order
+        assert len(tokens) == count
+        for row, token in zip(rows[start : start + count], tokens.tolist()):
+            rows_tk[token, indices[token].tolist().index(expert)] = row
+        start += count
+    expected = _primitive_test_helpers()._vllm_ep_gather(rows_tk, scores)
+
+    assert indices.shape[1] == 8
+    assert torch.equal(out, expected)
+
+
+def test_default_moe_layer_keeps_the_bf16_unpermute_combine(monkeypatch, experts_cls):
+    monkeypatch.setenv("MEGATRON_LITE_MOE_PERMUTE_FUSION", "0")
+    from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+
+    def unexpected(*_args, **_kwargs):
+        raise AssertionError("default path must not use the W4A8 combine")
+
+    monkeypatch.setattr(TokenDispatcher, "combine_unreduced", unexpected, raising=False)
+    layer, config = _moe_layer(
+        experts_cls,
+        hidden_size=128,
+        moe_intermediate_size=128,
+        num_experts=4,
+        num_experts_per_tok=2,
+    )
+    seen = _capture(layer)
+    torch.manual_seed(15)
+    x = torch.randn(6, config.hidden_size).to(torch.bfloat16)
+    with torch.no_grad():
+        out = layer(x)
+        # Experts apply the router weight to each BF16 row; unpermute sums in BF16.
+        indices, scores = seen["indices"], seen["scores"]
+        probs_2d = torch.zeros(len(x), config.num_experts, dtype=scores.dtype)
+        probs_2d.scatter_add_(1, indices, scores)
+        order = [
+            (expert, token)
+            for expert in range(config.num_experts)
+            for token in (indices == expert).any(-1).nonzero()[:, 0].tolist()
+        ]
+        probs = torch.stack([probs_2d[t, e] for e, t in order])
+        rows = layer.experts(seen["dispatched"], seen["tpe"], probs)
+        expected = torch.zeros_like(x).index_add_(
+            0, torch.tensor([t for _, t in order]), rows
+        )
+    assert torch.equal(out, expected)
+
+
+def test_build_rejects_w4a8_with_fused_moe_permute(monkeypatch, experts_cls):
+    from megatron.lite.model.qwen3_moe.config import Qwen3MoEConfig
+    from megatron.lite.model.qwen3_moe.lite import protocol
+
+    monkeypatch.setenv("MEGATRON_LITE_MOE_PERMUTE_FUSION", "1")
+    monkeypatch.setattr(protocol, "init_parallel", lambda _p: ParallelState())
+    monkeypatch.setattr(nn.Module, "cuda", lambda self: self)
+    from megatron.lite.primitive import transformer_engine as lite_te
+
+    for name, cls in (
+        ("Linear", CpuLinear),
+        ("LayerNormLinear", CpuLayerNormLinear),
+        ("RMSNorm", CpuRMSNorm),
+        ("DotProductAttention", CpuDotProductAttention),
+    ):
+        monkeypatch.setattr(lite_te._TE, name, cls, raising=False)
+    config = Qwen3MoEConfig(
+        num_hidden_layers=1,
+        hidden_size=128,
+        num_attention_heads=4,
+        num_key_value_heads=2,
+        head_dim=32,
+        vocab_size=64,
+        num_experts=4,
+        num_experts_per_tok=2,
+        moe_intermediate_size=128,
+        max_position_embeddings=16,
+        layer_types=["full_attention"],
+    )
+    with pytest.raises(ValueError, match="unfused MoE permute"):
+        protocol.build_model(
+            config, impl_cfg=protocol.ImplConfig(optimizer=None, qat=_spec())
+        )
+
+
 def test_default_experts_forward_never_imports_w4a8_module():
     script = "\n".join(
         [

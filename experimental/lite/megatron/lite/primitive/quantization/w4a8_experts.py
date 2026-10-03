@@ -17,8 +17,11 @@ Training-side counterpart of the rollout MoE contract served by vLLM's
   quantized operands and scales are bit-identical between the two; the
   accumulation order of the GEMM itself is the kernel's.
 * **Expert MLP** (:func:`w4a8_expert_mlp`) — FC1 output in BF16, SwiGLU in
-  float32 rounded once to BF16, A8 requantization, FC2 output in BF16, router
-  probabilities applied after FC2 in float32.
+  float32 rounded once to BF16, A8 requantization, FC2 output in BF16.
+* **Top-k combine** (:func:`topk_fma_combine`) — per token, the unweighted
+  BF16 FC2 rows are accumulated in float32 in top-k slot order as
+  ``acc = fma(row, weight, acc)`` and rounded to BF16 once, as vLLM's
+  ``ep_gather`` does.
 
 Backward is a straight-through estimator on both operands: gradients use the
 dequantized activations and weights the forward multiplied, and flow unmasked
@@ -48,6 +51,7 @@ __all__ = [
     "FP8_ACT_GROUP_SIZE",
     "dequantize_fp8_act",
     "quantize_fp8_act",
+    "topk_fma_combine",
     "w4a8_expert_mlp",
     "w4a8_grouped_gemm",
 ]
@@ -280,3 +284,73 @@ def w4a8_expert_mlp(
     if probs is not None:
         out = (out.float() * probs.float()).to(out.dtype)
     return out
+
+
+def _fma_f32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
+    """Correctly rounded float32 ``fma(a, b, c)`` (one rounding, nearest-even).
+
+    ``a * b`` is exact in float64 and TwoSum gives ``c + a * b`` exactly as
+    ``s + err``. Rounding ``s`` to float32 is correct unless ``s`` is exactly
+    a float32 midpoint and ``err`` breaks the tie, which is fixed up here.
+    """
+    a64, b64, c64 = a.double(), b.double(), c.double()
+    product = a64 * b64
+    s = c64 + product
+    bb = s - c64
+    err = (c64 - (s - bb)) + (product - bb)
+    r = s.float()
+    r64 = r.double()
+    inf = torch.full_like(r, float("inf"))
+    other = torch.nextafter(r, torch.where(s > r64, inf, -inf))
+    other64 = other.double()
+    tie = (s != r64) & ((r64 + other64) * 0.5 == s) & (err != 0)
+    return torch.where(tie & ((err > 0) == (other64 > r64)), other, r)
+
+
+class _TopKFmaCombine(torch.autograd.Function):
+    """Forward: rollout ``ep_gather`` accumulation. Backward: d(sum_k w_k * row_k)."""
+
+    @staticmethod
+    def forward(ctx, rows, row_weight, row_token, row_slot, num_tokens, topk):  # type: ignore[override]
+        hidden = rows.shape[-1]
+        slot_rows = rows.new_zeros((topk, num_tokens, hidden), dtype=torch.float32)
+        slot_weights = rows.new_zeros((topk, num_tokens, 1), dtype=torch.float32)
+        slot_rows[row_slot, row_token] = rows.float()
+        slot_weights[row_slot, row_token, 0] = row_weight.float()
+        acc = rows.new_zeros((num_tokens, hidden), dtype=torch.float32)
+        for k in range(topk):
+            acc = _fma_f32(slot_rows[k], slot_weights[k].expand_as(acc), acc)
+        ctx.save_for_backward(rows, row_weight, row_token)
+        return acc.to(rows.dtype)
+
+    @staticmethod
+    def backward(ctx, grad_out):  # type: ignore[override]
+        rows, row_weight, row_token = ctx.saved_tensors
+        grad = grad_out.float()[row_token]
+        grad_rows = (grad * row_weight.float().unsqueeze(-1)).to(rows.dtype)
+        grad_weight = (grad * rows.float()).sum(-1).to(row_weight.dtype)
+        return grad_rows, grad_weight, None, None, None, None
+
+
+def topk_fma_combine(
+    rows: torch.Tensor,
+    row_token: torch.Tensor,
+    row_expert: torch.Tensor,
+    topk_indices: torch.Tensor,
+    topk_scores: torch.Tensor,
+) -> torch.Tensor:
+    """Sum each token's unweighted expert rows the way the rollout does.
+
+    ``rows[i]`` is the BF16 FC2 output of token ``row_token[i]`` at expert
+    ``row_expert[i]``. Per token, in the router's top-k slot order,
+    ``acc = fma(row, float32(weight), acc)`` starting from zero, then one
+    rounding to BF16: vLLM's ``ep_gather`` (``acc += row * w``, which Triton
+    contracts to an FMA). Gradients flow to ``rows`` and ``topk_scores``.
+    """
+    num_tokens, topk = topk_indices.shape
+    match = topk_indices[row_token] == row_expert.unsqueeze(-1)
+    row_slot = match.to(torch.int8).argmax(dim=-1)
+    row_weight = topk_scores[row_token, row_slot].float()
+    return _TopKFmaCombine.apply(
+        rows, row_weight, row_token, row_slot, num_tokens, topk
+    )
