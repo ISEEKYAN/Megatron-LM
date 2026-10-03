@@ -38,6 +38,7 @@ opt in from their ``protocol.build_model`` via :func:`apply_qat_to_chunks`.
 
 from __future__ import annotations
 
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -679,6 +680,17 @@ class WeightFakeQuant(nn.Module):
 # ---------------------------------------------------------------------------
 
 
+# Modules whose quantizable weights are not a single ``weight`` declare their
+# exact parameter names here (TE ``GroupedLinear`` registers one ``weight{i}``
+# per local expert); discovery never infers them from parameter names.
+_QAT_WEIGHT_NAMES_ATTR = "qat_weight_names"
+
+
+def declare_qat_weights(module: nn.Module, names: Iterable[str]) -> None:
+    """Declare the exact parameters of ``module`` that weight-only QAT fake-quantizes."""
+    setattr(module, _QAT_WEIGHT_NAMES_ATTR, tuple(names))
+
+
 def _quantizable_weight_owner(module: nn.Module) -> nn.Module | None:
     """Return the sub-object that owns a quantizable ``weight`` Parameter, if any.
 
@@ -699,17 +711,34 @@ def _quantizable_weight_owner(module: nn.Module) -> nn.Module | None:
     return None
 
 
-def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
-    """Register weight fake-quant on a module's 2D/3D weight. Returns applied."""
+def _quantizable_weights(module: nn.Module) -> tuple[nn.Module, tuple[str, ...]] | None:
+    """Return ``(owner, weight names)``: the declared names, else the single ``weight``."""
+    declared = getattr(module, _QAT_WEIGHT_NAMES_ATTR, None)
+    if declared is not None:
+        return module, declared
     owner = _quantizable_weight_owner(module)
-    if owner is None:
+    return None if owner is None else (owner, ("weight",))
+
+
+def apply_qat_to_module(module: nn.Module, spec: QATSpec) -> bool:
+    """Register weight fake-quant on a module's 2D/3D weight(s). Returns applied."""
+    target = _quantizable_weights(module)
+    if target is None:
         return False
-    if parametrize.is_parametrized(owner, "weight"):
-        return False
-    parametrize.register_parametrization(
-        owner, "weight", WeightFakeQuant(spec, owner.weight.shape), unsafe=True
-    )
-    return True
+    owner, names = target
+    pending = [name for name in names if not parametrize.is_parametrized(owner, name)]
+    for name in pending:
+        weight = getattr(owner, name, None)
+        if not isinstance(weight, nn.Parameter) or weight.dim() not in (2, 3):
+            raise ValueError(
+                f"{type(owner).__name__} declares QAT weight {name!r}, which is not a "
+                f"2D/3D parameter (got {type(weight).__name__})."
+            )
+    for name in pending:
+        parametrize.register_parametrization(
+            owner, name, WeightFakeQuant(spec, getattr(owner, name).shape), unsafe=True
+        )
+    return bool(pending)
 
 
 def apply_qat_to_chunks(
@@ -735,7 +764,7 @@ def apply_qat_to_chunks(
         return stats
     for chunk in chunks:
         for name, module in chunk.named_modules():
-            if _quantizable_weight_owner(module) is None:
+            if _quantizable_weights(module) is None:
                 continue
             if not spec.targets_module(name):
                 stats["skipped_ignored"] += 1
@@ -761,6 +790,7 @@ __all__ = [
     "apply_qat_to_module",
     "canonical_state_key",
     "compute_amax",
+    "declare_qat_weights",
     "dequantize_weight",
     "fake_quantize_weight",
     "normalize_qat_spec",
