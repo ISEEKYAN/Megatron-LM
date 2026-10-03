@@ -170,37 +170,3 @@ def test_missing_tokens_and_bad_targets_are_errors():
     with pytest.raises(ValueError, match='token buffer'):
         PackedRouterReplay(5, [router])
     assert len(router.replay_backward_list) == 1
-
-
-def test_pair_state_and_cp_empty_intersection():
-    from types import SimpleNamespace
-
-    hidden = torch.arange(6.0).reshape(1, 3, 2).requires_grad_()
-    mix = torch.ones(1, 3, 1, requires_grad=True)
-    visits = []
-
-    class Context:
-        total_length = 5
-
-        def document(self, begin, end):
-            return SimpleNamespace(local_length=0 if begin == 0 else 3)
-
-    def sequence(state, cp_context):
-        h, p = state
-        visits.append((h.shape[1], cp_context.local_length))
-        # State is initialized by each invocation, including empty intersections.
-        return h + p, p * 2
-
-    out = packed_forward(
-        sequence,
-        (hidden, mix),
-        torch.tensor([0, 2, 5]),
-        axes=(1, 1),
-        cp_context=Context(),
-    )
-    assert visits == [(0, 0), (3, 3)]
-    assert torch.equal(out[0], hidden + mix)
-    assert torch.equal(out[1], mix * 2)
-    (out[0].sum() + out[1].sum()).backward()
-    assert torch.equal(hidden.grad, torch.ones_like(hidden))
-    assert torch.equal(mix.grad, torch.full_like(mix, 4.0))

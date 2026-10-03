@@ -348,14 +348,11 @@ def _optimizer_backend_name(optimizer: Any) -> str | None:
     return optimizer
 
 
-def _configure_attention_backend(
-    chunks: list[nn.Module], *, backend: str | None
-) -> None:
-    backend_name = backend or "torch"
+def _configure_attention_backend(chunks: list[nn.Module], *, backend: str) -> None:
     for chunk in chunks:
         for module in chunk.modules():
             if hasattr(module, "attention_backend"):
-                module.attention_backend = backend_name
+                module.attention_backend = backend
 
 
 def _iter_transformer_units(chunk: nn.Module) -> list[nn.Module]:
@@ -411,8 +408,13 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         DeepseekV4Model = PackedDeepseekV4Model
     p = impl_cfg.parallel
     _validate_parallel_scope(p)
-    _apply_mtp_config(model_cfg, impl_cfg)
-    mtp_enable = bool(impl_cfg.mtp_enable) and model_cfg.num_nextn_predict_layers > 0
+    if not impl_cfg.packed_documents:
+        _apply_mtp_config(model_cfg, impl_cfg)
+    mtp_enable = (
+        not impl_cfg.packed_documents
+        and bool(impl_cfg.mtp_enable)
+        and model_cfg.num_nextn_predict_layers > 0
+    )
     mtp_enable_train = mtp_enable and bool(impl_cfg.mtp_enable_train)
     ps = init_parallel(impl_cfg.parallel)
     vpp = None if p.vpp == 1 else p.vpp
@@ -427,6 +429,10 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
         use_deepep=impl_cfg.use_deepep,
     )
 
+    backend = impl_cfg.attention_backend_override or (
+        "flash" if impl_cfg.packed_documents else "torch"
+    )
+
     def _chunk(i: int | None = None):
         return (
             DeepseekV4Model(
@@ -437,7 +443,7 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
                 use_deepep=impl_cfg.use_deepep,
                 use_thd=impl_cfg.use_thd,
                 hf_path=impl_cfg.hf_path,
-                attention_backend_override=impl_cfg.attention_backend_override,
+                attention_backend_override=backend,
                 mtp_enable=mtp_enable,
                 mtp_enable_train=mtp_enable_train,
                 mtp_detach_encoder=impl_cfg.mtp_detach_encoder,
@@ -450,9 +456,6 @@ def build_model(model_cfg: DeepseekV4Config, *, impl_cfg: ImplConfig) -> ModelBu
     if impl_cfg.packed_documents:
         for chunk in chunks:
             chunk.packed_recompute = bool(parse_recompute_spec(impl_cfg.recompute))
-    backend = impl_cfg.attention_backend_override
-    if impl_cfg.packed_documents and backend is None:
-        backend = "flash"
     _configure_attention_backend(chunks, backend=backend)
 
     recompute_spec = parse_recompute_spec(impl_cfg.recompute)

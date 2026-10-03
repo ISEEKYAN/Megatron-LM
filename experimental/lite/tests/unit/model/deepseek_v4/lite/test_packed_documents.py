@@ -7,6 +7,7 @@ CPU implementations. This does not claim validation of the CUDA kernels.
 """
 import hashlib
 import importlib.util
+import os
 import subprocess
 import sys
 import types
@@ -266,7 +267,7 @@ _MAIN = 'd8e010069fef5c6da3690d008b899d480864a8de'
 _PROTOCOL = 'megatron.lite.model.deepseek_v4.lite.protocol'
 
 
-def test_default_build_is_byte_identical_to_pinned_main(cpu_v4, monkeypatch):
+def test_default_build_is_byte_identical_to_pinned_main_protocol(cpu_v4, monkeypatch):
     path = 'experimental/lite/' + _PROTOCOL.replace('.', '/') + '.py'
     source = subprocess.check_output(['git', 'show', f'{_MAIN}:{path}'])
     assert (
@@ -335,6 +336,36 @@ def test_default_build_does_not_import_packed_modules(cpu_v4, monkeypatch):
         assert all(name not in sys.modules for name in names)
 
 
+def _independent_replay(reference, routers, kwargs, targets, replay_mask):
+    from megatron.lite.primitive.modules.router_replay import (
+        RouterReplayAction as Action,
+    )
+    from megatron.lite.primitive.ops.cross_entropy import vocab_parallel_cross_entropy
+
+    outputs = []
+    cu = kwargs['packed_seq_params'].cu_seqlens_q_padded.tolist()
+    for begin, end in zip(cu, cu[1:]):
+        for router, target in zip(routers, targets):
+            router.router_replay_action = Action.REPLAY_FORWARD
+            router.target_topk_idx = target[begin:end]
+            router.target_replay_mask = replay_mask[begin:end]
+        outputs.append(
+            reference(
+                input_ids=kwargs['input_ids'][:, begin:end],
+                position_ids=kwargs['position_ids'][:, begin:end],
+                enable_mtp=False,
+            )
+        )
+    logits = torch.cat([out['logits'] for out in outputs], 1)
+    losses = vocab_parallel_cross_entropy(logits.clone(), kwargs['labels'])
+    mask = kwargs['loss_mask']
+    return {
+        'hidden_states': torch.cat([out['hidden_states'] for out in outputs]),
+        'log_probs': -losses,
+        'loss': (losses * mask).sum() / mask.sum(),
+    }
+
+
 def test_real_packer_preserves_masks_and_recorded_routes(cpu_v4):
     from megatron.lite.primitive.modules.router_replay import (
         RouterReplayAction as Action,
@@ -385,6 +416,9 @@ def test_real_packer_preserves_masks_and_recorded_routes(cpu_v4):
         r.router_replay_action = Action.REPLAY_FORWARD
         r.target_topk_idx, r.target_replay_mask = target, replay_mask
     replayed = packed(**kwargs)
+    expected = _independent_replay(reference, ref_routers, kwargs, targets, replay_mask)
+    for key, value in expected.items():
+        _equal(replayed[key], value)
     assert not torch.equal(replayed['hidden_states'], actual['hidden_states'])
     replayed['loss'].backward()
     assert packed.embed_tokens.embedding.weight.grad.count_nonzero() > 0
@@ -441,6 +475,8 @@ def test_runtime_replay_driver_owns_snapshot_queue_lifecycle(cpu_v4):
     from megatron.lite.runtime.contracts import PackedBatch
 
     model = _build(cpu_v4.protocol, packed=True, recompute=True)
+    reference = _build(cpu_v4.protocol)
+    ref_routers = _routers(reference)
     handle = SimpleNamespace(_model=model, _extras={'protocol': cpu_v4.protocol})
     driver = RouterReplayDriver(handle, 'replay')
     driver.begin()
@@ -468,6 +504,16 @@ def test_runtime_replay_driver_owns_snapshot_queue_lifecycle(cpu_v4):
                 ),
             )
             outputs.append(step(model, batch))
+            kwargs = cpu_v4.protocol._prepare_packed_batch_kwargs(model, batch)
+            targets = cpu_v4.protocol.pack_routed_experts(
+                model, batch, batch.routed_experts
+            )
+            replay_mask = cpu_v4.protocol.pack_r3_replay_mask(model, batch)
+            expected = _independent_replay(
+                reference, ref_routers, kwargs, targets, replay_mask
+            )
+            for key, value in expected.items():
+                _equal(outputs[-1][key], value)
         assert all(
             r.router_replay_action == RouterReplayAction.REPLAY_BACKWARD
             for r in routers
@@ -509,8 +555,76 @@ def test_opt_in_selects_working_sparse_backend_when_omitted(cpu_v4):
             optimizer=None, mtp_enable=False, packed_documents=True
         ),
     ).chunks[0]
+    assert all(
+        layer.self_attn.self_attn.attention_backend == 'flash'
+        for layer in model.layers.values()
+    )
     params = PackedSeqParams.from_cu_seqlens(
         torch.tensor([0, 2, 5], dtype=torch.int32), 3
     )
     output = model(input_ids=torch.tensor([[1, 2, 3, 4, 5]]), packed_seq_params=params)
     assert output['logits'].shape[:2] == (1, 5)
+
+
+@pytest.mark.parametrize('mtp_layers', [0, 1])
+def test_packed_build_skips_mtp_configuration(cpu_v4, mtp_layers):
+    config = _config(mtp=bool(mtp_layers))
+    original = vars(config).copy()
+    model = cpu_v4.protocol.build_model(
+        config,
+        impl_cfg=cpu_v4.protocol.ImplConfig(
+            optimizer=None,
+            packed_documents=True,
+            mtp_enable_train=True,
+            mtp_num_layers=3,
+            mtp_loss_scaling_factor=0.7,
+        ),
+    ).chunks[0]
+    assert vars(config) == original
+    assert not model.mtp_enable_train
+    assert not list(model.mtp)
+    assert not any(name.startswith('mtp.') for name in model.state_dict())
+
+
+@pytest.mark.parametrize('packed', [False, True])
+@pytest.mark.parametrize(
+    'override', [None, 'flash', 'fused', 'unfused', 'local', 'auto']
+)
+def test_backend_environment_matches_module_selection(
+    cpu_v4, monkeypatch, packed, override
+):
+    names = ('NVTE_FLASH_ATTN', 'NVTE_FUSED_ATTN', 'NVTE_UNFUSED_ATTN')
+    for name in names:
+        monkeypatch.setenv(name, 'sentinel')
+    expected = override or ('flash' if packed else 'torch')
+    env = {
+        'torch': ('0', '0', '1'),
+        'local': ('0', '0', '1'),
+        'unfused': ('0', '0', '1'),
+        'flash': ('1', '0', '0'),
+        'fused': ('0', '1', '0'),
+        'auto': ('1', '1', '1'),
+    }[expected]
+    observed = []
+    original = cpu_v4.model.DeepseekV4Layer.__init__
+
+    def capture(self, *args, **kwargs):
+        observed.append(tuple(os.environ[name] for name in names))
+        original(self, *args, **kwargs)
+
+    monkeypatch.setattr(cpu_v4.model.DeepseekV4Layer, '__init__', capture)
+    model = cpu_v4.protocol.build_model(
+        _config(),
+        impl_cfg=cpu_v4.protocol.ImplConfig(
+            optimizer=None,
+            mtp_enable=False,
+            packed_documents=packed,
+            attention_backend_override=override,
+        ),
+    ).chunks[0]
+    assert observed and all(value == env for value in observed)
+    assert tuple(os.environ[name] for name in names) == env
+    backends = [
+        m.attention_backend for m in model.modules() if hasattr(m, 'attention_backend')
+    ]
+    assert backends and all(value == expected for value in backends)

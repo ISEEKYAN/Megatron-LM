@@ -74,9 +74,8 @@ hold their own target snapshots; pending driver queues are cleared by driver end
   axis 0 and logits-output axis 1. Paired BSHD states can use `(1, 1)`.
 - Offsets describe **physical storage**. V4 explicitly uses
   `cu_seqlens_q_padded`; an unpadded adapter supplies its own unpadded offsets.
-  The callable creates fresh document-local state. An optional `cp_context`
-  provides `total_length` and `document(begin, end).local_length`; empty local
-  intersections still invoke the callable.
+  The callable creates fresh document-local state. This executor has no CP
+  document-intersection API.
 - `routers` is an explicit collection of `RouterReplay` instances, not a scan
   of global models. Each active router must visit every document token exactly
   once. Missing routers/tokens or incomplete partitions raise. Exceptions
@@ -88,17 +87,21 @@ This V4 adapter requires TP=ETP=CP=PP=EP=VPP=1 and no activation offload, and ei
 Full recompute means **whole-document** checkpointing; it requires packed
 metadata. Submodule recompute selections are rejected. EP needs a shared cross-rank
 document schedule, which this local executor does not provide. Packed execution disables
-MTP, as the existing packed protocol already does. Non-packed calls with no
+MTP at construction: it skips MTP configuration overrides and creates no MTP
+weights, even when `mtp_enable` retains its default `True`. Non-packed calls with no
 recompute retain the ordinary model path. The default model/MTP path is unchanged.
 When no attention override is supplied, the opt-in adapter selects the existing
-`flash` sparse backend; the default adapter retains its previous selection.
+`flash` sparse backend; the default adapter retains its `torch` selection.
+The resolved backend also configures TE environment flags before construction;
+explicit `flash` is no longer remapped to `fused`.
 
 CPU tests construct the real V4 modules and compare packed execution against
 ordinary independent-document execution, including outputs, parameter gradients,
 forced routes, recompute, the real packer and R3 driver cleanup. TE RMSNorm,
 GroupedLinear and the sparse CUDA attention kernel boundary are replaced with
 Torch CPU implementations in those tests. Default `build_model` weights,
-outputs and gradients are compared byte-for-byte against pinned main, including
-MTP training. An import guard verifies default execution loads no new packed
+outputs and gradients are compared byte-for-byte against the pinned main
+`protocol.py` blob, including MTP training. Both arms use the current model, CSA
+and MoE modules; this does not pin or validate the entire main model stack. An import guard verifies default execution loads no new packed
 modules. No GPU, EP, distributed optimizer, or compressed-CSA kernel validation
 is claimed by these CPU tests.
