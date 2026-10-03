@@ -89,6 +89,24 @@ def test_enabled_experts_run_the_w4a8_primitive_on_master_weights(experts_cls):
     assert not torch.equal(out, default_out)
 
 
+def test_w4a8_experts_pass_the_config_swiglu_limit(experts_cls):
+    from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+    from megatron.lite.primitive.quantization.w4a8_experts import w4a8_expert_mlp
+
+    torch.manual_seed(0)
+    config = SimpleNamespace(**vars(_CONFIG), swiglu_limit=10.0)
+    experts = experts_cls(config, ParallelState()).to(torch.bfloat16)
+    x, tokens_per_expert, _ = _routed_tokens()
+    x = x * 50  # FC1 outputs well past the limit
+    assert enable_w4a8_experts([experts], _spec()) == 1
+    out = experts(x, tokens_per_expert)
+
+    fc1 = [getattr(experts.fc1, f"weight{i}") for i in range(3)]
+    fc2 = [getattr(experts.fc2, f"weight{i}") for i in range(3)]
+    assert torch.equal(out, w4a8_expert_mlp(x, fc1, fc2, [4, 0, 9], 10.0))
+    assert not torch.equal(out, w4a8_expert_mlp(x, fc1, fc2, [4, 0, 9]))
+
+
 def test_w4a8_experts_train_the_bf16_master_weights(experts_cls):
     from megatron.lite.primitive.modules.experts import enable_w4a8_experts
 
