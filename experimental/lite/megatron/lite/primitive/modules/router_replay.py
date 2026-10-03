@@ -149,6 +149,8 @@ class RouterReplay:
     def select_indices(self, native_indices: torch.Tensor) -> torch.Tensor:
         """Return replayed/native indices according to action and causal mask."""
 
+        if getattr(self, "_packed_visit", None) is not None:
+            self._packed_visit(native_indices)
         action = self.router_replay_action
         if action == RouterReplayAction.RECORD:
             self.recorded_topk_idx = native_indices
@@ -166,7 +168,9 @@ class RouterReplay:
         else:
             return native_indices
         if target is None:
-            raise RuntimeError("router replay is active but no target indices were set.")
+            raise RuntimeError(
+                "router replay is active but no target indices were set."
+            )
 
         target = target.to(device=native_indices.device, dtype=torch.long)
         if target.shape != native_indices.shape:
@@ -200,6 +204,105 @@ class RouterReplay:
             RouterReplay.replay_calls += 1
             RouterReplay.replay_rows_total += int(native.numel())
             RouterReplay.replay_rows_changed += int((selected != native).sum().item())
+
+
+class PackedRouterReplay:
+    """Scope one FIFO entry per router to a complete local packed invocation.
+
+    Failed execution leaves queues/targets intact. Checkpoint closures retain
+    document targets independently of subsequent invocations and FIFO advances.
+    Instances are explicit: unrelated models' routers are never visited.
+    """
+
+    def __init__(self, total_tokens, routers):
+        self.total_tokens, self.next_begin, self.entries = total_tokens, 0, []
+        for r in routers:
+            action = r.router_replay_action
+            if action is None:
+                continue
+            target, mask = r.target_topk_idx, r.target_replay_mask
+            if action == RouterReplayAction.REPLAY_BACKWARD:
+                if not r.replay_backward_list or not r.replay_backward_mask_list:
+                    raise RuntimeError("Packed replay backward target queue is empty")
+                target, mask = r.replay_backward_list[0], r.replay_backward_mask_list[0]
+            if action != RouterReplayAction.RECORD:
+                if target is None or target.shape[0] != total_tokens:
+                    raise ValueError(
+                        "Packed replay target must match the local token buffer"
+                    )
+                if mask is not None and mask.numel() != total_tokens:
+                    raise ValueError(
+                        "Packed replay mask must match the local token buffer"
+                    )
+            self.entries.append((r, action, target, mask, []))
+
+    def run(self, function, begin, end, state, *, recompute=False, **kwargs):
+        if begin != self.next_begin or not begin <= end <= self.total_tokens:
+            raise ValueError(
+                "Packed replay ranges must partition the token buffer in order"
+            )
+        targets = [
+            (
+                None if t is None else t[begin:end].clone(),
+                None if m is None else m.reshape(-1)[begin:end].clone(),
+            )
+            for _, _, t, m, _ in self.entries
+        ]
+        records = {}
+
+        def invoke(value):
+            saved = [(r, vars(r).copy()) for r, *_ in self.entries]
+            visits = {}
+
+            def visit(r, indices):
+                visits[r] = visits.get(r, 0) + 1
+                if indices.shape[0] != end - begin or visits[r] != 1:
+                    raise RuntimeError(
+                        "Packed execution must visit every router/token once"
+                    )
+
+            try:
+                for (r, action, _, _, _), (target, mask) in zip(self.entries, targets):
+                    r._packed_visit = lambda indices, r=r: visit(r, indices)
+                    r.router_replay_action = (
+                        RouterReplayAction.RECORD
+                        if action == RouterReplayAction.RECORD
+                        else RouterReplayAction.REPLAY_FORWARD
+                    )
+                    r.target_topk_idx, r.target_replay_mask = target, mask
+                result = function(value, **kwargs)
+                if len(visits) != len(self.entries):
+                    raise RuntimeError(
+                        "Packed execution did not visit every router/token"
+                    )
+                records.update({r: r.recorded_topk_idx for r, *_ in self.entries})
+                return result
+            finally:
+                for r, attributes in saved:
+                    vars(r).clear()
+                    vars(r).update(attributes)
+
+        if recompute:
+            from torch.utils.checkpoint import checkpoint
+
+            result = checkpoint(invoke, state, use_reentrant=False)
+        else:
+            result = invoke(state)
+        for r, action, _, _, chunks in self.entries:
+            if action == RouterReplayAction.RECORD:
+                chunks.append(records[r].detach().clone())
+        self.next_begin = end
+        return result
+
+    def finish(self):
+        if self.next_begin != self.total_tokens:
+            raise RuntimeError("Packed replay token partition is incomplete")
+        for r, action, _, _, chunks in self.entries:
+            if action == RouterReplayAction.RECORD:
+                r.recorded_topk_idx = torch.cat(chunks)
+            elif action == RouterReplayAction.REPLAY_BACKWARD:
+                r.replay_backward_list.pop(0)
+                r.replay_backward_mask_list.pop(0)
 
 
 def attach_router_replay(model: nn.Module, *, reset: bool = True) -> int:
@@ -255,6 +358,7 @@ def gather_replayed_router_scores(
 
 
 __all__ = [
+    "PackedRouterReplay",
     "RouterReplay",
     "RouterReplayAction",
     "attach_router_replay",
