@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Deployment bytes, independently inspected rather than MLite round trips."""
+
 import pytest
 import torch
 from tensor_allocations import AllocationPeak
@@ -164,6 +165,33 @@ def test_tiled_matrix_codec_is_whole_matrix_bytes_within_budget(
     fallback = hf_weights.encode_matrix(_SPEC, name, tensor, encoding, 0)
     for actual, expected in zip(fallback, whole):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
+
+
+@pytest.mark.parametrize(
+    'name, shape',
+    [
+        ('layers.0.attn.wq_b.weight', (16384, 2560)),
+        ('layers.1.engram.wkv.weight', (25600, 6144)),
+    ],
+)
+def test_release_size_matrix_codec_fits_resync_budget(name, shape):
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import _SPEC
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    budget = 2147483648
+    allowance = budget // 4
+    tensor = torch.empty(shape, dtype=torch.bfloat16, device='meta')
+    _, workspace, output = _SPEC.codec_tile(name, 'F8_E4M3')
+    tile = hf_weights.plan_matrix_codec(_SPEC, name, tensor, 'F8_E4M3', allowance)
+    peak = output * tensor.numel() + 8192 + workspace * tile * tensor.shape[1]
+    assert 0 < tile <= tensor.shape[0]
+    assert peak <= allowance, (name, tile, peak, allowance)
+
+    if name.endswith('wq_b.weight'):
+        old_untiled_workspace = workspace * tensor.numel() + 8192
+        assert old_untiled_workspace == 1_342_185_472
+        assert budget // 2 == 1_073_741_824
+        assert old_untiled_workspace > budget // 2
 
 
 @pytest.mark.parametrize('trainable', [False, True])
