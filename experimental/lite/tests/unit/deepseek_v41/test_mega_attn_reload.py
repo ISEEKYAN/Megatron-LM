@@ -5,24 +5,8 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 import torch
+from native_reload import fused_layout
 from test_receiver_staging import adapter
-
-
-def permute_q(weight, scale, heads):
-    # Independent index equation from the native fused-layout contract.
-    dim = weight.shape[0] // heads
-    order = sorted(range(heads * dim), key=lambda i: (i % dim // 16, i // dim, i % 16))
-    for tensor in (weight, scale):
-        raw = tensor.view(torch.uint8)
-        raw.copy_(raw[order])
-
-
-def permute_o(weight, scale, heads):
-    dim = weight.shape[1] // heads
-    order = sorted(range(heads * dim), key=lambda i: (i % dim // 32, i // dim, i % 32))
-    weight.view(torch.uint8).copy_(weight.view(torch.uint8)[:, order])
-    blocks = [i // 32 for i in order[::32]]
-    scale.view(torch.uint8).copy_(scale.view(torch.uint8)[:, blocks])
 
 
 class Pack:
@@ -55,16 +39,17 @@ class DeepseekV4MegaAttnAttention(torch.nn.Module):
 
     def finalize_loaded_weights(self):
         if not self._fused_layouts_ready:
-            permute_q(self.wq_b.weight, self.wq_b.weight_scale, self.n_local_heads)
-            permute_o(self.wo_a.weight, self.wo_a.weight_scale, 8)
+            fused_layout().permute_wq_b_(
+                self.wq_b.weight, self.wq_b.weight_scale, self.n_local_heads
+            )
+            fused_layout().permute_wo_a_(self.wo_a.weight, self.wo_a.weight_scale, 8)
             self._fused_layouts_ready = True
 
 
 @pytest.fixture
 def native_permutations(monkeypatch):
     name = 'vllm.models.deepseek_v41.common.ops.fused_layout'
-    module = ModuleType(name)
-    module.permute_wq_b_, module.permute_wo_a_ = permute_q, permute_o
+    module = fused_layout()
     for count in range(1, len(name.split('.'))):
         parent_name = '.'.join(name.split('.')[:count])
         package = ModuleType(parent_name)
@@ -139,7 +124,7 @@ def test_incomplete_projection_fails_and_restores(v41_core_te, native_permutatio
 def test_wq_b_tile_codec_tp_slice_and_load_export_bytes(v41_core_te, tp):
 
     from megatron.lite.model.deepseek_v41.lite.checkpoint import _SPEC
-    from megatron.lite.primitive.ckpt.hf_weights import encode_matrix, load_bound_weight
+    from megatron.lite.primitive.ckpt import hf_weights
 
     name = 'layers.0.attn.wq_b.weight'
     # Keep actual 512-element heads and TP shard axes; smaller q-rank bounds CPU work.
@@ -147,7 +132,9 @@ def test_wq_b_tile_codec_tp_slice_and_load_export_bytes(v41_core_te, tp):
     matrix = (
         torch.arange(shape[0] * shape[1]).reshape(shape).remainder(31) - 15
     ).bfloat16()
-    weight, scale = encode_matrix(_SPEC, name, matrix, 'F8_E4M3', 5 * matrix.numel())
+    weight, scale = hf_weights.encode_matrix(
+        _SPEC, name, matrix, 'F8_E4M3', 5 * matrix.numel()
+    )
     whole = _SPEC.encode(name, matrix, 'F8_E4M3')
     for actual, expected in zip((weight, scale), whole):
         assert actual.shape == expected.shape
@@ -155,7 +142,7 @@ def test_wq_b_tile_codec_tp_slice_and_load_export_bytes(v41_core_te, tp):
     reader = SimpleNamespace(
         _get_raw_tensor=lambda key, device: weight if key == name else scale
     )
-    decoded = load_bound_weight(reader, name, _SPEC)
+    decoded = hf_weights.load_bound_weight(reader, name, _SPEC)
     encoded = _SPEC.encode(name, decoded, 'F8_E4M3')
     for actual, expected in zip(encoded, (weight, scale)):
         assert torch.equal(actual.view(torch.uint8), expected.view(torch.uint8))
@@ -168,3 +155,12 @@ def test_wq_b_tile_codec_tp_slice_and_load_export_bytes(v41_core_te, tp):
             assert torch.equal(
                 actual.view(torch.uint8), full[start:stop].view(torch.uint8)
             )
+
+
+def test_duplicate_projection_is_rejected(v41_core_te, native_permutations):
+    model = DeepseekV4MegaAttnAttention(8)
+    hook = adapter(v41_core_te).MegaAttnReload(model)
+    model.wq_b.quant_method.process_weights_after_loading(model.wq_b)
+    with pytest.raises(RuntimeError, match='processed twice'):
+        model.wq_b.quant_method.process_weights_after_loading(model.wq_b)
+    hook.restore()

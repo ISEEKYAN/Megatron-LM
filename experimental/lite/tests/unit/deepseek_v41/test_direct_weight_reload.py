@@ -51,7 +51,7 @@ def test_direct_sink_reload_matches_cold_and_preserves_address(
 
 
 @pytest.mark.parametrize('tp', [4, 8])
-def test_mxfp4_materialization_initializes_padding_once(v41_core_te, tp):
+def test_mxfp4_materialization_initializes_padding_once(v41_core_te, monkeypatch, tp):
     from test_receiver_staging import Mxfp4MoEMethod
 
     consumer = adapter(v41_core_te)
@@ -76,21 +76,44 @@ def test_mxfp4_materialization_initializes_padding_once(v41_core_te, tp):
     metadata = layer.w2_weight.to('meta')
     metadata.__dict__ = layer.w2_weight.__dict__.copy()
     loader(metadata, torch.ones(64, real // 2, dtype=torch.uint8), 0)
+    raw = torch.nn.Parameter(torch.empty_like(layer.w2_weight), requires_grad=False)
+    raw.__dict__ = metadata.__dict__.copy()
+    model = torch.nn.Module()
+    model.weight = raw
+    from megatron.lite.model.deepseek_v41.lite.resync import transport_weights
+    from reload_fixture import install_reload
+
+    def initialize(model):
+        # Same Parameter, new poisoned storage, during native initialize.
+        raw.data = torch.full_like(raw, 239)
+
+    install_reload(monkeypatch, model, initialize)
+
+    def load_weights(pairs):
+        for name, tensor in pairs:
+            loader(raw, tensor, int(name))
+        return {name for name, _ in pairs}
+
+    model.load_weights = load_weights
     for generation in (1, 2):
-        raw = torch.nn.Parameter(
-            torch.full_like(layer.w2_weight, 239), requires_grad=False
-        )
-        raw.__dict__ = metadata.__dict__.copy()
+        receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
         for expert in (0, 1):
-            loader(
-                raw,
-                torch.full((64, real // 2), generation + expert, dtype=torch.uint8),
-                expert,
+            receiver.receive(
+                [
+                    (
+                        str(expert),
+                        torch.full(
+                            (64, real // 2), generation + expert, dtype=torch.uint8
+                        ),
+                    )
+                ]
             )
         cold = torch.zeros_like(raw)
         for expert in (0, 1):
             cold[expert, :, : real // 2] = generation + expert
         assert torch.equal(raw, cold)
+        receiver.receive(list(transport_weights([], deployment=True)))
+        receiver.finish()
 
 
 def test_padding_loader_remains_a_rebindable_method(v41_core_te):
@@ -113,3 +136,68 @@ def test_padding_loader_remains_a_rebindable_method(v41_core_te):
     )
     rebound(param, torch.ones(2, dtype=torch.uint8))
     assert torch.equal(param, torch.tensor([[1, 1], [0, 0]], dtype=torch.uint8))
+
+
+@pytest.mark.parametrize('tp,rank', [(4, 3), (8, 7)])
+@pytest.mark.parametrize('return_names', [True, False])
+def test_native_sink_return_names_drive_receiver_finish(
+    v41_core_te, monkeypatch, tp, rank, return_names
+):
+    from types import MethodType
+
+    from megatron.lite.model.deepseek_v41.lite.resync import transport_weights
+    from native_reload import functions
+    from reload_fixture import install_reload
+
+    native = functions(
+        'vllm/models/deepseek_v41/nvidia/model.py',
+        ['load_weights'],
+        'DeepseekV4Model',
+        get_tensor_model_parallel_world_size=lambda: tp,
+        get_tensor_model_parallel_rank=lambda: rank,
+        is_pp_missing_parameter=lambda name, model: False,
+    )
+    consumer = adapter(v41_core_te)
+    model = torch.nn.Module()
+    model.attn = torch.nn.Module()
+    kernel = torch.nn.Parameter(torch.full((64,), -float('inf')), requires_grad=False)
+    model.attn._ds41_attn_sink_initializer = kernel.detach().clone()
+    model.attn.attn_sink = torch.nn.Parameter(
+        torch.empty(64, device='meta'), requires_grad=False
+    )
+    model.config = NS(num_attention_heads=64)
+    model.quant_config = None
+    model.get_expert_mapping = lambda: []
+    infos, _ = install_reload(monkeypatch, model)
+    infos[model.attn].kernel_tensors = ({'attn_sink': kernel}, {})
+    load = MethodType(native.load_weights, model)
+    returned = []
+
+    def load_weights(pairs):
+        names = load(pairs)
+        returned.append(names)
+        return names if return_names else None
+
+    model.load_weights = load_weights
+    receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    receiver.receive(
+        list(
+            transport_weights(
+                [('attn.attn_sink', torch.arange(64).float())], deployment=True
+            )
+        )
+    )
+    assert returned == [{'attn.attn_sink'}]
+    assert receiver.received_sinks == ({'attn.attn_sink'} if return_names else set())
+    expected = torch.full((64,), -float('inf'))
+    expected[: 64 // tp] = torch.arange(64)[
+        rank * (64 // tp) : (rank + 1) * (64 // tp)
+    ].float()
+    assert torch.equal(kernel, expected)
+    if return_names:
+        receiver.finish()
+        assert receiver.finished
+    else:
+        with pytest.raises(ValueError, match='missing attention sinks'):
+            receiver.finish()
+        receiver.abort()

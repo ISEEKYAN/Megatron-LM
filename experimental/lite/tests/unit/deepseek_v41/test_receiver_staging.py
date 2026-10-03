@@ -54,7 +54,9 @@ def test_unpadded_completion_waits_for_all_scales(v41_core_te, tp, rank, interme
         pytest.skip('outside TP group')
     module = adapter(v41_core_te)
     layer = torch.nn.Module()
-    layer.quant_method = Mxfp4MoEMethod()
+    from native_reload import mxfp4_method
+
+    layer.quant_method = mxfp4_method()
     layer.moe_config = NS(
         hidden_dim_unpadded=5120,
         intermediate_size=intermediate,
@@ -63,12 +65,27 @@ def test_unpadded_completion_waits_for_all_scales(v41_core_te, tp, rank, interme
     )
     with torch.device('meta'):
         layer.quant_method.create_weights(
-            layer, 384, 5120, ((intermediate // tp + 127) // 128) * 128, torch.bfloat16
+            layer,
+            384,
+            5120,
+            ((intermediate // tp + 127) // 128) * 128,
+            torch.bfloat16,
+            weight_loader=lambda *a: None,
         )
     original_size = layer.quant_method.intermediate_size
-    getattr(module, 'set_mxfp4_load_numel', lambda model: None)(layer)
+    module.set_mxfp4_load_numel(layer)
     assert layer.quant_method.intermediate_size == original_size
-    expected = 384 * 3 * 5120 * (intermediate // tp) * (1 / 2 + 1 / 32)
+    checkpoint = torch.nn.Module()
+    with torch.device('meta'):
+        mxfp4_method().create_weights(
+            checkpoint,
+            384,
+            5120,
+            intermediate // tp,
+            torch.bfloat16,
+            weight_loader=lambda *a: None,
+        )
+    expected = sum(p.numel() for p in checkpoint.parameters())
     counts = [getattr(p, 'weight_loader_numel', p.numel()) for p in layer.parameters()]
     assert sum(counts) == expected
     # Last scale is essential: earlier W/W/S arrivals must not complete.
@@ -130,7 +147,14 @@ def test_receiver_over_budget_aborts_and_restores_hooks(v41_core_te, monkeypatch
     restored = []
     layerwise._place_kernel_tensors = lambda layer, state: restored.append(layer)
     reloading.layerwise = layerwise
-    reloading.initialize_layerwise_reload = lambda model: None
+    old_info = info
+
+    def initialize(model):
+        nonlocal info
+        info = NS(loaded_weights=[], kernel_tensors={}, can_load=lambda: True)
+        info.reset = lambda: info.loaded_weights.clear()
+
+    reloading.initialize_layerwise_reload = initialize
     parent = None
     for name in ('vllm', 'vllm.model_executor', 'vllm.model_executor.model_loader'):
         package = types.ModuleType(name)
@@ -148,6 +172,8 @@ def test_receiver_over_budget_aborts_and_restores_hooks(v41_core_te, monkeypatch
     receiver = module.ResyncReceiver(
         model, NS(cpu_offload_gb=0), staging_budget_bytes=12
     )
+    assert receiver.staging.infos == [info]
+    assert info is not old_info
     receiver.receive([('weight', torch.zeros(8, dtype=torch.uint8))])
     assert receiver.staging.current_bytes == 8
     with pytest.raises(RuntimeError, match='staging.*budget'):
@@ -160,3 +186,69 @@ def test_receiver_over_budget_aborts_and_restores_hooks(v41_core_te, monkeypatch
     assert not layerwise.LOADING_LAYERS
     with pytest.raises(RuntimeError, match='finalized'):
         receiver.receive([('weight', torch.zeros(1, dtype=torch.uint8))])
+
+
+def test_native_288_to_384_completion_through_receiver(v41_core_te, monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite.resync import transport_weights
+    from native_reload import mxfp4_method, online_loader
+    from reload_fixture import install_reload
+
+    consumer = adapter(v41_core_te)
+    model = torch.nn.Module()
+    model.quant_method = mxfp4_method()
+    model.moe_config = NS(
+        hidden_dim_unpadded=64,
+        intermediate_size=2304,
+        moe_parallel_config=NS(tp_size=8),
+        tp_shard_with_padding=False,
+    )
+    model.quant_method.create_weights(
+        model, 2, 64, 384, torch.bfloat16, weight_loader=lambda *a: None
+    )
+    checkpoint = torch.nn.Module()
+    mxfp4_method().create_weights(
+        checkpoint, 2, 64, 288, torch.bfloat16, weight_loader=lambda *a: None
+    )
+    expected = sum(p.numel() for p in checkpoint.parameters())
+    consumer.set_mxfp4_load_numel(model)
+    assert sum(p.weight_loader_numel for p in model.parameters()) == expected
+    assert expected < sum(p.numel() for p in model.parameters())
+    infos, _ = install_reload(monkeypatch, model)
+    info = infos[model]
+    completed = []
+
+    info.can_load = lambda: True
+    info.load_numel = 0
+
+    def process(layer, state):
+        completed.append(state.load_numel)
+        state.reset()
+
+    make_loader = online_loader(info, process, monkeypatch)
+    for name, param in model.named_parameters():
+
+        def copy_checkpoint(param, loaded_weight):
+            # Copy the unpadded checkpoint slice; native CopyCounter observes it.
+            slices = tuple(slice(0, dim) for dim in loaded_weight.shape)
+            param.data[slices].copy_(loaded_weight)
+
+        param.weight_loader = copy_checkpoint
+        param.weight_loader = make_loader(model, name)
+
+    def load_weights(pairs):
+        for name, tensor in pairs:
+            param = model.get_parameter(name)
+            param.weight_loader(param, tensor)
+        return set(name for name, _ in pairs)
+
+    model.load_weights = load_weights
+    receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    weights = list(checkpoint.named_parameters())
+    receiver.receive(weights[:-1])
+    assert not completed
+    assert receiver.staging.current_bytes > 0
+    receiver.receive(weights[-1:])
+    assert completed == [expected]
+    assert receiver.staging.current_bytes == 0
+    receiver.receive(list(transport_weights([], deployment=True)))
+    receiver.finish()

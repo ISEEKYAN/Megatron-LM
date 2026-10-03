@@ -74,3 +74,10 @@ terminator and Engram census reject incomplete row generations; ordinary dense
 weight completeness relies on the exporter inventory and reliable transport.
 Failed reloads require restarting the worker; transactional rollback is absent.
 These results cover the reduced model and transport contracts, not the full release-sized engine.
+
+### Limitations
+
+The receiver depends on vLLM private reload symbols (`_place_kernel_tensors`
+and `LOADING_LAYERS`) and DS4.1 `fused_layout` permutation functions. Changes
+in their metadata, return-name, or layout contracts require revalidation against
+the deployed vLLM revision; compatibility across vLLM versions is not guaranteed.

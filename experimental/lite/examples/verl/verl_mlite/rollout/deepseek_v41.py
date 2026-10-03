@@ -17,8 +17,8 @@ from megatron.lite.primitive.ckpt.row_stream import RowChunk, RowReceiver
 def _initialize_mxfp4_parameter(param):
     # Native Mxfp4MoEMethod.create_weights initializes W and scale to zero.
     # Reload materializes with empty_strided; native loaders only fill the
-    # checkpoint slice. Initialize once per new raw Parameter, not per expert.
-    # Metadata is captured before cold load, so it does not inherit this flag.
+    # checkpoint slice. Initialize once per generation, not per expert. The receiver resets
+    # the flag after native initialize, including reused Parameter objects.
     if not param.is_meta and not getattr(param, '_ds41_mxfp4_initialized', False):
         param.data.zero_()
         param._ds41_mxfp4_initialized = True
@@ -46,6 +46,12 @@ def _mxfp4_initialized_loader(loader):
 
     load._ds41_mxfp4_initializer = True
     return load
+
+
+def reset_mxfp4_padding_initializers(model):
+    """Invalidate padding state after native initialization for each generation."""
+    for param in model.parameters():
+        param.__dict__.pop('_ds41_mxfp4_initialized', None)
 
 
 def reset_mxfp4_permute_caches(model):
@@ -294,10 +300,8 @@ class ResyncReceiver:
                 'DS4.1 resync currently requires FusedMoE, not MegaMoE'
             )
         self.model, self.model_config = model, model_config
-        self.staging = StagingBudget(
-            [layerwise.get_layerwise_info(m) for m in model.modules()],
-            staging_budget_bytes,
-        )
+        # Validate before mutating model hooks or native reload state.
+        self.staging = StagingBudget([], staging_budget_bytes)
         self.rows, self.hooks = {}, []
         self.expected_tables = {
             n
@@ -321,6 +325,8 @@ class ResyncReceiver:
         reset_mxfp4_permute_caches(model)
         with _without_tables(model):
             reload.initialize_layerwise_reload(model)
+        reset_mxfp4_padding_initializers(model)
+        self.staging.infos = [layerwise.get_layerwise_info(m) for m in model.modules()]
         self.expected_sinks = restore_attn_sink_parameters(model, layerwise)
         self.received_sinks = set()
         self.mega_attn = MegaAttnReload(model)
@@ -393,8 +399,6 @@ class ResyncReceiver:
         for module, hook in self.hooks:
             module.process_weights_after_loading = hook
         self.mega_attn.restore()
-        if hasattr(self.model, '_original_do_torchao_reload'):
-            self.model._do_torchao_reload = self.model._original_do_torchao_reload
         self.staging.refresh()
         self.finished = True
 
