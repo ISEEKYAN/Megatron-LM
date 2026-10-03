@@ -19,6 +19,7 @@ from megatron.lite.primitive.modules.lora import (
     normalize_lora_config,
 )
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.quantization.qat import declare_qat_weights
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
@@ -99,6 +100,11 @@ class Experts(nn.Module):
             bias=False,
             params_dtype=torch.bfloat16,
         )
+        # TE GroupedLinear holds one ``weight{i}`` per local expert, not ``weight``.
+        for fc in (self.fc1, self.fc2):
+            declare_qat_weights(
+                fc, (f"weight{i}" for i in range(self.num_local_experts))
+            )
         lora = normalize_lora_config(lora_config)
         self.fc1_lora: SharedGroupedLinearLoRA | None = None
         self.fc2_lora: SharedGroupedLinearLoRA | None = None
