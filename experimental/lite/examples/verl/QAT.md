@@ -60,7 +60,7 @@ quantized computation; it is not a fake-quantized BF16 GEMM:
 | FC1/FC2 input | Dynamic per-token FP8 E4M3, one UE8M0 scale per 128 K values: `scale = ceil_ue8m0(max(amax / 448, 1e-10))`. |
 | FC1/FC2 weight | MXFP4 bytes from `quantize_mxfp4` on the BF16 master, the same bytes the exporter streams to the rollout. |
 | GEMM | DeepGEMM `m_grouped_fp8_fp4_gemm_nt_contiguous` on CUDA (an error if unavailable); a CPU reference on the same dequantized operands. |
-| Activation | FC1 output BF16, SwiGLU in FP32 rounded once to BF16, then requantized to FP8. |
+| Activation | FC1 output BF16, SwiGLU in FP32 rounded once to BF16, then requantized to FP8. With the model's `swiglu_limit` `L` (vLLM `gemm1_clamp_limit`), `gate = min(gate, L)` and `up = clamp(up, -L, L)` in FP32 before SwiGLU, so the FP8 requantization sees the clamped result. |
 | Top-k combine | The unweighted BF16 FC2 rows of each token are accumulated in FP32 in router top-k slot order, `acc = fma(row, weight, acc)`, then rounded once to BF16, as vLLM's `ep_gather` does. |
 | Backward | Straight-through estimator on both operands into the BF16 master weights. |
 
@@ -100,7 +100,9 @@ W4A8 experts; the other protocols reject `activation_bits`.
 **Parity with the rollout.** Measured on GB200 against vLLM's own
 `DeepGemmFP4Experts` path, the routed-expert output is bit-identical to the
 rollout. That covers A1/A2 codes and scales, FC1, the SwiGLU requantization,
-FC2, and the top-k sum, at Qwen3-30B-A3B expert shapes with top-k 8. The
+FC2, and the top-k sum, at Qwen3-30B-A3B expert shapes with top-k 8, both
+without a SwiGLU clamp and with `swiglu_limit=10` on inputs where the clamp
+is active. The
 Qwen3 MoE layer, including dispatch and combine, is also checked bit for bit
 on CPU against an exact transcription of `ep_gather`. Conditions:
 

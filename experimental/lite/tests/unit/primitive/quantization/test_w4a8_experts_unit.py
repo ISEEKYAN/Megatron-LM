@@ -23,6 +23,7 @@ import torch
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 from megatron.lite.primitive.quantization.qat import QATSpec, apply_qat_to_chunks
 from megatron.lite.primitive.quantization.w4a8_experts import (
+    _swiglu_bf16,
     dequantize_fp8_act,
     quantize_fp8_act,
     w4a8_expert_mlp,
@@ -320,6 +321,114 @@ def test_expert_mlp_swiglu_limit_clamps_gate_and_up():
     assert not torch.equal(limited, w4a8_expert_mlp(x, fc1, fc2, [4]))
 
 
+# --- clamped SwiGLU (vLLM silu_mul_quant_fp8_packed_triton, HAS_CLAMP) ---------
+
+
+def _vllm_fp4_act_mul_quant(fc1_out: torch.Tensor, clamp_limit: float | None):
+    """``_silu_mul_quant_fp8_packed_kernel`` as ``DeepGemmFP4Experts`` runs it.
+
+    ``gate``/``up`` loaded as float32; with a clamp, ``gate = min(gate, L)`` and
+    ``up = clamp(up, -L, L)`` (``L`` is a float32 kernel argument);
+    ``glu = gate / (1 + exp(-gate * alpha))``, ``y = (up + beta) * glu`` with
+    alpha=1, beta=0; ``y`` rounded through BF16; then per 128-group
+    ``scale = exp2(ceil(log2(max(absmax / 448, 1e-10))))``, codes
+    ``clamp(y / scale, -448, 448)`` as E4M3 and scale byte ``exponent + 127``.
+    Returns the BF16 activation, the E4M3 code bytes and the scale bytes.
+    """
+    gate, up = fc1_out.float().chunk(2, dim=-1)
+    if clamp_limit is not None:
+        limit = torch.tensor(clamp_limit, dtype=torch.float32)
+        gate = torch.minimum(gate, limit)
+        up = torch.maximum(torch.minimum(up, limit), -limit)
+    glu = gate / (1.0 + torch.exp(-gate * 1.0))
+    y = ((up + 0.0) * glu).to(torch.bfloat16)
+    groups = y.float().reshape(y.shape[0], -1, 128)
+    scale_raw = torch.maximum(groups.abs().amax(-1) / 448.0, torch.tensor(1e-10))
+    exponent = torch.ceil(torch.log2(scale_raw))
+    q = (groups / torch.exp2(exponent).unsqueeze(-1)).clamp(-448.0, 448.0)
+    codes = q.to(torch.float8_e4m3fn).reshape(y.shape).view(torch.uint8)
+    return y, codes, (exponent + 127.0).clamp(0.0, 255.0).to(torch.int32)
+
+
+def _clamp_edge_fc1(limit: float, rows: int = 16, inter: int = 256) -> torch.Tensor:
+    """BF16 FC1 output ``[rows, 2 * inter]`` hitting the clamp from every side."""
+    lim = torch.tensor(limit, dtype=torch.bfloat16)
+    up_ulp = torch.nextafter(lim.float(), torch.tensor(1e9)).to(torch.bfloat16)
+    edges = torch.tensor(
+        [limit, -limit, 2 * limit, -2 * limit, 1e4, -1e4, 3e4, -3e4, 0.5, -0.5]
+        + [1e-3, 0.0, 88.0, -88.0, -150.0]
+    ).to(torch.bfloat16)
+    edges = torch.cat([edges, lim[None], up_ulp[None], -up_ulp[None]])
+    generator = torch.Generator().manual_seed(11)
+    picks = torch.randint(len(edges), (rows, 2 * inter), generator=generator)
+    out = edges[picks]
+    # Plain rows with clamped and unclamped entries mixed, and one small-magnitude row.
+    out[: rows // 2] = (torch.randn(rows // 2, 2 * inter, generator=generator) * 20).to(
+        torch.bfloat16
+    )
+    out[0] = (torch.randn(2 * inter, generator=generator) * 1e-3).to(torch.bfloat16)
+    return out
+
+
+@pytest.mark.parametrize("limit", [10.0, 7.3, None])
+def test_swiglu_clamp_and_a2_match_vllm_fp4_fused_kernel_bytewise(limit):
+    fc1_out = _clamp_edge_fc1(10.0 if limit is None else limit)
+    ref_y, ref_codes, ref_bytes = _vllm_fp4_act_mul_quant(fc1_out, limit)
+
+    hidden = _swiglu_bf16(fc1_out, limit)
+    codes, scale = quantize_fp8_act(hidden)
+
+    assert torch.equal(hidden.view(torch.int16), ref_y.view(torch.int16))
+    assert torch.equal(codes.view(torch.uint8), ref_codes)
+    assert torch.equal(_scale_bytes(scale), ref_bytes)
+    if limit is not None:  # the clamp is live on these inputs
+        assert not torch.equal(hidden, _swiglu_bf16(fc1_out, None))
+
+
+def _all_finite_bf16() -> torch.Tensor:
+    bits = torch.arange(-(2**15), 2**15, dtype=torch.int32).to(torch.int16)
+    values = bits.view(torch.bfloat16)
+    return values[values.float().isfinite()]
+
+
+def test_swiglu_clamp_matches_vllm_on_every_finite_bf16_gate():
+    gates = _all_finite_bf16().reshape(-1, 128)  # 65280 = 510 x 128
+    for up in (-20.0, -10.0, -1.0, 0.5, 10.0, 20.0):
+        fc1_out = torch.cat([gates, torch.full_like(gates, up)], dim=-1)
+        ref_y, ref_codes, ref_bytes = _vllm_fp4_act_mul_quant(fc1_out, 10.0)
+        hidden = _swiglu_bf16(fc1_out, 10.0)
+        codes, scale = quantize_fp8_act(hidden)
+        assert torch.equal(hidden.view(torch.int16), ref_y.view(torch.int16)), up
+        assert torch.equal(codes.view(torch.uint8), ref_codes), up
+        assert torch.equal(_scale_bytes(scale), ref_bytes), up
+
+
+def test_expert_mlp_clamp_runs_before_a2_quantization():
+    torch.manual_seed(12)
+    x = (torch.randn(5, 128) * 8).to(torch.bfloat16)
+    fc1 = [torch.randn(256, 128).to(torch.bfloat16)]
+    fc2 = [(torch.randn(128, 128) * 0.1).to(torch.bfloat16)]
+
+    out = w4a8_expert_mlp(x, fc1, fc2, [5], swiglu_limit=10.0, backend="reference")
+
+    fc1_out = w4a8_grouped_gemm(x, fc1, [5], backend="reference")
+    assert fc1_out.abs().max() > 10.0
+    hidden, _, _ = _vllm_fp4_act_mul_quant(fc1_out, 10.0)
+    assert torch.equal(out, w4a8_grouped_gemm(hidden, fc2, [5], backend="reference"))
+    unclamped = w4a8_expert_mlp(x, fc1, fc2, [5], swiglu_limit=None)
+    assert torch.equal(unclamped, w4a8_expert_mlp(x, fc1, fc2, [5]))
+    assert not torch.equal(out, unclamped)
+
+
+@pytest.mark.parametrize("limit", [0.0, -1.0, float("inf"), float("nan")])
+def test_expert_mlp_rejects_limits_the_rollout_cannot_express(limit):
+    x = torch.randn(2, 128).to(torch.bfloat16)
+    fc1 = [torch.randn(256, 128).to(torch.bfloat16)]
+    fc2 = [torch.randn(128, 128).to(torch.bfloat16)]
+    with pytest.raises(ValueError, match="swiglu_limit"):
+        w4a8_expert_mlp(x, fc1, fc2, [2], swiglu_limit=limit)
+
+
 def test_expert_mlp_gradients_reach_input_and_weights():
     torch.manual_seed(7)
     x = torch.randn(6, 128).to(torch.bfloat16).requires_grad_()
@@ -396,6 +505,7 @@ def test_deep_gemm_matches_reference_on_identical_operands():
 
 
 @pytest.mark.gpus(1, min_architecture="blackwell")
+@pytest.mark.parametrize("swiglu_limit", [None, 10.0])
 @pytest.mark.parametrize(
     "experts, hidden, inter, tokens, topk",
     [
@@ -404,7 +514,7 @@ def test_deep_gemm_matches_reference_on_identical_operands():
     ],
 )
 def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
-    experts, hidden, inter, tokens, topk
+    experts, hidden, inter, tokens, topk, swiglu_limit
 ):
     """Training W4A8 experts + top-k combine vs the rollout's ``DeepGemmFP4Experts``.
 
@@ -412,7 +522,9 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
     prepare step does it, MXFP4 weight-scale packing as its weight loading does
     it, then permute, FC1, fused SiLU+A2 quantization, FC2 and the FP32 top-k
     gather. The training side is the unweighted W4A8 expert MLP in MLite's
-    unfused dispatch order followed by ``topk_fma_combine``. Bitwise equal.
+    unfused dispatch order followed by ``topk_fma_combine``. Bitwise equal, with
+    and without the SwiGLU clamp (``gemm1_clamp_limit``); a third of the tokens
+    are scaled up so that the clamp is live.
     """
     from megatron.lite.primitive.quantization.w4a8_experts import topk_fma_combine
 
@@ -431,7 +543,9 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
     from vllm.utils.deep_gemm import get_mk_alignment_for_contiguous_layout
 
     torch.manual_seed(9)
-    x = torch.randn(tokens, hidden).to(torch.bfloat16).cuda()
+    x = torch.randn(tokens, hidden)
+    x[::3] *= 30.0
+    x = x.to(torch.bfloat16).cuda()
     fc1 = [
         (torch.randn(2 * inter, hidden) * 0.05).to(torch.bfloat16).cuda()
         for _ in range(experts)
@@ -473,7 +587,7 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
     rollout_self = SimpleNamespace(
         w1_scale=w1_scale,
         w2_scale=w2_scale,
-        gemm1_clamp_limit=None,
+        gemm1_clamp_limit=swiglu_limit,
         _ACT_BLOCK_K=impl._ACT_BLOCK_K,
         _WEIGHT_BLOCK_K=impl._WEIGHT_BLOCK_K,
         adjust_N_for_activation=impl.adjust_N_for_activation,
@@ -512,13 +626,59 @@ def test_expert_mlp_matches_vllm_deepgemm_fp4_experts_bitwise(
     row_expert = torch.repeat_interleave(
         torch.arange(experts, device="cuda"), routed.sum(0)
     )
-    rows = w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits)
+    rows = w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits, swiglu_limit)
     training = topk_fma_combine(
         rows, row_token, row_expert, topk_ids.long(), topk_weights
     )
 
     assert m_splits[2] == 0
     assert torch.equal(training.cpu(), rollout.cpu())
+    if swiglu_limit is not None:
+        fc1_out = w4a8_grouped_gemm(x[row_token], fc1, m_splits)
+        assert (fc1_out.abs() > swiglu_limit).float().mean() > 0.05
+        assert not torch.equal(rows, w4a8_expert_mlp(x[row_token], fc1, fc2, m_splits))
+
+
+@pytest.mark.gpus(1, min_architecture="blackwell")
+@pytest.mark.parametrize("limit", [10.0, 7.3, None])
+def test_swiglu_clamp_matches_installed_vllm_fp4_fused_kernel(limit):
+    """``_swiglu_bf16`` + A2 quantization vs vLLM's fused SiLU-mul-quant kernel.
+
+    The Triton kernel ``DeepGemmFP4Experts`` runs for UE8M0 scales, on the clamp
+    edge rows (M < 512) and on every finite BF16 gate (M >= 512, the other
+    launch configuration). Compares the code bytes and the scale bytes of every
+    row whose activation is finite. Without a clamp, gates near the BF16 maximum
+    overflow ``silu(gate) * up`` to infinity; there the kernel saturates the
+    codes to 448 and ``quantize_fp8_act`` gives NaN codes (measured on GB200).
+    The clamp bounds the activation by ``L * L``, so with it every row counts.
+    """
+    fp8_utils = pytest.importorskip(
+        "vllm.model_executor.layers.quantization.utils.fp8_utils"
+    )
+    gates = _all_finite_bf16().reshape(-1, 128)
+    sweep = torch.cat(
+        [
+            torch.cat([gates, torch.full_like(gates, up)], dim=-1)
+            for up in (-20.0, -10.0, -1.0, 0.5, 10.0, 20.0)
+        ]
+    )
+    for fc1_out in (_clamp_edge_fc1(10.0 if limit is None else limit), sweep):
+        fc1_out = fc1_out.cuda()
+        ref_codes, ref_packed = fp8_utils.silu_mul_quant_fp8_packed_triton(
+            fc1_out, group_size=128, clamp_limit=limit
+        )
+        hidden = _swiglu_bf16(fc1_out, limit)
+        codes, scale = quantize_fp8_act(hidden)
+        ref_bytes = torch.stack(
+            [(ref_packed >> (8 * j)) & 0xFF for j in range(4)], dim=-1
+        ).flatten(1)[:, : scale.shape[1]]
+        finite = hidden.float().isfinite().all(-1)
+        assert finite.all() or limit is None
+        assert finite.float().mean() > 0.99
+        assert torch.equal(
+            codes.view(torch.uint8)[finite], ref_codes.view(torch.uint8)[finite]
+        )
+        assert torch.equal(_scale_bytes(scale)[finite], ref_bytes[finite])
 
 
 @pytest.mark.gpus(1, min_architecture="blackwell")

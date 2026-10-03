@@ -197,7 +197,7 @@ class Experts(nn.Module):
                     self._expert_weights(self.fc1),
                     self._expert_weights(self.fc2),
                     m_splits,
-                    self.swiglu_limit,
+                    self.swiglu_limit or None,
                 )
             elif self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)

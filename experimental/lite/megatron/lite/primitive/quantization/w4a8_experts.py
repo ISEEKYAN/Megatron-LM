@@ -17,7 +17,8 @@ Training-side counterpart of the rollout MoE contract served by vLLM's
   quantized operands and scales are bit-identical between the two; the
   accumulation order of the GEMM itself is the kernel's.
 * **Expert MLP** (:func:`w4a8_expert_mlp`) — FC1 output in BF16, SwiGLU in
-  float32 rounded once to BF16, A8 requantization, FC2 output in BF16.
+  float32 (optionally clamped by ``swiglu_limit``) rounded once to BF16, A8
+  requantization, FC2 output in BF16.
 * **Top-k combine** (:func:`topk_fma_combine`) — per token, the unweighted
   BF16 FC2 rows are accumulated in float32 in top-k slot order as
   ``acc = fma(row, weight, acc)`` and rounded to BF16 once, as vLLM's
@@ -33,6 +34,7 @@ scale rule satisfies ``amax / scale <= 6`` by construction.
 from __future__ import annotations
 
 import importlib
+import math
 from collections.abc import Sequence
 
 import torch
@@ -257,12 +259,27 @@ def w4a8_grouped_gemm(
     return _W4A8GroupedGemm.apply(x, tuple(m_splits), backend, *weights)
 
 
+def _swiglu_bf16(fc1_out: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
+    """SwiGLU of the BF16 FC1 output, computed in float32 and rounded once.
+
+    With a limit ``L`` this is the rollout's clamped SwiGLU (vLLM's fused
+    SiLU-mul-quant kernel with ``gemm1_clamp_limit=L``): ``gate = min(gate, L)``
+    with no lower bound, ``up = clamp(up, -L, L)``, both in float32 before
+    ``silu(gate) * up``. The A2 quantization sees the rounded result.
+    """
+    gate, up = fc1_out.float().chunk(2, dim=-1)
+    if swiglu_limit is not None:
+        gate = gate.clamp(max=swiglu_limit)
+        up = up.clamp(-swiglu_limit, swiglu_limit)
+    return (torch.nn.functional.silu(gate) * up).to(fc1_out.dtype)
+
+
 def w4a8_expert_mlp(
     x: torch.Tensor,
     fc1_weights: Sequence[torch.Tensor],
     fc2_weights: Sequence[torch.Tensor],
     m_splits: Sequence[int],
-    swiglu_limit: float = 0.0,
+    swiglu_limit: float | None = None,
     *,
     backend: str | None = None,
 ) -> torch.Tensor:
@@ -270,15 +287,15 @@ def w4a8_expert_mlp(
 
     FC1 (``[gate, up]`` halves) -> SwiGLU computed in float32 and rounded once
     to BF16 -> FC2. The rows are unweighted; the router weights are applied by
-    :func:`topk_fma_combine`. With ``swiglu_limit > 0`` the gate is clamped from
-    above and ``up`` symmetrically before the activation, as in the rollout kernel.
+    :func:`topk_fma_combine`. ``swiglu_limit`` (finite and positive, or
+    ``None`` for no clamp) clamps the SwiGLU inputs as in :func:`_swiglu_bf16`.
     """
+    if swiglu_limit is not None and not (0 < swiglu_limit < math.inf):
+        raise ValueError(
+            f"swiglu_limit must be None or finite and positive, got {swiglu_limit!r}."
+        )
     fc1_out = w4a8_grouped_gemm(x, fc1_weights, m_splits, backend=backend)
-    gate, up = fc1_out.float().chunk(2, dim=-1)
-    if swiglu_limit > 0:
-        gate = gate.clamp(max=swiglu_limit)
-        up = up.clamp(-swiglu_limit, swiglu_limit)
-    hidden = (torch.nn.functional.silu(gate) * up).to(fc1_out.dtype)
+    hidden = _swiglu_bf16(fc1_out, swiglu_limit)
     return w4a8_grouped_gemm(hidden, fc2_weights, m_splits, backend=backend)
 
 
