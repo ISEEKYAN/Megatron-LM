@@ -80,6 +80,7 @@ def test_qwen_load_save_export_and_exact_qat_masters(
         model.config,
         model.ps,
         bounded=True,
+        target=target,
         buffer_max_size_bytes=budget,
     )
     for name, parameter in model.named_parameters():
@@ -87,6 +88,9 @@ def test_qwen_load_save_export_and_exact_qat_masters(
 
     # External HF loading must also work without the exact-training sidecar.
     shutil.rmtree(tmp_path / "mlite_masters")
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
     reader = BoundedTensorReader(str(tmp_path))
     spec = Qwen3MoEBoundSpec(model.config, model.ps, target)
     expected = {
@@ -397,3 +401,44 @@ def test_non_row_budget_rejected_before_conversion(
     monkeypatch.setattr(spec, "hf_to_native", checked_load)
     with pytest.raises(ValueError, match="Tensor exceeds buffer"):
         load_bound_model(model, str(tmp_path), spec, buffer_max_size_bytes=16384)
+
+
+@pytest.mark.parametrize("operation", ["save", "load"])
+def test_bound_checkpoint_without_dtensor(
+    tmp_path, monkeypatch, transformer_engine_import_stub, operation
+):
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEBoundSpec
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    model = make_qwen(monkeypatch, transformer_engine_import_stub)
+    spec = Qwen3MoEBoundSpec(model.config, model.ps)
+    original = {n: p.detach().clone() for n, p in model.named_parameters()}
+    if operation == "save":
+        monkeypatch.setattr(hf_weights, "DTensor", None)
+    hf_weights.save_bound_model(model, tmp_path, spec)
+    monkeypatch.setattr(hf_weights, "DTensor", None)
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    hf_weights.load_bound_model(model, tmp_path, spec)
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, original[name]), name
+
+
+def test_primitive_save_without_masters(
+    tmp_path, monkeypatch, transformer_engine_import_stub
+):
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEBoundSpec
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    model = make_qwen(monkeypatch, transformer_engine_import_stub)
+    spec = Qwen3MoEBoundSpec(model.config, model.ps)
+    original = {n: p.detach().clone() for n, p in model.named_parameters()}
+    hf_weights.save_bound_model(model, tmp_path, spec, save_masters=False)
+    assert not (tmp_path / "mlite_masters").exists()
+    with torch.no_grad():
+        for parameter in model.parameters():
+            parameter.zero_()
+    hf_weights.load_bound_model(model, tmp_path, spec)
+    for name, parameter in model.named_parameters():
+        assert torch.equal(parameter, original[name]), name

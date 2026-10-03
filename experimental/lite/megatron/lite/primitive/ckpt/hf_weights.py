@@ -1907,32 +1907,26 @@ class BoundedTensorReader(SafeTensorReader):
             value = f.get_tensor(name) if rows is None else source[rows[0] : rows[1]]
             return value.clone()
 
-    def rows(self, name, budget, scale_name=None):
+    def rows(self, name, budget):
         shape = self.shape(name)
-        scale_shape = None if scale_name is None else self.shape(scale_name)
-        if len(shape) != 2 or (
-            scale_shape is not None
-            and (len(scale_shape) != 2 or shape[0] != scale_shape[0])
-        ):
-            raise ValueError("Expected matching 2D row planes")
-        width = shape[1] + (0 if scale_shape is None else scale_shape[1])
-        count = budget // (32 * width)
+        if len(shape) != 2:
+            raise ValueError("Expected 2D rows")
+        count = budget // (32 * shape[1])
         if count < 1 or shape[0] == 0:
             raise ValueError("Buffer must hold at least one nonempty row")
         for start in range(0, shape[0], count):
             span = (start, min(shape[0], start + count))
             weight = self.read(name, budget // 2, span)
-            scale = (
-                None if scale_name is None else self.read(scale_name, budget // 2, span)
-            )
-            yield RowChunk(name, start, shape[0], weight, scale, scale_name)
-            del weight, scale
+            yield RowChunk(name, start, shape[0], weight)
+            del weight
 
 
 def _bound_inventory(model, spec: BoundHFWeights):
     bindings = validate_parameter_bindings(model, spec.bindings(model))
     for binding in bindings:
-        if binding.tensor.is_meta or isinstance(binding.tensor, DTensor):
+        if binding.tensor.is_meta or (
+            DTensor is not None and isinstance(binding.tensor, DTensor)
+        ):
             raise ValueError("Bound checkpoints require materialized local tensors")
     return bindings
 
@@ -2001,7 +1995,7 @@ def load_bound_model(
 ):
     """Load row bindings or exact native masters in chunks.
 
-    Only release row bindings (Qwen embedding/head) bypass full layout conversion.
+    Only release row bindings bypass full layout conversion.
     Non-row sources are read and decoded whole under per-source size checks;
     multiple decoded sources may coexist during native layout assembly.
     """
@@ -2066,12 +2060,15 @@ def save_bound_model(
     spec: BoundHFWeights,
     *,
     buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
+    save_masters=True,
 ):
-    """HF release tensors plus an exact, complete native-master sidecar."""
+    """Save release tensors, optionally with a complete native-master sidecar."""
     for masters, destination in (
         (False, Path(path)),
         (True, Path(path) / "mlite_masters"),
     ):
+        if masters and not save_masters:
+            continue
         stream_export_to_shards(
             export_bound_tensors(
                 model,

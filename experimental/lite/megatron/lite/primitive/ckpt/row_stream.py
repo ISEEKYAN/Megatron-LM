@@ -17,87 +17,42 @@ class RowChunk:
 
 
 @torch.no_grad()
-def stream_rows(
-    name, weight, scale=None, *, buffer_max_size_bytes=5 * 1024**3, scale_name=None
-):
-    """Copy local rows through one byte buffer; consume each before advancing.
+def stream_rows(name, weight, *, buffer_max_size_bytes=5 * 1024**3):
+    """Copy local rows through one buffer; consume each before advancing.
 
     Resident inputs and consumer-owned outputs are excluded from the scratch
-    limit. Paired weight/scale payload views expire on the next iteration.
+    limit. Payload views expire on the next iteration.
     """
     if type(buffer_max_size_bytes) is not int or buffer_max_size_bytes <= 0:
         raise ValueError("Export buffer must hold at least one row")
     if weight.ndim != 2 or not weight.is_contiguous() or weight.shape[1] == 0:
         raise ValueError("Expected contiguous 2D rows")
-    if scale is not None and (
-        scale.ndim != 2
-        or scale.shape[0] != weight.shape[0]
-        or not scale.is_contiguous()
-        or scale.device != weight.device
-    ):
-        raise ValueError("Expected colocated contiguous scale rows")
-    output_dtype = weight.dtype
-    scale_dtype = None if scale is None else scale.dtype
-    scale_width = 0 if scale is None else scale.shape[1]
-    if (scale is None) != (scale_name is None):
-        raise ValueError("Paired planes require an explicit scale key")
-    weight_bytes = weight.shape[1] * weight.element_size()
-    scale_bytes = 0 if scale is None else scale_width * scale.element_size()
-    alignment = 1 if scale is None else scale.element_size()
-    rows = (buffer_max_size_bytes - alignment + 1) // (weight_bytes + scale_bytes)
+    rows = buffer_max_size_bytes // (weight.shape[1] * weight.element_size())
     if rows < 1:
         raise ValueError("Export buffer must hold at least one row")
     rows = min(rows, weight.shape[0])
     if rows == 0:
         raise ValueError("Row streaming requires a nonempty global table")
     scratch = torch.empty(
-        rows * (weight_bytes + scale_bytes) + alignment - 1,
-        device=weight.device,
-        dtype=torch.uint8,
+        (rows, weight.shape[1]), device=weight.device, dtype=weight.dtype
     )
     for offset in range(0, weight.shape[0], rows):
         count = min(rows, weight.shape[0] - offset)
-        scale_offset = (count * weight_bytes + alignment - 1) // alignment * alignment
-        payload = scratch[: scale_offset + count * scale_bytes]
-        w = (
-            payload[: count * weight_bytes]
-            .view(output_dtype)
-            .view(count, weight.shape[1])
+        payload = scratch[:count]
+        payload.view(torch.uint8).copy_(
+            weight[offset : offset + count].view(torch.uint8)
         )
-        s = (
-            None
-            if scale_dtype is None
-            else payload[scale_offset:].view(scale_dtype).view(count, scale_width)
-        )
-        w.view(torch.uint8).copy_(weight[offset : offset + count].view(torch.uint8))
-        if s is not None:
-            s.view(torch.uint8).copy_(scale[offset : offset + count].view(torch.uint8))
-        yield RowChunk(name, offset, weight.shape[0], w, s, scale_name)
+        yield RowChunk(name, offset, weight.shape[0], payload)
 
 
 class RowReceiver:
-    """Copy ordered rows into a complete resident contiguous table.
+    """Copy ordered rows into a complete resident contiguous table."""
 
-    Both planes are validated before either is written. Scales may be stored
-    as raw uint8 on the receiver without changing their bytes.
-    """
-
-    def __init__(self, name, weight, scale=None):
-        if (
-            weight.ndim != 2
-            or not weight.is_contiguous()
-            or (
-                scale is not None
-                and (
-                    scale.ndim != 2
-                    or scale.shape[0] != weight.shape[0]
-                    or not scale.is_contiguous()
-                )
-            )
-        ):
-            raise ValueError("Receiver requires contiguous matching row planes")
+    def __init__(self, name, weight):
+        if weight.ndim != 2 or not weight.is_contiguous():
+            raise ValueError("Receiver requires contiguous 2D rows")
         self.name, self.total_rows = name, weight.shape[0]
-        self.weight, self.scale, self.next_row = weight, scale, 0
+        self.weight, self.next_row = weight, 0
 
     @torch.no_grad()
     def copy(self, chunk):
@@ -110,24 +65,17 @@ class RowReceiver:
             or chunk.offset + count > self.total_rows
         ):
             raise ValueError("Row stream name, shape or order mismatch")
-        pairs = [(self.weight, chunk.weight), (self.scale, chunk.scale)]
-        for target, source in pairs:
-            if (target is None) != (source is None):
-                raise ValueError("Row stream scale presence mismatch")
-            if target is not None and (
-                target.ndim != 2
-                or source.ndim != 2
-                or target.shape[1] != source.shape[1]
-                or source.shape[0] != count
-                or target.element_size() != source.element_size()
-                or (target.dtype != source.dtype and target.dtype != torch.uint8)
-            ):
-                raise ValueError("Row stream plane shape or dtype mismatch")
-        for target, source in pairs:
-            if target is not None:
-                target[chunk.offset : chunk.offset + count].view(torch.uint8).copy_(
-                    source.view(torch.uint8)
-                )
+        source = chunk.weight
+        if (
+            chunk.scale is not None
+            or source.ndim != 2
+            or self.weight.shape[1] != source.shape[1]
+            or self.weight.dtype != source.dtype
+        ):
+            raise ValueError("Row stream shape or dtype mismatch")
+        self.weight[chunk.offset : chunk.offset + count].view(torch.uint8).copy_(
+            source.view(torch.uint8)
+        )
         self.next_row += count
 
     def finish(self):

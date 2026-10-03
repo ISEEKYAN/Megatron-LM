@@ -55,6 +55,8 @@ CPU checkpoint tests instantiate the production Qwen model with the existing
 test-only TE parameter containers. They cover checkpoint/codec/master behavior;
 they do not emulate TE kernels or establish forward/backward numerical parity.
 
+## Limitations
+
 Limits of the memory evidence: non-row loads retain complete decoded sources
 (e.g. QKV) together before assembly. Per-source allowances are conservative, not
 a measured aggregate peak guarantee. RSS is sampled every 2 ms; short-lived
@@ -68,3 +70,15 @@ Training saves always include the complete native-master sidecar, and loads
 prefer it over release values. Save reserves half the budget for export; export
 uses another factor of 64 for row scratch (approximately caller budget / 128).
 The budget therefore is not the available row payload capacity.
+
+The row-load instrumentation test keeps the native-master sidecar, so it checks
+native-name row reads rather than the HF `row_key` path (C2). The frozen-main byte
+oracle covers default export only: default load and bounded MXFP4 packed-byte
+identity are not covered (C3). LoRA and DTensor rejection still lack dedicated
+tests (C4); the DTensor-unavailable fallback has save/load coverage.
+Bounded MXFP4 encode duplicates codec policy and skips the block-size, ndim and
+dtype checks used by the unbounded exporter; those policies can drift (C6).
+
+The generic primitive `save_bound_model(..., save_masters=False)` can omit the
+native-master sidecar when writing a fresh destination. Qwen saves retain the
+default complete sidecar policy.

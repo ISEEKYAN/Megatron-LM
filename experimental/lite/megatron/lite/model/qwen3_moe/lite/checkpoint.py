@@ -275,6 +275,7 @@ def load_hf_weights(
     ps,
     *,
     bounded=False,
+    target="hf",
     buffer_max_size_bytes=2 * 1024**3,
 ) -> None:
     from megatron.lite.primitive.ckpt.hf_weights import load_hf_weights as _load
@@ -285,7 +286,7 @@ def load_hf_weights(
         return load_bound_model(
             model,
             path,
-            Qwen3MoEBoundSpec(config, ps),
+            Qwen3MoEBoundSpec(config, ps, target),
             buffer_max_size_bytes=buffer_max_size_bytes,
         )
     _load(model, path, Qwen3MoEWeightSpec(config), ps, vocab_size=config.vocab_size)
