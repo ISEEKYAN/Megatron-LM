@@ -48,6 +48,19 @@ def _mxfp4_initialized_loader(loader):
     return load
 
 
+def reset_mxfp4_permute_caches(model):
+    """Rebuild native repack indices after sleep discards their CUDA storage.
+
+    These shape-keyed tensors are not registered buffers, so wake cannot
+    restore them. Keeping their keys makes native repack reuse invalid values.
+    Clear only this derived cache; native cold/reload share the same builder.
+    """
+    for layer in model.modules():
+        method = getattr(layer, 'quant_method', None)
+        if type(method).__name__ == 'Mxfp4MoEMethod':
+            method._cache_permute_indices.clear()
+
+
 def restore_attn_sink_parameters(model, layerwise):
     """Expose direct-copy sinks to the unchanged native checkpoint loader.
 
@@ -305,6 +318,7 @@ class ResyncReceiver:
             ):
                 self.hooks.append((module, module.process_weights_after_loading))
                 module.process_weights_after_loading = lambda: None
+        reset_mxfp4_permute_caches(model)
         with _without_tables(model):
             reload.initialize_layerwise_reload(model)
         self.expected_sinks = restore_attn_sink_parameters(model, layerwise)
