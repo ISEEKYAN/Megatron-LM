@@ -120,8 +120,7 @@ def test_qwen_load_save_export_and_exact_qat_masters(
     reloaded = BoundedTensorReader(str(second))
     assert reloaded.keys() == reader.keys()
     # MXFP4 can choose a different equivalent exponent after dequantization.
-    # Numerical release values must survive; archival byte passthrough is tested
-    # separately, while the training sidecar above is bitwise exact.
+    # Numerical release values must survive; the training sidecar above is bitwise exact.
     for binding in bindings:
         for name in binding.sources:
             assert torch.equal(
@@ -295,3 +294,106 @@ def test_qwen_independent_process_host_rss_is_bounded(tmp_path):
     # allowing fixed allocator/file-I/O overhead; this is not ATen storage.
     assert max(r['increment'] for r in readings) < 24 * 1024**2
     assert readings[-1]['increment'] - readings[0]['increment'] < 8 * 1024**2
+
+
+@pytest.mark.parametrize("target", ["hf", "bf16", "mxfp4"])
+def test_default_export_matches_main_bytes(
+    tmp_path, monkeypatch, transformer_engine_import_stub, target
+):
+    """Execute the frozen main exporter, including its primitive, as the oracle."""
+    import subprocess
+    import types
+    from pathlib import Path
+
+    from megatron.lite.model.qwen3_moe.lite import checkpoint
+    from megatron.lite.primitive.ckpt import hf_weights
+
+    root = Path(__file__).resolve().parents[5]
+    baseline = "d8e010069fef5c6da3690d008b899d480864a8de"
+
+    def main_module(relative):
+        source = subprocess.check_output(
+            ["git", "show", f"{baseline}:experimental/lite/megatron/lite/{relative}"],
+            cwd=root,
+            text=True,
+        )
+        module = types.ModuleType("main_reference")
+        exec(compile(source, relative, "exec"), module.__dict__)
+        return module
+
+    model = make_qwen(monkeypatch, transformer_engine_import_stub)
+    current = tmp_path / "current"
+    reference = tmp_path / "main"
+    hf_weights.stream_export_to_shards(
+        checkpoint.export_hf_weights(model, model.config, model.ps, target=target),
+        str(current),
+    )
+    main_primitive = main_module("primitive/ckpt/hf_weights.py")
+    main_checkpoint = main_module("model/qwen3_moe/lite/checkpoint.py")
+    monkeypatch.setattr(
+        hf_weights, "export_hf_weights", main_primitive.export_hf_weights
+    )
+    main_primitive.stream_export_to_shards(
+        main_checkpoint.export_hf_weights(model, model.config, model.ps, target=target),
+        str(reference),
+    )
+    assert {p.name: p.read_bytes() for p in current.iterdir()} == {
+        p.name: p.read_bytes() for p in reference.iterdir()
+    }
+
+
+@pytest.mark.parametrize("case", ["mtp", "meta", "multi_chunk"])
+def test_bound_rejections_before_writing(
+    tmp_path, monkeypatch, transformer_engine_import_stub, case
+):
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import save_hf_weights
+
+    model = make_qwen(monkeypatch, transformer_engine_import_stub)
+    expected = "MTP"
+    argument = model
+    if case == "mtp":
+        model.config.num_nextn_predict_layers = 1
+    elif case == "meta":
+        model.to("meta")
+        expected = "materialized local"
+    else:
+        argument = [model, model]
+        expected = "one complete chunk"
+    with pytest.raises((ValueError, NotImplementedError), match=expected):
+        save_hf_weights(argument, str(tmp_path), model.config, model.ps, bounded=True)
+    assert not list(tmp_path.rglob("*.safetensors"))
+
+
+def test_non_row_budget_rejected_before_conversion(
+    tmp_path, monkeypatch, transformer_engine_import_stub
+):
+    from megatron.lite.model.qwen3_moe.lite.checkpoint import Qwen3MoEBoundSpec
+    from megatron.lite.primitive.ckpt.hf_weights import (
+        export_bound_tensors,
+        load_bound_model,
+    )
+
+    model = make_qwen(monkeypatch, transformer_engine_import_stub, vocab_size=8)
+    spec = Qwen3MoEBoundSpec(model.config, model.ps)
+    stream_export_to_shards(
+        export_bound_tensors(model, spec, buffer_max_size_bytes=4 * 1024**2),
+        str(tmp_path),
+    )
+    original_export = spec.native_to_hf
+    original_load = spec.hf_to_native
+
+    def checked_export(name, tensor):
+        assert tensor.numel() * 64 <= 16384
+        return original_export(name, tensor)
+
+    def checked_load(name, tensors):
+        assert sum(t.numel() * 64 for t in tensors) <= 16384
+        return original_load(name, tensors)
+
+    monkeypatch.setattr(spec, "native_to_hf", checked_export)
+    with pytest.raises(ValueError, match="Non-row transform exceeds buffer"):
+        for _ in export_bound_tensors(model, spec, buffer_max_size_bytes=16384):
+            pass
+    monkeypatch.setattr(spec, "hf_to_native", checked_load)
+    with pytest.raises(ValueError, match="Tensor exceeds buffer"):
+        load_bound_model(model, str(tmp_path), spec, buffer_max_size_bytes=16384)

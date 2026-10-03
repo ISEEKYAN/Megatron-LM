@@ -4,7 +4,6 @@
 from dataclasses import dataclass
 
 import torch
-import torch.distributed as dist
 
 
 @dataclass(frozen=True)
@@ -19,37 +18,17 @@ class RowChunk:
 
 @torch.no_grad()
 def stream_rows(
-    name,
-    weight,
-    scale=None,
-    *,
-    boundaries=None,
-    group=None,
-    buffer_max_size_bytes=5 * 1024**3,
-    scale_name=None,
+    name, weight, scale=None, *, buffer_max_size_bytes=5 * 1024**3, scale_name=None
 ):
-    """Broadcast each owner's rows in global order through one byte buffer.
+    """Copy local rows through one byte buffer; consume each before advancing.
 
-    All group members must drain the iterator. W/S share one collective and
-    scratch allocation, including byte-valued FP8/E8M0 storage. Payload views
-    expire on the next iteration. Resident inputs and consumer-owned output
-    storage are excluded from the scratch limit; no full table is allocated.
+    Resident inputs and consumer-owned outputs are excluded from the scratch
+    limit. Paired weight/scale payload views expire on the next iteration.
     """
     if type(buffer_max_size_bytes) is not int or buffer_max_size_bytes <= 0:
         raise ValueError("Export buffer must hold at least one row")
-    rank = dist.get_rank(group) if group is not None else 0
-    size = dist.get_world_size(group) if group is not None else 1
-    boundaries = tuple(boundaries) if boundaries is not None else (0, weight.shape[0])
-    if (
-        len(boundaries) != size + 1
-        or boundaries[0] != 0
-        or any(a > b for a, b in zip(boundaries, boundaries[1:]))
-    ):
-        raise ValueError("Invalid row ownership boundaries")
     if weight.ndim != 2 or not weight.is_contiguous() or weight.shape[1] == 0:
         raise ValueError("Expected contiguous 2D rows")
-    if weight.shape[0] != boundaries[rank + 1] - boundaries[rank]:
-        raise ValueError("Local rows differ from ownership boundaries")
     if scale is not None and (
         scale.ndim != 2
         or scale.shape[0] != weight.shape[0]
@@ -68,7 +47,7 @@ def stream_rows(
     rows = (buffer_max_size_bytes - alignment + 1) // (weight_bytes + scale_bytes)
     if rows < 1:
         raise ValueError("Export buffer must hold at least one row")
-    rows = min(rows, max(b - a for a, b in zip(boundaries, boundaries[1:])))
+    rows = min(rows, weight.shape[0])
     if rows == 0:
         raise ValueError("Row streaming requires a nonempty global table")
     scratch = torch.empty(
@@ -76,48 +55,34 @@ def stream_rows(
         device=weight.device,
         dtype=torch.uint8,
     )
-    for owner, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
-        for offset in range(begin, end, rows):
-            count = min(rows, end - offset)
-            scale_offset = (
-                (count * weight_bytes + alignment - 1) // alignment * alignment
-            )
-            payload = scratch[: scale_offset + count * scale_bytes]
-            w = (
-                payload[: count * weight_bytes]
-                .view(output_dtype)
-                .view(count, weight.shape[1])
-            )
-            s = (
-                None
-                if scale_dtype is None
-                else payload[scale_offset:].view(scale_dtype).view(count, scale_width)
-            )
-            if rank == owner:
-                local = offset - begin
-                w.view(torch.uint8).copy_(
-                    weight[local : local + count].view(torch.uint8)
-                )
-                if s is not None:
-                    s.view(torch.uint8).copy_(
-                        scale[local : local + count].view(torch.uint8)
-                    )
-            if group is not None:
-                dist.broadcast(
-                    payload, src=dist.get_global_rank(group, owner), group=group
-                )
-            yield RowChunk(name, offset, boundaries[-1], w, s, scale_name)
+    for offset in range(0, weight.shape[0], rows):
+        count = min(rows, weight.shape[0] - offset)
+        scale_offset = (count * weight_bytes + alignment - 1) // alignment * alignment
+        payload = scratch[: scale_offset + count * scale_bytes]
+        w = (
+            payload[: count * weight_bytes]
+            .view(output_dtype)
+            .view(count, weight.shape[1])
+        )
+        s = (
+            None
+            if scale_dtype is None
+            else payload[scale_offset:].view(scale_dtype).view(count, scale_width)
+        )
+        w.view(torch.uint8).copy_(weight[offset : offset + count].view(torch.uint8))
+        if s is not None:
+            s.view(torch.uint8).copy_(scale[offset : offset + count].view(torch.uint8))
+        yield RowChunk(name, offset, weight.shape[0], w, s, scale_name)
 
 
 class RowReceiver:
-    """Copy intersections into a resident contiguous global row span.
+    """Copy ordered rows into a complete resident contiguous table.
 
-    Suitable for a hash-head bucket span as well as ordinary row sharding.
     Both planes are validated before either is written. Scales may be stored
     as raw uint8 on the receiver without changing their bytes.
     """
 
-    def __init__(self, name, total_rows, start, weight, scale=None):
+    def __init__(self, name, weight, scale=None):
         if (
             weight.ndim != 2
             or not weight.is_contiguous()
@@ -131,9 +96,7 @@ class RowReceiver:
             )
         ):
             raise ValueError("Receiver requires contiguous matching row planes")
-        if not 0 <= start <= start + weight.shape[0] <= total_rows:
-            raise ValueError("Receiver span outside global rows")
-        self.name, self.total_rows, self.start = name, total_rows, start
+        self.name, self.total_rows = name, weight.shape[0]
         self.weight, self.scale, self.next_row = weight, scale, 0
 
     @torch.no_grad()
@@ -160,18 +123,11 @@ class RowReceiver:
                 or (target.dtype != source.dtype and target.dtype != torch.uint8)
             ):
                 raise ValueError("Row stream plane shape or dtype mismatch")
-        begin = max(self.start, chunk.offset)
-        end = min(self.start + self.weight.shape[0], chunk.offset + count)
-        if end > begin:
-            for target, source in pairs:
-                if target is not None:
-                    target[begin - self.start : end - self.start].view(
-                        torch.uint8
-                    ).copy_(
-                        source[begin - chunk.offset : end - chunk.offset].view(
-                            torch.uint8
-                        )
-                    )
+        for target, source in pairs:
+            if target is not None:
+                target[chunk.offset : chunk.offset + count].view(torch.uint8).copy_(
+                    source.view(torch.uint8)
+                )
         self.next_row += count
 
     def finish(self):

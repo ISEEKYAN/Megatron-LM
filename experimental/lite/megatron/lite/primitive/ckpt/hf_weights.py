@@ -23,7 +23,10 @@ from typing import Any, Protocol, runtime_checkable
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.ckpt.binding_records import validate_parameter_bindings
+from megatron.lite.primitive.ckpt.binding_records import (
+    TensorBinding,
+    validate_parameter_bindings,
+)
 from megatron.lite.primitive.ckpt.row_stream import (
     RowChunk,
     RowReceiver,
@@ -170,6 +173,34 @@ class HFWeights(Protocol):
 
     def expert_local_name(self, native_name: str, local_idx: int) -> str:
         """Synthetic expert name → actual model param name."""
+        ...
+
+
+class BoundHFWeights(HFWeights, Protocol):
+    """Additional contract required by bound load, export and save.
+
+    Bindings cover every live parameter once. Row keys bypass layout conversion;
+    other bindings use HFWeights.hf_to_native/native_to_hf within size limits.
+    """
+
+    def bindings(self, model: nn.Module) -> list[TensorBinding]:
+        """Return live owners and source keys, including original QAT masters."""
+        ...
+
+    def encode(
+        self, name: str, tensor: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor | None, str | None]:
+        """Encode rows as weight plus optional scale plane and explicit scale key."""
+        ...
+
+    def decode(
+        self, reader: BoundedTensorReader, name: str, budget: int
+    ) -> torch.Tensor:
+        """Read/decode one complete non-row source within the supplied byte allowance."""
+        ...
+
+    def validate_keys(self, keys: set[str], expected: set[str]) -> None:
+        """Reject missing/unexpected release keys, allowing codec companion keys."""
         ...
 
 
@@ -1316,6 +1347,11 @@ def _present_hf_sources(
     return present
 
 
+def resolve_param_name(name: str, state_dict: dict) -> str | None:
+    """Resolve a logical checkpoint key to live storage, including QAT wrappers."""
+    return _resolve_param_name(name, state_dict)
+
+
 def _resolve_param_name(name: str, state_dict: dict) -> str | None:
     if name in state_dict:
         return name
@@ -1893,18 +1929,7 @@ class BoundedTensorReader(SafeTensorReader):
             del weight, scale
 
 
-def export_raw_tensors(
-    reader, names, *, buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
-):
-    """Bounded archival passthrough; no decoding or dtype conversion."""
-    for name in names:
-        if len(reader.shape(name)) == 2:
-            yield from reader.rows(name, buffer_max_size_bytes)
-        else:
-            yield name, reader.read(name, buffer_max_size_bytes // 2)
-
-
-def _bound_inventory(model, spec):
+def _bound_inventory(model, spec: BoundHFWeights):
     bindings = validate_parameter_bindings(model, spec.bindings(model))
     for binding in bindings:
         if binding.tensor.is_meta or isinstance(binding.tensor, DTensor):
@@ -1914,7 +1939,7 @@ def _bound_inventory(model, spec):
 
 def export_bound_tensors(
     model,
-    spec,
+    spec: BoundHFWeights,
     *,
     buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
     masters_only=False,
@@ -1968,9 +1993,18 @@ def export_bound_tensors(
 
 @torch.no_grad()
 def load_bound_model(
-    model, path, spec, *, buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+    model,
+    path,
+    spec: BoundHFWeights,
+    *,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ):
-    """Load bounded rows or exact native masters without whole-table reads."""
+    """Load row bindings or exact native masters in chunks.
+
+    Only release row bindings (Qwen embedding/head) bypass full layout conversion.
+    Non-row sources are read and decoded whole under per-source size checks;
+    multiple decoded sources may coexist during native layout assembly.
+    """
     budget = buffer_max_size_bytes
     if type(budget) is not int or budget < 1024:
         raise ValueError("Bound checkpoint buffer must be at least 1024 bytes")
@@ -1990,7 +2024,7 @@ def load_bound_model(
         if name is not None and target.ndim == 2:
             if source.shape(name) != tuple(target.shape):
                 raise ValueError(f"Row shape mismatch: {name}")
-            receiver = RowReceiver(name, target.shape[0], 0, target)
+            receiver = RowReceiver(name, target)
             for chunk in source.rows(name, budget):
                 if masters is not None and chunk.weight.dtype != target.dtype:
                     raise ValueError(f"Training master dtype mismatch: {name}")
@@ -2027,7 +2061,11 @@ def load_bound_model(
 
 
 def save_bound_model(
-    model, path, spec, *, buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES
+    model,
+    path,
+    spec: BoundHFWeights,
+    *,
+    buffer_max_size_bytes=DEFAULT_EXPORT_BUFFER_MAX_SIZE_BYTES,
 ):
     """HF release tensors plus an exact, complete native-master sidecar."""
     for masters, destination in (

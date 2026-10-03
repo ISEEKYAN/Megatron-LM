@@ -397,7 +397,7 @@ class Qwen3MoEBoundSpec(Qwen3MoEWeightSpec):
 
     def bindings(self, model):
         from megatron.lite.primitive.ckpt.binding_records import TensorBinding
-        from megatron.lite.primitive.ckpt.hf_weights import _resolve_param_name
+        from megatron.lite.primitive.ckpt.hf_weights import resolve_param_name
 
         parameters = dict(model.named_parameters())
         bindings = []
@@ -407,7 +407,7 @@ class Qwen3MoEBoundSpec(Qwen3MoEWeightSpec):
                 if self.is_expert(name)
                 else name
             )
-            actual = _resolve_param_name(actual, parameters)
+            actual = resolve_param_name(actual, parameters)
             if actual is None:
                 raise ValueError(f"Missing Qwen checkpoint owner: {name}")
             path, attribute = actual.rsplit(".", 1)
@@ -418,12 +418,7 @@ class Qwen3MoEBoundSpec(Qwen3MoEWeightSpec):
             )
             bindings.append(
                 TensorBinding(
-                    name,
-                    model.get_submodule(path),
-                    attribute,
-                    "expert" if self.is_expert(name) else "dense",
-                    tuple(sources),
-                    row,
+                    name, model.get_submodule(path), attribute, tuple(sources), row
                 )
             )
         return bindings

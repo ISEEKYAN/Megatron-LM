@@ -11,7 +11,6 @@ class TensorBinding:
     name: str
     owner: nn.Module
     attribute: str
-    role: str
     sources: tuple[str, ...]
     row_key: str | None = None
 
