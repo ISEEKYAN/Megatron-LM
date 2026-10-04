@@ -318,7 +318,9 @@ def install_reload_metadata_hook():
         if getattr(model_config.hf_config, 'model_type', '') == 'deepseek_v41':
             set_mxfp4_load_numel(model)
             for layer in model.modules():
-                if type(layer).__name__ == 'DeepseekV4MegaAttnAttention':
+                # Every DS4.1 attention backend direct-copies this parameter;
+                # native layerwise reload cannot intercept its weight loader.
+                if layer._parameters.get('attn_sink') is not None:
                     layer._ds41_attn_sink_initializer = (
                         layer.attn_sink.detach().cpu().clone()
                     )
