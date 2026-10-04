@@ -93,7 +93,9 @@ class ModalityRouter(nn.Module):
                 F.linear(x.float(), self.router.gate.weight.float())
                 / self.gate_temperature
             )
-        weights, indices = self.router.route_logits(logits, expert_bias=bias)
+        weights, indices = self.router.route_logits(
+            logits, expert_bias=bias, deployment_math=self.deployment_math and x.is_cuda
+        )
         stats = reduce_modality_load(
             indices, image_mask, self.router.num_experts, self.router._aux_loss_group
         )

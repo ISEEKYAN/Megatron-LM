@@ -67,3 +67,36 @@ def test_norm_decodes_updated_master_and_keeps_fp32_gradient():
     expected.backward(incoming)
     assert torch.equal(norm.weight.grad, decoded.grad)
     assert norm.weight.grad.dtype == torch.float32
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA deployment router')
+def test_router_native_slots_weights_and_fp32_reference_gradient():
+    from megatron.lite.primitive.modules.deployment_math import router_topk
+    from vllm import _custom_ops as ops
+
+    torch.manual_seed(719)
+    for experts in (4, 16):
+        logits = torch.randn(7, experts, device='cuda', requires_grad=True)
+        bias = torch.linspace(-0.03, 0.03, experts, device='cuda')
+        weights, indices = router_topk(logits, bias, topk=2, scaling_factor=1.5)
+        expected_weights = torch.empty_like(weights)
+        expected_indices = torch.empty_like(indices, dtype=torch.int32)
+        ops.topk_hash_softplus_sqrt(
+            expected_weights,
+            expected_indices,
+            torch.empty_like(expected_indices),
+            logits.detach(),
+            renormalize=True,
+            routed_scaling_factor=1.5,
+            e_score_correction_bias=bias,
+        )
+        assert torch.equal(indices, expected_indices.long())
+        assert torch.equal(weights, expected_weights)
+        incoming = torch.randn_like(weights)
+        weights.backward(incoming)
+        leaf = logits.detach().clone().requires_grad_()
+        selected = torch.nn.functional.softplus(leaf).sqrt().gather(1, indices)
+        (selected / selected.sum(-1, keepdim=True) * 1.5).backward(incoming)
+        assert torch.equal(logits.grad, leaf.grad)
+        assert logits.grad.dtype == torch.float32
+        assert torch.isfinite(logits.grad).all()

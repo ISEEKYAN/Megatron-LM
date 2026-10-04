@@ -62,6 +62,41 @@ def visible_forward(visible, reference, *inputs):
     return _Visible.apply(visible, reference, *inputs)
 
 
+def router_topk(logits, bias, *, topk, scaling_factor):
+    """CUDA selection order and FP32 normalization, with an owned score VJP.
+
+    Bias only selects experts. Keep the selected slots fixed for backward, as
+    in the reference router; never backpropagate through ranking or bias.
+    """
+    indices = torch.empty(
+        (logits.shape[0], topk), device=logits.device, dtype=torch.int32
+    )
+
+    def visible(x):
+        from vllm import _custom_ops as ops
+
+        weights = torch.empty_like(indices, dtype=torch.float32)
+        token_expert_indices = torch.empty_like(indices)
+        ops.topk_hash_softplus_sqrt(
+            weights,
+            indices,
+            token_expert_indices,
+            x.contiguous(),
+            renormalize=True,
+            routed_scaling_factor=scaling_factor,
+            e_score_correction_bias=bias.contiguous(),
+        )
+        return weights
+
+    def reference(x):
+        scores = torch.nn.functional.softplus(x.float()).sqrt()
+        selected = scores.gather(1, indices.long())
+        return selected / selected.sum(-1, keepdim=True) * scaling_factor
+
+    weights = visible_forward(visible, reference, logits)
+    return weights, indices.long()
+
+
 def mhc_coefficients(
     hidden, fn, scale, base, *, copies, norm_eps, hc_eps, iterations, broadcast
 ):
@@ -393,9 +428,9 @@ def compressor(x, wkv, wgate, gamma, ratio, eps):
     raw = bf16_fp32_linear(x, weights, persistent=False)
 
     def visible(scores, master):
-        from megatron.lite.primitive.kernels.deployment_compressor import compress_norm
+        from megatron.lite.primitive.kernels import deployment_compressor
 
-        return compress_norm(scores, master, ratio, eps)
+        return deployment_compressor.compress_norm(scores, master, ratio, eps)
 
     def reference(scores, master):
         cutoff = scores.shape[1] // ratio * ratio
