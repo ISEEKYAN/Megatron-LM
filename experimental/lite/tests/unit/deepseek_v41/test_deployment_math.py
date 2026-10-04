@@ -100,3 +100,45 @@ def test_router_native_slots_weights_and_fp32_reference_gradient():
         assert torch.equal(logits.grad, leaf.grad)
         assert logits.grad.dtype == torch.float32
         assert torch.isfinite(logits.grad).all()
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA deployment QKV RMS')
+@pytest.mark.parametrize('width', [128, 512, 1280, 2048])
+def test_qkv_norm_native_forward_fp32_vjp_and_process_state(width):
+    from megatron.lite.primitive.modules import deployment_math
+    from megatron.lite.primitive.modules.attention.mhc import RMSNorm
+    from vllm.model_executor.determinism import batch_invariant
+    from vllm.models.common.ops import fused_q_kv_rmsnorm
+
+    torch.manual_seed(942)
+    norm = RMSNorm(width, eps=1e-6, device='cuda', dtype=torch.float32)
+    norm.deployment_math = True
+    with torch.no_grad():
+        norm.weight.copy_(1 + torch.randn_like(norm.weight) * 0.03)
+    x = torch.randn(2, 13, width, device='cuda').bfloat16().requires_grad_()
+    incoming = torch.randn_like(x)
+    before = norm(x)
+    native, _ = fused_q_kv_rmsnorm(
+        x.detach().reshape(-1, width),
+        x.detach().reshape(-1, width),
+        norm.weight.detach().bfloat16(),
+        norm.weight.detach().bfloat16(),
+        norm.eps,
+    )
+    assert torch.equal(before.detach(), native.reshape_as(x))
+    batch_invariant.init_batch_invariance()
+    after = norm(x)
+    assert torch.equal(before, after)
+    assert torch.equal(after[:1], norm(x[:1]))
+    actual = torch.autograd.grad(after, (x, norm.weight), incoming)
+    values = x.detach().requires_grad_()
+    master = norm.weight.detach().requires_grad_()
+    reference = torch.nn.functional.rms_norm(
+        values, (width,), deployment_math.decoded_bf16_master(master), norm.eps
+    )
+    expected = torch.autograd.grad(reference, (values, master), incoming)
+    for got, wanted in zip(actual, expected, strict=True):
+        assert torch.isfinite(got).all()
+        assert torch.equal(got, wanted)
+    assert actual[1].dtype == torch.float32
+    assert not torch.equal(actual[1], actual[1].bfloat16().float())

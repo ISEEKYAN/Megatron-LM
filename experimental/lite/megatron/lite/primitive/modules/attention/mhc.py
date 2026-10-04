@@ -50,6 +50,10 @@ class RMSNorm(nn.RMSNorm):
         if self.deployment_math:
             from megatron.lite.primitive.modules import deployment_math
 
+            if x.is_cuda:
+                return deployment_math.qkv_rms_norm(
+                    x, self.weight, self.normalized_shape, self.eps
+                )
             return F.rms_norm(
                 x,
                 self.normalized_shape,

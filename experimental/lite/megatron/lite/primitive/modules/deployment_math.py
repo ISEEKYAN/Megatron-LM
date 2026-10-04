@@ -330,6 +330,26 @@ def rms_norm(x, weight, shape, eps):
     return visible_forward(visible, reference, x, weight)
 
 
+def qkv_rms_norm(x, weight, shape, eps):
+    """Fused-QKV visible row arithmetic; the FP32/STE reference owns its VJP."""
+    from megatron.lite.primitive.kernels import deployment_rms_norm
+
+    if tuple(shape) != (x.shape[-1],):
+        raise ValueError('Deployment QKV RMS requires one normalized row dimension')
+
+    def reference(values, master):
+        return torch.nn.functional.rms_norm(
+            values, shape, decoded_bf16_master(master), eps
+        )
+
+    return visible_forward(
+        lambda values, master: deployment_rms_norm.row_rms_norm(values, master, eps),
+        reference,
+        x,
+        weight,
+    )
+
+
 def mhc_post(output, residual, post, comb):
     def visible(y, h, p, c):
         import vllm.model_executor.kernels.mhc.tilelang as kernels
