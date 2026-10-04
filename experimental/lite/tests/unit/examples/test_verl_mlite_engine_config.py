@@ -17,7 +17,9 @@ pytestmark = pytest.mark.optional
 
 @pytest.fixture(autouse=True)
 def _require_verl() -> None:
-    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    pytest.importorskip(
+        "verl", reason="VERL is required for this optional example test."
+    )
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -73,7 +75,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -83,7 +88,9 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_verl_loss_hook_has_no_strong_self_reference():
@@ -204,6 +211,36 @@ def test_online_weight_export_requests_gpu_resident_bounded_streaming() -> None:
             "target": "vllm",
         },
     }
+
+
+def test_online_weight_export_budget_is_configurable() -> None:
+    engine = _engine(
+        engine_config=_engine_config(
+            export_buffer_max_size_bytes=3 * 1024**3, resync_format="mxfp4"
+        )
+    )
+    captured = {}
+
+    class Runtime:
+        @staticmethod
+        def export_weights(handle, **kwargs):
+            captured.update(kwargs)
+            return iter(())
+
+    engine.runtime = Runtime()
+    engine.handle = object()
+    engine._initial_sync_cache_cleared = True
+
+    engine.get_per_tensor_param()
+
+    assert captured["buffer_max_size_bytes"] == 3 * 1024**3
+    assert captured["target"] == "mxfp4"
+
+
+@pytest.mark.parametrize("budget", [0, -1, True, 2.0, "2147483648", None])
+def test_online_weight_export_budget_rejects_non_positive_int(budget) -> None:
+    with pytest.raises(ValueError, match="export_buffer_max_size_bytes"):
+        _engine_config(export_buffer_max_size_bytes=budget)
 
 
 def test_qwen3_moe_online_weight_export_does_not_pass_unsupported_target() -> None:

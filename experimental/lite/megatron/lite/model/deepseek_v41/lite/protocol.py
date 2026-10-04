@@ -7,26 +7,15 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 
+import megatron.lite.model.protocol_utils as _imports_protocol_utils
+import megatron.lite.primitive.modules.router_replay as _imports_router_replay
+import megatron.lite.primitive.modules.vision_training as _imports_vision_training
+import megatron.lite.primitive.ops.linear_cross_entropy as _imports_linear_cross_entropy
 import torch
 from megatron.lite.model import protocol_utils as _protocol_utils
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.protocol_utils import (
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-)
-from megatron.lite.model.protocol_utils import (
-    pack_routed_experts as _pack_routed_experts,
-)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config_fields import project_fields
-from megatron.lite.primitive.modules.router_replay import (
-    RouterReplay,
-    RouterReplayAction,
-)
-from megatron.lite.primitive.modules.vision_training import (
-    VisionSchedule,
-    VisionTrainability,
-)
-from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
 from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
@@ -37,6 +26,14 @@ from megatron.lite.runtime.contracts.loss import get_loss_context
 from .checkpoint import export_hf_weights as _export_hf_weights_impl
 from .checkpoint import load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
+
+_pack_r3_replay_mask = _imports_protocol_utils.pack_r3_replay_mask
+_pack_routed_experts = _imports_protocol_utils.pack_routed_experts
+RouterReplay = _imports_router_replay.RouterReplay
+RouterReplayAction = _imports_router_replay.RouterReplayAction
+VisionSchedule = _imports_vision_training.VisionSchedule
+VisionTrainability = _imports_vision_training.VisionTrainability
+linear_cross_entropy = _imports_linear_cross_entropy.linear_cross_entropy
 
 # HF checkpoints store trainable masters and byte-preserved archives.
 
@@ -168,7 +165,9 @@ def build_model(model_cfg, *, impl_cfg):
         raise ValueError('V4.1 W4A8 requires BF16 residuals, EP=1 and no DeepEP')
     layer_range = None
     if p.pp > 1:
-        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+        import megatron.lite.primitive.parallel.pp as _imports_pp
+
+        build_pipeline_chunk_layout = _imports_pp.build_pipeline_chunk_layout
 
         cut = impl_cfg.pipeline_split_layer
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
@@ -188,9 +187,11 @@ def build_model(model_cfg, *, impl_cfg):
             ),
         )
     model.pipeline_residual_dtype = impl_cfg.dtype
+    import megatron.lite.primitive.modules.native_fp32_linear as _imports_native_fp32_linear
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
-    from megatron.lite.primitive.modules.native_fp32_linear import (
-        configure_residual_projections,
+
+    configure_residual_projections = (
+        _imports_native_fp32_linear.configure_residual_projections
     )
 
     optimizing = impl_cfg.optimizer == 'muon'
@@ -276,11 +277,36 @@ export_hf_weights = _export_hf_weights_impl
 def save_hf_weights(
     chunks, path, model_cfg, ps, *, target=None, resync_config=None, **kwargs
 ):
-    if target is not None or resync_config is not None:
-        raise NotImplementedError(
-            "V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require "
-            "a resync exporter; this entry point only saves archival HF weights"
+    from .resync import decoded_weights, validate_target
+
+    if validate_target(target, resync_config):
+        import json
+        from pathlib import Path
+
+        import megatron.lite.primitive.ckpt.hf_weights as _imports_hf_weights
+
+        stream_export_to_shards = _imports_hf_weights.stream_export_to_shards
+
+        budget = kwargs.pop('buffer_max_size_bytes', 5 * 1024**3)
+        if type(budget) is not int or budget <= 0:
+            raise ValueError('Invalid resync buffer budget')
+        weights = export_hf_weights(
+            chunks,
+            model_cfg,
+            ps,
+            target=target,
+            resync_config=resync_config,
+            buffer_max_size_bytes=budget,
+            **kwargs,
         )
+        stream_export_to_shards(
+            decoded_weights(weights), str(path), shard_size_bytes=budget // 4
+        )
+        if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+            (Path(path) / 'config.json').write_text(
+                json.dumps(chunks[0].config.to_hf_dict(), indent=2) + '\n'
+            )
+        return
     if len(chunks) != 1:
         raise NotImplementedError('Single-rank V4.1 export requires one chunk')
     save_model(chunks[0], path, **kwargs)
@@ -563,7 +589,9 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
     cp_context = None
     ids = batch.input_ids[None]
     if model.ps.cp_size > 1:
-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+        import megatron.lite.primitive.modules.attention.cp as _imports_cp
+
+        ContiguousCPSequence = _imports_cp.ContiguousCPSequence
 
         if (
             modality
