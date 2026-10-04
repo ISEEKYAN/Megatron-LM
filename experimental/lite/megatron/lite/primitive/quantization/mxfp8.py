@@ -116,10 +116,14 @@ def dynamic_fp8_linear(x, weight):
         raise ValueError(
             "Linear requires matching K and weight dimensions divisible by 32"
         )
+    # Inverse RoPE keeps FP32 activations even in a frozen BF16 reference.
+    mixed_reference = x.dtype == torch.float32 and weight.dtype == torch.bfloat16
     if x.device != weight.device or (
-        x.dtype != weight.dtype and weight.dtype != torch.float32
+        x.dtype != weight.dtype
+        and weight.dtype != torch.float32
+        and not mixed_reference
     ):
         raise ValueError(
-            "activation and weight must share device and compute dtype, or use an FP32 master"
+            "activation and weight must share device and compute dtype, use an FP32 master, or pair FP32 activations with BF16 reference weights"
         )
     return _DynamicLinear.apply(x, weight)

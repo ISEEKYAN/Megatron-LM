@@ -8,7 +8,10 @@ import torch
     not torch.cuda.is_available(), reason='deployment FP8 GEMM requires CUDA'
 )
 @pytest.mark.parametrize('groups', [1, 2])
-def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
+@pytest.mark.parametrize('weight_dtype', [torch.float32, torch.bfloat16])
+def test_grouped_output_uses_fp8_with_master_or_reference_weights(
+    v41_core_te, groups, weight_dtype
+):
     from megatron.lite.primitive.modules.attention import csa
     from megatron.lite.primitive.quantization import mxfp8
 
@@ -39,7 +42,7 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
     )
     model = model.cuda()
     model.deployment_math = True
-    model.wo_a.weight.data = model.wo_a.weight.data.float()
+    model.wo_a.weight.data = model.wo_a.weight.data.to(weight_dtype)
     model.wo_a.native_fp32 = True
     assert model.wo_a.fp8
     # A value which changes under the deployment codec makes bypass observable.
@@ -58,12 +61,12 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
     for i, (operand, weight) in enumerate(calls):
         assert operand.shape == (1, 3, cfg.heads * cfg.head_dim // groups)
         assert operand.dtype == torch.float32
-        assert weight.dtype == torch.float32
+        assert weight.dtype == weight_dtype
         assert torch.equal(
             weight, model.wo_a.weight[i * cfg.o_rank : (i + 1) * cfg.o_rank]
         )
     y.float().square().mean().backward()
-    assert model.wo_a.weight.grad.dtype == torch.float32
+    assert model.wo_a.weight.grad.dtype == weight_dtype
     assert torch.isfinite(model.wo_a.weight.grad).all()
     assert torch.count_nonzero(model.wo_a.weight.grad) > 0
     assert x.grad.dtype == torch.bfloat16
@@ -93,3 +96,33 @@ def test_inverse_rope_fp8_midpoint_preserves_fp32(v41_core_te):
         mxfp8.quantize_linear_activation(old).values.view(torch.uint8)[0, 0, -4].item()
         == 100
     )
+
+
+@pytest.mark.skipif(
+    not torch.cuda.is_available(), reason='deployment FP8 GEMM requires CUDA'
+)
+def test_fp32_activation_bf16_reference_matches_master_codec_and_vjp(v41_core_te):
+    from megatron.lite.primitive.quantization import mxfp8
+
+    torch.manual_seed(913)
+    x = torch.randn(2, 3, 64, device='cuda', dtype=torch.float32).requires_grad_()
+    weight = torch.randn(32, 64, device='cuda', dtype=torch.bfloat16).requires_grad_()
+    output = mxfp8.dynamic_fp8_linear(x, weight)
+    master_output = mxfp8.dynamic_fp8_linear(x.detach(), weight.detach().float())
+    assert output.dtype == torch.float32
+    assert torch.equal(output, master_output)
+    cotangent = torch.randn_like(output)
+    output.backward(cotangent)
+    encoded, scale = mxfp8.quantize_block_fp8(
+        weight.detach(), (32, 32), scale_format='e8m0'
+    )
+    decoded = mxfp8.dequantize_block_fp8(encoded, scale, (32, 32)).float()
+    activation = mxfp8.quantize_linear_activation(x.detach()).decoded
+    with torch.autocast(device_type='cuda', enabled=False):
+        expected_x = (cotangent.reshape(-1, 32) @ decoded).reshape_as(x)
+        expected_weight = (
+            cotangent.reshape(-1, 32).T @ activation.reshape(-1, 64)
+        ).bfloat16()
+    assert torch.equal(x.grad, expected_x)
+    assert torch.equal(weight.grad, expected_weight)
+    assert weight.grad.dtype == torch.bfloat16
