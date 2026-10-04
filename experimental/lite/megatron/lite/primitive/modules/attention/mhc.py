@@ -10,7 +10,9 @@ class MultiHeadHyperConnectionHead(nn.Module):
         self.hidden_size = hidden_size
         self.hc_mult = hc_mult
         self.eps = eps
-        self.hc_fn = nn.Parameter(torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32))
+        self.hc_fn = nn.Parameter(
+            torch.empty(hc_mult, hc_mult * hidden_size, dtype=torch.float32)
+        )
         self.hc_base = nn.Parameter(torch.empty(hc_mult, dtype=torch.float32))
         self.hc_scale = nn.Parameter(torch.empty(1, dtype=torch.float32))
         self.reset_parameters()
@@ -27,22 +29,41 @@ class MultiHeadHyperConnectionHead(nn.Module):
         xf = x.flatten(2).float()
         rsqrt = torch.rsqrt(xf.square().mean(-1, keepdim=True) + self.eps)
         mixes = F.linear(xf, self.hc_fn.float()) * rsqrt
-        pre = torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float()) + self.eps
+        pre = (
+            torch.sigmoid(mixes * self.hc_scale.float() + self.hc_base.float())
+            + self.eps
+        )
         y = torch.sum(pre.unsqueeze(-1) * xf.view(shape), dim=2)
         return y.to(dtype)
 
 
 from inspect import unwrap
 
-from megatron.core.fusions.fused_mhc_kernels import fused_h_aggregate, fused_h_post_bda
-from megatron.core.transformer.hyper_connection import (
-    _sinkhorn_iterations,
-    native_h_aggregate,
-    native_h_post_bda,
-)
+import megatron.core.fusions.fused_mhc_kernels as core_mhc_kernels
+import megatron.core.transformer.hyper_connection as core_hyper_connection
 
-RMSNorm = nn.RMSNorm
-_sinkhorn_iterations = unwrap(_sinkhorn_iterations)
+
+class RMSNorm(nn.RMSNorm):
+    deployment_math = False
+
+    def forward(self, x):
+        if self.deployment_math:
+            from megatron.lite.primitive.modules import deployment_math
+
+            return F.rms_norm(
+                x,
+                self.normalized_shape,
+                deployment_math.decoded_bf16_master(self.weight),
+                self.eps,
+            )
+        return super().forward(x)
+
+
+fused_h_aggregate = core_mhc_kernels.fused_h_aggregate
+fused_h_post_bda = core_mhc_kernels.fused_h_post_bda
+native_h_aggregate = core_hyper_connection.native_h_aggregate
+native_h_post_bda = core_hyper_connection.native_h_post_bda
+_sinkhorn_iterations = unwrap(core_hyper_connection._sinkhorn_iterations)
 
 
 def contract_hc(hidden, pre_mix):
@@ -56,9 +77,9 @@ def mix_residual(output, residual, post, comb):
 
 
 def expand_hc(tokens, copies):
-    from megatron.lite.primitive.parallel.mhc import expand_mhc_hidden_for_pipeline
+    from megatron.lite.primitive.parallel import mhc as pipeline_mhc
 
-    hidden = expand_mhc_hidden_for_pipeline(tokens, hc_mult=copies)
+    hidden = pipeline_mhc.expand_mhc_hidden_for_pipeline(tokens, hc_mult=copies)
     pre = tokens.new_zeros(*tokens.shape[:2], copies, dtype=torch.float32)
     pre[..., 0] = 1
     return hidden, pre
@@ -70,6 +91,8 @@ class HCMixes(nn.Module):
         if copies < 1 or iterations < 1:
             raise ValueError("HC copies and Sinkhorn iterations must be positive")
         self.copies = copies
+        self.deployment_math = False
+        self.broadcast_projection = False
         self.norm_eps = norm_eps
         self.hc_eps = hc_eps
         self.iterations = iterations
@@ -82,17 +105,42 @@ class HCMixes(nn.Module):
         nn.init.xavier_uniform_(self.fn)
 
     def forward(self, hidden):
-        flat = hidden.flatten(2).float()
-        mixes = F.linear(flat, self.fn.float()) * torch.rsqrt(
-            flat.square().mean(-1, keepdim=True) + self.norm_eps
+        if self.deployment_math and hidden.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            return deployment_math.mhc_coefficients(
+                hidden,
+                self.fn,
+                self.scale,
+                self.base,
+                copies=self.copies,
+                norm_eps=self.norm_eps,
+                hc_eps=self.hc_eps,
+                iterations=self.iterations,
+                broadcast=self.broadcast_projection,
+            )
+        return reference_mixes(
+            hidden,
+            self.fn,
+            self.scale,
+            self.base,
+            self.copies,
+            self.norm_eps,
+            self.hc_eps,
+            self.iterations,
         )
-        sizes = [self.copies, self.copies, self.copies**2]
-        pre, post, comb = mixes.split(sizes, dim=-1)
-        bp, bpost, bc = self.base.float().split(sizes)
-        pre = torch.sigmoid(pre * self.scale[0] + bp) + self.hc_eps
-        post = 2 * torch.sigmoid(post * self.scale[1] + bpost)
-        comb = (comb * self.scale[2] + bc).reshape(
-            *flat.shape[:-1], self.copies, self.copies
-        )
-        comb = _sinkhorn_iterations(comb, self.iterations, self.hc_eps)
-        return pre, post, comb
+
+
+def reference_mixes(hidden, fn, scale, base, copies, norm_eps, hc_eps, iterations):
+    flat = hidden.flatten(2).float()
+    mixes = F.linear(flat, fn.float()) * torch.rsqrt(
+        flat.square().mean(-1, keepdim=True) + norm_eps
+    )
+    sizes = [copies, copies, copies**2]
+    pre, post, comb = mixes.split(sizes, dim=-1)
+    bp, bpost, bc = base.float().split(sizes)
+    pre = torch.sigmoid(pre * scale[0] + bp) + hc_eps
+    post = 2 * torch.sigmoid(post * scale[1] + bpost)
+    comb = (comb * scale[2] + bc).reshape(*flat.shape[:-1], copies, copies)
+    comb = _sinkhorn_iterations(comb, iterations, hc_eps)
+    return pre, post, comb

@@ -56,6 +56,7 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
     assert len(calls) == groups
     for i, (operand, weight) in enumerate(calls):
         assert operand.shape == (1, 3, cfg.heads * cfg.head_dim // groups)
+        assert operand.dtype == torch.float32
         assert weight.dtype == torch.float32
         assert torch.equal(
             weight, model.wo_a.weight[i * cfg.o_rank : (i + 1) * cfg.o_rank]
@@ -65,3 +66,29 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
     assert torch.isfinite(model.wo_a.weight.grad).all()
     assert torch.count_nonzero(model.wo_a.weight.grad) > 0
     assert x.grad.dtype == torch.bfloat16
+
+
+def test_inverse_rope_fp8_midpoint_preserves_fp32(v41_core_te):
+    from megatron.lite.primitive.modules.attention import csa
+    from megatron.lite.primitive.quantization import mxfp8
+
+    cfg = csa.CrossLayerAttentionConfig(head_dim=32, rope_dim=4)
+    x = torch.zeros(1, 1, 32, dtype=torch.bfloat16)
+    x[..., -4:] = torch.tensor([0.5, 0.53125, 0.0, 4.0])
+    positions = torch.tensor([1])
+    precise = csa.rotate(x, positions, cfg, 0, inverse=True, output_dtype=torch.float32)
+    old = csa.rotate(x, positions, cfg, 0, inverse=True)
+    # Inverse rotation yields 0.71718258, which rounds to 0.71875 in BF16.
+    # With the row's 1/64 UE8M0 scale these straddle an E4M3 midpoint.
+    assert precise.dtype == torch.float32
+    assert old.dtype == torch.bfloat16
+    assert (
+        mxfp8.quantize_linear_activation(precise)
+        .values.view(torch.uint8)[0, 0, -4]
+        .item()
+        == 99
+    )
+    assert (
+        mxfp8.quantize_linear_activation(old).values.view(torch.uint8)[0, 0, -4].item()
+        == 100
+    )

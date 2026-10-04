@@ -45,6 +45,7 @@ class ModalityRouter(nn.Module):
         if gate_temperature <= 0 or bias_rate < 0:
             raise ValueError("Require positive temperature and nonnegative bias rate")
         self.router = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
+        self.deployment_math = False
         self.gate_temperature = gate_temperature
         self.bias_rate = bias_rate
         self.world_size = max(
@@ -78,9 +79,20 @@ class ModalityRouter(nn.Module):
             raise ValueError("Expected one boolean image-mask entry per token")
         image_mask = image_mask.reshape(-1)
         bias = torch.where(image_mask[:, None], self.bias_vl, self.bias)
-        logits = (
-            F.linear(x.float(), self.router.gate.weight.float()) / self.gate_temperature
-        )
+        if self.deployment_math and x.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            logits = (
+                deployment_math.bf16_fp32_linear(
+                    x, self.router.gate.weight, persistent=True
+                )
+                / self.gate_temperature
+            )
+        else:
+            logits = (
+                F.linear(x.float(), self.router.gate.weight.float())
+                / self.gate_temperature
+            )
         weights, indices = self.router.route_logits(logits, expert_bias=bias)
         stats = reduce_modality_load(
             indices, image_mask, self.router.num_experts, self.router._aux_loss_group
@@ -174,14 +186,11 @@ class DeepseekV41MoE(nn.Module):
         weights, indices, stats = self.gate(flat, image_mask)
         dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
         if self.w4a8:
-            from megatron.lite.primitive.quantization.w4a8_experts import (
-                topk_fma_combine,
-                w4a8_expert_mlp,
-            )
+            from megatron.lite.primitive.quantization import w4a8_experts
 
             # Preserve w1/w2/w3 leaf owners and checkpoint/optimizer bindings.
             # Concatenation is row-wise, so group32 W quantization is unchanged.
-            expert_rows = w4a8_expert_mlp(
+            expert_rows = w4a8_experts.w4a8_expert_mlp(
                 dispatched,
                 [torch.cat((e.w1.weight, e.w3.weight)) for e in self.experts],
                 [e.w2.weight for e in self.experts],
@@ -189,7 +198,9 @@ class DeepseekV41MoE(nn.Module):
                 swiglu_limit=next(iter(self.experts)).swiglu_limit or None,
             )
             rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_rows)
-            output = topk_fma_combine(rows, row_token, row_expert, indices, weights)
+            output = w4a8_experts.topk_fma_combine(
+                rows, row_token, row_expert, indices, weights
+            )
         else:
             output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
         if self.shared_experts is not None:

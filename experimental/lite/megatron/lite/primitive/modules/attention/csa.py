@@ -381,6 +381,7 @@ class CompressedSparseAttention(nn.Module):
         codecs=None,
     ):
         super().__init__()
+        self.deployment_math = False
         self.cross_layer = candidate_mode is not None
         self.codecs = codecs
         if self.cross_layer:
@@ -526,7 +527,18 @@ class CompressedSparseAttention(nn.Module):
                 index_k = index_codec(
                     rotate(index_k, cp, c, ratio), enabled=c.index_qat
                 )
-                main = main_codec(rotate(latent, cp, c, ratio), enabled=c.main_qat)
+                # Native NVFP4 rotates FP32 values directly into the codec;
+                # rounding RoPE to BF16 first can cross an E2M1 midpoint.
+                main = main_codec(
+                    rotate(
+                        latent,
+                        cp,
+                        c,
+                        ratio,
+                        output_dtype=torch.float32 if self.deployment_math else None,
+                    ),
+                    enabled=c.main_qat,
+                ).to(x.dtype)
                 state = AttentionState(kv_owner=layer, main_kv=main, index_k=index_k)
             if (
                 state.kv_owner != self.kv_owner
@@ -581,14 +593,43 @@ class CompressedSparseAttention(nn.Module):
                     -1, state.indices.clamp_min(0).long(), (state.indices >= 0).int()
                 )
             mask = torch.cat([mask, counts > 0], -1)
-        logits = (
-            torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
+        if self.deployment_math and x.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            width = (
+                ((c.topk + c.window + 127) // 128) * 128
+                if ratio
+                else ((c.window + 127) // 128) * 128
+            )
+            output = deployment_math.sparse_attention(
+                q,
+                kv,
+                self.attn_sink,
+                mask,
+                None if ratio == 0 else state.indices,
+                main_size=0 if ratio == 0 else state.main_kv.shape[1],
+                window_size=global_length,
+                width=width,
+                scale=c.head_dim**-0.5,
+            )
+        else:
+            logits = (
+                torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
+            )
+            logits = logits.masked_fill(~mask.unsqueeze(2), -torch.inf)
+            sink = self.attn_sink.expand(b, length, -1).unsqueeze(-1)
+            probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
+            output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(
+                x.dtype
+            )
+        output = rotate(
+            output,
+            positions,
+            c,
+            ratio,
+            inverse=True,
+            output_dtype=torch.float32 if self.wo_a.fp8 else output.dtype,
         )
-        logits = logits.masked_fill(~mask.unsqueeze(2), -torch.inf)
-        sink = self.attn_sink.expand(b, length, -1).unsqueeze(-1)
-        probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
-        output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(x.dtype)
-        output = rotate(output, positions, c, ratio, inverse=True)
         grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
         if self.wo_a.fp8:
@@ -612,7 +653,9 @@ class CompressedSparseAttention(nn.Module):
             ).flatten(2)
         else:
             output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
-        return self.wo_b(output), state
+        # Deployment grouped GEMM retains FP32 inverse-RoPE values through
+        # activation quantization, then writes a BF16 projection result.
+        return self.wo_b(output.to(x.dtype)), state
 
     def forward(
         self,
@@ -1432,7 +1475,7 @@ class AttentionState:
     candidates: torch.Tensor | None = None
 
 
-def rotate(x, positions, config, ratio, *, inverse=False):
+def rotate(x, positions, config, ratio, *, inverse=False, output_dtype=None):
     rd = config.rope_dim
     theta = config.compress_rope_theta if ratio != 0 else config.rope_theta
     dims = torch.arange(0, rd, 2, device=x.device, dtype=torch.float32)
@@ -1452,14 +1495,16 @@ def rotate(x, positions, config, ratio, *, inverse=False):
     tail = torch.view_as_complex(
         x[..., -rd:].float().contiguous().unflatten(-1, (-1, 2))
     )
-    rotated = torch.view_as_real(tail * phase).flatten(-2).to(x.dtype)
-    return torch.cat([x[..., :-rd], rotated], -1)
+    dtype = x.dtype if output_dtype is None else output_dtype
+    rotated = torch.view_as_real(tail * phase).flatten(-2).to(dtype)
+    return torch.cat([x[..., :-rd].to(dtype), rotated], -1)
 
 
 class CrossLayerCompressor(nn.Module):
     def __init__(self, config, ratio):
         super().__init__()
         self.ratio = ratio
+        self.deployment_math = False
         dtype = torch.float32 if ratio > 1 else torch.bfloat16
         self.wkv = Linear(config.dim, config.head_dim, dtype=dtype)
         self.norm = RMSNorm(config.head_dim, config.eps)
@@ -1467,6 +1512,17 @@ class CrossLayerCompressor(nn.Module):
             self.wgate = Linear(config.dim, config.head_dim, dtype=torch.float32)
 
     def forward(self, x):
+        if self.deployment_math and x.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            return deployment_math.compressor(
+                x,
+                self.wkv.weight,
+                getattr(self, 'wgate', None).weight if self.ratio == 2 else None,
+                self.norm.weight,
+                self.ratio,
+                self.norm.eps,
+            )
         if self.ratio == 1:
             return self.norm(self.wkv(x))
         cutoff = x.shape[1] // self.ratio * self.ratio
