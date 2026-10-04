@@ -373,6 +373,48 @@ def reference_post(output, residual, post, comb):
     )
 
 
+def _mega_mhc_post_pre(
+    output, residual, pre, post, comb, fn, scale, base, gamma, mixes
+):
+    """Caller-owned Mega-mHC buffers, matching the native shifted kernel ABI."""
+    from vllm.utils.deep_gemm import mega_mhc
+
+    rows, width = output.shape
+    copies = residual.shape[1]
+    if rows > 1 << 20:
+        raise ValueError('Mega-mHC requires at most 2**20 rows')
+    stream = torch.empty_like(residual)
+    next_pre = output.new_empty(rows, copies, 1, dtype=torch.float32)
+    next_post = torch.empty_like(post)
+    next_comb = torch.empty_like(comb)
+    normed = output.new_empty(rows, width, dtype=torch.bfloat16)
+    mega_mhc(
+        x=output,
+        residual=residual,
+        shifted_prev_mix=pre.unsqueeze(-1),
+        post_mix=post,
+        comb_res_mix=comb,
+        fn=fn,
+        mix_scales=scale,
+        mix_bases=base,
+        hc_mult=copies,
+        hc_norm_eps=mixes.norm_eps,
+        hc_pre_eps=mixes.hc_eps,
+        hc_post_scale=2.0,
+        sinkhorn_eps=mixes.hc_eps,
+        num_sinkhorn_iters=mixes.iterations,
+        rmsnorm_weight=gamma.bfloat16().contiguous(),
+        rmsnorm_eps=mixes.norm_eps,
+        rmsnorm_scale=1.0,
+        new_residual=stream,
+        new_prev_mix=next_pre,
+        new_post_mix=next_post,
+        new_comb_res_mix=next_comb,
+        y_bf16=normed,
+    )
+    return stream, next_post, next_comb, normed, next_pre.squeeze(-1)
+
+
 def mhc_joint(hidden, previous_pre, norm_weight, mixes, pending=None):
     """Keep carried post + next pre in the deployment's joint CUDA boundary.
 
@@ -406,8 +448,6 @@ def mhc_joint(hidden, previous_pre, norm_weight, mixes, pending=None):
     def visible(values, pre, gamma, fn, scale, base, output, residual, p, c):
         import vllm.model_executor.kernels.mhc.tilelang as kernels
 
-        if width % 1024 == 0 and copies == 4:
-            raise NotImplementedError('Deployment math does not yet cover Mega-mHC')
         kwargs = dict(norm_weight=gamma.bfloat16(), norm_eps=mixes.norm_eps)
         if pending is None:
             stream = values.reshape(-1, copies, width).contiguous()
@@ -427,6 +467,19 @@ def mhc_joint(hidden, previous_pre, norm_weight, mixes, pending=None):
                 2.0,
                 mixes.iterations,
                 **kwargs,
+            )
+        elif width % 1024 == 0 and copies == 4:
+            stream, next_post, next_comb, normed, next_pre = _mega_mhc_post_pre(
+                output.reshape(-1, width).contiguous(),
+                residual.reshape(-1, copies, width).contiguous(),
+                pre.reshape(-1, copies).contiguous(),
+                p.reshape(-1, copies, 1).contiguous(),
+                c.reshape(-1, copies, copies).contiguous(),
+                fn,
+                scale,
+                base,
+                gamma,
+                mixes,
             )
         else:
             stream, next_post, next_comb, normed, next_pre, _ = (

@@ -149,21 +149,22 @@ def test_bf16_fp32_linear_production_backward_preserves_master(cuda, persistent)
 @pytest.mark.parametrize(
     'broadcast,pending', [(True, False), (False, False), (False, True)]
 )
-def test_joint_production_backward_all_live_operands(cuda, broadcast, pending):
+@pytest.mark.parametrize('width', [512, 1024, 5120])
+def test_joint_production_backward_all_live_operands(cuda, broadcast, pending, width):
     from megatron.lite.primitive.modules.attention.mhc import HCMixes
     from megatron.lite.primitive.modules.deployment_math import mhc_joint
 
-    h = _leaf((1, 3, 4, 512), cuda, torch.bfloat16)
+    h = _leaf((1, 3, 4, width), cuda, torch.bfloat16)
     pre = _leaf((1, 3, 4), cuda)
-    gamma = _leaf((512,), cuda)
-    mixes = HCMixes(512, 4, iterations=20).cuda()
+    gamma = _leaf((width,), cuda)
+    mixes = HCMixes(width, 4, iterations=20).cuda()
     mixes.broadcast_projection = broadcast
     carry = None
     leaves = [h, pre, gamma, mixes.fn, mixes.scale, mixes.base]
     if pending:
         carry = (
-            _leaf((1, 3, 512), cuda, torch.bfloat16),
-            _leaf((1, 3, 4, 512), cuda, torch.bfloat16),
+            _leaf((1, 3, width), cuda, torch.bfloat16),
+            _leaf((1, 3, 4, width), cuda, torch.bfloat16),
             _leaf((1, 3, 4), cuda),
             _leaf((1, 3, 4, 4), cuda),
         )
@@ -242,7 +243,7 @@ def test_two_production_blocks_joint_call_counts_and_composed_layer0_vjp(
 
     monkeypatch.setattr(dm, 'mhc_joint', trace_joint)
     monkeypatch.setattr(dm, 'mhc_post', trace_post)
-    tokens = _leaf((1, 3, 512), cuda, torch.bfloat16)
+    tokens = _leaf((1, 3, width), cuda, torch.bfloat16)
     hidden, pre = expand_hc(tokens, 4)
     sentinel = object()
     h1, p1, state, carry = blocks[0](hidden, pre, sentinel)
@@ -358,3 +359,58 @@ def test_default_ds4_forward_and_gradients_match_04c736eed_on_gpu(cuda, baseline
         preserved.test_v4_default_forward_and_all_parameter_gradients_are_bitwise(
             baseline_csa, ratio
         )
+
+
+@pytest.mark.parametrize('width', [1024, 5120])
+def test_mega_joint_matches_native_shifted_outputs_and_batch_partition(cuda, width):
+    import vllm.models.deepseek_v41.nvidia.ops.mega_mhc as native_mhc
+    from megatron.lite.primitive.modules.attention.mhc import HCMixes
+    from megatron.lite.primitive.modules.deployment_math import mhc_joint
+    from vllm.utils.deep_gemm import _import_deep_gemm
+
+    _import_deep_gemm().set_batch_invariant_mode(True)
+    rows, copies = 33, 4
+    h = _leaf((1, rows, copies, width), cuda, torch.bfloat16)
+    pre = _leaf((1, rows, copies), cuda)
+    gamma = _leaf((width,), cuda)
+    mixes = HCMixes(width, copies, iterations=20).cuda()
+    output = _leaf((1, rows, width), cuda, torch.bfloat16)
+    post = _leaf((1, rows, copies), cuda)
+    comb = _leaf((1, rows, copies, copies), cuda)
+    actual = mhc_joint(h, pre, gamma, mixes, (output, h, post, comb))
+    native = native_mhc.mhc_shifted_post_pre_deep_gemm(
+        output[0].contiguous(),
+        h[0].contiguous(),
+        pre[0].contiguous(),
+        post[0].unsqueeze(-1).contiguous(),
+        comb[0].contiguous(),
+        mixes.fn,
+        mixes.scale,
+        mixes.base,
+        mixes.norm_eps,
+        mixes.hc_eps,
+        2.0,
+        mixes.hc_eps,
+        mixes.iterations,
+        gamma.bfloat16(),
+        mixes.norm_eps,
+    )
+    # Native ABI order is residual, post, comb, normalized, shifted-pre.
+    for got, expected in zip(
+        actual, (native[0], native[4], native[1], native[2], native[3])
+    ):
+        assert torch.equal(got.reshape_as(expected), expected)
+    parts = []
+    for start, end in ((0, 1), (1, 16), (16, rows)):
+        sl = slice(start, end)
+        parts.append(
+            mhc_joint(
+                h[:, sl],
+                pre[:, sl],
+                gamma,
+                mixes,
+                (output[:, sl], h[:, sl], post[:, sl], comb[:, sl]),
+            )
+        )
+    for index, full in enumerate(actual):
+        assert torch.equal(full, torch.cat([part[index] for part in parts], dim=1))
