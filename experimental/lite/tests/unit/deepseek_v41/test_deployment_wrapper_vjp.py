@@ -243,7 +243,7 @@ def test_two_production_blocks_joint_call_counts_and_composed_layer0_vjp(
 
     monkeypatch.setattr(dm, 'mhc_joint', trace_joint)
     monkeypatch.setattr(dm, 'mhc_post', trace_post)
-    tokens = _leaf((1, 3, width), cuda, torch.bfloat16)
+    tokens = _leaf((1, 3, 512), cuda, torch.bfloat16)
     hidden, pre = expand_hc(tokens, 4)
     sentinel = object()
     h1, p1, state, carry = blocks[0](hidden, pre, sentinel)
@@ -368,7 +368,7 @@ def test_mega_joint_matches_native_shifted_outputs_and_batch_partition(cuda, wid
     from megatron.lite.primitive.modules.deployment_math import mhc_joint
     from vllm.utils.deep_gemm import _import_deep_gemm
 
-    _import_deep_gemm().set_batch_invariant_mode(True)
+    _import_deep_gemm().set_batch_invariant(True)
     rows, copies = 33, 4
     h = _leaf((1, rows, copies, width), cuda, torch.bfloat16)
     pre = _leaf((1, rows, copies), cuda)
