@@ -423,3 +423,66 @@ def test_resync_real_two_rank_rows_and_second_generation(tmp_path, trainable):
         result = json.loads((tmp_path / f'resync-{rank}.json').read_text())
         assert result['bitwise'] and result['generations'] == 2
         print('DS41_RESYNC_ROWS_RESULT ' + json.dumps(result))
+
+
+@pytest.mark.parametrize("trainable", [False, True])
+@pytest.mark.parametrize("loaded_archive", [False, True])
+def test_live_resync_without_dspark_archive(
+    v41_core_te, tmp_path, trainable, loaded_archive
+):
+    from megatron.lite.model.deepseek_v41.lite import checkpoint, protocol
+    from megatron.lite.model.deepseek_v41.lite.resync import decode_transport
+    from megatron.lite.primitive.ckpt.row_stream import RowChunk
+
+    model = make_model(tmp_path / "archive", trainable)
+    protocol.save_hf_weights(
+        [model],
+        tmp_path / "baseline",
+        model.config,
+        model.ps,
+        target="mxfp4",
+        buffer_max_size_bytes=524288,
+    )
+    complete = read_hf(tmp_path / "baseline")
+    archival = set(model.archival_keys)
+    assert archival and archival <= complete.keys()
+    if not loaded_archive:
+        model.archival_store = None
+        with pytest.raises(ValueError, match="Complete archival storage"):
+            list(checkpoint.export_checkpoint(model))
+        with pytest.raises(ValueError, match="Complete archival storage"):
+            checkpoint.save_model(model, tmp_path / "incomplete-save")
+    received = {}
+    for pair in protocol.export_hf_weights(
+        [model],
+        model.config,
+        model.ps,
+        target="mxfp4",
+        include_archival=False,
+        buffer_max_size_bytes=524288,
+    ):
+        item = decode_transport(*pair)
+        if isinstance(item, RowChunk):
+            for name, value in (
+                (item.name, item.weight),
+                (item.name[:-6] + "scale", item.scale),
+            ):
+                destination = received.setdefault(
+                    name, torch.empty_like(complete[name])
+                )
+                destination[item.offset : item.offset + value.shape[0]].copy_(value)
+        elif item is not None:
+            name, value = item
+            received[name] = value.clone()
+    assert received.keys() == complete.keys() - archival
+    for name, value in received.items():
+        assert value.dtype == complete[name].dtype
+        assert torch.equal(
+            value.view(torch.uint8), complete[name].view(torch.uint8)
+        ), name
+    if loaded_archive:
+        checkpoint.save_model(model, tmp_path / "complete-save")
+        saved = read_hf(tmp_path / "complete-save")
+        assert archival <= saved.keys()
+        for name in archival:
+            assert torch.equal(saved[name], complete[name])

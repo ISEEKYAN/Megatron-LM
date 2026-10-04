@@ -2166,16 +2166,18 @@ def export_checkpoint(
     cpu=False,
     buffer_max_size_bytes=5 * 1024**3,
     row_chunks=False,
+    include_archival=True,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
         type(cpu) is not bool
         or type(row_chunks) is not bool
+        or type(include_archival) is not bool
         or type(buffer_max_size_bytes) is not int
         or buffer_max_size_bytes < 4
     ):
         raise ValueError('Invalid export CPU or buffer option')
-    if model.archival_bindings and model.archival_store is None:
+    if include_archival and model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
     bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
     for item in export_model(
@@ -2206,7 +2208,7 @@ def export_checkpoint(
         if tensor.dtype in _PLAIN:
             tensor = _cast_export_tensor(tensor, export_dtype=dtype)
         yield name, tensor.cpu() if cpu else tensor
-    if model.archival_store is not None:
+    if include_archival and model.archival_store is not None:
         yield from export_raw_tensors(
             model.archival_store, model.archival_keys, cpu=cpu
         )

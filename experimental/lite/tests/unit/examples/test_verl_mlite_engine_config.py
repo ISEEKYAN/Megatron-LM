@@ -342,3 +342,22 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize(
+    "model_name,expected", [("deepseek_v41", False), ("deepseek_v4", None)]
+)
+def test_resync_archival_policy_is_ds41_online_only(model_name, expected):
+    engine = _engine(
+        engine_config=_engine_config(resync_format="mxfp4", model_name=model_name)
+    )
+    received = {}
+    engine.handle = object()
+    engine.runtime = SimpleNamespace(
+        export_weights=lambda handle, **kw: received.update(kw) or iter(())
+    )
+    engine._initial_sync_cache_cleared = True
+    stream, metadata = engine.get_per_tensor_param()
+    assert list(stream) == [] and metadata is None
+    assert received["target"] == "mxfp4"
+    assert received.get("include_archival") is expected

@@ -407,6 +407,10 @@ class MegatronLiteEngine(BaseEngine):
         )
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
+            if self._resolve_model_name() == "deepseek_v41":
+                # DSpark is archival and never executes in online text rollout.
+                # Complete HF saves still require and retain its original bytes.
+                export_kwargs["include_archival"] = False
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
         elif self._resolve_model_name() == "qwen3_5":
