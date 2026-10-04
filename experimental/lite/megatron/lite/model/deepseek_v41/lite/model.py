@@ -46,6 +46,7 @@ class DeepseekV41Model(nn.Module):
         *,
         token_map=None,
         quantized=True,
+        w4a8_experts=False,
         use_deepep=False,
         trainable_engram=False,
         shard_engram=True,
@@ -120,7 +121,12 @@ class DeepseekV41Model(nn.Module):
                 self._expert(t, quantized, shared=True) if t.n_shared_experts else None
             )
             ffn = DeepseekV41MoE(
-                router, experts, shared, ps=self.ps, use_deepep=use_deepep
+                router,
+                experts,
+                shared,
+                ps=self.ps,
+                use_deepep=use_deepep,
+                w4a8=w4a8_experts,
             )
             block = DeepseekV41Block(
                 dim,

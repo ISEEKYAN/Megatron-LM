@@ -1,0 +1,67 @@
+--- /tmp/w1ds41-baseline/experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py:before	2026-09-20 05:41:15
++++ /tmp/w1ds41-baseline/experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py:after	2026-10-03 17:24:17.989231
+@@ -10,23 +10,18 @@
+ import torch
+ from megatron.lite.model import protocol_utils as _protocol_utils
+ from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+-from megatron.lite.model.protocol_utils import (
+-    pack_r3_replay_mask as _pack_r3_replay_mask,
+-)
+-from megatron.lite.model.protocol_utils import (
+-    pack_routed_experts as _pack_routed_experts,
+-)
++from megatron.lite.model.protocol_utils import \
++    pack_r3_replay_mask as _pack_r3_replay_mask
++from megatron.lite.model.protocol_utils import \
++    pack_routed_experts as _pack_routed_experts
+ from megatron.lite.primitive.bundle import ModelBundle
+ from megatron.lite.primitive.config_fields import project_fields
+-from megatron.lite.primitive.modules.router_replay import (
+-    RouterReplay,
+-    RouterReplayAction,
+-)
++from megatron.lite.primitive.modules.router_replay import (RouterReplay,
++                                                           RouterReplayAction)
+ from megatron.lite.primitive.modules.vision_training import (
+-    VisionSchedule,
+-    VisionTrainability,
+-)
+-from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
++    VisionSchedule, VisionTrainability)
++from megatron.lite.primitive.ops.linear_cross_entropy import \
++    linear_cross_entropy
+ from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
+ from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+ from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
+@@ -165,7 +160,8 @@
+         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
+     layer_range = None
+     if p.pp > 1:
+-        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
++        from megatron.lite.primitive.parallel.pp import \
++            build_pipeline_chunk_layout
+
+         cut = impl_cfg.pipeline_split_layer
+         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+@@ -186,9 +182,8 @@
+         )
+     model.pipeline_residual_dtype = impl_cfg.dtype
+     from megatron.lite.primitive.modules.engram_lookup import EngramTable
+-    from megatron.lite.primitive.modules.native_fp32_linear import (
+-        configure_residual_projections,
+-    )
++    from megatron.lite.primitive.modules.native_fp32_linear import \
++        configure_residual_projections
+
+     optimizing = impl_cfg.optimizer == 'muon'
+     if optimizing and impl_cfg.device == 'meta':
+@@ -560,7 +555,8 @@
+     cp_context = None
+     ids = batch.input_ids[None]
+     if model.ps.cp_size > 1:
+-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
++        from megatron.lite.primitive.modules.attention.cp import \
++            ContiguousCPSequence
+
+         if (
+             modality

@@ -1,0 +1,143 @@
+--- /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/model.py:before	2026-10-03 17:22:30.247953
++++ /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/model.py:after	2026-10-03 17:24:17.822298
+@@ -14,17 +14,12 @@
+ from megatron.lite.primitive.modules import paired_stream as stream
+ from megatron.lite.primitive.modules import vision_training as visual
+ from megatron.lite.primitive.modules.attention.csa import (
+-    AttentionState,
+-    CompressedSparseAttention,
+-    Linear,
+-)
++    AttentionState, CompressedSparseAttention, Linear)
+ from megatron.lite.primitive.modules.image_data import validate_image_spans
+ from megatron.lite.primitive.modules.mlp import SwiGLUMLP
+ from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
+ from megatron.lite.primitive.modules.row_memory_build import (
+-    build_row_memories,
+-    sequence_hashes,
+-)
++    build_row_memories, sequence_hashes)
+ from megatron.lite.primitive.modules.vision import Aligner, ViT
+ from megatron.lite.primitive.parallel.state import ParallelState
+ from megatron.lite.primitive.utils import ensure_divisible
+@@ -436,8 +431,4 @@
+         )
+
+     from megatron.lite.primitive.ckpt.binding_records import (
+-        _bind,
+-        bind_rules,
+-        initialize_bindings,
+-        validate_parameter_bindings,
+-    )
++        _bind, bind_rules, initialize_bindings, validate_parameter_bindings)
+--- /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py:before	2026-10-03 17:22:30.657953
++++ /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py:after	2026-10-03 17:24:17.833665
+@@ -10,23 +10,18 @@
+ import torch
+ from megatron.lite.model import protocol_utils as _protocol_utils
+ from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+-from megatron.lite.model.protocol_utils import (
+-    pack_r3_replay_mask as _pack_r3_replay_mask,
+-)
+-from megatron.lite.model.protocol_utils import (
+-    pack_routed_experts as _pack_routed_experts,
+-)
++from megatron.lite.model.protocol_utils import \
++    pack_r3_replay_mask as _pack_r3_replay_mask
++from megatron.lite.model.protocol_utils import \
++    pack_routed_experts as _pack_routed_experts
+ from megatron.lite.primitive.bundle import ModelBundle
+ from megatron.lite.primitive.config_fields import project_fields
+-from megatron.lite.primitive.modules.router_replay import (
+-    RouterReplay,
+-    RouterReplayAction,
+-)
++from megatron.lite.primitive.modules.router_replay import (RouterReplay,
++                                                           RouterReplayAction)
+ from megatron.lite.primitive.modules.vision_training import (
+-    VisionSchedule,
+-    VisionTrainability,
+-)
+-from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
++    VisionSchedule, VisionTrainability)
++from megatron.lite.primitive.ops.linear_cross_entropy import \
++    linear_cross_entropy
+ from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
+ from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+ from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
+@@ -168,7 +163,8 @@
+         raise ValueError('V4.1 W4A8 requires BF16 residuals, EP=1 and no DeepEP')
+     layer_range = None
+     if p.pp > 1:
+-        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
++        from megatron.lite.primitive.parallel.pp import \
++            build_pipeline_chunk_layout
+
+         cut = impl_cfg.pipeline_split_layer
+         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+@@ -189,9 +185,8 @@
+         )
+     model.pipeline_residual_dtype = impl_cfg.dtype
+     from megatron.lite.primitive.modules.engram_lookup import EngramTable
+-    from megatron.lite.primitive.modules.native_fp32_linear import (
+-        configure_residual_projections,
+-    )
++    from megatron.lite.primitive.modules.native_fp32_linear import \
++        configure_residual_projections
+
+     optimizing = impl_cfg.optimizer == 'muon'
+     if optimizing and impl_cfg.device == 'meta':
+@@ -563,7 +558,8 @@
+     cp_context = None
+     ids = batch.input_ids[None]
+     if model.ps.cp_size > 1:
+-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
++        from megatron.lite.primitive.modules.attention.cp import \
++            ContiguousCPSequence
+
+         if (
+             modality
+--- /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/moe.py:before	2026-10-03 17:22:30.355954
++++ /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/moe.py:after	2026-10-03 17:24:17.839877
+@@ -175,9 +175,7 @@
+         dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
+         if self.w4a8:
+             from megatron.lite.primitive.quantization.w4a8_experts import (
+-                topk_fma_combine,
+-                w4a8_expert_mlp,
+-            )
++                topk_fma_combine, w4a8_expert_mlp)
+
+             # Preserve w1/w2/w3 leaf owners and checkpoint/optimizer bindings.
+             # Concatenation is row-wise, so group32 W quantization is unchanged.
+--- /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/primitive/quantization/w4a8_experts.py:before	2026-10-03 17:22:30.181953
++++ /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/primitive/quantization/w4a8_experts.py:after	2026-10-03 17:24:17.843529
+@@ -40,11 +40,9 @@
+ from collections.abc import Sequence
+
+ import torch
+-from megatron.lite.primitive.quantization.mxfp4 import (
+-    MXFP4_BLOCK_SIZE,
+-    dequantize_mxfp4,
+-    quantize_mxfp4,
+-)
++from megatron.lite.primitive.quantization.mxfp4 import (MXFP4_BLOCK_SIZE,
++                                                        dequantize_mxfp4,
++                                                        quantize_mxfp4)
+
+ FP8_ACT_GROUP_SIZE = 128
+ _E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
+--- /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/tests/unit/deepseek_v41/test_w4a8_fp32.py:before	2026-10-03 17:22:30.375953
++++ /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/tests/unit/deepseek_v41/test_w4a8_fp32.py:after	2026-10-03 17:24:17.850500
+@@ -118,10 +118,7 @@
+
+ def test_fp32_wgrad_uses_native_operands_even_under_autocast():
+     from megatron.lite.primitive.quantization.w4a8_experts import (
+-        dequantize_fp8_act,
+-        quantize_fp8_act,
+-        w4a8_grouped_gemm,
+-    )
++        dequantize_fp8_act, quantize_fp8_act, w4a8_grouped_gemm)
+
+     torch.manual_seed(97)
+     x = torch.randn(19, 128).bfloat16().requires_grad_()

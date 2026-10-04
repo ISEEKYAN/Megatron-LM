@@ -49,6 +49,7 @@ class ImplConfig:
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
+    w4a8_experts: bool = False
     use_deepep: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
@@ -163,6 +164,8 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
+    if c.w4a8_experts and (c.dtype != torch.bfloat16 or p.ep != 1 or c.use_deepep):
+        raise ValueError('V4.1 W4A8 requires BF16 residuals, EP=1 and no DeepEP')
     layer_range = None
     if p.pp > 1:
         from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
@@ -180,7 +183,7 @@ def build_model(model_cfg, *, impl_cfg):
             layer_range=layer_range,
             **project_fields(
                 vars(c),
-                'token_map quantized use_deepep trainable_engram shard_engram '
+                'token_map quantized w4a8_experts use_deepep trainable_engram shard_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )

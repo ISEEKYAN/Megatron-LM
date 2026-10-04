@@ -1,0 +1,25 @@
+isort....................................................................Failed
+- hook id: isort
+- files were modified by this hook
+
+Fixing /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/model.py
+Fixing /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py
+Fixing /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/model/deepseek_v41/lite/moe.py
+Fixing /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/megatron/lite/primitive/quantization/w4a8_experts.py
+Fixing /home/scratch.bayan_gpu/code/devtech-repos/megatron_lite-wt/1.5-W1ds41/experimental/lite/tests/unit/deepseek_v41/test_w4a8_fp32.py
+
+black....................................................................Failed
+- hook id: black
+- files were modified by this hook
+
+reformatted experimental/lite/megatron/lite/model/deepseek_v41/lite/model.py
+reformatted experimental/lite/megatron/lite/model/deepseek_v41/lite/moe.py
+reformatted experimental/lite/megatron/lite/model/deepseek_v41/lite/protocol.py
+
+All done! ✨ 🍰 ✨
+3 files reformatted, 1 file left unchanged.
+reformatted experimental/lite/megatron/lite/primitive/quantization/w4a8_experts.py
+reformatted experimental/lite/tests/unit/deepseek_v41/test_w4a8_fp32.py
+
+All done! ✨ 🍰 ✨
+2 files reformatted.

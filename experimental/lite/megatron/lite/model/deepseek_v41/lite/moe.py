@@ -118,12 +118,20 @@ class DeepseekV41MoE(nn.Module):
     """Global expert slots with local owners and primitive token transport."""
 
     def __init__(
-        self, router, experts, shared_experts=None, *, ps=None, use_deepep=False
+        self,
+        router,
+        experts,
+        shared_experts=None,
+        *,
+        ps=None,
+        use_deepep=False,
+        w4a8=False,
     ):
         super().__init__()
         self.gate = router
         self.experts = Experts.from_modules(experts)
         self.shared_experts = shared_experts
+        self.w4a8 = w4a8
         from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
         from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -143,12 +151,47 @@ class DeepseekV41MoE(nn.Module):
             )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
+        if w4a8:
+            if (
+                self.dispatcher.ep_size != 1
+                or use_deepep
+                or self.dispatcher.moe_permute_fusion
+            ):
+                raise ValueError(
+                    'V4.1 W4A8 requires EP=1, unfused dispatch and no DeepEP'
+                )
+            for expert in self.experts:
+                if expert is None or any(
+                    weight.shape[-1] % 128
+                    for weight in (expert.w1.weight, expert.w2.weight, expert.w3.weight)
+                ):
+                    raise ValueError(
+                        'V4.1 W4A8 expert K dimensions must be divisible by 128'
+                    )
 
     def forward(self, x, *, image_mask=None, load_sink=None):
         flat = x.reshape(-1, x.shape[-1])
         weights, indices, stats = self.gate(flat, image_mask)
         dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
-        output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
+        if self.w4a8:
+            from megatron.lite.primitive.quantization.w4a8_experts import (
+                topk_fma_combine,
+                w4a8_expert_mlp,
+            )
+
+            # Preserve w1/w2/w3 leaf owners and checkpoint/optimizer bindings.
+            # Concatenation is row-wise, so group32 W quantization is unchanged.
+            expert_rows = w4a8_expert_mlp(
+                dispatched,
+                [torch.cat((e.w1.weight, e.w3.weight)) for e in self.experts],
+                [e.w2.weight for e in self.experts],
+                counts.tolist(),
+                swiglu_limit=next(iter(self.experts)).swiglu_limit or None,
+            )
+            rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_rows)
+            output = topk_fma_combine(rows, row_token, row_expert, indices, weights)
+        else:
+            output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat)
         output = output.reshape_as(x)

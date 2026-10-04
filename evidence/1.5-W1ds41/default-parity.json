@@ -1,0 +1,8 @@
+{
+  "baseline": "01b252f37",
+  "tensor_count": 2153,
+  "byte_count": 53781316,
+  "all_tensor_bytes_equal": true,
+  "sha256": "cdc72275cffb999b30af0decd005eef36cf98b3a3bbe928efa9f5844bd02330c",
+  "scope": "FP32 residual full tiny logits/loss/weights/gradients and BF16 default MoE; no mHC adapter"
+}

@@ -26,7 +26,9 @@ Training-side counterpart of the rollout MoE contract served by vLLM's
 
 Backward is a straight-through estimator on both operands: gradients use the
 dequantized activations and weights the forward multiplied, and flow unmasked
-to the BF16 input and the BF16 master weights. No saturation mask is needed:
+to the BF16 input and BF16 or FP32 master weights. FP32 masters use native
+FP32 operand wgrad GEMMs, with autocast disabled and no BF16 intermediate.
+No saturation mask is needed:
 the dynamic activation scale satisfies ``amax / scale <= 448`` and the MXFP4
 scale rule satisfies ``amax / scale <= 6`` by construction.
 """
@@ -221,7 +223,11 @@ class _W4A8GroupedGemm(torch.autograd.Function):
             w_hat = dequantize_mxfp4(w_codes[expert], w_scale[expert])
             grad = grad_out[start:end]
             grad_x[start:end] = grad @ w_hat.to(grad.dtype)
-            grad_w = grad.t() @ x_hat[start:end]
+            if ctx.weight_dtypes[expert] == torch.float32:
+                with torch.autocast(device_type=grad.device.type, enabled=False):
+                    grad_w = grad.float().t() @ x_hat[start:end].float()
+            else:
+                grad_w = grad.t() @ x_hat[start:end]
             grad_weights.append(grad_w.to(ctx.weight_dtypes[expert]))
         return (grad_x, None, None, *grad_weights)
 
@@ -240,12 +246,15 @@ def w4a8_grouped_gemm(
     """Grouped ``[M, K] x [N, K]^T`` per expert with A8 activations and MXFP4 weights.
 
     ``x`` holds the expert-sorted BF16 tokens (``m_splits[e]`` rows for expert
-    ``e``); ``weights`` are the per-expert BF16 master weights. ``backend`` is
+    ``e``); ``weights`` are per-expert BF16 or FP32 masters. Quantization reads
+    the master directly without casting it to the activation dtype. ``backend`` is
     ``"deep_gemm"`` or ``"reference"``; ``None`` picks DeepGEMM on CUDA and the
     reference on CPU.
     """
     if x.dtype != torch.bfloat16:
         raise TypeError(f"W4A8 experts take BF16 activations, got {x.dtype}.")
+    if any(weight.dtype not in (torch.bfloat16, torch.float32) for weight in weights):
+        raise TypeError("W4A8 expert masters must be BF16 or FP32")
     if len(weights) != len(m_splits) or sum(m_splits) != x.shape[0]:
         raise ValueError(
             f"m_splits {list(m_splits)} must give one row count per expert weight "
