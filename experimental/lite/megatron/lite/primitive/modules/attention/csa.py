@@ -508,7 +508,11 @@ class CompressedSparseAttention(nn.Module):
         qr = self.q_norm(self.wq_a(x))
         # V4.1 deliberately has no per-query-head RMS after wq_b.
         q = rotate(
-            self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)), positions, c, ratio
+            self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)),
+            positions,
+            c,
+            ratio,
+            deployment_math=self.deployment_math,
         )
         window = rotate(self.kv_norm(self.wkv(full_x)), key_positions, c, ratio)
         if c.swa_fp8:
@@ -1479,11 +1483,21 @@ class AttentionState:
     candidates: torch.Tensor | None = None
 
 
-def rotate(x, positions, config, ratio, *, inverse=False, output_dtype=None):
+def rotate(
+    x,
+    positions,
+    config,
+    ratio,
+    *,
+    inverse=False,
+    output_dtype=None,
+    deployment_math=False,
+):
     rd = config.rope_dim
     theta = config.compress_rope_theta if ratio != 0 else config.rope_theta
     dims = torch.arange(0, rd, 2, device=x.device, dtype=torch.float32)
-    freqs = 1 / theta ** (dims / rd)
+    pos_freqs = theta ** (dims / rd)
+    freqs = 1 / pos_freqs
     if ratio != 0 and config.original_length > 0:
 
         low, high = _yarn_find_correction_range(
@@ -1492,8 +1506,27 @@ def rotate(x, positions, config, ratio, *, inverse=False, output_dtype=None):
         ramp = (
             (torch.arange(rd // 2, device=x.device) - low) / max(high - low, 1e-3)
         ).clamp(0, 1)
-        freqs = freqs / config.factor * ramp + freqs * (1 - ramp)
+        if deployment_math:
+            mask = 1 - ramp
+            freqs = (1 / (config.factor * pos_freqs)) * (1 - mask) + freqs * mask
+        else:
+            freqs = freqs / config.factor * ramp + freqs * (1 - ramp)
     angles = positions.float().unsqueeze(-1) * freqs
+    if deployment_math:
+        # Match the deployed FP32 Q RoPE multiply-add order before BF16 rounding.
+        # addcmul retains the ordinary Torch VJP; the default complex path is unchanged.
+        shape = (1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
+        cosine = angles.cos().reshape(shape)
+        sine = angles.sin().reshape(shape)
+        if inverse:
+            sine = -sine
+        pairs = x[..., -rd:].float().unflatten(-1, (-1, 2))
+        even, odd = pairs[..., 0], pairs[..., 1]
+        real = torch.addcmul(-(odd * sine), even, cosine)
+        imag = torch.addcmul(odd * cosine, even, sine)
+        dtype = x.dtype if output_dtype is None else output_dtype
+        rotated = torch.stack((real, imag), -1).flatten(-2).to(dtype)
+        return torch.cat((x[..., :-rd].to(dtype), rotated), -1)
     phase = torch.polar(torch.ones_like(angles), -angles if inverse else angles)
     phase = phase.reshape(1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
     tail = torch.view_as_complex(
