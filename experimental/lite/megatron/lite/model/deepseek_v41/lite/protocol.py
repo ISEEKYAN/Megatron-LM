@@ -360,20 +360,38 @@ def _cp_targets(batch, cp_context):
     )
 
 
-def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
+def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits=None):
     context = get_loss_context()
     temperature = 1.0 if context is None else context.temperature
     if temperature <= 0:
         raise ValueError("Temperature must be positive")
+    if logits is not None:
+        from megatron.lite.primitive.modules import deployment_math
+
+        if cp_context is not None:
+            raise ValueError('Deployment head probabilities require CP1')
+        if tp_group is not None and torch.distributed.get_world_size(tp_group) != 1:
+            raise ValueError('Deployment head probabilities require full-vocab TP1')
+        logits = logits.float() / temperature
     if batch.labels is None:
-        result = {"logits": torch.nn.functional.linear(hidden, weight) / temperature}
+        result = {
+            "logits": (
+                logits
+                if logits is not None
+                else torch.nn.functional.linear(hidden, weight) / temperature
+            )
+        }
         if context is not None and context.calculate_entropy:
-            labels = torch.zeros(
-                hidden.shape[:-1], dtype=torch.long, device=hidden.device
-            )
-            _, result["entropy"] = linear_cross_entropy(
-                hidden, weight, labels, temperature, tp_group
-            )
+            if logits is None:
+                labels = torch.zeros(
+                    hidden.shape[:-1], dtype=torch.long, device=hidden.device
+                )
+                _, result["entropy"] = linear_cross_entropy(
+                    hidden, weight, labels, temperature, tp_group
+                )
+            else:
+                distribution = deployment_math.log_softmax(logits)
+                result["entropy"] = -(distribution.exp() * distribution).sum(-1)
         return result
     if batch.labels.shape != batch.input_ids.shape:
         raise ValueError("Labels must match packed input shape")
@@ -384,9 +402,18 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
     ):
         raise ValueError('V4.1_CP_NORMALIZATION_REQUIRED: use prepare_microbatches')
     labels, mask, denominator = _cp_targets(batch, cp_context)
-    log_probs, entropy = linear_cross_entropy(
-        hidden, weight, labels, temperature, tp_group
-    )
+    if logits is None:
+        log_probs, entropy = linear_cross_entropy(
+            hidden, weight, labels, temperature, tp_group
+        )
+    else:
+        distribution = deployment_math.log_softmax(logits)
+        log_probs = distribution.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        entropy = (
+            -(distribution.exp() * distribution).sum(-1)
+            if context is not None and context.calculate_entropy
+            else None
+        )
     if context is not None and context.normalization_denominator is not None:
         denominator = context.normalization_denominator
         if not math.isfinite(denominator) or denominator <= 0:
@@ -625,18 +652,19 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
             ids,
             cu_seqlens=batch.cu_seqlens,
             cp_context=cp_context,
-            return_head_hidden=True,
+            return_head_hidden=not model.deployment_math,
             **modality,
         )
     result = (
         {'hidden_states': output['hidden_states']}
         if 'hidden_states' in output
         else text_output(
-            output['head_hidden'][0],
-            output['head_weight'],
+            output.get('head_hidden', output.get('logits'))[0],
+            output.get('head_weight'),
             batch,
             cp_context=cp_context,
             tp_group=model.ps.tp_group,
+            logits=output['logits'][0] if model.deployment_math else None,
         )
     )
     if optimizer is not None and model.training and torch.is_grad_enabled():
