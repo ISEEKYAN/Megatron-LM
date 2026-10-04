@@ -7,6 +7,8 @@ in the production block. REQUIRE_CUDA=1 makes missing CUDA a failure.
 """
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 
 import pytest
@@ -135,11 +137,11 @@ def test_shared_swiglu_production_backward_includes_intermediate_rounding(cuda, 
 
 @pytest.mark.parametrize('persistent', [False, True])
 def test_bf16_fp32_linear_production_backward_preserves_master(cuda, persistent):
-    from megatron.lite.primitive.modules.deployment_math import bf16_fp32_linear
+    from megatron.lite.primitive.modules import deployment_math as dm
 
     x = _leaf((7, 32), cuda, torch.bfloat16)
     w = _leaf((16, 32), cuda)
-    actual = bf16_fp32_linear(x, w, persistent=persistent)
+    actual = dm.bf16_fp32_linear(x, w, persistent=persistent)
     expected = F.linear(x.float(), _decoded(w))
     _compare(actual, expected, (x, w))
 
@@ -287,7 +289,9 @@ def test_compressor_production_backward_raw_and_gamma(cuda, monkeypatch, ratio):
     w = _leaf((512, 32), cuda)
     gate = _leaf((512, 32), cuda) if ratio == 2 else None
     gamma = _leaf((512,), cuda)
-    from megatron.lite.primitive.kernels.deployment_compressor import compress_norm
+    from megatron.lite.primitive.kernels import deployment_compressor
+
+    compress_norm = deployment_compressor.compress_norm
 
     raw_shape = (2, 5, 512 * ratio)
     with pytest.raises(ValueError, match='CUDA FP32'):
@@ -316,11 +320,41 @@ def test_compressor_production_backward_raw_and_gamma(cuda, monkeypatch, ratio):
 
 
 def test_default_ds4_forward_and_gradients_match_04c736eed_on_gpu(cuda, baseline_csa):
-    from test_redo_v4_preservation import (
-        test_v4_default_forward_and_all_parameter_gradients_are_bitwise,
-    )
+    # The pinned 04c CSA THD adapter requires the newer compressed_rows ABI.
+    # Keep DS41/W4's validated core unchanged; isolate this legacy compatibility
+    # arm on the recorded nv/dev reference used for the adapter's original tests.
+    compat_core = os.environ.get('DS41_CSA_COMPAT_CORE')
+    if compat_core and os.environ.get('DS41_CSA_COMPAT_CHILD') != '1':
+        env = dict(
+            os.environ,
+            DS41_CSA_COMPAT_CHILD='1',
+            PYTHONPATH=compat_core + os.pathsep + os.environ['PYTHONPATH'],
+        )
+        node = (
+            str(Path(__file__).resolve())
+            + '::test_default_ds4_forward_and_gradients_match_04c736eed_on_gpu'
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                '-m',
+                'pytest',
+                '-c',
+                '/dev/null',
+                '-s',
+                '-v',
+                '-p',
+                'no:cacheprovider',
+                node,
+            ],
+            env=env,
+            check=True,
+        )
+        assert result.returncode == 0
+        return
+    import test_redo_v4_preservation as preserved
 
     for ratio in (0, 2, 4):
-        test_v4_default_forward_and_all_parameter_gradients_are_bitwise(
+        preserved.test_v4_default_forward_and_all_parameter_gradients_are_bitwise(
             baseline_csa, ratio
         )
