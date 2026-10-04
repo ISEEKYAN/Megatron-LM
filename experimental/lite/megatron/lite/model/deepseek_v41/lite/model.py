@@ -65,6 +65,8 @@ class DeepseekV41Model(nn.Module):
         parallel_state=None,
     ):
         nn.Module.__init__(self)
+        if deployment_math and (not w4a8_experts or not quantized):
+            raise ValueError('Deployment math requires quantized W4A8 experts')
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
         self.deployment_math = deployment_math

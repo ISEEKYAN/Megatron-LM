@@ -16,7 +16,7 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
     cfg = csa.CrossLayerAttentionConfig(
         dim=32,
         heads=4,
-        head_dim=32,
+        head_dim=512,
         rope_dim=4,
         q_rank=32,
         o_rank=32,
@@ -38,6 +38,7 @@ def test_grouped_output_uses_fp8_with_fp32_masters(v41_core_te, groups):
         compress_ratio=0,
     )
     model = model.cuda()
+    model.deployment_math = True
     model.wo_a.weight.data = model.wo_a.weight.data.float()
     model.wo_a.native_fp32 = True
     assert model.wo_a.fp8

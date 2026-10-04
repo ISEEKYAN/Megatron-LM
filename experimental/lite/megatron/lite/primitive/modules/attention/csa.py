@@ -628,11 +628,15 @@ class CompressedSparseAttention(nn.Module):
             c,
             ratio,
             inverse=True,
-            output_dtype=torch.float32 if self.wo_a.fp8 else output.dtype,
+            output_dtype=(
+                torch.float32
+                if self.deployment_math and self.wo_a.fp8
+                else output.dtype
+            ),
         )
         grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
-        if self.wo_a.fp8:
+        if self.deployment_math and self.wo_a.fp8:
             # Each output group owns a row slice of the release-layout matrix.
             # Keep the same deployment codec as the other FP8 projections;
             # FP32 optimizer masters must never bypass the forward codec.

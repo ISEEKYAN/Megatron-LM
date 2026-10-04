@@ -97,13 +97,52 @@ def router_topk(logits, bias, *, topk, scaling_factor):
     return weights, indices.long()
 
 
+def _reference_mixes(hidden, fn, scale, base, mixes, *, broadcast):
+    """Broadcast consumes copy zero and the sum of the per-copy weights.
+
+    This equals the concatenated projection on repeated layer-0 token inputs.
+    Its VJP describes the actual CUDA arguments, including zero dependence on
+    unused copies. The composed token VJP sums back through the broadcast.
+    """
+    from megatron.lite.primitive.modules.attention import mhc
+
+    copies = mixes.copies
+    if not broadcast:
+        return mhc.reference_mixes(
+            hidden,
+            fn,
+            scale,
+            base,
+            copies,
+            mixes.norm_eps,
+            mixes.hc_eps,
+            mixes.iterations,
+        )
+    token = hidden[..., 0, :].float()
+    folded = fn.reshape(-1, copies, hidden.shape[-1]).sum(1)
+    projected = torch.nn.functional.linear(token, folded) * torch.rsqrt(
+        token.square().mean(-1, keepdim=True) + mixes.norm_eps
+    )
+    sizes = [copies, copies, copies**2]
+    pre, post, comb = projected.split(sizes, -1)
+    bp, bpost, bc = base.float().split(sizes)
+    pre = torch.sigmoid(pre * scale[0] + bp) + mixes.hc_eps
+    post = 2 * torch.sigmoid(post * scale[1] + bpost)
+    comb = (comb * scale[2] + bc).reshape(*token.shape[:-1], copies, copies)
+    return pre, post, mhc._sinkhorn_iterations(comb, mixes.iterations, mixes.hc_eps)
+
+
 def mhc_coefficients(
     hidden, fn, scale, base, *, copies, norm_eps, hc_eps, iterations, broadcast
 ):
-    from megatron.lite.primitive.modules.attention.mhc import reference_mixes
+    from types import SimpleNamespace
+
+    config = SimpleNamespace(
+        copies=copies, norm_eps=norm_eps, hc_eps=hc_eps, iterations=iterations
+    )
 
     def reference(h, w, s, b):
-        return reference_mixes(h, w, s, b, copies, norm_eps, hc_eps, iterations)
+        return _reference_mixes(h, w, s, b, config, broadcast=broadcast)
 
     def visible(h, w, s, b):
         import vllm.model_executor.kernels.mhc.tilelang as mhc_kernels
@@ -240,7 +279,12 @@ def bf16_fp32_linear(x, weight, *, persistent):
 
 
 def shared_swiglu(gate_up, limit):
-    """Generic deployment SiLU-mul: SiLU rounds to BF16 before up multiply."""
+    """SiLU rounds to input dtype before multiplying up; rounding uses an STE.
+
+    Backward differentiates FP32 SiLU and clamp. The up VJP uses the rounded
+    activation value; the gate VJP uses the smooth FP32 derivative. This is an
+    explicitly owned surrogate, not finite differences of the discrete kernel.
+    """
 
     def visible(y):
         out = torch.empty(
@@ -257,7 +301,9 @@ def shared_swiglu(gate_up, limit):
         if limit > 0:
             gate = gate.clamp(max=limit)
             up = up.clamp(-limit, limit)
-        return (torch.nn.functional.silu(gate) * up).to(y.dtype)
+        activated = torch.nn.functional.silu(gate)
+        rounded = activated + (activated.to(y.dtype).float() - activated).detach()
+        return (rounded * up).to(y.dtype)
 
     return visible_forward(visible, reference, gate_up)
 
@@ -311,10 +357,11 @@ def mhc_joint(hidden, previous_pre, norm_weight, mixes, pending=None):
     """Keep carried post + next pre in the deployment's joint CUDA boundary.
 
     The owned graph carries live post operands explicitly; no module cache or
-    inference model is used. Reference VJPs are the corresponding MLite math.
+    inference model is used. Layer-0 broadcast consumes copy zero, folded
+    projection weights and its RMS; previous_pre is unused in that arm. Other
+    calls consume the carried pre-mix. Reference VJPs use the same dependency
+    graph, FP32 master leaves and straight-through BF16 value boundaries.
     """
-    from megatron.lite.primitive.modules.attention import mhc
-
     shape = hidden.shape
     copies, width = shape[-2:]
     empty = hidden.new_empty(0)
@@ -322,17 +369,15 @@ def mhc_joint(hidden, previous_pre, norm_weight, mixes, pending=None):
 
     def reference(values, pre, gamma, fn, scale, base, output, residual, p, c):
         stream = values if pending is None else reference_post(output, residual, p, c)
-        coefficients = mhc.reference_mixes(
-            stream,
-            fn,
-            scale,
-            base,
-            copies,
-            mixes.norm_eps,
-            mixes.hc_eps,
-            mixes.iterations,
+        broadcast = pending is None and mixes.broadcast_projection
+        coefficients = _reference_mixes(
+            stream, fn, scale, base, mixes, broadcast=broadcast
         )
-        collapsed = (stream.float() * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
+        collapsed = (
+            stream[..., 0, :]
+            if broadcast
+            else (stream.float() * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
+        )
         normed = torch.nn.functional.rms_norm(
             collapsed, (width,), decoded_bf16_master(gamma), mixes.norm_eps
         )
