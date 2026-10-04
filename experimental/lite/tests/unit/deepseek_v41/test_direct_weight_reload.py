@@ -50,8 +50,11 @@ def test_direct_sink_reload_matches_cold_and_preserves_address(
         assert attention.attn_sink.data_ptr() == ptr
 
 
+@pytest.mark.parametrize('has_padding_field', [True, False])
 @pytest.mark.parametrize('tp', [4, 8])
-def test_mxfp4_materialization_initializes_padding_once(v41_core_te, monkeypatch, tp):
+def test_mxfp4_materialization_initializes_padding_once(
+    v41_core_te, monkeypatch, tp, has_padding_field
+):
     from test_receiver_staging import Mxfp4MoEMethod
 
     consumer = adapter(v41_core_te)
@@ -61,8 +64,9 @@ def test_mxfp4_materialization_initializes_padding_once(v41_core_te, monkeypatch
         hidden_dim_unpadded=64,
         intermediate_size=2304,
         moe_parallel_config=NS(tp_size=tp),
-        tp_shard_with_padding=False,
     )
+    if has_padding_field:
+        layer.moe_config.tp_shard_with_padding = False
     real = 2304 // tp
     padded = ((real + 127) // 128) * 128
     layer.quant_method.create_weights(layer, 2, 64, padded, torch.bfloat16)

@@ -106,7 +106,10 @@ def set_mxfp4_load_numel(model):
         config = layer.moe_config
         tp = config.moe_parallel_config.tp_size
         intermediate = config.intermediate_size
-        if config.tp_shard_with_padding or intermediate % (tp * 32):
+        # 168a040 divides checkpoint shards evenly; kernel alignment padding
+        # is separate. Newer vLLM can also pad the checkpoint TP split itself.
+        padded_shard = getattr(config, 'tp_shard_with_padding', False)
+        if padded_shard or intermediate % (tp * 32):
             raise NotImplementedError(
                 'DS4.1 MXFP4 reload requires evenly sharded group32 checkpoints'
             )
@@ -125,8 +128,51 @@ def set_mxfp4_load_numel(model):
             if parameter.numel() > target.numel():
                 raise ValueError('DS4.1 MXFP4 checkpoint exceeds padded parameter')
             target.weight_loader_numel = parameter.numel()
+            target._ds41_load_numel = parameter.numel()
             if parameter.numel() < target.numel():
                 target.weight_loader = _mxfp4_initialized_loader(target.weight_loader)
+
+
+def install_mxfp4_load_numel_compat(layerwise):
+    """Honor MLite's checkpoint counts on pre-weight_loader_numel vLLM.
+
+    Keep the adapter here: the pinned vLLM source/install remains unchanged.
+    Unmarked tensors retain native accounting, including skipped buffers.
+    """
+    original_size = layerwise.get_layer_size
+    if getattr(original_size, '_ds41_load_numel_compat', False):
+        return
+    original_loaded = layerwise.get_numel_loaded
+
+    @wraps(original_size)
+    def size(layer):
+        if not any(
+            hasattr(tensor, '_ds41_load_numel')
+            for tensor in (*layer._parameters.values(), *layer._buffers.values())
+        ):
+            return original_size(layer)
+        # Feed native accounting a shallow view with only declared checkpoint
+        # tensors resized. This works with both old numel() and newer explicit
+        # weight_loader_numel accounting without double-subtracting padding.
+        view = copy(layer)
+        for field in ('_parameters', '_buffers'):
+            tensors = getattr(layer, field).copy()
+            for name, tensor in tensors.items():
+                count = getattr(tensor, '_ds41_load_numel', None)
+                if count is not None:
+                    tensors[name] = torch.empty(count, device='meta')
+            setattr(view, field, tensors)
+        return original_size(view)
+
+    @wraps(original_loaded)
+    def loaded(loader, args):
+        count, result = original_loaded(loader, args)
+        limit = getattr(args.arguments.get('param'), '_ds41_load_numel', None)
+        return (min(count, limit) if limit is not None else count), result
+
+    size._ds41_load_numel_compat = True
+    layerwise.get_layer_size = size
+    layerwise.get_numel_loaded = loaded
 
 
 class StagingBudget:
@@ -258,6 +304,9 @@ def install_reload_metadata_hook():
     """Install in the rollout worker before its loader creates the model."""
     from vllm.model_executor.model_loader import reload
     from vllm.model_executor.model_loader.base_loader import BaseModelLoader
+    from vllm.model_executor.model_loader.reload import layerwise
+
+    install_mxfp4_load_numel_compat(layerwise)
 
     original = BaseModelLoader.create_model
     if getattr(original, '_ds41_metadata_hook', False):

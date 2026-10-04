@@ -128,28 +128,33 @@ def permute_builders():
     )
 
 
-def online_loader(info, process, monkeypatch):
+def online_loader(info, process, monkeypatch, load_numel_compat=None):
     import inspect
     from functools import wraps
 
     from torch.utils._python_dispatch import TorchDispatchMode
 
     base = 'vllm/model_executor/model_loader/reload/'
+    optional = (
+        ['get_tensor_load_numel']
+        if 'def get_tensor_load_numel(' in source(base + 'utils.py').read_text()
+        else []
+    )
     utils = functions(
         base + 'utils.py',
         [
             'get_layer_tensors',
             'get_layer_params_buffers',
-            'get_tensor_load_numel',
             'get_layer_size',
             'has_device_tensors',
-        ],
+        ]
+        + optional,
     )
     meta = functions(
         base + 'meta.py',
         ['CopyCounter', 'get_numel_loaded', 'SKIP_LOAD_TENSORS'],
         TorchDispatchMode=TorchDispatchMode,
-        get_tensor_load_numel=utils.get_tensor_load_numel,
+        **vars(utils),
     )
     # Keep the native get_layer_size relative import intact.
     import sys
@@ -174,6 +179,10 @@ def online_loader(info, process, monkeypatch):
         _layerwise_process=process,
         logger=SimpleNamespace(debug=lambda *a: None),
     )
+    if load_numel_compat is not None:
+        layerwise = SimpleNamespace(**bindings)
+        load_numel_compat(layerwise)
+        bindings.update(vars(layerwise))
     native = functions(
         base + 'layerwise.py',
         ['make_online_process_loader', '_get_original_loader', '_get_weight_loader'],

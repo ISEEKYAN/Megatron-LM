@@ -188,7 +188,10 @@ def test_receiver_over_budget_aborts_and_restores_hooks(v41_core_te, monkeypatch
         receiver.receive([('weight', torch.zeros(1, dtype=torch.uint8))])
 
 
-def test_native_288_to_384_completion_through_receiver(v41_core_te, monkeypatch):
+@pytest.mark.parametrize('has_padding_field', [True, False])
+def test_native_288_to_384_completion_through_receiver(
+    v41_core_te, monkeypatch, has_padding_field
+):
     from megatron.lite.model.deepseek_v41.lite.resync import transport_weights
     from native_reload import mxfp4_method, online_loader
     from reload_fixture import install_reload
@@ -200,8 +203,9 @@ def test_native_288_to_384_completion_through_receiver(v41_core_te, monkeypatch)
         hidden_dim_unpadded=64,
         intermediate_size=2304,
         moe_parallel_config=NS(tp_size=8),
-        tp_shard_with_padding=False,
     )
+    if has_padding_field:
+        model.moe_config.tp_shard_with_padding = False
     model.quant_method.create_weights(
         model, 2, 64, 384, torch.bfloat16, weight_loader=lambda *a: None
     )
@@ -224,7 +228,9 @@ def test_native_288_to_384_completion_through_receiver(v41_core_te, monkeypatch)
         completed.append(state.load_numel)
         state.reset()
 
-    make_loader = online_loader(info, process, monkeypatch)
+    make_loader = online_loader(
+        info, process, monkeypatch, consumer.install_mxfp4_load_numel_compat
+    )
     for name, param in model.named_parameters():
 
         def copy_checkpoint(param, loaded_weight):
@@ -252,3 +258,39 @@ def test_native_288_to_384_completion_through_receiver(v41_core_te, monkeypatch)
     assert receiver.staging.current_bytes == 0
     receiver.receive(list(transport_weights([], deployment=True)))
     receiver.finish()
+
+
+def test_load_numel_compat_preserves_native_unmarked_and_skipped(v41_core_te):
+    import inspect
+
+    consumer = adapter(v41_core_te)
+    layer = torch.nn.Module()
+    layer.weight = torch.nn.Parameter(torch.zeros(8))
+    layer.register_buffer('_expert_map', torch.zeros(3))
+    layer._expert_map._ds41_load_numel = 1
+
+    def native_size(module):
+        return sum(
+            tensor.numel()
+            for name, tensor in {**module._parameters, **module._buffers}.items()
+            if tensor is not None and name != '_expert_map'
+        )
+
+    def native_loaded(loader, args):
+        return 8, 'native-return-value'
+
+    layerwise = NS(get_layer_size=native_size, get_numel_loaded=native_loaded)
+    consumer.install_mxfp4_load_numel_compat(layerwise)
+    wrapped = layerwise.get_layer_size
+    consumer.install_mxfp4_load_numel_compat(layerwise)
+    assert layerwise.get_layer_size is wrapped
+    assert wrapped(layer) == 8
+    layer.weight.weight_loader_numel = 4  # Not owned by this receiver.
+    assert wrapped(layer) == 8
+    args = inspect.signature(lambda param: None).bind(layer.weight)
+    assert layerwise.get_numel_loaded(None, args) == (8, 'native-return-value')
+    layer.weight._ds41_load_numel = 4
+    assert wrapped(layer) == 4
+    assert layerwise.get_numel_loaded(None, args) == (4, 'native-return-value')
+    assert layer.weight.numel() == 8
+    assert layer._expert_map.numel() == 3
