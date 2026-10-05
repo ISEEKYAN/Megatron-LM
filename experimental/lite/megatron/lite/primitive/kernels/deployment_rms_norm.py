@@ -25,7 +25,12 @@ def _row_norm(
     tl.store(out + row * WIDTH + d, normalized, mask=mask)
 
 
-def row_rms_norm(x, weight, eps):
+def row_rms_norm(x, weight, eps, *, reduction_width=None):
+    """Use an optional shared row tile without changing the mathematical VJP.
+
+    Paired Q/KV norms use their maximum width for both reductions. Padding
+    with zeros preserves RMS math, while tile size fixes CUDA summation order.
+    """
     if (
         not x.is_cuda
         or x.dtype != torch.bfloat16
@@ -39,12 +44,17 @@ def row_rms_norm(x, weight, eps):
             'Deployment row RMS requires CUDA BF16 rows and an FP32 gamma master'
         )
     width = x.shape[-1]
+    if reduction_width is not None and (
+        type(reduction_width) is not int or reduction_width < width
+    ):
+        raise ValueError('Reduction width must be an integer at least the row width')
+    tile_width = width if reduction_width is None else reduction_width
     values = x.contiguous()
     gamma = weight.bfloat16().contiguous()
     result = torch.empty_like(values)
     rows = values.numel() // width
     if rows:
-        block = triton.next_power_of_2(width)
+        block = triton.next_power_of_2(tile_width)
         _row_norm[(rows,)](
             values,
             gamma,

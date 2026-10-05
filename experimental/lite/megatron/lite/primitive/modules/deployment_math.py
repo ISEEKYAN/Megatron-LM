@@ -341,8 +341,11 @@ def rms_norm(x, weight, shape, eps):
     return visible_forward(visible, reference, x, weight)
 
 
-def qkv_rms_norm(x, weight, shape, eps):
-    """Fused-QKV visible row arithmetic; the FP32/STE reference owns its VJP."""
+def qkv_rms_norm(x, weight, shape, eps, *, reduction_width=None):
+    """Fused-QKV row arithmetic with an explicit optional paired reduction tile.
+
+    The FP32/STE reference owns the unchanged mathematical VJP.
+    """
     from megatron.lite.primitive.kernels import deployment_rms_norm
 
     if tuple(shape) != (x.shape[-1],):
@@ -354,7 +357,9 @@ def qkv_rms_norm(x, weight, shape, eps):
         )
 
     return visible_forward(
-        lambda values, master: deployment_rms_norm.row_rms_norm(values, master, eps),
+        lambda values, master: deployment_rms_norm.row_rms_norm(
+            values, master, eps, reduction_width=reduction_width
+        ),
         reference,
         x,
         weight,

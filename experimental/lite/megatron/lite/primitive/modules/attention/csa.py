@@ -478,6 +478,11 @@ class CompressedSparseAttention(nn.Module):
         )
         self.wkv = linear(config.dim, config.head_dim, fp8=config.linear_fp8)
         self.kv_norm = RMSNorm(config.head_dim, config.eps)
+        # Native fused Q/KV norm pads both rows to their maximum width.
+        # Preserve that reduction order only in the deployment-math path.
+        reduction_width = max(config.q_rank, config.head_dim)
+        self.q_norm.deployment_reduction_width = reduction_width
+        self.kv_norm.deployment_reduction_width = reduction_width
         self.attn_sink = nn.Parameter(torch.zeros(config.heads, dtype=torch.float32))
         self.wo_a = linear(
             config.heads * config.head_dim // config.groups,

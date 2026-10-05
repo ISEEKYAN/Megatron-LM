@@ -45,6 +45,7 @@ import megatron.core.transformer.hyper_connection as core_hyper_connection
 
 class RMSNorm(nn.RMSNorm):
     deployment_math = False
+    deployment_reduction_width = None
 
     def forward(self, x):
         if self.deployment_math:
@@ -52,7 +53,11 @@ class RMSNorm(nn.RMSNorm):
 
             if x.is_cuda:
                 return deployment_math.qkv_rms_norm(
-                    x, self.weight, self.normalized_shape, self.eps
+                    x,
+                    self.weight,
+                    self.normalized_shape,
+                    self.eps,
+                    reduction_width=self.deployment_reduction_width,
                 )
             return F.rms_norm(
                 x,
