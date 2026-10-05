@@ -166,16 +166,16 @@ class DeepseekV41MoE(nn.Module):
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
         if w4a8:
-            if (
-                self.dispatcher.ep_size != 1
-                or use_deepep
-                or self.dispatcher.moe_permute_fusion
-            ):
-                raise ValueError(
-                    'V4.1 W4A8 requires EP=1, unfused dispatch and no DeepEP'
-                )
-            for expert in self.experts:
-                if expert is None or any(
+            if use_deepep or self.dispatcher.moe_permute_fusion:
+                raise ValueError('V4.1 W4A8 requires unfused dispatch and no DeepEP')
+            start = self.dispatcher.ps.ep_rank * self.dispatcher.num_local_experts
+            for index, expert in enumerate(self.experts):
+                owned = start <= index < start + self.dispatcher.num_local_experts
+                if (expert is not None) != owned:
+                    raise ValueError('V4.1 W4A8 requires contiguous EP expert owners')
+                if not owned:
+                    continue
+                if any(
                     weight.shape[-1] % 128
                     for weight in (expert.w1.weight, expert.w2.weight, expert.w3.weight)
                 ):
@@ -192,12 +192,15 @@ class DeepseekV41MoE(nn.Module):
 
             # Preserve w1/w2/w3 leaf owners and checkpoint/optimizer bindings.
             # Concatenation is row-wise, so group32 W quantization is unchanged.
+            # Dispatcher counts and rows are local expert-major. Keep global
+            # module slots intact for mirrored load/export and optimizer owners.
+            local = [expert for expert in self.experts if expert is not None]
             expert_rows = w4a8_experts.w4a8_expert_mlp(
                 dispatched,
-                [torch.cat((e.w1.weight, e.w3.weight)) for e in self.experts],
-                [e.w2.weight for e in self.experts],
+                [torch.cat((e.w1.weight, e.w3.weight)) for e in local],
+                [e.w2.weight for e in local],
                 counts.tolist(),
-                swiglu_limit=next(iter(self.experts)).swiglu_limit or None,
+                swiglu_limit=local[0].swiglu_limit or None,
             )
             rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_rows)
             output = w4a8_experts.topk_fma_combine(

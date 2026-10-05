@@ -162,18 +162,16 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
-    if c.w4a8_experts and (c.dtype != torch.bfloat16 or p.ep != 1 or c.use_deepep):
-        raise ValueError('V4.1 W4A8 requires BF16 residuals, EP=1 and no DeepEP')
+    if c.w4a8_experts and (c.dtype != torch.bfloat16 or c.use_deepep):
+        raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
     if c.deployment_math and (not c.w4a8_experts or not c.quantized):
         raise ValueError('Deployment math requires quantized W4A8 experts')
     if c.deployment_math and (
         c.dtype != torch.bfloat16
-        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp', 'ep'))
+        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp'))
         or c.use_deepep
     ):
-        raise ValueError(
-            'Deployment math requires BF16 and EP/TP/CP/PP=1 without DeepEP'
-        )
+        raise ValueError('Deployment math requires BF16 and TP/CP/PP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
         import megatron.lite.primitive.parallel.pp as _imports_pp
