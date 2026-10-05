@@ -330,6 +330,7 @@ class Engram(nn.Module):
         self.dim = hidden_size
         self.copies = copies
         self.eps = eps
+        self.deployment_math = False
         self.embed = embedding
         self.wkv = projection
         self.q_weight = nn.Parameter(torch.ones(copies, hidden_size))
@@ -339,6 +340,17 @@ class Engram(nn.Module):
         if hidden.ndim != 4 or hidden.shape[-2:] != (self.copies, self.dim):
             raise ValueError("Expected residual stream [B,S,HC,D]")
         kv = self.wkv(self.embed(hash_ids).flatten(-2))
+        if self.deployment_math:
+            from .deployment_math import engram_post
+
+            return engram_post(
+                hidden,
+                kv,
+                self.q_weight,
+                self.k_weight,
+                eps=self.eps,
+                token_mask=token_mask,
+            )
         key, value = kv.split([self.copies * self.dim, self.dim], -1)
         key = key.float().unflatten(-1, (self.copies, self.dim))
         h = hidden.float()

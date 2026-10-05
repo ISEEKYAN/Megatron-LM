@@ -188,6 +188,8 @@ class DeepseekV41Model(nn.Module):
             projection=partial(_FP8_LINEAR, fp8=quantized),
         )
         for index, module in memories.items():
+            module.deployment_math = deployment_math
+            module.wkv.deployment_math = deployment_math
             self.layers[index].engram = module
         self.vision = None
         self.aligner = None
@@ -359,7 +361,9 @@ class DeepseekV41Model(nn.Module):
                     hidden, hashes[:, :, self.topology[index].engram_slot], token_mask
                 )
             if self.deployment_math and layer.engram is not None:
-                raise NotImplementedError('Deployment math does not yet cover Engram')
+                # Engram consumes the already-materialized previous HC post.
+                # Do not let fused post/pre recompute and discard its injection.
+                previous_post = None
             extra = (
                 {'previous_post': previous_post}
                 if self.deployment_math and hidden.is_cuda
