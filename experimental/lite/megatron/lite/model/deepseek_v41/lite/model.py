@@ -72,7 +72,12 @@ class DeepseekV41Model(nn.Module):
         self.deployment_math = deployment_math
         self.topology = config.topology
         self.pipeline_cut = next(
-            policy.index for policy in self.topology if policy.candidate_mode == "build"
+            (
+                policy.index
+                for policy in self.topology
+                if policy.candidate_mode == "build"
+            ),
+            len(self.topology),
         )
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
@@ -444,7 +449,7 @@ class DeepseekV41Model(nn.Module):
                 packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
             )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
-        if local_end == cut:
+        if local_end == cut and cut < count:
             return {'hidden_states': stream.pack_pair(hidden, pre)}
         if self.deployment_math and hidden.is_cuda:
             from megatron.lite.primitive.modules import deployment_math
