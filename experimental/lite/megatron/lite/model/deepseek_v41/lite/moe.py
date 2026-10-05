@@ -78,7 +78,6 @@ class ModalityRouter(nn.Module):
         if image_mask.dtype != torch.bool or image_mask.numel() != x.shape[0]:
             raise ValueError("Expected one boolean image-mask entry per token")
         image_mask = image_mask.reshape(-1)
-        bias = torch.where(image_mask[:, None], self.bias_vl, self.bias)
         if self.deployment_math and x.is_cuda:
             from megatron.lite.primitive.modules import deployment_math
 
@@ -93,9 +92,23 @@ class ModalityRouter(nn.Module):
                 F.linear(x.float(), self.router.gate.weight.float())
                 / self.gate_temperature
             )
-        weights, indices = self.router.route_logits(
-            logits, expert_bias=bias, deployment_math=self.deployment_math and x.is_cuda
-        )
+        if self.deployment_math and x.is_cuda:
+            # Native top-k is row-independent; partition by selection bias while
+            # preserving original token order and the selected-score FP32 VJP.
+            weights = logits.new_empty((len(logits), self.router.topk))
+            indices = torch.empty_like(weights, dtype=torch.int64)
+            for selected, bias in (
+                (~image_mask, self.bias),
+                (image_mask, self.bias_vl),
+            ):
+                if selected.any():
+                    routed, slots = self.router.route_logits(
+                        logits[selected], expert_bias=bias, deployment_math=True
+                    )
+                    weights[selected], indices[selected] = routed, slots
+        else:
+            bias = torch.where(image_mask[:, None], self.bias_vl, self.bias)
+            weights, indices = self.router.route_logits(logits, expert_bias=bias)
         stats = reduce_modality_load(
             indices, image_mask, self.router.num_experts, self.router._aux_loss_group
         )

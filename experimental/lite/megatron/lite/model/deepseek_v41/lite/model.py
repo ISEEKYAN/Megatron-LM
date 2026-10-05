@@ -347,6 +347,12 @@ class DeepseekV41Model(nn.Module):
     ):
         start, end = self.local_layer_range
         token_mask = None if image_mask is None else ~image_mask
+        routing_mask = image_mask
+        if self.deployment_math:
+            # Native routing treats all five sentinel IDs as visual, including
+            # generated placeholders. Engram only blocks the actual image ID.
+            routing_mask = (input_ids >= 129264) & (input_ids < 129269)
+            token_mask = input_ids != 129264
         hashes = (
             sequence_hashes(self.engram_hash, input_ids, token_mask, cp_context)
             if any(start <= i < end for i in self.engram_layer_ids)
@@ -375,7 +381,7 @@ class DeepseekV41Model(nn.Module):
                 state,
                 attention_kwargs={'cp_context': cp_context},
                 ffn_kwargs={
-                    'image_mask': image_mask,
+                    'image_mask': routing_mask,
                     'load_sink': (
                         None if modality_loads is None else modality_loads[index]
                     ),
