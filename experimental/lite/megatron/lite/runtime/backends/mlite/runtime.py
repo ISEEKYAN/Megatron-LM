@@ -498,6 +498,9 @@ class MegatronLiteRuntime(RuntimeBase):
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
+                transfer_hook = handle._extras.get("post_model_device_transfer_hook")
+                if callable(transfer_hook):
+                    transfer_hook("cpu")
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
@@ -518,6 +521,9 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
+                transfer_hook = handle._extras.get("post_model_device_transfer_hook")
+                if callable(transfer_hook):
+                    transfer_hook("cuda")
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):

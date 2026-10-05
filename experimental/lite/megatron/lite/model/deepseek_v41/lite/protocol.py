@@ -234,7 +234,8 @@ def build_model(model_cfg, *, impl_cfg):
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
         model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
-    execution_model = wrap_owned_ddp(
+    wrap_execution_model = partial(
+        wrap_owned_ddp,
         model,
         ps,
         optimizing=optimizing,
@@ -246,6 +247,21 @@ def build_model(model_cfg, *, impl_cfg):
         ],
         shard_group=model.engram_group,
     )
+    forward_step = partial(
+        _forward_step, optimizer=optimizer, execution_model=wrap_execution_model()
+    )
+    transfer_extras = {}
+    if optimizing and (ps.dp_size > 1 or ps.cp_size > 1):
+
+        def post_model_device_transfer(device):
+            # Parameter device migration replaces AccumulateGrad nodes. Release
+            # the old reducer on offload and bind a fresh public DDP after load;
+            # parameter owners and the native optimizer remain unchanged.
+            forward_step.keywords['execution_model'] = (
+                model if device == 'cpu' else wrap_execution_model()
+            )
+
+        transfer_extras['post_model_device_transfer_hook'] = post_model_device_transfer
     return ModelBundle(
         [model],
         ps,
@@ -255,10 +271,9 @@ def build_model(model_cfg, *, impl_cfg):
             if optimizing and (ps.ep_size > 1 or model.engram_group is not None)
             else None
         ),
-        forward_step=partial(
-            _forward_step, optimizer=optimizer, execution_model=execution_model
-        ),
+        forward_step=forward_step,
         extras={
+            **transfer_extras,
             'model_cfg': model_cfg,
             **({'pipeline_dtype': torch.float32} if p.pp > 1 else {}),
             'vision_schedule': model.vision_schedule,
