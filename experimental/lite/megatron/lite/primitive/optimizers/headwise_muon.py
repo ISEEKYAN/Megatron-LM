@@ -7,6 +7,8 @@ from copy import deepcopy
 import torch
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 
+from . import staged_update
+
 
 def _matrix_shape(shape):
     return (
@@ -38,9 +40,9 @@ class HeadwiseMuon(torch.optim.Optimizer):
         momentum=0.95,
         update_rms=0.18,
     ):
-        from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
-            newton_schulz,
-        )
+        import emerging_optimizers.orthogonalized_optimizers.muon_utils as muon
+
+        newton_schulz = muon.newton_schulz
 
         if type(ns_steps) is not int or ns_steps < 1:
             raise ValueError('ns_steps must be a positive integer')
@@ -184,15 +186,13 @@ class HeadwiseMuon(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         self._validate_groups()
 
-    from .staged_update import (
-        _idle,
-        _validate_momentum,
-        candidates,
-        commit_step,
-        discard_step,
-        state_dict,
-        step,
-    )
+    _idle = staged_update._idle
+    _validate_momentum = staged_update._validate_momentum
+    candidates = staged_update.candidates
+    commit_step = staged_update.commit_step
+    discard_step = staged_update.discard_step
+    state_dict = staged_update.state_dict
+    step = staged_update.step
 
 
 class MixedOptimizer:
@@ -366,7 +366,9 @@ class MixedOptimizer:
         empty state. This is an explicit post-training transition, not an
         automatic pretraining unfreeze or LR schedule.
         """
-        from megatron.lite.primitive.modules.vision_training import VisionTrainability
+        from megatron.lite.primitive.modules import vision_training
+
+        VisionTrainability = vision_training.VisionTrainability
 
         if not isinstance(mask, VisionTrainability):
             raise TypeError('Expected explicit visual trainability mask')
@@ -542,6 +544,41 @@ class MixedOptimizer:
                     backend.discard_step()
             for p, grad, main in original:
                 p.grad, p.main_grad = grad, main
+
+    def _move_state(self, device):
+        self._validate_trainability()
+        if any(
+            getattr(backend, '_prepared', None) is not None
+            for backend in self.optimizers
+        ):
+            raise RuntimeError('Cannot migrate a prepared optimizer step')
+        for backend in self.optimizers:
+            cpu_steps = {
+                id(parameter)
+                for group in backend.param_groups
+                if isinstance(backend, torch.optim.AdamW)
+                and not group.get('capturable', False)
+                and not group.get('fused', False)
+                for parameter in group['params']
+            }
+            for parameter, state in backend.state.items():
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        target = (
+                            'cpu'
+                            if device == 'cpu'
+                            or (key == 'step' and id(parameter) in cpu_steps)
+                            else parameter.device
+                        )
+                        state[key] = value.to(target)
+
+    def offload_state_to_cpu(self):
+        """Move published state to CPU without changing masters or gradients."""
+        self._move_state('cpu')
+
+    def load_state_to_device(self):
+        """Restore state beside each owner, retaining AdamW CPU step counters."""
+        self._move_state(None)
 
     def state_dict(self):
         self._validate_trainability()
