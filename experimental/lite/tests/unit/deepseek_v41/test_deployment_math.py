@@ -1,5 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Visible CUDA math is explicit; its reference VJP owns FP32 master gradients."""
+import importlib
+
 import pytest
 import torch
 
@@ -142,3 +144,38 @@ def test_qkv_norm_native_forward_fp32_vjp_and_process_state(width):
         assert torch.equal(got, wanted)
     assert actual[1].dtype == torch.float32
     assert not torch.equal(actual[1], actual[1].bfloat16().float())
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA deployment router')
+@pytest.mark.parametrize('experts', (256, 384))
+@pytest.mark.parametrize('tokens', (1, 7, 65))
+def test_release_router_matches_native_dispatch_and_owned_vjp(experts, tokens):
+    from megatron.lite.primitive.modules.deployment_math import router_topk
+
+    native = importlib.import_module(
+        'vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router'
+    )
+
+    torch.manual_seed(1429)
+    logits = torch.randn(tokens, experts, device='cuda', requires_grad=True)
+    bias = torch.linspace(-0.07, 0.04, experts, device='cuda')
+    incoming = torch.randn(tokens, 6, device='cuda')
+    weights, indices = router_topk(logits, bias, topk=6, scaling_factor=1.5)
+    expected_weights, expected_indices = native.fused_topk_bias(
+        torch.empty(tokens, 32, device='cuda', dtype=torch.bfloat16),
+        logits.detach(),
+        'sqrtsoftplus',
+        bias,
+        6,
+        True,
+        indices_type=torch.int32,
+        routed_scaling_factor=1.5,
+    )
+    assert torch.equal(weights, expected_weights)
+    assert torch.equal(indices, expected_indices.long())
+    weights.backward(incoming)
+    leaf = logits.detach().clone().requires_grad_()
+    selected = torch.nn.functional.softplus(leaf).sqrt().gather(1, indices)
+    (selected / selected.sum(-1, keepdim=True) * 1.5).backward(incoming)
+    assert logits.grad.dtype == torch.float32
+    assert torch.equal(logits.grad, leaf.grad)

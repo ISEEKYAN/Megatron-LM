@@ -75,16 +75,27 @@ def router_topk(logits, bias, *, topk, scaling_factor):
     def visible(x):
         from vllm import _custom_ops as ops
 
+        kernels = importlib.import_module(
+            'vllm.model_executor.layers.fused_moe.router.dsv4_topk'
+        )
+
+        scores, correction = x.contiguous(), bias.contiguous()
+        if kernels.can_use_dsv4_topk(scores, correction, topk, True, indices.dtype):
+            weights, selected = kernels.dsv4_topk(
+                scores, correction, indices.dtype, scaling_factor
+            )
+            indices.copy_(selected)
+            return weights
         weights = torch.empty_like(indices, dtype=torch.float32)
         token_expert_indices = torch.empty_like(indices)
         ops.topk_hash_softplus_sqrt(
             weights,
             indices,
             token_expert_indices,
-            x.contiguous(),
+            scores,
             renormalize=True,
             routed_scaling_factor=scaling_factor,
-            e_score_correction_bias=bias.contiguous(),
+            e_score_correction_bias=correction,
         )
         return weights
 
