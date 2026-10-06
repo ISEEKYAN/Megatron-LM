@@ -7,28 +7,20 @@ from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass, field, replace
 from functools import partial
 
+import megatron.lite.model.protocol_utils as _imports_protocol_utils
+import megatron.lite.primitive.modules.router_replay as _imports_router_replay
+import megatron.lite.primitive.modules.vision_training as _imports_vision_training
+import megatron.lite.primitive.ops.linear_cross_entropy as _imports_linear_cross_entropy
+import megatron.lite.primitive.parallel.state as _imports_state
 import torch
 from megatron.lite.model import protocol_utils as _protocol_utils
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.protocol_utils import (
-    pack_r3_replay_mask as _pack_r3_replay_mask,
-)
-from megatron.lite.model.protocol_utils import (
-    pack_routed_experts as _pack_routed_experts,
-)
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config_fields import project_fields
-from megatron.lite.primitive.modules.router_replay import (
-    RouterReplay,
-    RouterReplayAction,
-)
-from megatron.lite.primitive.modules.vision_training import (
-    VisionSchedule,
-    VisionTrainability,
-)
-from megatron.lite.primitive.ops.linear_cross_entropy import linear_cross_entropy
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
-from megatron.lite.primitive.parallel.state import ParallelState, init_parallel
+
+ParallelState = _imports_state.ParallelState
+init_parallel = _imports_state.init_parallel
 from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
 from megatron.lite.primitive.train_step import prepare_microbatches
 from megatron.lite.runtime.contracts import ParallelConfig
@@ -37,6 +29,14 @@ from megatron.lite.runtime.contracts.loss import get_loss_context
 from .checkpoint import export_hf_weights as _export_hf_weights_impl
 from .checkpoint import load_model, save_model
 from .optimizer_groups import OptimizerConfig, V41Optimizer
+
+_pack_r3_replay_mask = _imports_protocol_utils.pack_r3_replay_mask
+_pack_routed_experts = _imports_protocol_utils.pack_routed_experts
+RouterReplay = _imports_router_replay.RouterReplay
+RouterReplayAction = _imports_router_replay.RouterReplayAction
+VisionSchedule = _imports_vision_training.VisionSchedule
+VisionTrainability = _imports_vision_training.VisionTrainability
+linear_cross_entropy = _imports_linear_cross_entropy.linear_cross_entropy
 
 # HF checkpoints store trainable masters and byte-preserved archives.
 
@@ -49,6 +49,8 @@ class ImplConfig:
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
+    w4a8_experts: bool = False
+    deployment_math: bool = False
     use_deepep: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
@@ -163,9 +165,21 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
+    if c.w4a8_experts and (c.dtype != torch.bfloat16 or c.use_deepep):
+        raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
+    if c.deployment_math and (not c.w4a8_experts or not c.quantized):
+        raise ValueError('Deployment math requires quantized W4A8 experts')
+    if c.deployment_math and (
+        c.dtype != torch.bfloat16
+        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp'))
+        or c.use_deepep
+    ):
+        raise ValueError('Deployment math requires BF16 and TP/CP/PP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
-        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+        import megatron.lite.primitive.parallel.pp as _imports_pp
+
+        build_pipeline_chunk_layout = _imports_pp.build_pipeline_chunk_layout
 
         cut = impl_cfg.pipeline_split_layer
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
@@ -180,14 +194,16 @@ def build_model(model_cfg, *, impl_cfg):
             layer_range=layer_range,
             **project_fields(
                 vars(c),
-                'token_map quantized use_deepep trainable_engram shard_engram '
+                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )
     model.pipeline_residual_dtype = impl_cfg.dtype
+    import megatron.lite.primitive.modules.native_fp32_linear as _imports_native_fp32_linear
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
-    from megatron.lite.primitive.modules.native_fp32_linear import (
-        configure_residual_projections,
+
+    configure_residual_projections = (
+        _imports_native_fp32_linear.configure_residual_projections
     )
 
     optimizing = impl_cfg.optimizer == 'muon'
@@ -560,7 +576,9 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
     cp_context = None
     ids = batch.input_ids[None]
     if model.ps.cp_size > 1:
-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+        import megatron.lite.primitive.modules.attention.cp as _imports_cp
+
+        ContiguousCPSequence = _imports_cp.ContiguousCPSequence
 
         if (
             modality

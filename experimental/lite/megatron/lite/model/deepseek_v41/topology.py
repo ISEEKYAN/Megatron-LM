@@ -12,6 +12,7 @@ class TopologySpec:
     compress_ratios: tuple[int, ...] = (0, 0) + (2,) * 18 + (1,) * 20 + (0,) * 3
     kv_source_layer_ids: tuple[int, ...] = (2, 8, 14, 20)
     index_source_layer_ids: tuple[int, ...] = (2, 8, 14, 20, 24, 28, 32, 36)
+    # -1 closes a text prefix before the candidate publisher; no ratio-1 reuse.
     candidate_source_layer_id: int = 20
     engram_layer_ids: tuple[int, ...] = (1, 14)
     engram_num_embeddings: tuple[int, ...] = (384006168, 384016682)
@@ -64,7 +65,10 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
         if not spec.compress_ratios[source]:
             raise ValueError("attention source cannot be uncompressed")
     candidate = spec.candidate_source_layer_id
-    if (
+    disabled_candidate = type(candidate) is int and candidate == -1
+    if disabled_candidate and 1 in spec.compress_ratios[:n]:
+        raise ValueError("disabled candidate prefix cannot contain ratio 1")
+    if not disabled_candidate and (
         type(candidate) is not int
         or candidate not in spec.kv_source_layer_ids
         or candidate not in spec.index_source_layer_ids
@@ -87,7 +91,11 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
                 raise ValueError(f"layer {i} has no index owner")
             if any(spec.compress_ratios[o] != ratio for o in (kv_owner, index_owner)):
                 raise ValueError(f"layer {i} disagrees with its owner ratio")
-        mode = "none" if i < candidate else "build" if i == candidate else "reuse"
+        mode = (
+            "none"
+            if disabled_candidate or i < candidate
+            else "build" if i == candidate else "reuse"
+        )
         policies.append(
             LayerPolicy(
                 i,

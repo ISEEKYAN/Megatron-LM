@@ -8,32 +8,39 @@ The floating diagnostic mode is explicit; it is not native quantized parity.
 from functools import partial
 from types import SimpleNamespace
 
+import megatron.lite.primitive.modules.attention.csa as attention_primitives
 import torch
 from megatron.lite.primitive.config_fields import project_fields
 from megatron.lite.primitive.modules import engram_lookup as memory
 from megatron.lite.primitive.modules import paired_stream as stream
+from megatron.lite.primitive.modules import row_memory_build as row_memories
 from megatron.lite.primitive.modules import vision_training as visual
-from megatron.lite.primitive.modules.attention.csa import (
-    AttentionState,
-    CompressedSparseAttention,
-    Linear,
-)
 from megatron.lite.primitive.modules.image_data import validate_image_spans
 from megatron.lite.primitive.modules.mlp import SwiGLUMLP
 from megatron.lite.primitive.modules.native_fp32_linear import FP4Linear
-from megatron.lite.primitive.modules.row_memory_build import (
-    build_row_memories,
-    sequence_hashes,
-)
 from megatron.lite.primitive.modules.vision import Aligner, ViT
 from megatron.lite.primitive.parallel.state import ParallelState
 from megatron.lite.primitive.utils import ensure_divisible
 from torch import nn
 
 from ..codecs import CODECS, attention_codecs
-from .block import DeepseekV41Block, RMSNorm, contract_hc, expand_hc
-from .checkpoint import DeferredModule, Rule, TensorBinding, validate_execution
+from . import block as block_primitives
+from . import checkpoint as checkpoint_primitives
 from .moe import DeepseekV41MoE, ModalityRouter
+
+DeferredModule = checkpoint_primitives.DeferredModule
+Rule = checkpoint_primitives.Rule
+TensorBinding = checkpoint_primitives.TensorBinding
+validate_execution = checkpoint_primitives.validate_execution
+DeepseekV41Block = block_primitives.DeepseekV41Block
+RMSNorm = block_primitives.RMSNorm
+contract_hc = block_primitives.contract_hc
+expand_hc = block_primitives.expand_hc
+AttentionState = attention_primitives.AttentionState
+CompressedSparseAttention = attention_primitives.CompressedSparseAttention
+Linear = attention_primitives.Linear
+build_row_memories = row_memories.build_row_memories
+sequence_hashes = row_memories.sequence_hashes
 
 _FP8_LINEAR = partial(Linear, fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")])
 
@@ -46,6 +53,8 @@ class DeepseekV41Model(nn.Module):
         *,
         token_map=None,
         quantized=True,
+        w4a8_experts=False,
+        deployment_math=False,
         use_deepep=False,
         trainable_engram=False,
         shard_engram=True,
@@ -56,11 +65,19 @@ class DeepseekV41Model(nn.Module):
         parallel_state=None,
     ):
         nn.Module.__init__(self)
+        if deployment_math and (not w4a8_experts or not quantized):
+            raise ValueError('Deployment math requires quantized W4A8 experts')
         validate_execution(enable_dspark_execution=enable_dspark_execution)
         self.config = config
+        self.deployment_math = deployment_math
         self.topology = config.topology
         self.pipeline_cut = next(
-            policy.index for policy in self.topology if policy.candidate_mode == "build"
+            (
+                policy.index
+                for policy in self.topology
+                if policy.candidate_mode == "build"
+            ),
+            len(self.topology),
         )
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
@@ -84,6 +101,7 @@ class DeepseekV41Model(nn.Module):
             self.embed = nn.Embedding(t.vocab_size, dim, dtype=torch.bfloat16)
         if end == count:
             self.norm = RMSNorm(dim, eps)
+            self.norm.deployment_math = deployment_math
             self.head = nn.Linear(dim, t.vocab_size, bias=False, dtype=torch.float32)
         self.layers = nn.ModuleList([None] * count)
         ac = config.attention_config(
@@ -102,12 +120,19 @@ class DeepseekV41Model(nn.Module):
                 ),
                 codecs=attention_codecs(),
             )
+            attention.deployment_math = deployment_math
+            if attention.compressor is not None:
+                attention.compressor.deployment_math = deployment_math
+            for norm in attention.modules():
+                if isinstance(norm, RMSNorm):
+                    norm.deployment_math = deployment_math
             router = ModalityRouter(
                 t,
                 SimpleNamespace(tp_size=1),
                 gate_temperature=gate_temperature,
                 bias_rate=bias_rate,
             )
+            router.deployment_math = deployment_math
             experts = [
                 (
                     self._expert(t, quantized, shared=False)
@@ -119,8 +144,15 @@ class DeepseekV41Model(nn.Module):
             shared = (
                 self._expert(t, quantized, shared=True) if t.n_shared_experts else None
             )
+            if shared is not None:
+                shared.deployment_math = deployment_math
             ffn = DeepseekV41MoE(
-                router, experts, shared, ps=self.ps, use_deepep=use_deepep
+                router,
+                experts,
+                shared,
+                ps=self.ps,
+                use_deepep=use_deepep,
+                w4a8=w4a8_experts,
             )
             block = DeepseekV41Block(
                 dim,
@@ -131,6 +163,11 @@ class DeepseekV41Model(nn.Module):
                 hc_eps=t.hc_eps,
                 iterations=t.hc_sinkhorn_iters,
             )
+            block.attn_norm.deployment_math = deployment_math
+            block.ffn_norm.deployment_math = deployment_math
+            block.attn_mixes.deployment_math = deployment_math
+            block.attn_mixes.broadcast_projection = layer_id == 0
+            block.ffn_mixes.deployment_math = deployment_math
             block.engram = None
             self.layers[layer_id] = block
         self.engram_layer_ids = tuple(t.engram_layer_ids)
@@ -151,6 +188,8 @@ class DeepseekV41Model(nn.Module):
             projection=partial(_FP8_LINEAR, fp8=quantized),
         )
         for index, module in memories.items():
+            module.deployment_math = deployment_math
+            module.wkv.deployment_math = deployment_math
             self.layers[index].engram = module
         self.vision = None
         self.aligner = None
@@ -308,30 +347,50 @@ class DeepseekV41Model(nn.Module):
     ):
         start, end = self.local_layer_range
         token_mask = None if image_mask is None else ~image_mask
+        routing_mask = image_mask
+        if self.deployment_math:
+            # Native routing treats all five sentinel IDs as visual, including
+            # generated placeholders. Engram only blocks the actual image ID.
+            routing_mask = (input_ids >= 129264) & (input_ids < 129269)
+            token_mask = input_ids != 129264
         hashes = (
             sequence_hashes(self.engram_hash, input_ids, token_mask, cp_context)
             if any(start <= i < end for i in self.engram_layer_ids)
             else None
         )
         state = AttentionState()
+        previous_post = None
         for index in range(start, end):
             layer = self.layers[index]
             if layer.engram is not None:
                 hidden = layer.engram(
                     hidden, hashes[:, :, self.topology[index].engram_slot], token_mask
                 )
-            hidden, pre, state = layer.forward(
+            if self.deployment_math and layer.engram is not None:
+                # Engram consumes the already-materialized previous HC post.
+                # Do not let fused post/pre recompute and discard its injection.
+                previous_post = None
+            extra = (
+                {'previous_post': previous_post}
+                if self.deployment_math and hidden.is_cuda
+                else {}
+            )
+            result = layer.forward(
                 hidden,
                 pre,
                 state,
                 attention_kwargs={'cp_context': cp_context},
                 ffn_kwargs={
-                    'image_mask': image_mask,
+                    'image_mask': routing_mask,
                     'load_sink': (
                         None if modality_loads is None else modality_loads[index]
                     ),
                 },
+                **extra,
             )
+            hidden, pre, state = result[:3]
+            if extra:
+                previous_post = result[3]
         return hidden, pre
 
     def set_input_tensor(self, input_tensor):
@@ -354,6 +413,8 @@ class DeepseekV41Model(nn.Module):
         cp_context=None,
         return_head_hidden=False,
     ):
+        if self.deployment_math and images is not None:
+            raise NotImplementedError('Deployment math is text-only')
         from .protocol import packed_paired_forward as packed_forward
 
         local_start, local_end = self.local_layer_range
@@ -398,9 +459,36 @@ class DeepseekV41Model(nn.Module):
                 packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
             )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
-        if local_end == cut:
+        if local_end == cut and cut < count:
             return {'hidden_states': stream.pack_pair(hidden, pre)}
-        head_hidden = self.norm(contract_hc(hidden, pre)).float()
+        if self.deployment_math and hidden.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            collapsed = deployment_math.rms_norm(
+                deployment_math.hc_collapse(hidden, pre),
+                self.norm.weight,
+                self.norm.normalized_shape,
+                self.norm.eps,
+            )
+        else:
+            collapsed = self.norm(contract_hc(hidden, pre))
+        head_hidden = collapsed.float()
+        if self.deployment_math and collapsed.is_cuda:
+            if return_head_hidden:
+                raise NotImplementedError(
+                    'Deployment math uses the owned head forward, not an external fused head'
+                )
+            from megatron.lite.primitive.modules import deployment_math
+
+            result = {
+                'logits': deployment_math.bf16_fp32_linear(
+                    collapsed, self.head.weight, persistent=False
+                )
+            }
+            if loads is not None:
+                result['modality_loads'] = tuple(tuple(entries) for entries in loads)
+            return result
+
         result = (
             {
                 'head_hidden': head_hidden,
@@ -429,9 +517,9 @@ class DeepseekV41Model(nn.Module):
             if b.role != 'scale' and isinstance(b.tensor, nn.Parameter)
         )
 
-    from megatron.lite.primitive.ckpt.binding_records import (
-        _bind,
-        bind_rules,
-        initialize_bindings,
-        validate_parameter_bindings,
-    )
+    from megatron.lite.primitive.ckpt import binding_records
+
+    _bind = binding_records._bind
+    bind_rules = binding_records.bind_rules
+    initialize_bindings = binding_records.initialize_bindings
+    validate_parameter_bindings = binding_records.validate_parameter_bindings
