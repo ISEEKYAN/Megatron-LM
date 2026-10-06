@@ -16,9 +16,9 @@ def test_deployment_q_rope_native_and_vjp(v41_core_te, ratio):
         pytest.skip('CUDA native RoPE')
     from megatron.lite.primitive.modules.attention.csa import rotate
     from vllm.config import VllmConfig, set_current_vllm_config
-    from vllm.model_executor.layers.rotary_embedding.deepseek_scaling_rope import (
-        DeepseekV4ScalingRotaryEmbedding,
-    )
+    from vllm.model_executor.layers import rotary_embedding
+
+    rope_module = rotary_embedding.deepseek_scaling_rope
 
     config = SimpleNamespace(
         rope_dim=64,
@@ -31,7 +31,7 @@ def test_deployment_q_rope_native_and_vjp(v41_core_te, ratio):
     )
     with set_current_vllm_config(VllmConfig()), torch.device('cuda'):
         if ratio:
-            rope = DeepseekV4ScalingRotaryEmbedding(
+            rope = rope_module.DeepseekV4ScalingRotaryEmbedding(
                 512,
                 64,
                 65536,
