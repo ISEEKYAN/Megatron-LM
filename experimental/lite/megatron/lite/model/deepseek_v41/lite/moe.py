@@ -45,7 +45,6 @@ class ModalityRouter(nn.Module):
         if gate_temperature <= 0 or bias_rate < 0:
             raise ValueError("Require positive temperature and nonnegative bias rate")
         self.router = SigmoidTopKRouter(config, ps, compute_aux_loss=False)
-        self.deployment_math = False
         self.gate_temperature = gate_temperature
         self.bias_rate = bias_rate
         self.world_size = max(
@@ -78,37 +77,11 @@ class ModalityRouter(nn.Module):
         if image_mask.dtype != torch.bool or image_mask.numel() != x.shape[0]:
             raise ValueError("Expected one boolean image-mask entry per token")
         image_mask = image_mask.reshape(-1)
-        if self.deployment_math and x.is_cuda:
-            from megatron.lite.primitive.modules import deployment_math
-
-            logits = (
-                deployment_math.bf16_fp32_linear(
-                    x, self.router.gate.weight, persistent=True
-                )
-                / self.gate_temperature
-            )
-        else:
-            logits = (
-                F.linear(x.float(), self.router.gate.weight.float())
-                / self.gate_temperature
-            )
-        if self.deployment_math and x.is_cuda:
-            # Native top-k is row-independent; partition by selection bias while
-            # preserving original token order and the selected-score FP32 VJP.
-            weights = logits.new_empty((len(logits), self.router.topk))
-            indices = torch.empty_like(weights, dtype=torch.int64)
-            for selected, bias in (
-                (~image_mask, self.bias),
-                (image_mask, self.bias_vl),
-            ):
-                if selected.any():
-                    routed, slots = self.router.route_logits(
-                        logits[selected], expert_bias=bias, deployment_math=True
-                    )
-                    weights[selected], indices[selected] = routed, slots
-        else:
-            bias = torch.where(image_mask[:, None], self.bias_vl, self.bias)
-            weights, indices = self.router.route_logits(logits, expert_bias=bias)
+        bias = torch.where(image_mask[:, None], self.bias_vl, self.bias)
+        logits = (
+            F.linear(x.float(), self.router.gate.weight.float()) / self.gate_temperature
+        )
+        weights, indices = self.router.route_logits(logits, expert_bias=bias)
         stats = reduce_modality_load(
             indices, image_mask, self.router.num_experts, self.router._aux_loss_group
         )
@@ -145,20 +118,12 @@ class DeepseekV41MoE(nn.Module):
     """Global expert slots with local owners and primitive token transport."""
 
     def __init__(
-        self,
-        router,
-        experts,
-        shared_experts=None,
-        *,
-        ps=None,
-        use_deepep=False,
-        w4a8=False,
+        self, router, experts, shared_experts=None, *, ps=None, use_deepep=False
     ):
         super().__init__()
         self.gate = router
         self.experts = Experts.from_modules(experts)
         self.shared_experts = shared_experts
-        self.w4a8 = w4a8
         from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
         from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -178,49 +143,12 @@ class DeepseekV41MoE(nn.Module):
             )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
-        if w4a8:
-            if use_deepep or self.dispatcher.moe_permute_fusion:
-                raise ValueError('V4.1 W4A8 requires unfused dispatch and no DeepEP')
-            start = self.dispatcher.ps.ep_rank * self.dispatcher.num_local_experts
-            for index, expert in enumerate(self.experts):
-                owned = start <= index < start + self.dispatcher.num_local_experts
-                if (expert is not None) != owned:
-                    raise ValueError('V4.1 W4A8 requires contiguous EP expert owners')
-                if not owned:
-                    continue
-                if any(
-                    weight.shape[-1] % 128
-                    for weight in (expert.w1.weight, expert.w2.weight, expert.w3.weight)
-                ):
-                    raise ValueError(
-                        'V4.1 W4A8 expert K dimensions must be divisible by 128'
-                    )
 
     def forward(self, x, *, image_mask=None, load_sink=None):
         flat = x.reshape(-1, x.shape[-1])
         weights, indices, stats = self.gate(flat, image_mask)
         dispatched, counts, scores = self.dispatcher.dispatch(flat, weights, indices)
-        if self.w4a8:
-            from megatron.lite.primitive.quantization import w4a8_experts
-
-            # Preserve w1/w2/w3 leaf owners and checkpoint/optimizer bindings.
-            # Concatenation is row-wise, so group32 W quantization is unchanged.
-            # Dispatcher counts and rows are local expert-major. Keep global
-            # module slots intact for mirrored load/export and optimizer owners.
-            local = [expert for expert in self.experts if expert is not None]
-            expert_rows = w4a8_experts.w4a8_expert_mlp(
-                dispatched,
-                [torch.cat((e.w1.weight, e.w3.weight)) for e in local],
-                [e.w2.weight for e in local],
-                counts.tolist(),
-                swiglu_limit=local[0].swiglu_limit or None,
-            )
-            rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_rows)
-            output = w4a8_experts.topk_fma_combine(
-                rows, row_token, row_expert, indices, weights
-            )
-        else:
-            output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
+        output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
         if self.shared_experts is not None:
             output = output + self.shared_experts(flat)
         output = output.reshape_as(x)

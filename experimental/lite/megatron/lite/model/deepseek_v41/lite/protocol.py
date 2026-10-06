@@ -49,8 +49,6 @@ class ImplConfig:
     device: str = 'cuda'
     dtype: torch.dtype = torch.bfloat16
     quantized: bool = True
-    w4a8_experts: bool = False
-    deployment_math: bool = False
     use_deepep: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
@@ -165,21 +163,9 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
-    if c.w4a8_experts and (c.dtype != torch.bfloat16 or c.use_deepep):
-        raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
-    if c.deployment_math and (not c.w4a8_experts or not c.quantized):
-        raise ValueError('Deployment math requires quantized W4A8 experts')
-    if c.deployment_math and (
-        c.dtype != torch.bfloat16
-        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp'))
-        or c.use_deepep
-    ):
-        raise ValueError('Deployment math requires BF16 and TP/CP/PP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
-        import megatron.lite.primitive.parallel.pp as _imports_pp
-
-        build_pipeline_chunk_layout = _imports_pp.build_pipeline_chunk_layout
+        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
 
         cut = impl_cfg.pipeline_split_layer
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
@@ -194,7 +180,7 @@ def build_model(model_cfg, *, impl_cfg):
             layer_range=layer_range,
             **project_fields(
                 vars(c),
-                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
+                'token_map quantized use_deepep trainable_engram shard_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )
@@ -576,9 +562,7 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
     cp_context = None
     ids = batch.input_ids[None]
     if model.ps.cp_size > 1:
-        import megatron.lite.primitive.modules.attention.cp as _imports_cp
-
-        ContiguousCPSequence = _imports_cp.ContiguousCPSequence
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
 
         if (
             modality
