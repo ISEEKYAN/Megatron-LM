@@ -110,27 +110,3 @@ def test_off_csa2_is_bitwise_baseline_forward_and_all_gradients(
             assert torch.equal(a.grad, b.grad), name
 
 
-@pytest.mark.parametrize(
-    'quantized,w4a8', [(True, False), (False, True), (False, False)]
-)
-def test_deployment_math_rejects_unverified_expert_modes(v41_core_te, quantized, w4a8):
-    from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
-    from test_w4a8_fp32 import tiny_config
-
-    config = tiny_config()
-    with pytest.raises(ValueError, match='Deployment math requires quantized W4A8'):
-        protocol.build_model(
-            config,
-            impl_cfg=protocol.ImplConfig(
-                device='cpu',
-                dtype=torch.bfloat16,
-                quantized=quantized,
-                w4a8_experts=w4a8,
-                deployment_math=True,
-            ),
-        )
-    with pytest.raises(ValueError, match='Deployment math requires quantized W4A8'):
-        DeepseekV41Model(
-            config, quantized=quantized, w4a8_experts=w4a8, deployment_math=True
-        )

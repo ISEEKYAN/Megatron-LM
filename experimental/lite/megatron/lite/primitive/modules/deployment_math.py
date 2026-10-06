@@ -3,8 +3,10 @@
 
 The DS41 EP1 precision recipe selects these explicitly. They consume live
 parameters, never rollout model objects or recorded outputs. CUDA forward
-requires vLLM's generic mHC/FlashMLA kernel package; no rollout, receiver or
-legacy batch_invariant module is imported. Reference VJPs retain FP32 leaves.
+requires vLLM kernel providers. It never constructs a rollout or receiver.
+Persistent GEMM and RMS lazily import determinism.batch_invariant kernels;
+legacy layers.batch_invariant initialization is not imported.
+Reference VJPs retain FP32 leaves.
 Higher order derivatives are not supported.
 """
 import importlib
@@ -578,27 +580,6 @@ def compressor(x, wkv, wgate, gamma, ratio, eps):
         ).bfloat16()
 
     return visible_forward(visible, reference, raw, gamma)
-
-
-def log_softmax(logits):
-    """Fixed-row CUDA log probabilities with an owned FP32 logsumexp VJP.
-
-    The input is the materialized model-owned head output. No projection or
-    quantizer is repeated here. CPU uses the ordinary Torch implementation.
-    """
-    if not logits.is_cuda:
-        return torch.log_softmax(logits.float(), dim=-1)
-
-    def visible(x):
-        from vllm.model_executor.determinism.batch_invariant import log_softmax
-
-        return log_softmax(x.float(), dim=-1)
-
-    def reference(x):
-        value = x.float()
-        return value - torch.logsumexp(value, dim=-1, keepdim=True)
-
-    return visible_forward(visible, reference, logits)
 
 
 def engram_reference(hidden, kv, query, key, *, eps, token_mask=None):
