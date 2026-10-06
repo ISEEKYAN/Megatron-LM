@@ -45,44 +45,34 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from typing import Any
 
-import torch
-import torch.nn as nn
-import torch.nn.utils.parametrize as parametrize
-
 # MXFP4 numerics live in one place (see that module's docstring): the scale rule
 # and the element rounding are defined to be bit-identical to the ModelOpt
 # quantizer the rollout actually runs, so the error QAT compensates during
 # training is the error deployment actually makes.
-from megatron.lite.primitive.quantization.mxfp4 import (
-    E2M1_LEVELS as _E2M1_LEVELS,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    E2M1_MAX as _E2M1_MAX,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    E8M0_BIAS as _E8M0_BIAS,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    MXFP4_BLOCK_SIZE as _MXFP4_BLOCK,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    e2m1_round_index as _e2m1_round_index,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    mx_shared_scale as _mx_shared_scale,
-)
-from megatron.lite.primitive.quantization.mxfp4 import (
-    mx_shared_scale_exponent as _mx_shared_scale_exponent,
-)
+import megatron.lite.primitive.quantization.mxfp4 as _imports_mxfp4
+import torch
+import torch.nn as nn
+import torch.nn.utils.parametrize as parametrize
+
+_E2M1_LEVELS = _imports_mxfp4.E2M1_LEVELS
+import megatron.lite.primitive.quantization.mxfp4 as _imports_mxfp4
+from megatron.lite.primitive.quantization.mxfp4 import E2M1_MAX as _E2M1_MAX
+from megatron.lite.primitive.quantization.mxfp4 import E8M0_BIAS as _E8M0_BIAS
+
+_MXFP4_BLOCK = _imports_mxfp4.MXFP4_BLOCK_SIZE
+import megatron.lite.primitive.quantization.mxfp4 as _imports_mxfp4
+
+_e2m1_round_index = _imports_mxfp4.e2m1_round_index
+import megatron.lite.primitive.quantization.mxfp4 as _imports_mxfp4
+
+_mx_shared_scale = _imports_mxfp4.mx_shared_scale
+import megatron.lite.primitive.quantization.mxfp4 as _imports_mxfp4
+
+_mx_shared_scale_exponent = _imports_mxfp4.mx_shared_scale_exponent
 
 # Supported formats -> nominal bit-width. Free-form strings are rejected; every
 # enum must map to an exact quant/dequant contract.
-_FORMAT_BITS: dict[str, int] = {
-    "int8": 8,
-    "int4": 4,
-    "fp8_e4m3": 8,
-    "mxfp4": 4,
-}
+_FORMAT_BITS: dict[str, int] = {"int8": 8, "int4": 4, "fp8_e4m3": 8, "mxfp4": 4}
 
 # Canonicalising aliases accepted from configs.
 _FORMAT_ALIASES: dict[str, str] = {"fp8": "fp8_e4m3"}
@@ -172,9 +162,7 @@ class QATSpec:
             object.__setattr__(self, "format", canonical)
         if self.group_size is None:
             object.__setattr__(
-                self,
-                "group_size",
-                _MXFP4_BLOCK if canonical == "mxfp4" else 0,
+                self, "group_size", _MXFP4_BLOCK if canonical == "mxfp4" else 0
             )
         if not self.enabled:
             return
@@ -635,8 +623,7 @@ def _compute_amax_tensor(weight: torch.Tensor, group_size: int) -> torch.Tensor:
     """Per-tensor or per-expert amax for 2D ``[out, in]`` or 3D ``[E, out, in]`` weights."""
     if weight.dim() == 3:
         return torch.stack(
-            [compute_amax(weight[i], group_size) for i in range(weight.shape[0])],
-            dim=0,
+            [compute_amax(weight[i], group_size) for i in range(weight.shape[0])], dim=0
         )
     if weight.dim() != 2:
         raise ValueError(

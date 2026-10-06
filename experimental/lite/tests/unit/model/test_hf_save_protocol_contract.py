@@ -68,7 +68,9 @@ def test_registered_protocol_honors_engine_export_kwargs(
         calls.append((args, kwargs))
 
     if runtime_name == "deepseek_v41":
-        from megatron.lite.model.deepseek_v41.lite.resync import decoded_weights
+        import megatron.lite.model.deepseek_v41.lite.resync as _imports_resync
+
+        decoded_weights = _imports_resync.decoded_weights
         from megatron.lite.primitive.ckpt import hf_weights
 
         tensor = torch.ones(2, dtype=torch.bfloat16)

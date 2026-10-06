@@ -42,9 +42,9 @@ compute_local_shape_and_global_offset = (
     _imports__utils.compute_local_shape_and_global_offset
 )
 
-from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
-    get_weight_sync_probe,
-)
+import megatron.lite.primitive.ckpt.weight_sync_probe as _imports_weight_sync_probe
+
+get_weight_sync_probe = _imports_weight_sync_probe.get_weight_sync_probe
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -1125,9 +1125,9 @@ def load_hf_weights(
                         if vocab_size is not None and (
                             "embed" in mapped or "head" in mapped
                         ):
-                            from megatron.lite.primitive.parallel import (  # isort: skip
-                                pad_vocab_for_tp,
-                            )
+                            import megatron.lite.primitive.parallel as _imports_parallel
+
+                            pad_vocab_for_tp = _imports_parallel.pad_vocab_for_tp
 
                             padded = pad_vocab_for_tp(vocab_size, ps.tp_size)
                             if tensor.size(0) < padded:

@@ -3,20 +3,23 @@
 from dataclasses import replace
 from functools import partial
 
+import megatron.lite.primitive.ckpt.binding_records as _imports_binding_records
 import torch
-from megatron.lite.primitive.ckpt.binding_records import (
-    DeferredModule,
-    Rule,
-    TensorBinding,
-)
-from megatron.lite.primitive.ckpt.hf_weights import (
-    export_checkpoint as _export_checkpoint,
-)
-from megatron.lite.primitive.ckpt.hf_weights import load_bound_model, save_bound_model
-from megatron.lite.primitive.modules.engram_lookup import (
-    EngramTable,
-    ShardedEngramTable,
-)
+
+DeferredModule = _imports_binding_records.DeferredModule
+Rule = _imports_binding_records.Rule
+TensorBinding = _imports_binding_records.TensorBinding
+import megatron.lite.primitive.ckpt.hf_weights as _imports_hf_weights
+
+_export_checkpoint = _imports_hf_weights.export_checkpoint
+import megatron.lite.primitive.ckpt.hf_weights as _imports_hf_weights
+
+load_bound_model = _imports_hf_weights.load_bound_model
+save_bound_model = _imports_hf_weights.save_bound_model
+import megatron.lite.primitive.modules.engram_lookup as _imports_engram_lookup
+
+EngramTable = _imports_engram_lookup.EngramTable
+ShardedEngramTable = _imports_engram_lookup.ShardedEngramTable
 
 
 def validate_execution(*, enable_dspark_execution: bool = False) -> None:
@@ -35,7 +38,9 @@ class DeepseekV41WeightSpec:
 
     @staticmethod
     def encode(name, tensor, encoding):
-        from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+        import megatron.lite.primitive.quantization.block_fp8 as _imports_block_fp8
+
+        quantize_block_fp8 = _imports_block_fp8.quantize_block_fp8
         from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
         if encoding == 'I8':

@@ -24,7 +24,9 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
 
     monkeypatch.setattr(protocol, "Qwen3MoEModel", Model)
     monkeypatch.setattr(protocol, "init_parallel", lambda _p: SimpleNamespace())
-    monkeypatch.setattr(protocol, "normalize_lora_config", lambda _cfg: SimpleNamespace(enabled=False))
+    monkeypatch.setattr(
+        protocol, "normalize_lora_config", lambda _cfg: SimpleNamespace(enabled=False)
+    )
     monkeypatch.setattr(protocol, "parse_recompute_spec", lambda _cfg: [])
     monkeypatch.setattr(protocol, "set_cross_entropy_fusion", lambda *_args: None)
     monkeypatch.setattr(protocol, "apply_qat_to_chunks", lambda *_args, **_kwargs: None)
@@ -34,7 +36,9 @@ def _build_fsdp2(monkeypatch, transformer_engine_import_stub):
     return seen, [param.device.type for param in bundle.chunks[0].parameters()]
 
 
-def test_fsdp2_always_builds_on_meta(monkeypatch, transformer_engine_import_stub) -> None:
+def test_fsdp2_always_builds_on_meta(
+    monkeypatch, transformer_engine_import_stub
+) -> None:
     assert _build_fsdp2(monkeypatch, transformer_engine_import_stub) == (
         ["meta"],
         ["meta"],
@@ -45,15 +49,15 @@ def test_meta_parameter_check_reports_explicit_cuda_module(
     transformer_engine_import_stub,
 ) -> None:
     transformer_engine_import_stub()
-    from megatron.lite.model.qwen3_moe.lite.protocol import _validate_meta_parameters
+    import megatron.lite.model.qwen3_moe.lite.protocol as _imports_protocol
+
+    _validate_meta_parameters = _imports_protocol._validate_meta_parameters
 
     class ExplicitCudaModule(nn.Module):
         def named_parameters(self, *args, **kwargs):
             del args, kwargs
             parameter = SimpleNamespace(
-                device=torch.device("cuda"),
-                numel=lambda: 8,
-                element_size=lambda: 2,
+                device=torch.device("cuda"), numel=lambda: 8, element_size=lambda: 2
             )
             return iter((("weight", parameter),))
 
@@ -101,18 +105,20 @@ def test_future_te_parameter_module_uses_central_device_policy(
         def __init__(self, *, device):
             super().__init__()
             seen.append(device.type)
-            self.weight = nn.Parameter(torch.empty(3, dtype=torch.bfloat16, device="cpu"))
+            self.weight = nn.Parameter(
+                torch.empty(3, dtype=torch.bfloat16, device="cpu")
+            )
 
     monkeypatch.setattr(central_te._TE, "FutureLinear", FutureLinear, raising=False)
     with torch.device("meta"):
         module = central_te.FutureLinear()
 
     assert seen == ["meta"]
-    assert (module.weight.device.type, module.weight.dtype, tuple(module.weight.shape)) == (
-        "meta",
-        torch.bfloat16,
-        (3,),
-    )
+    assert (
+        module.weight.device.type,
+        module.weight.dtype,
+        tuple(module.weight.shape),
+    ) == ("meta", torch.bfloat16, (3,))
 
 
 def test_fully_sharded_meta_model_supports_to_empty(tmp_path) -> None:
@@ -138,11 +144,11 @@ def test_custom_parameter_initializers_are_repeatable(
     transformer_engine_import_stub,
 ) -> None:
     transformer_engine_import_stub()
+    import megatron.lite.primitive.modules.attention.mhc as _imports_mhc
     from megatron.lite.primitive.modules import lora
     from megatron.lite.primitive.modules.attention.hca import HyperConnection
-    from megatron.lite.primitive.modules.attention.mhc import (
-        MultiHeadHyperConnectionHead,
-    )
+
+    MultiHeadHyperConnectionHead = _imports_mhc.MultiHeadHyperConnectionHead
     from megatron.lite.primitive.parallel.linear import _VanillaColLinear
 
     hca = HyperConnection(hidden_size=4, hc_mult=2, sinkhorn_iters=2, eps=1e-6)
@@ -160,7 +166,10 @@ def test_custom_parameter_initializers_are_repeatable(
             for param in module.parameters(recurse=False):
                 param.fill_(float("nan"))
             module.reset_parameters()
-            assert all(torch.isfinite(param).all() for param in module.parameters(recurse=False))
+            assert all(
+                torch.isfinite(param).all()
+                for param in module.parameters(recurse=False)
+            )
 
     assert torch.equal(hca.base, torch.zeros_like(hca.base))
     assert torch.equal(hca.scale, torch.ones_like(hca.scale))
@@ -193,32 +202,20 @@ def test_expert_grouped_linears_follow_meta_context(
 
     monkeypatch.setattr(central_te._TE, "GroupedLinear", GroupedLinear, raising=False)
     monkeypatch.setattr(
-        experts,
-        "normalize_lora_config",
-        lambda _cfg: SimpleNamespace(enabled=False),
+        experts, "normalize_lora_config", lambda _cfg: SimpleNamespace(enabled=False)
     )
     ps = SimpleNamespace(
-        ep_size=1,
-        etp_size=1,
-        etp_group=None,
-        tp_size=1,
-        tp_group=None,
+        ep_size=1, etp_size=1, etp_group=None, tp_size=1, tp_group=None
     )
-    config = SimpleNamespace(
-        num_experts=8,
-        hidden_size=16,
-        moe_intermediate_size=8,
-    )
+    config = SimpleNamespace(num_experts=8, hidden_size=16, moe_intermediate_size=8)
 
     with torch.device("meta"):
         module = experts.Experts(config, ps)
 
     assert {
-        (param.device.type, param.dtype, tuple(param.shape)) for param in module.parameters()
-    } == {
-        ("meta", torch.bfloat16, (8, 16, 16)),
-        ("meta", torch.bfloat16, (8, 16, 8)),
-    }
+        (param.device.type, param.dtype, tuple(param.shape))
+        for param in module.parameters()
+    } == {("meta", torch.bfloat16, (8, 16, 16)), ("meta", torch.bfloat16, (8, 16, 8))}
 
 
 def test_te_parallel_linears_follow_meta_context(
@@ -235,7 +232,9 @@ def test_te_parallel_linears_follow_meta_context(
             super().__init__()
             seen.append(device.type)
             self.weight = nn.Parameter(
-                torch.empty(out_features, in_features, dtype=torch.bfloat16, device="cpu")
+                torch.empty(
+                    out_features, in_features, dtype=torch.bfloat16, device="cpu"
+                )
             )
 
         def forward(self, x):

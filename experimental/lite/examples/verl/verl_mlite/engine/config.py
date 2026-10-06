@@ -52,9 +52,7 @@ class MegatronLiteEngineConfig(EngineConfig):
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
             object.__setattr__(
-                self,
-                "resync_format",
-                ResyncFormat.parse(self.resync_format).value,
+                self, "resync_format", ResyncFormat.parse(self.resync_format).value
             )
         budget = self.export_buffer_max_size_bytes
         if type(budget) is not int or budget <= 0:
