@@ -807,6 +807,13 @@ def test_topk_fma_combine_is_the_rollout_gather_and_differentiates():
 
 
 def test_fp32_master_wgrad_preserves_native_fp32_under_autocast():
+    """Keep the original BF16 STE activation boundary, not a BF16 wgrad GEMM.
+
+    The activation round trip below is intentional: it matches the existing
+    BF16 output-gradient boundary. Only the operands of the FP32-master wgrad
+    GEMM are promoted; the resulting gradient must never be rounded to BF16.
+    This CPU autocast regression does not claim a vLLM backward comparison.
+    """
     torch.manual_seed(97)
     x = torch.randn(19, 128).bfloat16().requires_grad_()
     weight = torch.nn.Parameter(torch.randn(128, 128))

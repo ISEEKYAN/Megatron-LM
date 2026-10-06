@@ -62,7 +62,16 @@ quantized computation; it is not a fake-quantized BF16 GEMM:
 | GEMM | DeepGEMM `m_grouped_fp8_fp4_gemm_nt_contiguous` on CUDA (an error if unavailable); a CPU reference on the same dequantized operands. |
 | Activation | FC1 output BF16, SwiGLU in FP32 rounded once to BF16, then requantized to FP8. With the model's `swiglu_limit` `L` (vLLM `gemm1_clamp_limit`), `gate = min(gate, L)` and `up = clamp(up, -L, L)` in FP32 before SwiGLU, so the FP8 requantization sees the clamped result. |
 | Top-k combine | The unweighted BF16 FC2 rows of each token are accumulated in FP32 in router top-k slot order, `acc = fma(row, weight, acc)`, then rounded once to BF16, as vLLM's `ep_gather` does. |
-| Backward | Straight-through estimator on both operands into BF16 or FP32 master weights; FP32-master weight gradients use FP32 operand GEMMs with autocast disabled. |
+| Backward | Straight-through estimator on both operands into BF16 or FP32 master weights; Decoded A8 activations first take the BF16 output-gradient dtype. For FP32 masters, those activations and upstream gradients are promoted to FP32 for the wgrad GEMM with autocast disabled; its result is not rounded to BF16. |
+
+`Experts` constructs its grouped parameters in BF16, so the Qwen3-MoE recipe
+below uses BF16 masters. `enable_w4a8_experts` selects the arithmetic path;
+it does not convert parameters or create FP32 masters. The FP32 contract
+applies when the caller already provides live FP32 weights to the primitive,
+or explicitly converts the expert module to FP32 before enabling W4A8 and
+constructing its optimizer (for example, `experts.float()`). Activations and
+expert outputs remain BF16. An optimizer's separate FP32 state does not make
+the live BF16 expert parameters FP32.
 
 ```python
 impl_cfg = ImplConfig(

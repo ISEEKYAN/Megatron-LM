@@ -636,3 +636,29 @@ def test_default_experts_forward_never_imports_w4a8_module():
     )
     env = {**os.environ, "MEGATRON_LITE_DISABLE_JIT_FUSER": "1"}
     subprocess.run([sys.executable, "-c", script], cwd=LITE_ROOT, env=env, check=True)
+
+
+def test_enable_w4a8_preserves_explicit_fp32_expert_masters(experts_cls):
+    """FP32 is supplied by the caller, not created by the W4A8 switch."""
+    from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+
+    experts = _experts(experts_cls).float()
+    masters = [
+        getattr(layer, f"weight{index}")
+        for layer in (experts.fc1, experts.fc2)
+        for index in range(3)
+    ]
+    assert all(weight.dtype == torch.float32 for weight in masters)
+    assert enable_w4a8_experts([experts], _spec()) == 1
+    assert all(weight.dtype == torch.float32 for weight in masters)
+    x, tokens_per_expert, _ = _routed_tokens()
+    x.requires_grad_()
+    out = experts(x, tokens_per_expert)
+    assert out.dtype == torch.bfloat16
+    out.float().square().mean().backward()
+    for index, weight in enumerate(masters):
+        assert weight.grad is not None and weight.grad.dtype == torch.float32
+        assert torch.isfinite(weight.grad).all()
+        if index % 3 != 1:
+            assert torch.count_nonzero(weight.grad) > 0
+    assert x.grad.dtype == torch.bfloat16

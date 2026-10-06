@@ -26,8 +26,11 @@ Training-side counterpart of the rollout MoE contract served by vLLM's
 
 Backward is a straight-through estimator on both operands: gradients use the
 dequantized activations and weights the forward multiplied, and flow unmasked
-to the BF16 input and BF16 or FP32 master weights. FP32 masters use native
-FP32 operand wgrad GEMMs, with autocast disabled and no BF16 intermediate.
+to the BF16 input and BF16 or FP32 master weights. Decoded A8 activations
+first take the BF16 output-gradient dtype, preserving the established STE
+activation boundary. For FP32 masters, those activations and the upstream
+gradients are promoted to FP32 for the wgrad GEMM, with autocast disabled.
+Its result reaches the FP32 master without a BF16 rounding of the gradient.
 No saturation mask is needed:
 the dynamic activation scale satisfies ``amax / scale <= 448`` and the MXFP4
 scale rule satisfies ``amax / scale <= 6`` by construction.
