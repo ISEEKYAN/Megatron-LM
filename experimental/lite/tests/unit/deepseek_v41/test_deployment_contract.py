@@ -108,5 +108,3 @@ def test_off_csa2_is_bitwise_baseline_forward_and_all_gradients(
         assert (a.grad is None) == (b.grad is None), name
         if a.grad is not None:
             assert torch.equal(a.grad, b.grad), name
-
-
