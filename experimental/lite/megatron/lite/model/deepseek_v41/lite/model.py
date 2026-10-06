@@ -6,6 +6,7 @@ The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
 from functools import partial
+from inspect import signature
 from types import SimpleNamespace
 
 import megatron.lite.primitive.modules.attention.csa as attention_primitives
@@ -186,6 +187,7 @@ class DeepseekV41Model(nn.Module):
             group_size=self.ps.dp_cp_size,
             local_range=(start, end),
             projection=partial(_FP8_LINEAR, fp8=quantized),
+            **memory_options,
         )
         for index, module in memories.items():
             module.deployment_math = deployment_math
@@ -246,13 +248,21 @@ class DeepseekV41Model(nn.Module):
         # Checkpoint patterns bind objects; optimizer routes independently audit
         # actual owners and logical matrix shapes, never release-name prefixes.
         fp8 = 'F8_E4M3'
+        explicit_shape = 'shape' in Rule._fields
+        heads = (t.num_attention_heads, t.head_dim, t.q_lora_rank)
+        index_heads = (t.index_n_heads, t.index_head_dim, t.q_lora_rank)
         rules = {
             'embed': Rule('weight', 'embedding'),
             'norm': Rule('weight', 'norm'),
             'head': Rule('weight', 'head'),
-            'layers.*.attn.wq_b': Rule('weight', 'wq_b', fp8, t.num_attention_heads),
+            'layers.*.attn.wq_b': Rule(
+                'weight', 'wq_b', fp8, heads if explicit_shape else heads[0]
+            ),
             'layers.*.attn.indexer.wq_b': Rule(
-                'weight', 'indexer', fp8, t.index_n_heads
+                'weight',
+                'indexer',
+                fp8,
+                index_heads if explicit_shape else index_heads[0],
             ),
             'layers.*.attn': Rule('attn_sink', 'attention_sink'),
             'layers.*.ffn.gate': Rule('bias bias_vl', 'router_bias'),
