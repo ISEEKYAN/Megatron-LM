@@ -7,17 +7,19 @@ import os
 from contextlib import contextmanager
 from typing import Any
 
+import megatron.lite.primitive.kernels.swiglu as _imports_swiglu
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.lite.primitive.modules.lora import (
-    LoraConfig,
-    SharedGroupedLinearLoRA,
-    normalize_lora_config,
-)
+
+bias_swiglu_impl = _imports_swiglu.bias_swiglu_impl
+weighted_bias_swiglu_impl = _imports_swiglu.weighted_bias_swiglu_impl
+import megatron.lite.primitive.modules.lora as _imports_lora
+
+LoraConfig = _imports_lora.LoraConfig
+SharedGroupedLinearLoRA = _imports_lora.SharedGroupedLinearLoRA
+normalize_lora_config = _imports_lora.normalize_lora_config
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
@@ -27,7 +29,10 @@ __all__ = ["Experts", "_AllReduceETP", "enable_w4a8_experts"]
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if (
+        os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -150,7 +155,9 @@ class Experts(nn.Module):
         )
         pad_mask = None
         if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
+            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(
+                x, permuted_probs, m_splits
+            )
 
         etp_real_len = x.shape[0]
         if self.etp_group is not None:
@@ -162,7 +169,10 @@ class Experts(nn.Module):
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                            max_len - etp_real_len,
+                            x.shape[1],
+                            dtype=x.dtype,
+                            device=x.device,
                         ),
                     ],
                     dim=0,
@@ -172,7 +182,9 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                                max_len - etp_real_len,
+                                dtype=permuted_probs.dtype,
+                                device=x.device,
                             ),
                         ],
                         dim=0,
@@ -183,9 +195,9 @@ class Experts(nn.Module):
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
             if self.w4a8:
-                from megatron.lite.primitive.quantization.w4a8_experts import (
-                    w4a8_expert_mlp,
-                )
+                import megatron.lite.primitive.quantization.w4a8_experts as _imports_w4a8_experts
+
+                w4a8_expert_mlp = _imports_w4a8_experts.w4a8_expert_mlp
 
                 # The router weights are applied in the caller's top-k combine.
                 if probs is not None:
@@ -197,14 +209,16 @@ class Experts(nn.Module):
                     self._expert_weights(self.fc1),
                     self._expert_weights(self.fc2),
                     m_splits,
-                    self.swiglu_limit,
+                    self.swiglu_limit or None,
                 )
             elif self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -243,13 +257,17 @@ class Experts(nn.Module):
         mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
         probs_pad = None
         if permuted_probs is not None:
-            probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
+            probs_pad = torch.zeros(
+                total_padded, device=device, dtype=permuted_probs.dtype
+            )
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
             x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
             mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[
+                    src_off : src_off + real
+                ]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask
@@ -264,7 +282,9 @@ def enable_w4a8_experts(chunks, spec) -> int:
     A8 activation groups cannot tile, are rejected here, before any module is
     switched, rather than at the first forward.
     """
-    from megatron.lite.primitive.quantization.w4a8_experts import FP8_ACT_GROUP_SIZE
+    import megatron.lite.primitive.quantization.w4a8_experts as _imports_w4a8_experts
+
+    FP8_ACT_GROUP_SIZE = _imports_w4a8_experts.FP8_ACT_GROUP_SIZE
 
     targets = []
     for chunk in chunks:
