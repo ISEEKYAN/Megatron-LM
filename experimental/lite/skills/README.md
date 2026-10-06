@@ -67,6 +67,7 @@ validation commands instead of copying long design background.
 - `primitive.contract`
 - `primitive.principle`
 - `primitive.select_for_compose`
+- `primitive.bound_training` — binding records/config projection, row memory, paired streams, vision, FP8/FP4 codecs, and owned optimizer/DDP; exact source-to-test routes are in its `ROUTES` table.
 - `primitive.design`
 - `primitive.validate`
 - `primitive.fuse`

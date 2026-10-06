@@ -8,7 +8,7 @@ Choose primitives for model composition without coupling their implementations.
 ```python
 schema = Skill(
     "primitive.select_for_compose", kind="state_machine", purpose="choose primitives for model compose",
-    imports=["basic.constitution"], calls=["primitive.principle"],
+    imports=["basic.constitution"], calls=["primitive.principle", "primitive.bound_training"],
     inputs=["task", "model_spec", "candidates", "budget"],
     outputs=["selection", "rejected", "evidence", "risks"], exits=["done", "blocked", "out_of_scope"],
 )
@@ -17,6 +17,10 @@ schema = Skill(
 
 ```python
 def select_for_compose(task, model_spec, candidates, budget):
+    if touches_bound_training_primitives(candidates):
+        bound = primitive.bound_training(task, files=candidates, reference=model_spec.reference, budget=budget)
+        if not bound.done:
+            return blocked("bound primitive validation missing", evidence=bound)
     selection = []
     rejected = []
     evidence = []

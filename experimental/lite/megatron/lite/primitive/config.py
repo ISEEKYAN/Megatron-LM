@@ -26,7 +26,7 @@ def load_hf_config_dict(path_or_name: str) -> dict[str, Any]:
     """Load HF config dict from local path or Hub."""
     p = Path(path_or_name)
 
-    if p.is_file() and p.name == "config.json":
+    if p.is_file():
         with open(p) as f:
             return json.load(f)
 

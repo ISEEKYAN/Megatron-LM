@@ -253,7 +253,7 @@ def _int_qrange(num_bits: int, symmetric: bool) -> tuple[int, int]:
 def _reshape_for_groups(
     weight: torch.Tensor, group_size: int
 ) -> tuple[torch.Tensor, int]:
-    """Reshape a 2D ``[out, in]`` weight so the reduction dim is last.
+    """Reshape a tensor along its last dimension so the reduction dim is last.
 
     Returns ``(view, reduce_dim)``. ``reduce_dim`` is the axis over which amax is
     taken (kept as size-1 for broadcasting).
@@ -261,15 +261,15 @@ def _reshape_for_groups(
     if group_size == 0:  # per-tensor
         return weight, -1  # sentinel: reduce over all elements
     if group_size == -1:  # per-output-channel: one scale per row
-        return weight, 1
+        return weight, weight.ndim - 1
     # block along in-features
-    out_features, in_features = weight.shape
+    in_features = weight.shape[-1]
     if in_features % group_size != 0:
         raise ValueError(
             f"group_size={group_size} does not divide in_features={in_features}."
         )
-    view = weight.reshape(out_features, in_features // group_size, group_size)
-    return view, 2
+    view = weight.reshape(*weight.shape[:-1], in_features // group_size, group_size)
+    return view, view.ndim - 1
 
 
 def compute_amax(weight: torch.Tensor, group_size: int) -> torch.Tensor:
@@ -420,15 +420,15 @@ class _FloatFakeQuantSTE(torch.autograd.Function):
 
 
 def _grouped_view(weight: torch.Tensor, group_size: int) -> torch.Tensor:
-    """2D->grouped view whose scale broadcasts along the reduction axis."""
+    """N-D grouped view whose scale broadcasts along the reduction axis."""
     if group_size <= 0:  # per-tensor / per-channel keep 2D
         return weight
-    out_features, in_features = weight.shape
+    in_features = weight.shape[-1]
     if in_features % group_size != 0:
         raise ValueError(
             f"group_size={group_size} does not divide in_features={in_features}."
         )
-    return weight.reshape(out_features, in_features // group_size, group_size)
+    return weight.reshape(*weight.shape[:-1], in_features // group_size, group_size)
 
 
 def _fp8_fake_quantize_weight(weight: torch.Tensor, spec: QATSpec) -> torch.Tensor:

@@ -10,7 +10,7 @@ schema = Skill(
     "primitive.validate", kind="state_machine", purpose="validate primitive correctness and precision",
     imports=["basic.constitution"], calls=["basic.construct_proxy_task", "basic.align_precision"],
     inputs=["task", "primitive", "implementation", "budget"],
-    outputs=["validation", "evidence", "risks"], exits=["done", "blocked", "out_of_scope"],
+    outputs=["validation", "evidence", "risks"], exits=["done", "blocked"],
 )
 ```
 <!-- MLITE_SKILL_SCHEMA_END -->
@@ -27,12 +27,21 @@ def validate(task, primitive, implementation, budget):
     if not precision.done:
         return blocked("primitive precision not validated", evidence=precision)
 
-    validation = [
+    required = (
         "static_contract",
         "single_gpu_or_node_proxy",
         "controlled_variable_precision",
         "composition_with_adjacent_primitives",
         "usage_example_runs",
-    ]
-    return done(validation=validation, evidence=[proxy, precision], risks=precision.next)
+    )
+    checks = getattr(implementation, "checks", {})
+    if any(name not in checks for name in required):
+        return blocked("missing executable validation checks", evidence=[name for name in required if name not in checks])
+    validation = []
+    for name in required:
+        result = checks[name]()
+        validation.append((name, result))
+        if not result.done:
+            return blocked("primitive check failed", evidence=validation)
+    return done(validation=validation, evidence=[proxy, precision, validation], risks=precision.next)
 ```

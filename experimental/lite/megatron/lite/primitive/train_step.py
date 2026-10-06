@@ -8,6 +8,7 @@ from collections.abc import Callable
 import torch
 import torch.distributed as dist
 from megatron.lite.primitive.parallel import ParallelState
+from megatron.lite.primitive.parallel.thd import parallel_state_from_model
 from megatron.lite.primitive.protocols import ExpertClassifierFn, default_expert_classifier
 from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
 
@@ -22,6 +23,7 @@ def run_microbatch_loop(
     pre_forward_hook: Callable[[torch.Tensor], None] | None = None,
     loss_fn: Callable | None = None,
     forward_only: bool = False,
+    prepare_microbatches: Callable | None = None,
 ):
     """Run forward-backward over microbatches with loss accumulation.
 
@@ -30,13 +32,10 @@ def run_microbatch_loop(
             (when ``loss_fn`` is None) or model outputs (when ``loss_fn`` is provided).
         pre_forward_hook: Optional callable ``hook(scale: torch.Tensor) -> None``
             invoked once per microbatch, right before ``forward_fn``. ``scale`` is
-            ``1.0 / num_microbatches`` (matches MC's ``schedules.forward_step``,
+            ``cp_size / num_microbatches`` (matches MC's ``schedules.forward_step``,
             see `pipeline_parallel/schedules.py`). Used e.g. by MoE aux-loss
             scale-setting; runtime stays model-agnostic by passing the hook
             through from the model bundle's extras.
-            # TODO: once CP is supported, align with MC's
-            # `schedules:297`-style scale of `cp_group_size / num_microbatches`
-            # (currently assumes ``cp_group_size == 1``).
         loss_fn: Optional external loss function.
             ``loss_fn(model_output: dict, batch) -> (loss: Tensor, metrics: dict)``.
             When provided, ``forward_fn`` output is passed to ``loss_fn`` instead of
@@ -45,13 +44,24 @@ def run_microbatch_loop(
             ``infer_batch``). The caller (verl) runs the forward under ``no_grad`` so the
             loss has no ``grad_fn``; calling ``.backward()`` then raises. Mirrors the
             pipeline path, which already threads ``forward_only`` to skip backward.
+            Return the sum of detached microbatch losses divided by their count,
+            matching backward scaling. Other outputs retain the last microbatch.
+        prepare_microbatches: Prepare the native loss denominator in both training
+            and validation; this hook must not depend on gradients. External
+            ``loss_fn`` callbacks own normalization and bypass this hook. For
+            V4.1 SFT, preparation makes averaging equivalent to a token-weighted
+            objective; averaging unprepared local token means would be incorrect.
     """
+    if prepare_microbatches is not None and loss_fn is None:
+        data_iter = iter(prepare_microbatches(data_iter, num_microbatches))
     last_out = None
+    validation_loss = None
     all_metrics: list[dict] = []
     for mb in range(num_microbatches):
         batch, loss_context = split_loss_context(next(data_iter))
         if pre_forward_hook is not None:
-            scale = torch.tensor(1.0 / num_microbatches, device="cuda")
+            cp_size = getattr(parallel_state_from_model(model), "cp_size", 1)
+            scale = torch.tensor(cp_size / num_microbatches, device="cuda")
             pre_forward_hook(scale)
         with use_loss_context(loss_context):
             out = forward_fn(model, batch)
@@ -63,15 +73,33 @@ def run_microbatch_loop(
             else:
                 loss, metrics = loss_fn(out, batch, loss_context)
             if not forward_only:
-                (loss / num_microbatches).backward()
+                backward_output(out, loss / num_microbatches)
             out["loss"] = loss.detach()
             all_metrics.append(metrics)
         elif not forward_only:
-            (out["loss"] / num_microbatches).backward()
+            backward_output(out, out["loss"] / num_microbatches)
+        if forward_only and out.get("loss") is not None:
+            contribution = out["loss"].detach() / num_microbatches
+            validation_loss = (
+                contribution
+                if validation_loss is None
+                else validation_loss + contribution
+            )
         last_out = out
+    if last_out is not None and validation_loss is not None:
+        last_out["loss"] = validation_loss
     if last_out is not None and all_metrics:
         last_out["_loss_fn_metrics"] = all_metrics
     return last_out
+
+
+def backward_output(output, loss):
+    """Allow a model to finish staged backward after the scaled runtime loss."""
+    callback = output.get("backward")
+    if callback is None:
+        loss.backward()
+    else:
+        callback(loss)
 
 
 def compute_and_clip_grad_norm(
@@ -190,3 +218,60 @@ __all__ = [
     "optimizer_step",
     "run_microbatch_loop",
 ]
+
+
+def prepare_microbatches(data_iter, count, *, dp_group=None, cp_rank=0, cp_size=1):
+    """Sum owned token weights over the gradient averaging group (DP x CP)."""
+    from dataclasses import replace
+
+    from megatron.lite.primitive.parallel.thd import roll_packed_thd_left
+    from megatron.lite.runtime.contracts.loss import LossContext, split_loss_context
+
+    if count < 1:
+        raise ValueError('Microbatch count must be positive')
+    items = [split_loss_context(next(data_iter)) for _ in range(count)]
+    total = 0.0
+    for batch, _ in items:
+        if batch.labels is None:
+            raise ValueError('SFT normalization requires labels')
+        mask = (
+            torch.ones_like(batch.labels, dtype=torch.float32)
+            if batch.loss_mask is None
+            else batch.loss_mask
+        )
+        if (
+            mask.shape != batch.input_ids.shape
+            or not torch.isfinite(mask).all()
+            or (mask < 0).any()
+        ):
+            raise ValueError('Expected finite nonnegative token loss weights')
+        # Count exactly the weights consumed by _text_output's next-token CE.
+        # The packed shift zeros each sequence tail (there is no next label),
+        # so the original first-token weight does not contribute.
+        shifted_mask, _ = roll_packed_thd_left(mask, cu_seqlens_padded=batch.cu_seqlens)
+        if cp_size > 1:
+            from megatron.lite.primitive.modules.attention.cp import (
+                ContiguousCPSequence,
+            )
+
+            shifted_mask = ContiguousCPSequence(
+                batch.input_ids.numel(), cp_rank, cp_size
+            ).slice(shifted_mask, seq_dim=0)
+        total += float(shifted_mask.sum())
+    # The generic runtime divides every microbatch by count after this loss.
+    dp_size = 1
+    if dp_group is not None:
+        tokens = torch.tensor(
+            total, dtype=torch.float64, device=items[0][0].input_ids.device
+        )
+        torch.distributed.all_reduce(tokens, group=dp_group)
+        total = float(tokens)
+        dp_size = torch.distributed.get_world_size(dp_group)
+    denominator = max(total, 1.0) / (count * dp_size)
+    return [
+        (
+            batch,
+            replace(context or LossContext(), normalization_denominator=denominator),
+        )
+        for batch, context in items
+    ]

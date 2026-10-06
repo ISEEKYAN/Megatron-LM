@@ -133,6 +133,21 @@ class Experts(nn.Module):
 
                     param.register_hook(_ar)
 
+    @classmethod
+    def from_modules(cls, modules):
+        experts = cls.__new__(cls)
+        nn.Module.__init__(experts)
+        experts.individual = True
+        for index, module in enumerate(modules):
+            experts.add_module(str(index), module)
+        return experts
+
+    def __iter__(self):
+        return iter(self._modules.values())
+
+    def __len__(self):
+        return len(self._modules)
+
     def forward(
         self,
         x: torch.Tensor,
@@ -145,6 +160,22 @@ class Experts(nn.Module):
             if tokens_per_expert_list is None
             else list(tokens_per_expert_list)
         )
+        if getattr(self, 'individual', False):
+            scores = permuted_probs.split(m_splits)
+            values = [
+                (
+                    expert(tokens, weights=probs[:, None])
+                    if tokens.shape[0]
+                    else (tokens * probs[:, None]).to(tokens.dtype)
+                )
+                for expert, tokens, probs in zip(
+                    (e for e in self if e is not None),
+                    x.split(m_splits),
+                    scores,
+                    strict=True,
+                )
+            ]
+            return torch.cat(values)
         pad_mask = None
         if self.fp8:
             x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)

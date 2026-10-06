@@ -25,6 +25,8 @@ that is the point.
 
 from __future__ import annotations
 
+from dataclasses import dataclass
+
 import torch
 
 MXFP4_BLOCK_SIZE = 32
@@ -103,28 +105,39 @@ def _validate(tensor: torch.Tensor) -> None:
         )
 
 
-def _select_scale(blocks: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
-    exponent = mx_shared_scale_exponent(blocks.abs().amax(dim=-1))
+def _select_scale(
+    blocks: torch.Tensor, min_amax: float = 0.0
+) -> tuple[torch.Tensor, torch.Tensor]:
+    exponent = mx_shared_scale_exponent(blocks.abs().amax(dim=-1).clamp_min(min_amax))
     encoded = (exponent + E8M0_BIAS).to(torch.uint8)
     return torch.exp2(exponent), encoded.view(torch.float8_e8m0fnu)
 
 
-def _quantize_nibbles(values: torch.Tensor) -> torch.Tensor:
-    index = e2m1_round_index(values.abs()).to(torch.uint8)
+def _quantize_nibbles(values: torch.Tensor, *, ties="down") -> torch.Tensor:
+    magnitude = values.abs()
+    index = e2m1_round_index(magnitude).to(torch.uint8)
+    if ties not in ("down", "away", "even"):
+        raise ValueError("E2M1 ties must be down, away, or even")
+    if ties != "down":
+        boundaries = E2M1_MIDPOINTS if ties == "away" else (0.75, 1.75, 3.5)
+        for boundary in boundaries:
+            index += (magnitude == boundary).to(torch.uint8)
     sign = torch.where(values.signbit(), torch.tensor(8, device=values.device), 0).to(
         torch.uint8
     )
     return index | sign
 
 
-def quantize_mxfp4(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def quantize_mxfp4(
+    tensor: torch.Tensor, *, ties="down", min_amax=0.0
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Serialize the last dimension in 32-value MXFP4 blocks."""
     _validate(tensor)
     source = tensor.float()
     blocks = source.reshape(*source.shape[:-1], -1, MXFP4_BLOCK_SIZE)
-    scale_f, scale = _select_scale(blocks)
+    scale_f, scale = _select_scale(blocks, min_amax)
     normalized = blocks / scale_f.unsqueeze(-1)
-    nibbles = _quantize_nibbles(normalized).reshape(
+    nibbles = _quantize_nibbles(normalized, ties=ties).reshape(
         *source.shape[:-1], source.shape[-1]
     )
     packed = nibbles[..., 0::2] | (nibbles[..., 1::2] << 4)
@@ -165,3 +178,45 @@ __all__ = [
     "mx_shared_scale_exponent",
     "quantize_mxfp4",
 ]
+
+
+@dataclass(frozen=True)
+class QuantizedValues:
+    packed: torch.Tensor
+    scale: torch.Tensor
+    decoded: torch.Tensor
+
+
+def _validate_input(x, block):
+    if x.ndim == 0 or x.shape[-1] == 0 or x.shape[-1] % block:
+        raise ValueError(f"last dimension must be nonzero and divisible by {block}")
+    if x.dtype not in (torch.float32, torch.bfloat16, torch.float16):
+        raise TypeError("codec input must be F32, BF16 or F16")
+    if not torch.isfinite(x).all():
+        raise ValueError("codec input must be finite")
+
+
+def _fake_quant(post_rope, enabled, quantize, phase="post-training"):
+    from .qat import _FloatFakeQuantSTE
+
+    if type(enabled) is not bool:
+        raise TypeError("enabled must be bool")
+    if phase != "post-training":
+        raise ValueError("Activation QAT is supported only for post-training")
+    if not enabled:
+        return post_rope
+    return _FloatFakeQuantSTE.apply(post_rope, quantize(post_rope).decoded, None)
+
+
+@torch.no_grad()
+def quantize_index(post_rope):
+    _validate_input(post_rope, 32)
+    packed, scale = quantize_mxfp4(post_rope, ties="even", min_amax=6.0 * 2.0**-126)
+    decoded = dequantize_mxfp4(packed, scale).to(post_rope.dtype)
+    if not torch.isfinite(decoded).all():
+        raise ValueError("MXFP4 codec produced nonfinite values")
+    return QuantizedValues(packed, scale, decoded)
+
+
+def fake_quant_index(post_rope, *, enabled=True):
+    return _fake_quant(post_rope, enabled, quantize_index)

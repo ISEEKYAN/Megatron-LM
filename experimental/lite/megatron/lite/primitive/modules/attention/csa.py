@@ -5,16 +5,31 @@ from typing import Any
 import torch
 import torch.nn as nn
 
-from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
 # of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
 from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
+from megatron.lite.primitive import transformer_engine as te
+
+try:
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_layout_kernels,
+    )
+    from megatron.core.transformer.experimental_attention_variant import (
+        csa_cp_utils as cp_utils,
+    )
+
+    _MODERN_CSA_LAYOUT = False
+except ImportError:
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_layout_kernels as csa_cp_layout_kernels,
+    )
+    from megatron.core.transformer.experimental_attention_variant.csa_utils import (
+        cp_utils,
+    )
+
+    _MODERN_CSA_LAYOUT = True
 from megatron.core.transformer.experimental_attention_variant.csa import (
     _unfused_indexer_sparse_attn_from_topk,
     unfused_compressed_sparse_attn,
@@ -344,8 +359,33 @@ class CompressedSparseAttention(nn.Module):
         dsa_indexer_loss_coeff: float = 0.0,
         dsa_indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
+        kv_owner: int | None = None,
+        index_owner: int | None = None,
+        candidate_mode: str | None = None,
+        compress_ratio: int | None = None,
+        codecs=None,
     ):
         super().__init__()
+        self.cross_layer = candidate_mode is not None
+        self.codecs = codecs
+        if self.cross_layer:
+            if (
+                candidate_mode not in ("none", "build", "reuse")
+                or compress_ratio is None
+            ):
+                raise ValueError(
+                    "Cross-layer attention requires a ratio and candidate mode"
+                )
+            self.ps = ps
+            self._init_cross_layer(
+                config,
+                layer_idx,
+                ratio=compress_ratio,
+                kv_owner=kv_owner,
+                index_owner=index_owner,
+                candidate_mode=candidate_mode,
+            )
+            return
         self.config = config
         self.ps = ps
         self.layer_idx = layer_idx
@@ -395,14 +435,173 @@ class CompressedSparseAttention(nn.Module):
             else None
         )
 
+    def _init_cross_layer(
+        self, config, layer_id, *, ratio, kv_owner, index_owner, candidate_mode
+    ):
+        if (
+            config.heads % config.groups
+            or config.rope_dim % 2
+            or not 0 < config.rope_dim <= min(config.head_dim, config.index_dim)
+        ):
+            raise ValueError("Invalid grouped-head or rotary dimensions")
+        self.config, self.layer_id = config, layer_id
+        self.ratio, self.kv_owner, self.index_owner = ratio, kv_owner, index_owner
+        self.candidate_mode = candidate_mode
+        self.owns_kv, self.owns_index = layer_id == kv_owner, layer_id == index_owner
+        from functools import partial
+
+        linear = partial(Linear, fp8_operator=mxfp8.dynamic_fp8_linear)
+        self.wq_a = linear(config.dim, config.q_rank, fp8=config.linear_fp8)
+        self.q_norm = RMSNorm(config.q_rank, config.eps)
+        self.wq_b = linear(
+            config.q_rank, config.heads * config.head_dim, fp8=config.linear_fp8
+        )
+        self.wkv = linear(config.dim, config.head_dim, fp8=config.linear_fp8)
+        self.kv_norm = RMSNorm(config.head_dim, config.eps)
+        self.attn_sink = nn.Parameter(torch.zeros(config.heads, dtype=torch.float32))
+        self.wo_a = linear(
+            config.heads * config.head_dim // config.groups,
+            config.groups * config.o_rank,
+        )
+        self.wo_b = linear(
+            config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
+        )
+        self.compressor = (
+            CrossLayerCompressor(config, self.ratio) if self.owns_kv else None
+        )
+        self.indexer = (
+            CrossLayerIndexer(config, self.owns_kv) if self.owns_index else None
+        )
+
+    def _forward_cross_layer(self, x, state, *, candidate_mask=None, cp_context=None):
+        c, layer, ratio = self.config, self.layer_id, self.ratio
+        main_codec = fake_quant_main_kv if self.codecs is None else self.codecs["main"]
+        index_codec = fake_quant_index if self.codecs is None else self.codecs["index"]
+        swa_codec = mxfp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
+        b, length, _ = x.shape
+        full_x = x if cp_context is None else cp_context.gather(x)
+        global_length = full_x.shape[1]
+        start = 0 if cp_context is None else cp_context.start
+        positions = torch.arange(start, start + length, device=x.device)
+        key_positions = torch.arange(global_length, device=x.device)
+        qr = self.q_norm(self.wq_a(x))
+        # V4.1 deliberately has no per-query-head RMS after wq_b.
+        q = rotate(
+            self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)), positions, c, ratio
+        )
+        window = rotate(self.kv_norm(self.wkv(full_x)), key_positions, c, ratio)
+        if c.swa_fp8:
+            window = swa_codec(window)
+        kv = window
+        visible = (key_positions[None, :] <= positions[:, None]) & (
+            key_positions[None, :] > positions[:, None] - c.window
+        )
+        mask = visible.expand(b, -1, -1)
+        if ratio:
+            if self.owns_kv:
+                latent = self.compressor(full_x)
+                cp = torch.arange(latent.shape[1], device=x.device) * ratio
+                # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
+                index_k = self.indexer.k_norm(self.indexer.wk(latent))
+                index_k = index_codec(
+                    rotate(index_k, cp, c, ratio), enabled=c.index_qat
+                )
+                main = main_codec(rotate(latent, cp, c, ratio), enabled=c.main_qat)
+                state = AttentionState(kv_owner=layer, main_kv=main, index_k=index_k)
+            if (
+                state.kv_owner != self.kv_owner
+                or state.main_kv is None
+                or state.index_k is None
+            ):
+                raise ValueError("Missing or incorrect CSA2 KV source state")
+            if state.main_kv.shape[:2] != (b, global_length // ratio):
+                raise ValueError("Shared KV belongs to a different sequence shape")
+            lengths = ((positions + 1) // ratio).unsqueeze(-1)
+            if self.owns_index:
+                iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
+                iq = index_codec(rotate(iq, positions, c, ratio), enabled=c.index_qat)
+                weights = self.indexer.weights_proj(x) * (
+                    c.index_dim**-0.5 * c.index_heads**-0.5
+                )
+                scores = (
+                    torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
+                    * weights.unsqueeze(-1)
+                ).sum(2)
+                pool = state.candidates
+                if self.candidate_mode == 'build':
+                    pool = candidate_blocks(
+                        scores,
+                        lengths,
+                        topk_blocks=c.candidate_blocks,
+                        block_size=c.block_size,
+                    )
+                injected_pool = pool if candidate_mask is None else candidate_mask
+                if self.candidate_mode == 'reuse' and injected_pool is None:
+                    raise ValueError("Reindex requires the layer-20 candidate pool")
+                selected = select_positions(
+                    scores,
+                    lengths,
+                    c.topk,
+                    candidates=(
+                        injected_pool if self.candidate_mode == 'reuse' else None
+                    ),
+                )
+                state = replace(
+                    state, index_owner=layer, indices=selected, candidates=pool
+                )
+            elif state.index_owner != self.index_owner or state.indices is None:
+                raise ValueError("Missing or incorrect CSA2 index source state")
+            kv = torch.cat([window, state.main_kv], 1)
+            counts = torch.zeros(
+                b, length, state.main_kv.shape[1], dtype=torch.int32, device=x.device
+            )
+            # Additive scatter keeps padded -1 slots from erasing a valid position zero.
+            if counts.shape[-1]:
+                counts.scatter_add_(
+                    -1, state.indices.clamp_min(0).long(), (state.indices >= 0).int()
+                )
+            mask = torch.cat([mask, counts > 0], -1)
+        logits = (
+            torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
+        )
+        logits = logits.masked_fill(~mask.unsqueeze(2), -torch.inf)
+        sink = self.attn_sink.expand(b, length, -1).unsqueeze(-1)
+        probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
+        output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(x.dtype)
+        output = rotate(output, positions, c, ratio, inverse=True)
+        grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
+        weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
+        if getattr(self.wo_a, 'native_fp32', False):
+            output = torch.stack(
+                [
+                    native_fp32_linear(grouped[:, :, i], weight[i])
+                    for i in range(c.groups)
+                ],
+                dim=2,
+            ).flatten(2)
+        else:
+            output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
+        return self.wo_b(output), state
+
     def forward(
         self,
         x: torch.Tensor,
+        state=None,
         *,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        candidate_mask=None,
+        cp_context=None,
         attention_mask: torch.Tensor | None = None,
         packed_seq_params: Any = None,
     ) -> torch.Tensor:
+        if self.cross_layer:
+            if state is None:
+                raise ValueError(
+                    "Cross-layer attention requires explicit AttentionState"
+                )
+            return self._forward_cross_layer(
+                x, state, candidate_mask=candidate_mask, cp_context=cp_context
+            )
         # THD packed sequences take the primary DSv4 CP path. THD is the only
         # sequence-parallel route now: the BSHD dense fallback has been removed.
         if packed_seq_params is not None:
@@ -567,8 +766,6 @@ class CompressedSparseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.ps.cp_size != 1:
-            raise NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
@@ -891,17 +1088,30 @@ class CompressedSparseAttention(nn.Module):
                     torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
                 )
             )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
+            if _MODERN_CSA_LAYOUT:
+                (
+                    hidden_compact,
+                    compressed_group_ids,
+                    _,
+                    _,
+                    _,
                     cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
+                    seq_to_rank_row,
+                ) = cp_utils.prepare_cp_compressor_input(
+                    x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
                 )
-            )
+            else:
+                hidden_compact, compressed_group_ids, seq_to_rank_row = (
+                    cp_utils.prepare_cp_compressor_input(
+                        x,
+                        boundary_hidden,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        cp_size,
+                        ratio,
+                    )
+                )
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -943,10 +1153,31 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                topk_options = {}
+                topk_keys = k_indexer_seq_major
+                if _MODERN_CSA_LAYOUT:
+                    logical = cp_utils.build_cp_indexer_layout(
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        l_local,
+                        k_indexer_seq_major.shape[0],
+                    )
+                    layout = logical
+                    if self.apply_dsa_kernel_fusion:
+                        layout, row_map = cp_utils.build_cp_compact_indexer_layout(
+                            logical, cu_seqlens_compressed, topk_keys.shape[0], ratio
+                        )
+                        topk_keys = cp_utils.pack_cp_compact_indexer_k(
+                            topk_keys, row_map
+                        )
+                    topk_options = dict(
+                        indexer_layout=layout, logical_indexer_layout=logical
+                    )
+                topk_result = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
-                    k_indexer_seq_major,
+                    topk_keys,
                     cu_seqlens,
                     cu_seqlens_compressed,
                     global_start,
@@ -955,7 +1186,9 @@ class CompressedSparseAttention(nn.Module):
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
                     use_fused=self.apply_dsa_kernel_fusion,
+                    **topk_options,
                 )
+                compressed_topk, indexer_layout = topk_result[:2]
 
             compressed_kv_local, _ = self.compressor._forward_thd(
                 hidden_compact,
@@ -976,8 +1209,7 @@ class CompressedSparseAttention(nn.Module):
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
+        attention_indices = csa_cp_layout_kernels.build_attention_indices(
                 cu_seqlens,
                 global_start,
                 l_local,
@@ -989,8 +1221,12 @@ class CompressedSparseAttention(nn.Module):
                 cu_seqlens_compressed=cu_seqlens_compressed,
                 seq_to_rank_row=seq_to_rank_row,
                 for_indexer_loss=use_indexer_loss,
+            # nv/dev now requires the physical capacity of the compressed buffer
+            # the indices will address; it is the gathered rank-major KV itself.
+            compressed_rows=compressed_kv_rank_major.shape[0],
             )
-        )
+
+        topk_idxs, topk_length, indexer_topk_rank_major = attention_indices[:3]
 
         if use_indexer_loss:
             k_indexer_for_loss = k_indexer_rank_major
@@ -1073,3 +1309,163 @@ class CompressedSparseAttention(nn.Module):
                 query, kv_full_thd, self.sinks.float(), topk_idxs, self.softmax_scale
             )
         return output.unsqueeze(1)
+
+
+from dataclasses import dataclass, replace
+
+from megatron.lite.primitive.modules.attention.mhc import RMSNorm
+from megatron.lite.primitive.modules.native_fp32_linear import (
+    Linear,
+    native_fp32_linear,
+)
+from megatron.lite.primitive.quantization import mxfp8
+from megatron.lite.primitive.quantization.mxfp4 import fake_quant_index
+from megatron.lite.primitive.quantization.nvfp4 import fake_quant_main_kv
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
+from torch.nn import functional as F
+
+
+@dataclass(frozen=True)
+class CrossLayerAttentionConfig:
+    dim: int = 5120
+    heads: int = 64
+    head_dim: int = 512
+    rope_dim: int = 64
+    q_rank: int = 1280
+    o_rank: int = 1024
+    groups: int = 8
+    index_heads: int = 32
+    index_dim: int = 128
+    topk: int = 512
+    window: int = 128
+    candidate_blocks: int = 2048
+    block_size: int = 8
+    eps: float = 1e-20
+    rope_theta: float = 10000
+    compress_rope_theta: float = 160000
+    original_length: int = 65536
+    factor: float = 16
+    beta_fast: float = 32
+    beta_slow: float = 1
+    linear_fp8: bool = True
+    main_qat: bool = True
+    index_qat: bool = True
+    swa_fp8: bool = True
+
+
+@dataclass(frozen=True)
+class AttentionState:
+    kv_owner: int | None = None
+    index_owner: int | None = None
+    main_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+    indices: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
+
+
+def rotate(x, positions, config, ratio, *, inverse=False):
+    rd = config.rope_dim
+    theta = config.compress_rope_theta if ratio != 0 else config.rope_theta
+    dims = torch.arange(0, rd, 2, device=x.device, dtype=torch.float32)
+    freqs = 1 / theta ** (dims / rd)
+    if ratio != 0 and config.original_length > 0:
+
+        low, high = _yarn_find_correction_range(
+            config.beta_fast, config.beta_slow, rd, theta, config.original_length
+        )
+        ramp = (
+            (torch.arange(rd // 2, device=x.device) - low) / max(high - low, 1e-3)
+        ).clamp(0, 1)
+        freqs = freqs / config.factor * ramp + freqs * (1 - ramp)
+    angles = positions.float().unsqueeze(-1) * freqs
+    phase = torch.polar(torch.ones_like(angles), -angles if inverse else angles)
+    phase = phase.reshape(1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
+    tail = torch.view_as_complex(
+        x[..., -rd:].float().contiguous().unflatten(-1, (-1, 2))
+    )
+    rotated = torch.view_as_real(tail * phase).flatten(-2).to(x.dtype)
+    return torch.cat([x[..., :-rd], rotated], -1)
+
+
+class CrossLayerCompressor(nn.Module):
+    def __init__(self, config, ratio):
+        super().__init__()
+        self.ratio = ratio
+        dtype = torch.float32 if ratio > 1 else torch.bfloat16
+        self.wkv = Linear(config.dim, config.head_dim, dtype=dtype)
+        self.norm = RMSNorm(config.head_dim, config.eps)
+        if ratio > 1:
+            self.wgate = Linear(config.dim, config.head_dim, dtype=torch.float32)
+
+    def forward(self, x):
+        if self.ratio == 1:
+            return self.norm(self.wkv(x))
+        cutoff = x.shape[1] // self.ratio * self.ratio
+        values = self.wkv(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
+        gates = self.wgate(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
+        return self.norm((values * gates.softmax(2)).sum(2).to(x.dtype))
+
+
+class CrossLayerIndexer(nn.Module):
+    def __init__(self, config, owns_k):
+        super().__init__()
+        self.wq_b = Linear(
+            config.q_rank,
+            config.index_heads * config.index_dim,
+            fp8=config.linear_fp8,
+            fp8_operator=mxfp8.dynamic_fp8_linear,
+        )
+        self.weights_proj = Linear(config.dim, config.index_heads)
+        if owns_k:
+            self.wk = Linear(config.head_dim, config.index_dim)
+            self.k_norm = RMSNorm(config.index_dim, config.eps)
+        # Post-training port policy: selection is frozen, with no indexer loss.
+        # Shared compressor/Q projections outside this module remain trainable.
+        self.requires_grad_(False)
+
+
+def _visible(scores, lengths):
+    lengths = torch.as_tensor(lengths, device=scores.device)
+    return torch.arange(scores.shape[-1], device=scores.device) < lengths
+
+
+def candidate_blocks(
+    scores, lengths, *, topk_blocks=2048, block_size=8, phase="post-training"
+):
+    if phase != "post-training":
+        raise ValueError("Two-level candidates are a post-training policy")
+    if block_size <= 0 or topk_blocks <= 0:
+        raise ValueError("Candidate block size and count must be positive")
+    width = scores.shape[-1]
+    if width == 0:
+        return torch.zeros_like(scores, dtype=torch.bool)
+    masked = scores.masked_fill(~_visible(scores, lengths), -torch.inf)
+    maxima = F.pad(masked, (0, -width % block_size), value=-torch.inf)
+    maxima = maxima.unflatten(-1, (-1, block_size)).amax(-1)
+    last = (torch.as_tensor(lengths, device=scores.device) - 1) // block_size
+    blocks = torch.arange(maxima.shape[-1], device=scores.device)
+    maxima = maxima.masked_fill(blocks == last, torch.inf)
+    top = maxima.topk(min(topk_blocks, maxima.shape[-1]), dim=-1)
+    keep = torch.zeros_like(maxima, dtype=torch.bool).scatter_(
+        -1, top.indices, top.values > -torch.inf
+    )
+    # Preserve complete block membership; consumers independently apply causal
+    # visibility, including the unfinished portion of the newest block.
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_positions(scores, lengths, topk, *, offset=0, candidates=None):
+    if topk < 0:
+        raise ValueError("Top-K must be nonnegative")
+    visible = _visible(scores, lengths)
+    masked = scores.masked_fill(~visible, -torch.inf)
+    if candidates is not None:
+        if candidates.shape != scores.shape or candidates.dtype != torch.bool:
+            raise ValueError("Candidate mask must be boolean and match scores")
+        masked = masked.masked_fill(~candidates, -torch.inf)
+    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1, sorted=False).indices
+    indices = indices.sort(-1).values
+    # An empty/small pool must never reintroduce an excluded position through
+    # the arbitrary tail of topk(-inf). Invalid slots are represented by -1.
+    valid = masked.gather(-1, indices) > -torch.inf
+    return torch.where(valid, indices + offset, -1).to(torch.int32)
