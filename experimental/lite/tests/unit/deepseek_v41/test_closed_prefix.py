@@ -98,3 +98,53 @@ def test_disabled_candidate_cannot_silently_remove_ratio_one_publisher():
         topology.build_topology(
             replace(topology.TopologySpec(), candidate_source_layer_id=-1)
         )
+
+
+def run_documented_recipe(path, cfg, tmp_path, monkeypatch):
+    """Execute the shipped recipe; substitute only CPU/EP1 hardware settings."""
+    import ast
+    import json
+
+    source = path.read_text().split('```python\n')[1].split('```')[0]
+    tree = ast.parse(source)
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
+            if node.func.id == 'ImplConfig':
+                for keyword in node.keywords:
+                    if keyword.arg == 'device':
+                        keyword.value = ast.Constant('cpu')
+                    elif keyword.arg == 'quantized':
+                        keyword.value = ast.Constant(False)
+            elif node.func.id == 'ParallelConfig':
+                for keyword in node.keywords:
+                    if keyword.arg == 'ep':
+                        keyword.value = ast.Constant(1)
+    (tmp_path / 'config.json').write_text(json.dumps(cfg.to_hf_dict()))
+    monkeypatch.chdir(tmp_path)
+    scope = {}
+    exec(compile(ast.fix_missing_locations(tree), str(path), 'exec'), scope)
+    assert scope['bundle'].optimizer is not None
+    assert scope['impl'].optimizer_config.lr == 1e-6
+    return scope['bundle']
+
+
+def test_documented_closed_prefix_recipe_constructs(v41_core_te, tmp_path, monkeypatch):
+    from pathlib import Path
+
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+    source = release_config().to_hf_dict()
+    source['text_config'].update(
+        num_hidden_layers=2,
+        compress_ratios=[0] * 5,
+        candidate_source_layer_id=-1,
+        kv_source_layer_ids=[],
+        index_source_layer_ids=[],
+        engram_layer_ids=[],
+        engram_num_embeddings=[],
+    )
+    path = Path(__file__).resolve().parents[3] / 'examples/verl/DS41_CLOSED_PREFIX.md'
+    bundle = run_documented_recipe(
+        path, DeepseekV41Config(source), tmp_path, monkeypatch
+    )
+    assert bundle.chunks[0].pipeline_cut == 2
