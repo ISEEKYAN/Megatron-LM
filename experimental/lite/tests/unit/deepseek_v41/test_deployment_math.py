@@ -38,19 +38,6 @@ def test_visible_multi_output_unused_gradient():
     assert torch.equal(x.grad, torch.tensor([4.0, 6.0]))
 
 
-def test_deployment_math_rejects_fp32_residuals(v41_core_te):
-    from megatron.lite.model.deepseek_v41.lite import protocol
-    from test_w4a8_fp32 import tiny_config
-
-    with pytest.raises(ValueError, match='Deployment math requires'):
-        protocol.build_model(
-            tiny_config(),
-            impl_cfg=protocol.ImplConfig(
-                device='cpu', quantized=False, deployment_math=True, dtype=torch.float32
-            ),
-        )
-
-
 def test_norm_decodes_updated_master_and_keeps_fp32_gradient():
     from megatron.lite.primitive.modules.attention.mhc import RMSNorm
 

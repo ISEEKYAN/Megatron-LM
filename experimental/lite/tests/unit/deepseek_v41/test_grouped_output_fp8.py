@@ -50,9 +50,10 @@ def test_grouped_output_uses_fp8_with_master_or_reference_weights(
         model.wo_a.weight[0, 0] = 0.7501
     calls = []
 
-    def project(x, weight):
+    def project(x, weight, *, deployment_math=False):
         calls.append((x.detach().clone(), weight.detach().clone()))
-        return mxfp8.dynamic_fp8_linear(x, weight)
+        assert deployment_math
+        return mxfp8.dynamic_fp8_linear(x, weight, deployment_math=deployment_math)
 
     model.wo_a.fp8_operator = project
     x = torch.randn(1, 3, 32, device='cuda').bfloat16().requires_grad_()
@@ -107,7 +108,7 @@ def test_fp32_activation_bf16_reference_matches_master_codec_and_vjp(v41_core_te
     torch.manual_seed(913)
     x = torch.randn(2, 3, 64, device='cuda', dtype=torch.float32).requires_grad_()
     weight = torch.randn(32, 64, device='cuda', dtype=torch.bfloat16).requires_grad_()
-    output = mxfp8.dynamic_fp8_linear(x, weight)
+    output = mxfp8.dynamic_fp8_linear(x, weight, deployment_math=True)
     master_output = mxfp8.dynamic_fp8_linear(x.detach(), weight.detach().float())
     assert output.dtype == torch.float32
     assert torch.equal(output, master_output)
@@ -126,3 +127,19 @@ def test_fp32_activation_bf16_reference_matches_master_codec_and_vjp(v41_core_te
     assert torch.equal(x.grad, expected_x)
     assert torch.equal(weight.grad, expected_weight)
     assert weight.grad.dtype == torch.bfloat16
+
+
+def test_mixed_activation_dtype_is_deployment_only():
+    """Execute the public validation boundary; CPU never pretends to run GEMM."""
+    from megatron.lite.primitive.quantization import mxfp8
+
+    x = torch.randn(2, 64, dtype=torch.float32)
+    weight = torch.randn(32, 64, dtype=torch.bfloat16)
+    for kwargs in ({}, {'deployment_math': False}):
+        with pytest.raises(ValueError, match='compute dtype'):
+            mxfp8.dynamic_fp8_linear(x, weight, **kwargs)
+    with pytest.raises(RuntimeError, match='requires CUDA'):
+        mxfp8.dynamic_fp8_linear(x, weight, deployment_math=True)
+    # An FP32 master remains supported without deployment opt-in.
+    with pytest.raises(RuntimeError, match='requires CUDA'):
+        mxfp8.dynamic_fp8_linear(x.bfloat16(), weight.float())

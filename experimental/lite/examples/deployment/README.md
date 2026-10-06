@@ -29,9 +29,10 @@ PYTHONPATH=experimental/lite python \
 
 Use `--device cuda` only with the compatible SM100 provider build. The CPU
 example validates the reference/master contract, not CUDA bitwise parity.
-The deployment tests also compose normalization, projection, RoPE, attention,
-compressor, Engram and hyper-connection providers and compare their VJPs to
-independent references. Default-off tests compare forward and every gradient
+The deployment tests compare normalization, projection, RoPE, compressor,
+Engram and hyper-connection reference VJPs. The grouped projection test
+exercises attention as an adjacent consumer; it does not provide an
+independent sparse-attention output or VJP oracle. Default-off tests compare forward and every gradient
 with a pinned prior CSA implementation; missing reference source is an error.
 
 The prior GB200 integration passed an 85-case combined kernel gate and

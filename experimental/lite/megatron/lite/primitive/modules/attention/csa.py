@@ -651,7 +651,9 @@ class CompressedSparseAttention(nn.Module):
             # FP32 optimizer masters must never bypass the forward codec.
             output = torch.stack(
                 [
-                    self.wo_a.fp8_operator(grouped[:, :, i], weight[i])
+                    self.wo_a.fp8_operator(
+                        grouped[:, :, i], weight[i], deployment_math=True
+                    )
                     for i in range(c.groups)
                 ],
                 dim=2,
