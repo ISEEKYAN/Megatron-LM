@@ -17,7 +17,9 @@ pytestmark = pytest.mark.optional
 
 @pytest.fixture(autouse=True)
 def _require_verl() -> None:
-    pytest.importorskip("verl", reason="VERL is required for this optional example test.")
+    pytest.importorskip(
+        "verl", reason="VERL is required for this optional example test."
+    )
 
 
 def _optimizer_config(**override_optimizer_config) -> SimpleNamespace:
@@ -73,7 +75,10 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
     engine.get_data_parallel_group = lambda: None
 
     hook = engine._make_runtime_loss_fn(
-        lambda model_output, **_kwargs: (model_output["log_probs"] / num_microbatches, {}),
+        lambda model_output, **_kwargs: (
+            model_output["log_probs"] / num_microbatches,
+            {},
+        ),
         num_microbatches=num_microbatches,
         output_lst=outputs,
     )
@@ -83,7 +88,9 @@ def test_verl_loss_hook_preserves_gradient_and_micro_outputs(num_microbatches):
         (loss / num_microbatches).backward()
 
     torch.testing.assert_close(weight.grad, torch.tensor(3.0))
-    assert [output["loss"] for output in outputs] == [3.0 / num_microbatches] * num_microbatches
+    assert [output["loss"] for output in outputs] == [
+        3.0 / num_microbatches
+    ] * num_microbatches
 
 
 def test_verl_loss_hook_has_no_strong_self_reference():
@@ -335,3 +342,22 @@ def test_local_lr_scheduler_warmup_decay_and_state_roundtrip() -> None:
 
     assert scheduler.state_dict() == state
     assert optimizer.param_groups[0]["lr"] == pytest.approx(0.7)
+
+
+@pytest.mark.parametrize(
+    "model_name,expected", [("deepseek_v41", False), ("deepseek_v4", None)]
+)
+def test_resync_archival_policy_is_ds41_online_only(model_name, expected):
+    engine = _engine(
+        engine_config=_engine_config(resync_format="mxfp4", model_name=model_name)
+    )
+    received = {}
+    engine.handle = object()
+    engine.runtime = SimpleNamespace(
+        export_weights=lambda handle, **kw: received.update(kw) or iter(())
+    )
+    engine._initial_sync_cache_cleared = True
+    stream, metadata = engine.get_per_tensor_param()
+    assert list(stream) == [] and metadata is None
+    assert received["target"] == "mxfp4"
+    assert received.get("include_archival") is expected

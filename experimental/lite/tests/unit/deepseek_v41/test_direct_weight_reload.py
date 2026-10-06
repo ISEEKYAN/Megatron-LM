@@ -205,3 +205,86 @@ def test_native_sink_return_names_drive_receiver_finish(
         with pytest.raises(ValueError, match='missing attention sinks'):
             receiver.finish()
         receiver.abort()
+
+
+@pytest.mark.parametrize(
+    'backend',
+    ['DeepseekV4FlashInferAttention', 'DeepseekV4FlashMLAAttention', 'FutureAttention'],
+)
+@pytest.mark.parametrize('tp', [1, 4, 8])
+def test_metadata_hook_direct_sink_survives_real_native_reload(
+    v41_core_te, monkeypatch, backend, tp
+):
+    import sys
+    from types import MethodType, ModuleType
+
+    from megatron.lite.model.deepseek_v41.lite.resync import transport_weights
+    from native_reload import functions
+    from reload_fixture import install_reload
+
+    rank = tp - 1
+    consumer = adapter(v41_core_te)
+    model = torch.nn.Module()
+    attention = type(backend, (torch.nn.Module,), {})()
+    model.layers = torch.nn.ModuleList([torch.nn.Module()])
+    model.layers[0].attn = attention
+    kernel = torch.nn.Parameter(torch.full((64,), -float('inf')), requires_grad=False)
+    attention.attn_sink = kernel
+    model.config = NS(num_attention_heads=64)
+    model.quant_config = None
+    model.get_expert_mapping = lambda: []
+    native = functions(
+        'vllm/models/deepseek_v41/nvidia/model.py',
+        ['load_weights'],
+        'DeepseekV4Model',
+        get_tensor_model_parallel_world_size=lambda: tp,
+        get_tensor_model_parallel_rank=lambda: rank,
+        is_pp_missing_parameter=lambda name, model: False,
+    )
+    model.load_weights = MethodType(native.load_weights, model)
+
+    def initialize(_):
+        infos[attention].kernel_tensors = ({'attn_sink': kernel}, {})
+        attention.attn_sink = torch.nn.Parameter(
+            torch.empty(64, device='meta'), requires_grad=False
+        )
+
+    infos, reload = install_reload(monkeypatch, model, initialize)
+    layerwise = reload.layerwise
+    layerwise.get_layer_size = lambda layer: sum(p.numel() for p in layer.parameters())
+    layerwise.get_numel_loaded = lambda loader, args: (0, None)
+    recorded = []
+    reload.record_metadata_for_reloading = lambda model: recorded.append(model)
+    base = ModuleType('vllm.model_executor.model_loader.base_loader')
+
+    class BaseModelLoader:
+        def create_model(self, vllm_config, model_config, prefix=''):
+            return model
+
+    base.BaseModelLoader = BaseModelLoader
+    monkeypatch.setitem(sys.modules, base.__name__, base)
+    consumer.install_reload_metadata_hook()
+    config = NS(cpu_offload_gb=0, hf_config=NS(model_type='deepseek_v41'))
+    assert BaseModelLoader().create_model(None, config) is model
+    assert recorded == [model]
+    ptr = kernel.data_ptr()
+    count = 64 // tp
+    for generation in (1, 2, 3):
+        kernel.data.zero_()  # Simulate sleep(level=2) discarding resident bytes.
+        receiver = consumer.ResyncReceiver(model, config)
+        weight = torch.arange(64).float() / 7 + generation
+        receiver.receive(
+            list(
+                transport_weights(
+                    [('layers.0.attn.attn_sink', weight)], deployment=True
+                )
+            )
+        )
+        receiver.finish()
+        cold = torch.full((64,), -float('inf'))
+        cold[:count] = weight[rank * count : (rank + 1) * count]
+        assert attention.attn_sink.device.type != 'meta'
+        assert torch.equal(attention.attn_sink, cold)
+        assert attention.attn_sink is kernel
+        assert kernel.data_ptr() == ptr
+        assert receiver.received_sinks == {'layers.0.attn.attn_sink'}

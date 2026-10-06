@@ -20,14 +20,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import megatron.lite.primitive.ckpt.row_stream as _imports_row_stream
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.ckpt.row_stream import (
-    RowChunk,
-    stream_rows,
-    write_row_file,
-)
+
+RowChunk = _imports_row_stream.RowChunk
+stream_rows = _imports_row_stream.stream_rows
+write_row_file = _imports_row_stream.write_row_file
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -36,7 +36,11 @@ try:
     from torch.distributed.tensor import DTensor
 except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+import torch.distributed.tensor._utils as _imports__utils
+
+compute_local_shape_and_global_offset = (
+    _imports__utils.compute_local_shape_and_global_offset
+)
 
 from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
     get_weight_sync_probe,
@@ -2162,16 +2166,18 @@ def export_checkpoint(
     cpu=False,
     buffer_max_size_bytes=5 * 1024**3,
     row_chunks=False,
+    include_archival=True,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
         type(cpu) is not bool
         or type(row_chunks) is not bool
+        or type(include_archival) is not bool
         or type(buffer_max_size_bytes) is not int
         or buffer_max_size_bytes < 4
     ):
         raise ValueError('Invalid export CPU or buffer option')
-    if model.archival_bindings and model.archival_store is None:
+    if include_archival and model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
     bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
     for item in export_model(
@@ -2202,7 +2208,7 @@ def export_checkpoint(
         if tensor.dtype in _PLAIN:
             tensor = _cast_export_tensor(tensor, export_dtype=dtype)
         yield name, tensor.cpu() if cpu else tensor
-    if model.archival_store is not None:
+    if include_archival and model.archival_store is not None:
         yield from export_raw_tensors(
             model.archival_store, model.archival_keys, cpu=cpu
         )
