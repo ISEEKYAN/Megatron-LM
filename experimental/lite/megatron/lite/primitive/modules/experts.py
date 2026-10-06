@@ -7,27 +7,32 @@ import os
 from contextlib import contextmanager
 from typing import Any
 
+import megatron.lite.primitive.kernels.swiglu as _imports_swiglu
 import torch  # pyright: ignore[reportMissingImports]
 import torch.distributed as dist  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
-
 from megatron.lite.primitive import transformer_engine as te
-from megatron.lite.primitive.kernels.swiglu import bias_swiglu_impl, weighted_bias_swiglu_impl
-from megatron.lite.primitive.modules.lora import (
-    LoraConfig,
-    SharedGroupedLinearLoRA,
-    normalize_lora_config,
-)
+
+bias_swiglu_impl = _imports_swiglu.bias_swiglu_impl
+weighted_bias_swiglu_impl = _imports_swiglu.weighted_bias_swiglu_impl
+import megatron.lite.primitive.modules.lora as _imports_lora
+
+LoraConfig = _imports_lora.LoraConfig
+SharedGroupedLinearLoRA = _imports_lora.SharedGroupedLinearLoRA
+normalize_lora_config = _imports_lora.normalize_lora_config
 from megatron.lite.primitive.parallel import ParallelState
 from megatron.lite.primitive.recompute import CheckpointWithoutOutput
 from megatron.lite.primitive.utils import ensure_divisible
 
-__all__ = ["Experts", "_AllReduceETP"]
+__all__ = ["Experts", "_AllReduceETP", "enable_w4a8_experts"]
 
 
 @contextmanager
 def _expert_nvtx_range(name: str):
-    if os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1" or not torch.cuda.is_available():
+    if (
+        os.environ.get("MEGATRON_LITE_EP_EXPERT_NVTX") != "1"
+        or not torch.cuda.is_available()
+    ):
         yield
         return
     torch.cuda.nvtx.range_push(name)
@@ -81,10 +86,13 @@ class Experts(nn.Module):
     ):
         super().__init__()
         self.num_local_experts = ensure_divisible(config.num_experts, ps.ep_size)
+        self.ep_size = ps.ep_size
         self.fp8 = fp8
         self.moe_act_recompute = moe_act_recompute
         self.etp_group = ps.etp_group if ps.etp_size > 1 else None
         self.swiglu_limit = float(getattr(config, "swiglu_limit", 0.0) or 0.0)
+        # Opt-in W4A8 forward; set only by ``enable_w4a8_experts``.
+        self.w4a8 = False
         self.fc1 = te.GroupedLinear(
             self.num_local_experts,
             config.hidden_size,
@@ -147,7 +155,9 @@ class Experts(nn.Module):
         )
         pad_mask = None
         if self.fp8:
-            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(x, permuted_probs, m_splits)
+            x, permuted_probs, m_splits, pad_mask = self._fp8_pad(
+                x, permuted_probs, m_splits
+            )
 
         etp_real_len = x.shape[0]
         if self.etp_group is not None:
@@ -159,7 +169,10 @@ class Experts(nn.Module):
                     [
                         x,
                         torch.zeros(
-                            max_len - etp_real_len, x.shape[1], dtype=x.dtype, device=x.device
+                            max_len - etp_real_len,
+                            x.shape[1],
+                            dtype=x.dtype,
+                            device=x.device,
                         ),
                     ],
                     dim=0,
@@ -169,7 +182,9 @@ class Experts(nn.Module):
                         [
                             permuted_probs,
                             torch.zeros(
-                                max_len - etp_real_len, dtype=permuted_probs.dtype, device=x.device
+                                max_len - etp_real_len,
+                                dtype=permuted_probs.dtype,
+                                device=x.device,
                             ),
                         ],
                         dim=0,
@@ -179,12 +194,31 @@ class Experts(nn.Module):
 
         probs = permuted_probs.unsqueeze(-1) if permuted_probs is not None else None
         with _expert_nvtx_range("ep_experts.forward"):
-            if self.moe_act_recompute and probs is not None:
+            if self.w4a8:
+                import megatron.lite.primitive.quantization.w4a8_experts as _imports_w4a8_experts
+
+                w4a8_expert_mlp = _imports_w4a8_experts.w4a8_expert_mlp
+
+                # The router weights are applied in the caller's top-k combine.
+                if probs is not None:
+                    raise ValueError(
+                        "W4A8 experts return unweighted rows; pass probs=None."
+                    )
+                out = w4a8_expert_mlp(
+                    x,
+                    self._expert_weights(self.fc1),
+                    self._expert_weights(self.fc2),
+                    m_splits,
+                    self.swiglu_limit or None,
+                )
+            elif self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
                 if self.fc1_lora is not None:
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
-                h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
+                h = act_ckpt.checkpoint(
+                    swiglu_with_probs, fc1_out, probs, self.swiglu_limit
+                )
                 out = self.fc2(h, m_splits)
                 if self.fc2_lora is not None:
                     out = out + self.fc2_lora(h, m_splits)
@@ -206,6 +240,12 @@ class Experts(nn.Module):
             out = out[pad_mask]
         return out
 
+    def _expert_weights(self, grouped_linear: nn.Module) -> list[torch.Tensor]:
+        return [
+            getattr(grouped_linear, f"weight{index}")
+            for index in range(self.num_local_experts)
+        ]
+
     @staticmethod
     def _fp8_pad(x, permuted_probs, m_splits):
         padded = [(s + 15) // 16 * 16 for s in m_splits]
@@ -217,13 +257,63 @@ class Experts(nn.Module):
         mask = torch.zeros(total_padded, dtype=torch.bool, device=device)
         probs_pad = None
         if permuted_probs is not None:
-            probs_pad = torch.zeros(total_padded, device=device, dtype=permuted_probs.dtype)
+            probs_pad = torch.zeros(
+                total_padded, device=device, dtype=permuted_probs.dtype
+            )
         src_off, dst_off = 0, 0
         for real, pad in zip(m_splits, padded, strict=True):
             x_pad[dst_off : dst_off + real] = x[src_off : src_off + real]
             mask[dst_off : dst_off + real] = True
             if probs_pad is not None:
-                probs_pad[dst_off : dst_off + real] = permuted_probs[src_off : src_off + real]
+                probs_pad[dst_off : dst_off + real] = permuted_probs[
+                    src_off : src_off + real
+                ]
             src_off += real
             dst_off += pad
         return x_pad, probs_pad, padded, mask
+
+
+def enable_w4a8_experts(chunks, spec) -> int:
+    """Switch every targeted ``Experts`` module to the W4A8 forward.
+
+    ``spec`` is the model's ``QATSpec``; modules whose path it ignores are left
+    unchanged. Returns the number of modules switched. Combinations whose
+    numerics the W4A8 forward does not reproduce, and per-rank GEMM shapes the
+    A8 activation groups cannot tile, are rejected here, before any module is
+    switched, rather than at the first forward.
+    """
+    import megatron.lite.primitive.quantization.w4a8_experts as _imports_w4a8_experts
+
+    FP8_ACT_GROUP_SIZE = _imports_w4a8_experts.FP8_ACT_GROUP_SIZE
+
+    targets = []
+    for chunk in chunks:
+        for name, module in chunk.named_modules():
+            if not isinstance(module, Experts) or not spec.targets_module(name):
+                continue
+            if module.fp8 or module.moe_act_recompute:
+                raise ValueError(
+                    f"{name}: W4A8 experts cannot be combined with fp8 or moe_act recompute."
+                )
+            if module.fc1_lora is not None or module.fc2_lora is not None:
+                raise ValueError(f"{name}: W4A8 experts cannot be combined with LoRA.")
+            # The EP all-to-all return of the unreduced top-k rows has no
+            # multi-GPU parity evidence yet.
+            if module.ep_size > 1:
+                raise ValueError(
+                    f"{name}: W4A8 experts are not supported with EP={module.ep_size} "
+                    "until the expert-parallel combine has multi-GPU validation; use EP=1."
+                )
+            # K of each GEMM is the weight's input dim on this rank (FC2's is the
+            # ETP-sharded intermediate size).
+            for label, linear in (("FC1", module.fc1), ("FC2", module.fc2)):
+                k = module._expert_weights(linear)[0].shape[1]
+                if k % FP8_ACT_GROUP_SIZE:
+                    raise ValueError(
+                        f"{name}: W4A8 experts need the {label} GEMM K dimension "
+                        f"({k} per rank) to be divisible by {FP8_ACT_GROUP_SIZE}."
+                    )
+            targets.append(module)
+    for module in targets:
+        module.w4a8 = True
+    return len(targets)
