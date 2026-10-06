@@ -11,14 +11,22 @@ from datetime import timedelta
 from itertools import chain
 from typing import Any
 
+import megatron.lite.runtime.contracts.data as _imports_data
+import megatron.lite.runtime.contracts.loss as _imports_loss
 import torch
 import torch.distributed as dist
+import torch.distributed.tensor as _imports_dtensor
 from megatron.lite.runtime.backends import Runtime as RuntimeBase
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts.data import ForwardResult, ModelOutputs, PackedBatch
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import get_loss_context, split_loss_context, use_loss_context
-from torch.distributed.tensor import DTensor  # pyright: ignore[reportMissingImports]
+
+DTensor = _imports_dtensor.DTensor
+ForwardResult = _imports_data.ForwardResult
+ModelOutputs = _imports_data.ModelOutputs
+PackedBatch = _imports_data.PackedBatch
+get_loss_context = _imports_loss.get_loss_context
+split_loss_context = _imports_loss.split_loss_context
+use_loss_context = _imports_loss.use_loss_context
 
 
 def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
@@ -26,25 +34,34 @@ def _build_impl_cfg(proto, rt_cfg: MegatronLiteConfig):
     init_fields = {f.name for f in dc_fields(proto.ImplConfig) if f.init}
     # Only forward impl_cfg keys this model's ImplConfig declares: the connector
     # may pass knobs (e.g. cross_entropy_fusion) that some models don't model.
-    impl_cfg_kwargs = {key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields}
+    impl_cfg_kwargs = {
+        key: value for key, value in rt_cfg.impl_cfg.items() if key in init_fields
+    }
     impl_cfg_kwargs["parallel"] = rt_cfg.parallel
     if (
         "attention_backend_override" in init_fields
         and impl_cfg_kwargs.get("attention_backend_override") is None
     ):
-        impl_cfg_kwargs["attention_backend_override"] = rt_cfg.attention_backend_override
+        impl_cfg_kwargs["attention_backend_override"] = (
+            rt_cfg.attention_backend_override
+        )
     if (
         "router_aux_loss_coef" in init_fields
         and impl_cfg_kwargs.get("router_aux_loss_coef") is None
         and rt_cfg.router_aux_loss_coef is not None
     ):
         impl_cfg_kwargs["router_aux_loss_coef"] = rt_cfg.router_aux_loss_coef
-    if "hf_path" in init_fields and impl_cfg_kwargs.get("hf_path") in (None, "") and rt_cfg.hf_path:
+    if (
+        "hf_path" in init_fields
+        and impl_cfg_kwargs.get("hf_path") in (None, "")
+        and rt_cfg.hf_path
+    ):
         impl_cfg_kwargs["hf_path"] = rt_cfg.hf_path
     # Thread the user-level OptimizerConfig so the protocol can pass it to
     # optimizer primitives without reading runtime internals.
     if (
         "optimizer_config" in init_fields
+        and impl_cfg_kwargs.get("optimizer", True) is not None
         and impl_cfg_kwargs.get("optimizer_config") is None
         and getattr(rt_cfg, "optimizer", None) is not None
     ):
@@ -63,12 +80,18 @@ def _reset_parameters(module: torch.nn.Module) -> None:
         for name, original in original_parameters.items():
             replacement = module._parameters.get(name)
             if replacement is None:
-                raise RuntimeError(f"{type(module).__name__}.reset_parameters() removed {name!r}.")
+                raise RuntimeError(
+                    f"{type(module).__name__}.reset_parameters() removed {name!r}."
+                )
             if replacement is original:
                 continue
-            original_local = original.to_local() if isinstance(original, DTensor) else original
+            original_local = (
+                original.to_local() if isinstance(original, DTensor) else original
+            )
             replacement_local = (
-                replacement.to_local() if isinstance(replacement, DTensor) else replacement
+                replacement.to_local()
+                if isinstance(replacement, DTensor)
+                else replacement
             )
             if original_local.shape != replacement_local.shape:
                 raise RuntimeError(
@@ -78,8 +101,7 @@ def _reset_parameters(module: torch.nn.Module) -> None:
             if original_local.data_ptr() != replacement_local.data_ptr():
                 original_local.copy_(
                     replacement_local.to(
-                        device=original_local.device,
-                        dtype=original_local.dtype,
+                        device=original_local.device, dtype=original_local.dtype
                     )
                 )
             module._parameters[name] = original
@@ -108,9 +130,13 @@ def _apply_attention_backend_env(backend: str | None, *, tag: str) -> None:
     os.environ["NVTE_UNFUSED_ATTN"] = unfused
 
 
-def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tuple[int, int, int]:
+def _infer_pipeline_tensor_shape(
+    batch: PackedBatch, model_cfg: Any, ps
+) -> tuple[int, int, int]:
     if model_cfg is None or not hasattr(model_cfg, "hidden_size"):
-        raise ValueError("Megatron Lite pipeline runtime requires model_cfg.hidden_size.")
+        raise ValueError(
+            "Megatron Lite pipeline runtime requires model_cfg.hidden_size."
+        )
     if not isinstance(batch, PackedBatch):
         raise TypeError("Megatron Lite pipeline runtime requires PackedBatch inputs.")
 
@@ -122,7 +148,9 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
         batch_size = int(input_ids.size(0))
         local_seq_len = int(input_ids.size(1))
     else:
-        raise ValueError(f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}.")
+        raise ValueError(
+            f"Unsupported input_ids rank for pipeline runtime: {input_ids.dim()}."
+        )
 
     if local_seq_len < 1:
         raise ValueError("Pipeline tensor shape requires non-empty sequence.")
@@ -136,7 +164,11 @@ def _infer_pipeline_tensor_shape(batch: PackedBatch, model_cfg: Any, ps) -> tupl
     # (each sequence padded to align = tp * (2*cp if cp>1 else 1)) then divide by CP*TP.
     seq_lens = getattr(batch, "seq_lens", None)
     if seq_lens is not None and cp_size * tp_size > 1:
-        sl = seq_lens if isinstance(seq_lens, torch.Tensor) else torch.as_tensor(seq_lens)
+        sl = (
+            seq_lens
+            if isinstance(seq_lens, torch.Tensor)
+            else torch.as_tensor(seq_lens)
+        )
         sl = sl.to(torch.int64).reshape(-1)
         align = tp_size * (2 * cp_size if cp_size > 1 else 1)
         padded = sl + (align - sl % align) % align
@@ -267,9 +299,15 @@ class MegatronLiteRuntime(RuntimeBase):
 
         # ── load HF weights (optional) ──
         loaded_hf_weights = False
-        if rt_cfg.load_hf_weights and rt_cfg.hf_path and hasattr(proto, "load_hf_weights"):
+        if (
+            rt_cfg.load_hf_weights
+            and rt_cfg.hf_path
+            and hasattr(proto, "load_hf_weights")
+        ):
             for chunk in bundle.chunks:
-                proto.load_hf_weights(chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state)
+                proto.load_hf_weights(
+                    chunk, rt_cfg.hf_path, model_cfg, bundle.parallel_state
+                )
             loaded_hf_weights = True
 
         post_load_hook = bundle.extras.pop("post_model_load_hook", None)
@@ -285,7 +323,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 extra_updates = post_load_updates.get("extras")
                 if extra_updates:
                     if not isinstance(extra_updates, dict):
-                        raise TypeError("post_model_load_hook extras update must be a dict.")
+                        raise TypeError(
+                            "post_model_load_hook extras update must be a dict."
+                        )
                     bundle.extras.update(extra_updates)
 
         if (loaded_hf_weights or meta_initialized) and bundle.optimizer is not None:
@@ -294,7 +334,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 reload_model_params()
 
         if bundle.forward_step is None:
-            raise ValueError("Megatron Lite model bundles must provide a typed forward_step.")
+            raise ValueError(
+                "Megatron Lite model bundles must provide a typed forward_step."
+            )
 
         p = rt_cfg.parallel
         model = bundle.chunks[0] if len(bundle.chunks) == 1 else bundle.chunks
@@ -318,7 +360,10 @@ class MegatronLiteRuntime(RuntimeBase):
 
     def _load_protocol(self, rt_cfg: MegatronLiteConfig):
         """Load and return the model protocol module."""
-        from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES, resolve_runtime_model_name
+        import megatron.lite.model.registry as _imports_registry
+
+        TRAIN_RUNTIME_MODULES = _imports_registry.TRAIN_RUNTIME_MODULES
+        resolve_runtime_model_name = _imports_registry.resolve_runtime_model_name
 
         try:
             runtime_key = resolve_runtime_model_name(rt_cfg.model_name, rt_cfg.impl)
@@ -338,7 +383,9 @@ class MegatronLiteRuntime(RuntimeBase):
 
         for fn_name in ("build_model_config", "build_model"):
             if not callable(getattr(proto, fn_name, None)):
-                raise ValueError(f"Protocol module {mod_path} missing required function: {fn_name}")
+                raise ValueError(
+                    f"Protocol module {mod_path} missing required function: {fn_name}"
+                )
         if not hasattr(proto, "ImplConfig"):
             raise ValueError(f"Protocol module {mod_path} missing ImplConfig class")
 
@@ -401,7 +448,9 @@ class MegatronLiteRuntime(RuntimeBase):
             **kwargs,
         )
 
-    def export_weights(self, handle: ModelHandle, **kwargs) -> Iterator[tuple[str, torch.Tensor]]:
+    def export_weights(
+        self, handle: ModelHandle, **kwargs
+    ) -> Iterator[tuple[str, torch.Tensor]]:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
@@ -433,12 +482,12 @@ class MegatronLiteRuntime(RuntimeBase):
         grad: bool = True,
     ) -> None:
         model_chunks = handle._extras.get("model_chunks", [handle._model])
-        from megatron.lite.runtime.megatron_utils import (
-            load_model_to_gpu,
-            load_optimizer,
-            offload_model_to_cpu,
-            offload_optimizer,
-        )
+        import megatron.lite.runtime.megatron_utils as _imports_utils
+
+        load_model_to_gpu = _imports_utils.load_model_to_gpu
+        load_optimizer = _imports_utils.load_optimizer
+        offload_model_to_cpu = _imports_utils.offload_model_to_cpu
+        offload_optimizer = _imports_utils.offload_optimizer
 
         # A model+gradient transfer is the training context boundary.  On its
         # CPU side the colocated rollout is about to map its sleeping weights;
@@ -449,6 +498,9 @@ class MegatronLiteRuntime(RuntimeBase):
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
+                transfer_hook = handle._extras.get("post_model_device_transfer_hook")
+                if callable(transfer_hook):
+                    transfer_hook("cpu")
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
@@ -469,6 +521,9 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
+                transfer_hook = handle._extras.get("post_model_device_transfer_hook")
+                if callable(transfer_hook):
+                    transfer_hook("cuda")
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
@@ -496,8 +551,10 @@ class MegatronLiteRuntime(RuntimeBase):
         forward_only: bool = False,
         router_replay: Any = None,
     ) -> ForwardResult:
+        import megatron.lite.runtime.backends.mlite.router_replay as _imports_replay
         from megatron.lite.primitive.train_step import run_microbatch_loop
-        from megatron.lite.runtime.backends.mlite.router_replay import RouterReplayDriver
+
+        RouterReplayDriver = _imports_replay.RouterReplayDriver
 
         forward_step = handle._extras["forward_step"]
         if num_microbatches < 1:
@@ -519,8 +576,10 @@ class MegatronLiteRuntime(RuntimeBase):
         if ps.pp_size > 1:
             from types import SimpleNamespace
 
+            import megatron.lite.primitive.parallel.pipeline as _imports_pipeline
             from megatron.lite.primitive.ckpt.hf_weights import unwrap_model
-            from megatron.lite.primitive.parallel.pipeline import forward_backward_pipelining
+
+            forward_backward_pipelining = _imports_pipeline.forward_backward_pipelining
 
             try:
                 prepare = handle._extras.get("prepare_microbatches")
@@ -588,7 +647,9 @@ class MegatronLiteRuntime(RuntimeBase):
                 dtype=torch.float32,
             )
             if ps.pp_group is not None and ps.pp_global_ranks is not None:
-                dist.broadcast(loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group)
+                dist.broadcast(
+                    loss_payload, src=ps.pp_global_ranks[-1], group=ps.pp_group
+                )
             out = {"loss": loss_payload[1]} if bool(loss_payload[0].item()) else {}
         else:
             try:
@@ -708,7 +769,10 @@ def _checkpoint_model(handle: ModelHandle, *, use_dcp: bool):
 
 
 def _checkpoint_hooks(handle: ModelHandle):
-    from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+    import megatron.lite.primitive.protocols as _imports_protocols
+
+    default_expert_classifier = _imports_protocols.default_expert_classifier
+    default_placement_fn = _imports_protocols.default_placement_fn
 
     proto = handle._extras.get("protocol")
     return (
