@@ -9,7 +9,9 @@ import operator
 import os
 from pathlib import Path
 
-from verl.experimental.agent_loop.single_turn_agent_loop import SingleTurnAgentLoop
+import verl.experimental.agent_loop.single_turn_agent_loop as single_turn
+
+SingleTurnAgentLoop = single_turn.SingleTurnAgentLoop
 
 
 def request_sampling_params(original, base_seed, priority):

@@ -142,7 +142,9 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
 
         algos.compute_grpo_outcome_advantage = advantage
         algos.ADV_ESTIMATOR_REGISTRY['grpo'] = advantage
-        from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
+        import megatron.lite.primitive.optimizers.headwise_muon as headwise_muon
+
+        MixedOptimizer = headwise_muon.MixedOptimizer
 
         optimizer_original = MixedOptimizer.step
 
@@ -249,7 +251,9 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
             return digest.hexdigest()
 
         def checkpoint_receipt(engine):
-            from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+            import megatron.lite.primitive.ckpt.frozen_storage as frozen_storage
+
+            storage_digest = frozen_storage.storage_digest
 
             model = engine.module
             opt = engine.handle._optimizer

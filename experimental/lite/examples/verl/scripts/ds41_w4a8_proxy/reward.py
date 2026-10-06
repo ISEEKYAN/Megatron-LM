@@ -11,7 +11,9 @@ import json
 import os
 from pathlib import Path
 
-from verl.utils.reward_score.math_dapo import compute_score as actual_math_score
+import verl.utils.reward_score.math_dapo as math_dapo
+
+actual_math_score = math_dapo.compute_score
 
 
 def compute_score(data_source, solution_str, ground_truth, extra_info=None, **kwargs):
