@@ -10,7 +10,9 @@ from test_receiver_staging import adapter
 
 
 def exports(model, frozen=True):
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import export_hf_weights
+    import megatron.lite.model.deepseek_v41.lite.checkpoint as ckpt
+
+    export_hf_weights = ckpt.export_hf_weights
 
     options = {'expert_dtype': 'fp4'}
     if frozen:
@@ -171,7 +173,9 @@ def test_saved_hf_is_standalone_after_online_freeze(v41_core_te, tmp_path):
 
 
 def test_frozen_table_has_no_optimizer_state(v41_core_te, tmp_path):
-    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import V41Optimizer
+    import megatron.lite.model.deepseek_v41.lite.optimizer_groups as groups
+
+    V41Optimizer = groups.V41Optimizer
     from megatron.lite.model.deepseek_v41.vision_config import OptimizerConfig
 
     model = make_model(tmp_path / 'archive', False)
