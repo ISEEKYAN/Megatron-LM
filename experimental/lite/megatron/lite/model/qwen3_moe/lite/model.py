@@ -73,6 +73,9 @@ class MoELayer(nn.Module):
 
         scores, indices = self.router(x_2d)
         dispatched, tpe, permuted_probs = self.dispatcher.dispatch(x_2d, scores, indices)
+        if self.experts.w4a8:
+            combined = self._w4a8_experts_and_combine(dispatched, tpe, scores, indices)
+            return combined.view(input_shape).to(x.dtype)
         del scores, indices
         self.dispatcher.wait_dispatch_event()
         expert_out = self.experts(
@@ -86,6 +89,21 @@ class MoELayer(nn.Module):
         del expert_out
 
         return combined.view(input_shape).to(x.dtype)
+
+    def _w4a8_experts_and_combine(self, dispatched, tpe, scores, indices):
+        """Rollout order: unweighted expert rows, router weights applied in the
+        float32 top-k accumulation (vLLM ``ep_gather``), one rounding to BF16."""
+        from megatron.lite.primitive.quantization.w4a8_experts import topk_fma_combine
+
+        self.dispatcher.wait_dispatch_event()
+        expert_out = self.experts(
+            dispatched,
+            tpe,
+            None,
+            tokens_per_expert_list=getattr(self.dispatcher, "_local_tpe_list", None),
+        )
+        rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_out)
+        return topk_fma_combine(rows, row_token, row_expert, indices, scores)
 
 
 # ---------------------------------------------------------------------------

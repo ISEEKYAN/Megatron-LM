@@ -212,6 +212,7 @@ class TokenDispatcher:
 
         self._row_id_map: torch.Tensor | None = None
         self._restore_shape: tuple | None = None
+        self._routed_tpe: torch.Tensor | None = None
         self._input_splits: list[int] | None = None
         self._output_splits: list[int] | None = None
         self._handle = None
@@ -310,6 +311,7 @@ class TokenDispatcher:
         self._restore_shape = hidden_states.shape
 
         tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+        self._routed_tpe = tokens_per_expert
         return permuted, tokens_per_expert, permuted_probs
 
     def _combine_local(self, expert_output):
@@ -351,6 +353,7 @@ class TokenDispatcher:
         self._restore_shape = hidden_states.shape
 
         tokens_per_expert = routing_map.sum(dim=0).to(torch.int64)
+        self._routed_tpe = tokens_per_expert
         tpe_by_rank = tokens_per_expert.view(self.ep_size, self.num_local_experts).sum(dim=1)
         self._input_splits = tpe_by_rank.tolist()
 
@@ -388,7 +391,32 @@ class TokenDispatcher:
         recv_tpe = recv_tpe_2d.sum(dim=0)
         return dispatched, recv_tpe, permuted_probs_out.squeeze(-1)
 
-    def _combine_alltoall(self, expert_output):
+    def combine_unreduced(self, expert_output: torch.Tensor):
+        """Return expert rows to this rank without summing each token's top-k rows.
+
+        Returns ``(rows, row_token, row_expert)`` in this rank's dispatch order:
+        ``rows[i]`` is the output for token ``row_token[i]`` at (global) expert
+        ``row_expert[i]``. For callers that reduce the top-k rows themselves.
+        Only the unfused local and all-to-all paths keep this row layout.
+        """
+        if self.use_deepep or self.moe_permute_fusion:
+            raise RuntimeError(
+                "combine_unreduced needs the unfused permute and no DeepEP "
+                f"(use_deepep={self.use_deepep}, moe_permute_fusion={self.moe_permute_fusion})."
+            )
+        if self.ep_size > 1:
+            rows = self._alltoall_return(expert_output)
+        else:
+            rows = expert_output
+        row_token = self._row_id_map
+        # The unfused permute orders rows expert-major over all experts.
+        row_expert = torch.repeat_interleave(
+            torch.arange(self.num_experts, device=rows.device), self._routed_tpe
+        )
+        self._clear_combine_state()
+        return rows, row_token, row_expert
+
+    def _alltoall_return(self, expert_output):
         if self._combine_chunk_sizes is not None:
             chunks = torch.split(expert_output, self._combine_chunk_sizes, dim=0)
             restore_idxs = (
@@ -400,22 +428,29 @@ class TokenDispatcher:
         else:
             rank_grouped = expert_output
 
-        combined = _AllToAll.apply(
+        return _AllToAll.apply(
             rank_grouped, self._output_splits, self._input_splits, self.ps.ep_group
         )
+
+    def _clear_combine_state(self):
+        self._row_id_map = None
+        self._restore_shape = None
+        self._routed_tpe = None
+        self._input_splits = None
+        self._output_splits = None
+        self._combine_chunk_sizes = None
+        self._combine_restore_idxs = None
+        self._local_tpe_list = None
+
+    def _combine_alltoall(self, expert_output):
+        combined = self._alltoall_return(expert_output)
         result = unpermute(
             combined,
             self._row_id_map,
             restore_shape=self._restore_shape,
             fused=self.moe_permute_fusion,
         )
-        self._row_id_map = None
-        self._restore_shape = None
-        self._input_splits = None
-        self._output_splits = None
-        self._combine_chunk_sizes = None
-        self._combine_restore_idxs = None
-        self._local_tpe_list = None
+        self._clear_combine_state()
         return result
 
     def submit_deepep_dispatch(

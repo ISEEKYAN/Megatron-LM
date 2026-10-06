@@ -97,6 +97,7 @@ class ImplConfig:
     deterministic: bool = True
     lora: LoraConfig | dict | None = None
     # Weight-only QAT: float fp8_e4m3 / mxfp4 or int8 / int4. Default None = disabled.
+    # mxfp4 with activation_bits=8 additionally runs routed experts as W4A8.
     qat: QATSpec | dict | None = None
 
 
@@ -252,7 +253,27 @@ def build_model(model_cfg: Qwen3MoEConfig, *, impl_cfg: ImplConfig) -> ModelBund
 
     # Weight-only QAT (fake-quant/STE on the BF16 master, including MoE experts).
     # Must run before optimizer construction so dist_opt captures weight.original.
-    apply_qat_to_chunks(chunks, normalize_qat_spec(impl_cfg.qat))
+    qat_spec = normalize_qat_spec(impl_cfg.qat)
+    apply_qat_to_chunks(chunks, qat_spec, w4a8_experts=True)
+    if qat_spec.enabled and qat_spec.activation_bits is not None:
+        from megatron.lite.primitive.modules.experts import enable_w4a8_experts
+
+        if enable_w4a8_experts(chunks, qat_spec) == 0:
+            raise ValueError("QAT activation_bits=8 matched no routed-expert module.")
+        # The W4A8 top-k FP32 combine reads the unfused dispatch row layout.
+        for chunk in chunks:
+            for name, module in chunk.named_modules():
+                dispatcher = getattr(module, "dispatcher", None)
+                experts = getattr(module, "experts", None)
+                if (
+                    getattr(experts, "w4a8", False)
+                    and dispatcher is not None
+                    and (dispatcher.use_deepep or dispatcher.moe_permute_fusion)
+                ):
+                    raise ValueError(
+                        f"{name}: W4A8 experts need the unfused MoE permute and no DeepEP "
+                        "(MEGATRON_LITE_MOE_PERMUTE_FUSION=0, use_deepep=False)."
+                    )
 
     # ── optimizer (model chooses which primitive) ──
     optimizer = None
