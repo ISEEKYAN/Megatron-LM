@@ -12,6 +12,8 @@ export_dtype: bfloat16
 qat: {}
 resync_format: null
 resync_config: {}
+# Online weight-sync exporter staging budget per rank (bytes).
+export_buffer_max_size_bytes: 2147483648
 router_replay_mode: disabled
 load_hf_weights: true
 

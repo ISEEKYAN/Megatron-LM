@@ -20,14 +20,14 @@ from contextlib import ExitStack
 from pathlib import Path
 from typing import Any, Protocol, runtime_checkable
 
+import megatron.lite.primitive.ckpt.row_stream as _imports_row_stream
 import torch
 import torch.distributed as dist
 import torch.nn as nn
-from megatron.lite.primitive.ckpt.row_stream import (
-    RowChunk,
-    stream_rows,
-    write_row_file,
-)
+
+RowChunk = _imports_row_stream.RowChunk
+stream_rows = _imports_row_stream.stream_rows
+write_row_file = _imports_row_stream.write_row_file
 from megatron.lite.primitive.quantization.qat import canonical_state_key
 from safetensors import safe_open
 from safetensors.torch import save_file as _safe_save
@@ -36,7 +36,11 @@ try:
     from torch.distributed.tensor import DTensor
 except Exception:  # pragma: no cover - older torch without DTensor
     DTensor = None  # type: ignore[assignment]
-from torch.distributed.tensor._utils import compute_local_shape_and_global_offset
+import torch.distributed.tensor._utils as _imports__utils
+
+compute_local_shape_and_global_offset = (
+    _imports__utils.compute_local_shape_and_global_offset
+)
 
 from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
     get_weight_sync_probe,
@@ -1999,6 +2003,57 @@ def export_bound_tensors(
 _PLAIN = (torch.float32, torch.bfloat16, torch.float16)
 
 
+def plan_matrix_codec(
+    spec, name, tensor, encoding, buffer_max_size_bytes, *, strict=True
+):
+    """Rows per codec tile whose workspace plus the whole encoded output fit.
+
+    The spec bounds bytes per source element for codec workspace and for the
+    encoded weight plus scale, and the row alignment of its scale blocks.
+    Without strict, an unfit matrix uses its smallest aligned tile.
+    """
+    align, workspace, output = spec.codec_tile(name, encoding)
+    rows = tensor.shape[0] if tensor.ndim == 2 else 1
+    if rows % align:
+        align = rows  # Untileable: the whole tensor is one tile.
+    width = tensor.numel() // rows
+    available = buffer_max_size_bytes - output * tensor.numel() - 8192
+    tile = min(max(available, 0) // (workspace * width) // align * align, rows)
+    if tile > 0:
+        return tile
+    if strict:
+        raise ValueError(f'Export buffer too small for matrix codec: {name}')
+    return align
+
+
+def encode_matrix(spec, name, tensor, encoding, buffer_max_size_bytes):
+    """Encode block-row-aligned tiles into preallocated outputs.
+
+    Release codecs scale each block independently, so the bytes equal one
+    whole-matrix encode while workspace stays bounded by a single tile.
+    Deployment callers refuse unfit budgets before streaming.
+    """
+    tile = plan_matrix_codec(
+        spec, name, tensor, encoding, buffer_max_size_bytes, strict=False
+    )
+    rows = tensor.shape[0] if tensor.ndim == 2 else 1
+    if tile == rows:
+        return spec.encode(name, tensor, encoding)
+    outputs = None
+    for start in range(0, rows, tile):
+        parts = spec.encode(name, tensor[start : start + tile], encoding)
+        if outputs is None:
+            outputs = [
+                part.new_empty((part.shape[0] * rows // tile, *part.shape[1:]))
+                for part in parts
+            ]
+        for output, part in zip(outputs, parts):
+            offset = start * output.shape[0] // rows
+            output[offset : offset + part.shape[0]].copy_(part)
+        del parts
+    return tuple(outputs)
+
+
 def _keys(reader):
     if reader.index:
         return set(reader.index)
@@ -2099,6 +2154,10 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     model.archival_keys = sorted(required_archive)
 
 
+def export_model(model, spec, **kwargs):
+    yield from export_bound_tensors(model, spec, **kwargs)
+
+
 def export_checkpoint(
     model,
     spec,
@@ -2107,19 +2166,21 @@ def export_checkpoint(
     cpu=False,
     buffer_max_size_bytes=5 * 1024**3,
     row_chunks=False,
+    include_archival=True,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
         type(cpu) is not bool
         or type(row_chunks) is not bool
+        or type(include_archival) is not bool
         or type(buffer_max_size_bytes) is not int
         or buffer_max_size_bytes < 4
     ):
         raise ValueError('Invalid export CPU or buffer option')
-    if model.archival_bindings and model.archival_store is None:
+    if include_archival and model.archival_bindings and model.archival_store is None:
         raise ValueError('Complete archival storage is required for export')
     bindings = spec.expand_bindings(model, dict(model.tensor_bindings))
-    for item in export_bound_tensors(
+    for item in export_model(
         model,
         spec,
         row_chunks=row_chunks,
@@ -2138,14 +2199,16 @@ def export_checkpoint(
             continue
         name, tensor = item
         if tensor.dtype in _PLAIN and bindings[name].encoding in ('I8', 'F8_E4M3'):
-            weight, scale = spec.encode(name, tensor, bindings[name].encoding)
+            weight, scale = encode_matrix(
+                spec, name, tensor, bindings[name].encoding, buffer_max_size_bytes
+            )
             yield name, weight.cpu() if cpu else weight
             yield name[:-6] + 'scale', scale.cpu() if cpu else scale
             continue
         if tensor.dtype in _PLAIN:
             tensor = _cast_export_tensor(tensor, export_dtype=dtype)
         yield name, tensor.cpu() if cpu else tensor
-    if model.archival_store is not None:
+    if include_archival and model.archival_store is not None:
         yield from export_raw_tensors(
             model.archival_store, model.archival_keys, cpu=cpu
         )
@@ -2170,7 +2233,7 @@ def save_bound_model(
     # Quantized HF weights cannot preserve numerical masters bitwise. Keep
     # resume tensors outside the HF index and the consumer's root-level glob.
     def masters():
-        for item in export_bound_tensors(
+        for item in export_model(
             model,
             spec,
             row_chunks=True,
