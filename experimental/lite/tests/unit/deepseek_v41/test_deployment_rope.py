@@ -105,7 +105,6 @@ def test_deployment_swa_kv_rope_native_codec(v41_core_te, num_tokens):
         pytest.skip("CUDA native SWA KV codec")
     from megatron.lite.primitive.modules.attention.csa import rotate
     from megatron.lite.primitive.quantization.mxfp8 import quantize_swa
-    from vllm.models.deepseek_v41.common import ops as native_ops
 
     config = SimpleNamespace(rope_dim=64, rope_theta=10000)
     torch.manual_seed(93)
@@ -137,21 +136,13 @@ def test_deployment_swa_kv_rope_native_codec(v41_core_te, num_tokens):
         False,
         False,
     )
-    native = torch.empty(1, num_tokens, 512, device="cuda", dtype=kv.dtype)
-    native_ops.dequantize_and_gather_k_cache(
-        native,
-        storage.view(num_blocks, block_size, 528),
-        torch.tensor([num_tokens], device="cuda", dtype=torch.int32),
-        None,
-        torch.arange(num_blocks, device="cuda", dtype=torch.int32)[None],
-        block_size,
-        offset=0,
-        use_fnuz=False,
-    )
-    actual = quantize_swa(
-        rotate(kv[None], positions, config, 0, deployment_math=True)
-    ).decoded
-    assert torch.equal(actual, native)
+    # Compare the actual encoder's bytes directly. Decoding would add an
+    # unrelated optional backend dependency and can hide signed-zero bits.
+    actual = quantize_swa(rotate(kv[None], positions, config, 0, deployment_math=True))
+    native_codes = storage[:, : block_size * 512].reshape(-1, 512)[:num_tokens]
+    native_scales = storage[:, block_size * 512 :].reshape(-1, 16)[:num_tokens]
+    assert torch.equal(actual.values.view(torch.uint8)[0], native_codes)
+    assert torch.equal(actual.scale.view(torch.uint8)[0], native_scales)
 
 
 def test_deployment_swa_kv_rope_vjp_and_default(v41_core_te):
