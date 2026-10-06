@@ -43,6 +43,16 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
                     if torch.cuda.is_initialized()
                     else None
                 ),
+                'cuda_peak_allocated': (
+                    torch.cuda.max_memory_allocated()
+                    if torch.cuda.is_initialized()
+                    else None
+                ),
+                'cuda_peak_reserved': (
+                    torch.cuda.max_memory_reserved()
+                    if torch.cuda.is_initialized()
+                    else None
+                ),
                 'cuda_reserved': (
                     torch.cuda.memory_reserved()
                     if torch.cuda.is_initialized()
