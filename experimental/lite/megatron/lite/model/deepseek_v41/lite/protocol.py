@@ -353,7 +353,7 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
     if temperature <= 0:
         raise ValueError("Temperature must be positive")
     if logits is not None:
-        from megatron.lite.primitive.modules import deployment_math
+        from megatron.lite.primitive.modules import deployment_log_probs
 
         if cp_context is not None:
             raise ValueError('Deployment head probabilities require CP1')
@@ -377,7 +377,7 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
                     hidden, weight, labels, temperature, tp_group
                 )
             else:
-                distribution = deployment_math.log_softmax(logits)
+                distribution = deployment_log_probs.log_softmax(logits)
                 result["entropy"] = -(distribution.exp() * distribution).sum(-1)
         return result
     if batch.labels.shape != batch.input_ids.shape:
@@ -394,7 +394,7 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
             hidden, weight, labels, temperature, tp_group
         )
     else:
-        distribution = deployment_math.log_softmax(logits)
+        distribution = deployment_log_probs.log_softmax(logits)
         log_probs = distribution.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
         entropy = (
             -(distribution.exp() * distribution).sum(-1)
@@ -639,7 +639,7 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
             ids,
             cu_seqlens=batch.cu_seqlens,
             cp_context=cp_context,
-            return_head_hidden=not model.deployment_math,
+            return_head_hidden=not getattr(model, 'deployment_math', False),
             **modality,
         )
     result = (
@@ -651,7 +651,11 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
             batch,
             cp_context=cp_context,
             tp_group=model.ps.tp_group,
-            logits=output['logits'][0] if model.deployment_math else None,
+            logits=(
+                output['logits'][0]
+                if getattr(model, 'deployment_math', False)
+                else None
+            ),
         )
     )
     if optimizer is not None and model.training and torch.is_grad_enabled():

@@ -98,17 +98,19 @@ def test_deployment_log_softmax_native_and_vjp(v41_core_te, vocab):
         assert torch.cuda.is_available()
     elif not torch.cuda.is_available():
         pytest.skip('real CUDA log probabilities')
-    from megatron.lite.primitive.modules import deployment_math
+    from megatron.lite.primitive.modules import deployment_log_probs
     from vllm.model_executor.determinism.batch_invariant import log_softmax
 
     torch.manual_seed(57)
     x = torch.randn(7, vocab, device='cuda', requires_grad=True)
-    actual = deployment_math.log_softmax(x)
+    actual = deployment_log_probs.log_softmax(x)
     native = log_softmax(x.detach(), dim=-1)
     assert torch.equal(actual, native)
     assert torch.equal(
         actual,
-        torch.cat([deployment_math.log_softmax(part) for part in x.detach().split(2)]),
+        torch.cat(
+            [deployment_log_probs.log_softmax(part) for part in x.detach().split(2)]
+        ),
     )
     incoming = torch.randn_like(actual)
     grad = torch.autograd.grad(actual, x, incoming)[0]

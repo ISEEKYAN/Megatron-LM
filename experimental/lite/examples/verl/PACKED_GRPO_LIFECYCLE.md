@@ -55,3 +55,16 @@ used an explicit deterministic digit/nonwhitespace proxy reward with nonzero
 advantage; DAPO scoring was recorded separately and all160 scores were-1.
 These results do not establish mathematical quality, full-release parity or
 successful checkpoint restore after GRPO.
+
+The materialized-head consumer owns `deployment_log_probs.log_softmax`;
+it is shipped here with actual packed loss/entropy/VJP callers and tests,
+rather than as an unused deployment-math API. CPU tests exercise the Torch
+branch; native CUDA output/VJP cases require the compatible provider build.
+
+On every model residency transfer, the old PyTorch DDP reducer's autograd
+hooks are explicitly removed before a replacement is installed. This also
+applies to `grad=False` boundaries and does not depend on garbage collection.
+The two-rank test deliberately retains old wrapper objects, checks averaged
+gradients, then steps the original optimizer and compares every replicated
+dense parameter byte before another DDP construction can broadcast it.
+GPU offload remains a separate conditional test.

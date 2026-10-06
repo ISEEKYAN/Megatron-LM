@@ -1,7 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native model-owned DDP survives the runtime's parameter residency boundary."""
 import runpy
-import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -102,19 +101,25 @@ def _worker(rank, directory, cuda):
                 continue
             copies = [torch.empty_like(parameter) for _ in range(2)]
             dist.all_gather(copies, parameter.detach())
-            assert torch.equal(copies[0].view(torch.uint8), copies[1].view(torch.uint8)), binding.role
+            assert torch.equal(
+                copies[0].view(torch.uint8), copies[1].view(torch.uint8)
+            ), binding.role
         bundle.optimizer.zero_grad(set_to_none=True)
+
+    retired_wrappers = []
 
     def offload_and_check_detach():
         previous = bundle.forward_step.keywords['execution_model']
-        dead = weakref.ref(previous)
         # Observe the actual reducer removal rather than inferring it from GC.
-        with patch.object(previous, '_remove_autograd_hooks', wraps=previous._remove_autograd_hooks) as removed:
+        with patch.object(
+            previous, '_remove_autograd_hooks', wraps=previous._remove_autograd_hooks
+        ) as removed:
             runtime.to(handle, 'cpu', optimizer=False, grad=False)
             removed.assert_called_once_with()
             assert bundle.forward_step.keywords['execution_model'] is model
-        del previous
-        assert dead() is None
+        # Deliberately keep the old wrapper alive: correctness must depend on
+        # explicit hook detachment, not on a Python GC timing assumption.
+        retired_wrappers.append(previous)
 
     check_gradient()
     if cuda:

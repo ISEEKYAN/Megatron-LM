@@ -7,22 +7,29 @@ import types
 from dataclasses import dataclass
 from unittest.mock import MagicMock, patch
 
+import megatron.lite.runtime.backends.mlite.runtime as _imports_runtime
 import pytest
 import torch
 import torch.nn as nn
-
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.backends.mlite.runtime import (
-    MegatronLiteRuntime,
-    _apply_attention_backend_env,
-    _build_impl_cfg,
-    _pipeline_callbacks,
-    _reset_parameters,
-)
-from megatron.lite.runtime.contracts.config import OptimizerConfig, ParallelConfig, RuntimeConfig
+
+MegatronLiteRuntime = _imports_runtime.MegatronLiteRuntime
+_apply_attention_backend_env = _imports_runtime._apply_attention_backend_env
+_build_impl_cfg = _imports_runtime._build_impl_cfg
+_pipeline_callbacks = _imports_runtime._pipeline_callbacks
+_reset_parameters = _imports_runtime._reset_parameters
+import megatron.lite.runtime.contracts.config as _imports_config
+
+OptimizerConfig = _imports_config.OptimizerConfig
+ParallelConfig = _imports_config.ParallelConfig
+RuntimeConfig = _imports_config.RuntimeConfig
+import megatron.lite.runtime.contracts.loss as _imports_loss
 from megatron.lite.runtime.contracts.handle import ModelHandle
-from megatron.lite.runtime.contracts.loss import LossContext, get_loss_context, use_loss_context
+
+LossContext = _imports_loss.LossContext
+get_loss_context = _imports_loss.get_loss_context
+use_loss_context = _imports_loss.use_loss_context
 
 
 def test_runtime_returns_loss_separately_from_microbatch_metrics():
@@ -50,7 +57,10 @@ def test_pipeline_callbacks_accept_wrapped_and_presplit_context():
     forward, loss = _pipeline_callbacks(
         lambda _model, batch: seen.append((batch, get_loss_context()))
         or {"loss": torch.tensor(1.0)},
-        lambda out, batch, ctx: (out["loss"], {"batch": batch, "source": ctx.source_batch}),
+        lambda out, batch, ctx: (
+            out["loss"],
+            {"batch": batch, "source": ctx.source_batch},
+        ),
     )
 
     output = forward(None, ("wrapped", context))
@@ -84,7 +94,8 @@ def test_runtime_config_accepts_mlite_backend_cfg():
 
 def test_mlite_config_defaults_and_parallel_fields():
     cfg = MegatronLiteConfig(
-        model_name="qwen3_moe", parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2)
+        model_name="qwen3_moe",
+        parallel=ParallelConfig(tp=4, etp=1, ep=8, pp=2, vpp=2, cp=2),
     )
 
     assert cfg.model_name == "qwen3_moe"
@@ -207,9 +218,13 @@ def test_reset_parameters_helper_preserves_replaced_parameter_identity():
 def test_runtime_meta_init_refreshes_fsdp2_master_after_weights_are_ready(
     monkeypatch, load_hf_weights
 ):
+    import megatron.lite.primitive.optimizers.fsdp2.adamw as _imports_adamw
+    import megatron.lite.primitive.optimizers.fsdp2.optimizer as _imports_optimizer
     from megatron.lite.primitive.bundle import ModelBundle
-    from megatron.lite.primitive.optimizers.fsdp2.adamw import build_adamw_optimizer
-    from megatron.lite.primitive.optimizers.fsdp2.optimizer import FSDP2Optimizer
+
+    build_adamw_optimizer = _imports_adamw.build_adamw_optimizer
+
+    FSDP2Optimizer = _imports_optimizer.FSDP2Optimizer
 
     loaded_value = torch.tensor([1.5, -2.25], dtype=torch.bfloat16)
 
@@ -353,7 +368,9 @@ class HookedOptimizer:
 
 def test_runtime_to_prefers_optimizer_specific_offload_hooks():
     optimizer = HookedOptimizer()
-    handle = ModelHandle(model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []})
+    handle = ModelHandle(
+        model=nn.Linear(2, 2), optimizer=optimizer, _extras={"model_chunks": []}
+    )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
     runtime.to(handle, "cpu", model=False, optimizer=True, grad=False)
@@ -401,7 +418,9 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
         optimizer=Optimizer(),
         _extras={
             "model_chunks": [chunk],
-            "post_model_device_transfer_hook": lambda device: events.append("hook-" + device),
+            "post_model_device_transfer_hook": lambda device: events.append(
+                "hook-" + device
+            ),
         },
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
@@ -439,9 +458,7 @@ def test_export_transfer_does_not_move_optimizer_or_release_scratch(monkeypatch)
     )
     chunk = Chunk()
     handle = ModelHandle(
-        model=chunk,
-        optimizer=HookedOptimizer(),
-        _extras={"model_chunks": [chunk]},
+        model=chunk, optimizer=HookedOptimizer(), _extras={"model_chunks": [chunk]}
     )
 
     MegatronLiteRuntime.__new__(MegatronLiteRuntime).to(
@@ -557,7 +574,10 @@ def test_megatron_ddp_detection_accepts_ddp_and_subclasses(monkeypatch):
 
 @pytest.mark.parametrize("model_cls", [_FakeMegatronDDP, _FakeMegatronDDPSubclass])
 def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    import megatron.lite.runtime.megatron_utils as _imports_megatron_utils
+
+    load_model_to_gpu = _imports_megatron_utils.load_model_to_gpu
+    offload_model_to_cpu = _imports_megatron_utils.offload_model_to_cpu
 
     _install_fake_megatron_ddp(monkeypatch)
     model = model_cls()
@@ -584,7 +604,10 @@ def test_megatron_ddp_model_move_helpers_use_buffer_path(monkeypatch, model_cls)
 
 
 def test_native_model_move_helpers_do_not_require_megatron_core(monkeypatch):
-    from megatron.lite.runtime.megatron_utils import load_model_to_gpu, offload_model_to_cpu
+    import megatron.lite.runtime.megatron_utils as _imports_megatron_utils
+
+    load_model_to_gpu = _imports_megatron_utils.load_model_to_gpu
+    offload_model_to_cpu = _imports_megatron_utils.offload_model_to_cpu
 
     monkeypatch.setitem(sys.modules, "megatron.core", None)
     monkeypatch.setitem(sys.modules, "megatron.core.distributed", None)
@@ -643,7 +666,9 @@ def test_model_handle_dp_from_parallel_state():
 def test_model_handle_cp_range_and_config_properties():
     cfg = {"tp": 8, "ep": 4}
     default_handle = ModelHandle(model=MagicMock())
-    configured_handle = ModelHandle(model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)})
+    configured_handle = ModelHandle(
+        model=MagicMock(), config=cfg, _extras={"cp_range": (1, 8)}
+    )
 
     assert default_handle.cp_range == (1, 1)
     assert configured_handle.cp_range == (1, 8)
@@ -657,7 +682,9 @@ def test_runtime_dispatch_creates_mlite_backend():
 
         runtime = create_runtime(
             RuntimeConfig(
-                backend="mlite", hf_path="/models/test", backend_cfg={"model_name": "qwen3"}
+                backend="mlite",
+                hf_path="/models/test",
+                backend_cfg={"model_name": "qwen3"},
             )
         )
 
