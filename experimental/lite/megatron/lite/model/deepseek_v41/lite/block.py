@@ -35,15 +35,43 @@ class DeepseekV41Block(nn.Module):
         self.ffn_norm = RMSNorm(hidden_size, norm_eps)
         self.attn_mixes = HCMixes(hidden_size, copies, norm_eps, hc_eps, iterations)
         self.ffn_mixes = HCMixes(hidden_size, copies, norm_eps, hc_eps, iterations)
+        self.attn_mixes.deployment_math = False
+        self.ffn_mixes.deployment_math = False
 
     def forward(
-        self, hidden, pre_mix, state, *, attention_kwargs=None, ffn_kwargs=None
+        self,
+        hidden,
+        pre_mix,
+        state,
+        *,
+        attention_kwargs=None,
+        ffn_kwargs=None,
+        previous_post=None
     ):
         """Return hidden, shifted pre-mix and caller-owned CSA2 state.
 
         State is an explicit graph input/output, never a module cache. Callers
         must preserve it alongside both HC tensors across layer boundaries.
         """
+        if self.attn_mixes.deployment_math and hidden.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            hidden, attn_pre, attn_post, attn_comb, x = deployment_math.mhc_joint(
+                hidden, pre_mix, self.attn_norm.weight, self.attn_mixes, previous_post
+            )
+            x, state = self.attn(
+                x, state, **({} if attention_kwargs is None else attention_kwargs)
+            )
+            hidden, ffn_pre, ffn_post, ffn_comb, ffn_input = deployment_math.mhc_joint(
+                hidden,
+                attn_pre,
+                self.ffn_norm.weight,
+                self.ffn_mixes,
+                (x, hidden, attn_post, attn_comb),
+            )
+            x = self.ffn(ffn_input, **({} if ffn_kwargs is None else ffn_kwargs))
+            pending = (x, hidden, ffn_post, ffn_comb)
+            return deployment_math.mhc_post(*pending), ffn_pre, state, pending
         attn_pre, attn_post, attn_comb = self.attn_mixes(hidden)
         x = self.attn_norm(contract_hc(hidden, pre_mix))
         kwargs = {} if attention_kwargs is None else attention_kwargs

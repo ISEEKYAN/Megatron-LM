@@ -34,6 +34,8 @@ class MegatronLiteEngineConfig(EngineConfig):
     qat: dict[str, Any] = field(default_factory=dict)
     resync_format: str | None = None
     resync_config: dict[str, Any] = field(default_factory=dict)
+    # Exporter staging budget for online weight sync, in bytes per rank.
+    export_buffer_max_size_bytes: int = 2 * 1024**3
     router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
@@ -50,9 +52,12 @@ class MegatronLiteEngineConfig(EngineConfig):
             from megatron.lite.runtime.contracts.weights import ResyncFormat
 
             object.__setattr__(
-                self,
-                "resync_format",
-                ResyncFormat.parse(self.resync_format).value,
+                self, "resync_format", ResyncFormat.parse(self.resync_format).value
+            )
+        budget = self.export_buffer_max_size_bytes
+        if type(budget) is not int or budget <= 0:
+            raise ValueError(
+                f"export_buffer_max_size_bytes must be a positive int, got {budget!r}"
             )
         if not isinstance(self.resync_config, Mapping):
             raise TypeError("resync_config must be a mapping")

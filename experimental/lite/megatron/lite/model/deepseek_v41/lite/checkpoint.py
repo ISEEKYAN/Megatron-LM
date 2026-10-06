@@ -3,19 +3,23 @@
 from dataclasses import replace
 from functools import partial
 
-from megatron.lite.primitive.ckpt.binding_records import (
-    DeferredModule,
-    Rule,
-    TensorBinding,
-)
-from megatron.lite.primitive.ckpt.hf_weights import (
-    export_checkpoint as _export_checkpoint,
-)
-from megatron.lite.primitive.ckpt.hf_weights import load_bound_model, save_bound_model
-from megatron.lite.primitive.modules.engram_lookup import (
-    EngramTable,
-    ShardedEngramTable,
-)
+import megatron.lite.primitive.ckpt.binding_records as _imports_binding_records
+import torch
+
+DeferredModule = _imports_binding_records.DeferredModule
+Rule = _imports_binding_records.Rule
+TensorBinding = _imports_binding_records.TensorBinding
+import megatron.lite.primitive.ckpt.hf_weights as _imports_hf_weights
+
+_export_checkpoint = _imports_hf_weights.export_checkpoint
+import megatron.lite.primitive.ckpt.hf_weights as _imports_hf_weights
+
+load_bound_model = _imports_hf_weights.load_bound_model
+save_bound_model = _imports_hf_weights.save_bound_model
+import megatron.lite.primitive.modules.engram_lookup as _imports_engram_lookup
+
+EngramTable = _imports_engram_lookup.EngramTable
+ShardedEngramTable = _imports_engram_lookup.ShardedEngramTable
 
 
 def validate_execution(*, enable_dspark_execution: bool = False) -> None:
@@ -34,7 +38,9 @@ class DeepseekV41WeightSpec:
 
     @staticmethod
     def encode(name, tensor, encoding):
-        from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+        import megatron.lite.primitive.quantization.block_fp8 as _imports_block_fp8
+
+        quantize_block_fp8 = _imports_block_fp8.quantize_block_fp8
         from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
         if encoding == 'I8':
@@ -44,6 +50,14 @@ class DeepseekV41WeightSpec:
             (DeepseekV41WeightSpec.row_block(name) or 32, 32),
             scale_format='e8m0',
         )
+
+    @staticmethod
+    def codec_tile(name, encoding):
+        # Scale-block row alignment; conservative bytes per source element for
+        # codec workspace and for encoded weight plus scale (at most 1 + 1/32).
+        if encoding == 'I8':
+            return 1, 64, 2
+        return DeepseekV41WeightSpec.row_block(name) or 32, 32, 2
 
     @staticmethod
     def row_shard(owner):
@@ -85,14 +99,39 @@ def load_model(model, path, *, allow_missing_mtp=False):
     return load_bound_model(model, path, _SPEC, allow_missing_archive=allow_missing_mtp)
 
 
+def validate_resync_budget(model, budget):
+    """Return the exporter share of budget; refuse before the first yield.
+
+    Non-row codecs encode tiles, so each matrix needs one tile of workspace
+    plus its whole encoded output within the share.
+    """
+    from megatron.lite.primitive.ckpt.hf_weights import plan_matrix_codec
+
+    if type(budget) is not int or budget <= 0:
+        raise ValueError('Invalid resync buffer budget')
+    share = budget // 4
+    for name, binding in model.tensor_bindings.items():
+        if (
+            binding.role != 'scale'
+            and _SPEC.row_block(name) != 1
+            and binding.encoding in ('I8', 'F8_E4M3')
+            and binding.tensor.dtype in (torch.float32, torch.bfloat16, torch.float16)
+        ):
+            try:
+                plan_matrix_codec(_SPEC, name, binding.tensor, binding.encoding, share)
+            except ValueError:
+                raise ValueError(
+                    f'Resync buffer too small for matrix codec: {name}'
+                ) from None
+    return share
+
+
 def export_hf_weights(
     chunks, model_cfg, ps, *, target=None, resync_config=None, **kwargs
 ):
-    if target is not None or resync_config is not None:
-        raise NotImplementedError(
-            'V4.1_HF_SAVE_RESYNC_UNSUPPORTED: target/resync_config require '
-            'a resync exporter; this entry point only exports archival HF weights'
-        )
+    from .resync import transport_weights, validate_target
+
+    deployment = validate_target(target, resync_config)
     if len(chunks) != 1:
         raise NotImplementedError('Export requires a single complete chunk')
     if kwargs.pop('include_mtp_only', False):
@@ -100,7 +139,26 @@ def export_hf_weights(
     if kwargs.pop('include_local_prefixes', None) is not None:
         raise NotImplementedError('V4.1_HF_EXPORT_LOCAL_PREFIXES_UNSUPPORTED')
     limit = kwargs.pop('limit', None)
-    for count, pair in enumerate(export_checkpoint(chunks[0], **kwargs), 1):
+    if deployment and limit is not None:
+        raise ValueError('DS4.1 resync requires a complete generation, without limit')
+    if deployment:
+        if kwargs.pop('row_chunks', True) is not True:
+            raise ValueError('DS4.1 resync requires bounded row chunks')
+        budget = kwargs.get('buffer_max_size_bytes', 5 * 1024**3)
+        # Reserve source, packed payload, and overlapping iterator handoff views.
+        kwargs['buffer_max_size_bytes'] = validate_resync_budget(chunks[0], budget)
+        kwargs['row_chunks'] = True
+        if kwargs.pop('export_dtype', None) not in (
+            None,
+            'bf16',
+            'bfloat16',
+            torch.bfloat16,
+        ):
+            raise ValueError('DS4.1 resync uses official mixed FP32/BF16 dtypes')
+    weights = export_checkpoint(chunks[0], **kwargs)
+    if deployment:
+        weights = transport_weights(weights, deployment=True)
+    for count, pair in enumerate(weights, 1):
         yield pair
         if limit is not None and count >= limit:
             break

@@ -2,8 +2,6 @@
 """Build resident row memories from explicit vocabulary and projection dimensions."""
 import torch
 
-from . import engram_lookup as memory
-
 
 def build_row_memories(
     *,
@@ -24,12 +22,22 @@ def build_row_memories(
     group,
     group_size,
     local_range,
+    constructors,
     projection
 ):
+    (
+        primes_fn,
+        multipliers_fn,
+        hash_type,
+        lookup_type,
+        local_type,
+        shard_type,
+        memory_type,
+    ) = constructors
     hash_module = None
     if layer_ids and token_map is not None:
         with torch.device('cpu'):
-            primes = memory.prime_buckets(layer_ids, order, heads, vocabulary)
+            primes = primes_fn(layer_ids, order, heads, vocabulary)
             if primes.flatten(1).sum(1).tolist() != row_counts:
                 raise ValueError('Row counts disagree with prime layout')
             if (
@@ -38,29 +46,29 @@ def build_row_memories(
                 or max(token_map) >= compressed_vocabulary
             ):
                 raise ValueError('Token map disagrees with compressed vocabulary')
-            hash_module = memory.NgramHash(
+            hash_module = hash_type(
                 token_map,
                 pad_id,
-                memory.hash_multipliers(layer_ids, order, compressed_vocabulary),
+                multipliers_fn(layer_ids, order, compressed_vocabulary),
                 primes,
             )
     memories = {}
     for slot, index in enumerate(layer_ids):
         if not local_range[0] <= index < local_range[1]:
             continue
-        rows, table_type, options = row_counts[slot], memory.EngramTable, {}
+        rows, table_type, options = row_counts[slot], local_type, {}
         if group is not None:
             boundaries = [rows * i // group_size for i in range(group_size + 1)]
-            lookup = memory.RowLookup(boundaries, group)
+            lookup = lookup_type(boundaries, group)
             rows = boundaries[lookup.rank + 1] - boundaries[lookup.rank]
-            table_type, options = memory.ShardedEngramTable, {'lookup': lookup}
+            table_type, options = shard_type, {'lookup': lookup}
         table = table_type(
             torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
             torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
             trainable=trainable,
             **options
         )
-        memories[index] = memory.Engram(
+        memories[index] = memory_type(
             hidden_size,
             copies,
             table,
