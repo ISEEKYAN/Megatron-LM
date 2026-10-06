@@ -172,6 +172,18 @@ class DeepseekV41Model(nn.Module):
             block.engram = None
             self.layers[layer_id] = block
         self.engram_layer_ids = tuple(t.engram_layer_ids)
+        # Bounded-row composition makes constructor ownership explicit.
+        memory_options = {}
+        if 'constructors' in signature(build_row_memories).parameters:
+            memory_options['constructors'] = (
+                memory.prime_buckets,
+                memory.hash_multipliers,
+                memory.NgramHash,
+                memory.RowLookup,
+                memory.EngramTable,
+                memory.ShardedEngramTable,
+                memory.Engram,
+            )
         self.engram_hash, memories = build_row_memories(
             **project_fields(
                 vars(t),
