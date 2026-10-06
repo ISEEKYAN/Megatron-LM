@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""HF save/export reject resync requests before touching checkpoint tensors."""
+"""HF save/export reject unsupported resync requests before reading tensors."""
 from unittest.mock import Mock
 
 import pytest
@@ -10,7 +10,7 @@ from megatron.lite.model.deepseek_v41.lite import checkpoint, protocol
 @pytest.mark.parametrize(
     'options',
     [
-        {'target': 'vllm'},
+        {'target': 'unsupported'},
         {'resync_config': {'format': 'fp8'}},
         {'target': 'vllm', 'resync_config': {'format': 'fp8'}},
     ],
@@ -20,9 +20,9 @@ def test_save_and_export_reject_resync(monkeypatch, tmp_path, options):
     monkeypatch.setattr(protocol, 'save_model', writer)
     exporter = Mock(side_effect=AssertionError('Resync reached tensor exporter'))
     monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
-    with pytest.raises(NotImplementedError, match='V4.1_HF_SAVE_RESYNC_UNSUPPORTED'):
+    with pytest.raises(ValueError, match='DS4.1 resync'):
         protocol.save_hf_weights([object()], tmp_path / 'save', None, None, **options)
-    with pytest.raises(NotImplementedError, match='V4.1_HF_SAVE_RESYNC_UNSUPPORTED'):
+    with pytest.raises(ValueError, match='DS4.1 resync'):
         list(protocol.export_hf_weights([object()], None, None, **options))
     writer.assert_not_called()
     exporter.assert_not_called()
