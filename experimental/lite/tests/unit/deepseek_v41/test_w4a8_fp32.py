@@ -6,6 +6,7 @@ tests/kernels/moe/w4a8_reference.py (Apache-2.0). CPU GEMM is not a GPU oracle.
 """
 
 import os
+from pathlib import Path
 from types import MethodType
 
 import pytest
