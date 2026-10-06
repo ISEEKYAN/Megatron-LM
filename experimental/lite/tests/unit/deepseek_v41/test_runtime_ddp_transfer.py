@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native model-owned DDP survives the runtime's parameter residency boundary."""
 import runpy
+import weakref
 from datetime import timedelta
 from pathlib import Path
 from types import SimpleNamespace
@@ -90,12 +91,36 @@ def _worker(rank, directory, cuda):
         assert owners == {
             id(p) for group in bundle.optimizer.param_groups for p in group['params']
         }
+        # Compare immediately after step, before any load/DDP broadcast can
+        # mask replica divergence. This checks every replicated dense owner.
+        before = model.embed.weight.detach().clone()
+        assert bundle.optimizer.step()[0]
+        assert not torch.equal(before, model.embed.weight)
+        for binding in model.parameter_bindings():
+            parameter = binding.tensor
+            if binding.role == 'expert' or not parameter.requires_grad:
+                continue
+            copies = [torch.empty_like(parameter) for _ in range(2)]
+            dist.all_gather(copies, parameter.detach())
+            assert torch.equal(copies[0].view(torch.uint8), copies[1].view(torch.uint8)), binding.role
+        bundle.optimizer.zero_grad(set_to_none=True)
+
+    def offload_and_check_detach():
+        previous = bundle.forward_step.keywords['execution_model']
+        dead = weakref.ref(previous)
+        # Observe the actual reducer removal rather than inferring it from GC.
+        with patch.object(previous, '_remove_autograd_hooks', wraps=previous._remove_autograd_hooks) as removed:
+            runtime.to(handle, 'cpu', optimizer=False, grad=False)
+            removed.assert_called_once_with()
+            assert bundle.forward_step.keywords['execution_model'] is model
+        del previous
+        assert dead() is None
 
     check_gradient()
     if cuda:
         for _ in range(2):
             bundle.optimizer.zero_grad(set_to_none=True)
-            runtime.to(handle, 'cpu', optimizer=False, grad=False)
+            offload_and_check_detach()
             assert model.embed.weight.device.type == 'cpu'
             runtime.to(handle, 'cuda', optimizer=False, grad=False)
             check_gradient()
@@ -113,7 +138,7 @@ def _worker(rank, directory, cuda):
         ):
             for _ in range(2):
                 bundle.optimizer.zero_grad(set_to_none=True)
-                runtime.to(handle, 'cpu', optimizer=False, grad=False)
+                offload_and_check_detach()
                 runtime.to(handle, 'cuda', optimizer=False, grad=False)
                 check_gradient()
     dist.destroy_process_group()

@@ -260,6 +260,14 @@ def build_model(model_cfg, *, impl_cfg):
             # Parameter device migration replaces AccumulateGrad nodes. Release
             # the old reducer on offload and bind a fresh public DDP after load;
             # parameter owners and the native optimizer remain unchanged.
+            from torch.nn.parallel import DistributedDataParallel
+
+            previous = forward_step.keywords['execution_model']
+            if isinstance(previous, DistributedDataParallel):
+                # PyTorch's reducer owns AccumulateGrad hooks independently of
+                # the Python wrapper lifetime. Detach them before rebinding,
+                # including export-only transfers where grad=False skips GC.
+                previous._remove_autograd_hooks()
             forward_step.keywords['execution_model'] = (
                 model if device == 'cpu' else wrap_execution_model()
             )

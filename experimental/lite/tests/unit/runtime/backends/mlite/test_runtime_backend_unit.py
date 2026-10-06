@@ -399,7 +399,10 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
     handle = ModelHandle(
         model=chunk,
         optimizer=Optimizer(),
-        _extras={"model_chunks": [chunk]},
+        _extras={
+            "model_chunks": [chunk],
+            "post_model_device_transfer_hook": lambda device: events.append("hook-" + device),
+        },
     )
     runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
 
@@ -408,12 +411,14 @@ def test_training_transfer_parks_optimizer_and_releases_scratch(monkeypatch):
 
     assert events == [
         "offload-model",
+        "hook-cpu",
         "offload-optimizer",
         "release-scratch",
         "synchronize",
         "collect",
         "empty-cache",
         "load-model",
+        "hook-cuda",
         "load-optimizer",
     ]
 
