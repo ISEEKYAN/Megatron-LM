@@ -165,7 +165,9 @@ def build_model(model_cfg, *, impl_cfg):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
     layer_range = None
     if p.pp > 1:
-        from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+        import megatron.lite.primitive.parallel.pp as _imports_pp
+
+        build_pipeline_chunk_layout = _imports_pp.build_pipeline_chunk_layout
 
         cut = impl_cfg.pipeline_split_layer
         count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
@@ -562,7 +564,9 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
     cp_context = None
     ids = batch.input_ids[None]
     if model.ps.cp_size > 1:
-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+        import megatron.lite.primitive.modules.attention.cp as _imports_cp
+
+        ContiguousCPSequence = _imports_cp.ContiguousCPSequence
 
         if (
             modality
