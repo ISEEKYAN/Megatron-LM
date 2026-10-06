@@ -2,6 +2,8 @@
 
 Requires the matching MLite/vLLM experiment revisions, the canonical CUDA/VERL environment, an eight-GPU Ray cluster (two four-GPU nodes), W&B credentials, the DAPO parquet and a prepared release-revision 2-layer prefix. Preserve hidden5120/hc4/384 experts/top6 and the release tokenizer. Visual and archival MTP execution are excluded by the text recipe.
 
+The tested runtime uses NVIDIA PyTorch 26.07, VERL `0c849d86175340b8d1141acda101d91c551493cb`, MegatronCore base `327a238239448de6771beea185dc6902a8de3eaa`, MLite frozen-table implementation `b062ebb9cefe9358f3680c9b450fa3902b323dd0`, and vLLM fork `bbddb5f5d0cf127182ff5a321b0670b730d73060`. Use this experiment branch for the recipe and implementation. The parent example's generic `REQUIRED_VERL.txt` is not the tested pin for this recipe. The runtime must include the pinned fork's native DS4.1 W4A8 batch-invariant kernels and MLite optimizer dependencies; this script does not install the CUDA environment. See the [VERL integration prerequisites](../../README.md) for source-tree setup.
+
 Set `DS41_RELEASE` (official weights plus verified LFS receipts) or `DS41_MODEL` (prepared prefix), `DS41_DATA`, `DS41_OUTPUT`, and `PYTHONPATH` for MLite plus `examples/verl`, then run:
 
 ```bash
