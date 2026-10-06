@@ -237,7 +237,8 @@ def build_model(model_cfg, *, impl_cfg):
         if impl_cfg.vision_trainability is None:
             raise ValueError('External vision requires an explicit post-training mask')
         model.vision_schedule = VisionSchedule(model, impl_cfg.external_vision_device)
-    execution_model = wrap_owned_ddp(
+    wrap_execution_model = partial(
+        wrap_owned_ddp,
         model,
         ps,
         optimizing=optimizing,
@@ -249,6 +250,21 @@ def build_model(model_cfg, *, impl_cfg):
         ],
         shard_group=model.engram_group,
     )
+    forward_step = partial(
+        _forward_step, optimizer=optimizer, execution_model=wrap_execution_model()
+    )
+    transfer_extras = {}
+    if optimizing and (ps.dp_size > 1 or ps.cp_size > 1):
+
+        def post_model_device_transfer(device):
+            # Parameter device migration replaces AccumulateGrad nodes. Release
+            # the old reducer on offload and bind a fresh public DDP after load;
+            # parameter owners and the native optimizer remain unchanged.
+            forward_step.keywords['execution_model'] = (
+                model if device == 'cpu' else wrap_execution_model()
+            )
+
+        transfer_extras['post_model_device_transfer_hook'] = post_model_device_transfer
     return ModelBundle(
         [model],
         ps,
@@ -258,10 +274,9 @@ def build_model(model_cfg, *, impl_cfg):
             if optimizing and (ps.ep_size > 1 or model.engram_group is not None)
             else None
         ),
-        forward_step=partial(
-            _forward_step, optimizer=optimizer, execution_model=execution_model
-        ),
+        forward_step=forward_step,
         extras={
+            **transfer_extras,
             'model_cfg': model_cfg,
             **({'pipeline_dtype': torch.float32} if p.pp > 1 else {}),
             'vision_schedule': model.vision_schedule,
@@ -336,20 +351,38 @@ def _cp_targets(batch, cp_context):
     )
 
 
-def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
+def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits=None):
     context = get_loss_context()
     temperature = 1.0 if context is None else context.temperature
     if temperature <= 0:
         raise ValueError("Temperature must be positive")
+    if logits is not None:
+        from megatron.lite.primitive.modules import deployment_math
+
+        if cp_context is not None:
+            raise ValueError('Deployment head probabilities require CP1')
+        if tp_group is not None and torch.distributed.get_world_size(tp_group) != 1:
+            raise ValueError('Deployment head probabilities require full-vocab TP1')
+        logits = logits.float() / temperature
     if batch.labels is None:
-        result = {"logits": torch.nn.functional.linear(hidden, weight) / temperature}
+        result = {
+            "logits": (
+                logits
+                if logits is not None
+                else torch.nn.functional.linear(hidden, weight) / temperature
+            )
+        }
         if context is not None and context.calculate_entropy:
-            labels = torch.zeros(
-                hidden.shape[:-1], dtype=torch.long, device=hidden.device
-            )
-            _, result["entropy"] = linear_cross_entropy(
-                hidden, weight, labels, temperature, tp_group
-            )
+            if logits is None:
+                labels = torch.zeros(
+                    hidden.shape[:-1], dtype=torch.long, device=hidden.device
+                )
+                _, result["entropy"] = linear_cross_entropy(
+                    hidden, weight, labels, temperature, tp_group
+                )
+            else:
+                distribution = deployment_math.log_softmax(logits)
+                result["entropy"] = -(distribution.exp() * distribution).sum(-1)
         return result
     if batch.labels.shape != batch.input_ids.shape:
         raise ValueError("Labels must match packed input shape")
@@ -360,9 +393,18 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None):
     ):
         raise ValueError('V4.1_CP_NORMALIZATION_REQUIRED: use prepare_microbatches')
     labels, mask, denominator = _cp_targets(batch, cp_context)
-    log_probs, entropy = linear_cross_entropy(
-        hidden, weight, labels, temperature, tp_group
-    )
+    if logits is None:
+        log_probs, entropy = linear_cross_entropy(
+            hidden, weight, labels, temperature, tp_group
+        )
+    else:
+        distribution = deployment_math.log_softmax(logits)
+        log_probs = distribution.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
+        entropy = (
+            -(distribution.exp() * distribution).sum(-1)
+            if context is not None and context.calculate_entropy
+            else None
+        )
     if context is not None and context.normalization_denominator is not None:
         denominator = context.normalization_denominator
         if not math.isfinite(denominator) or denominator <= 0:
@@ -601,18 +643,19 @@ def _forward_step_impl(model, batch, *, optimizer=None, execution_model=None):
             ids,
             cu_seqlens=batch.cu_seqlens,
             cp_context=cp_context,
-            return_head_hidden=True,
+            return_head_hidden=not model.deployment_math,
             **modality,
         )
     result = (
         {'hidden_states': output['hidden_states']}
         if 'hidden_states' in output
         else text_output(
-            output['head_hidden'][0],
-            output['head_weight'],
+            output.get('head_hidden', output.get('logits'))[0],
+            output.get('head_weight'),
             batch,
             cp_context=cp_context,
             tp_group=model.ps.tp_group,
+            logits=output['logits'][0] if model.deployment_math else None,
         )
     )
     if optimizer is not None and model.training and torch.is_grad_enabled():

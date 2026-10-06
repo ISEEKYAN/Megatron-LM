@@ -8,7 +8,6 @@ from dataclasses import dataclass, field
 from typing import Any
 
 import torch.nn as nn
-
 from megatron.lite.primitive.parallel.state import ParallelState
 
 
@@ -18,6 +17,11 @@ class ModelBundle:
 
     Returned by protocol.build_model(). Model owns the construction
     of all fields — runtime just consumes them.
+
+    An optional extras["post_model_device_transfer_hook"] receives "cpu" or
+    "cuda" after a model residency transfer, before optimizer state transfer.
+    The model owns rebuilding its forward/synchronization wrapper; runtime
+    invokes the callback only for requested model transfers.
     """
 
     chunks: list[nn.Module]
