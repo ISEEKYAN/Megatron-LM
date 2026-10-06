@@ -360,6 +360,8 @@ class ResyncReceiver:
             if n.endswith('.weight') and hasattr(p, 'engram_vocab_start')
         }
         self.received_tables = set()
+        self.frozen_manifest = None
+        self.reuse_frozen = False
         self.finished = self.ended = False
         # load_weights invokes these model hooks per bucket. Defer all of them
         # until weight AND scale tensors for the entire generation have arrived.
@@ -393,7 +395,34 @@ class ResyncReceiver:
             if item is None:
                 self.ended = True
                 continue
+            import megatron.lite.model.deepseek_v41.lite.resync as resync
+
+            if isinstance(item, resync.FrozenTables):
+                if self.frozen_manifest is not None or self.rows or self.received_sinks:
+                    raise ValueError('Frozen table manifest must precede weights')
+                mapped = {
+                    next(iter(self.model.hf_to_vllm_mapper.apply([(name, None)])))[
+                        0
+                    ]: hashes
+                    for name, hashes in item.manifest.items()
+                }
+                if set(mapped) != self.expected_tables:
+                    raise ValueError('Frozen Engram manifest census mismatch')
+                previous = getattr(self.model, '_ds41_frozen_tables', None)
+                if item.reuse:
+                    if previous is None or previous[0] != mapped:
+                        raise ValueError(
+                            'Frozen Engram reuse without matching initial generation'
+                        )
+                    if previous[1] != self._table_digests():
+                        raise ValueError('Receiver frozen Engram storage changed')
+                self.frozen_manifest, self.reuse_frozen = mapped, item.reuse
+                continue
             if isinstance(item, RowChunk):
+                if self.reuse_frozen:
+                    raise ValueError(
+                        'Unexpected rows in frozen Engram reuse generation'
+                    )
                 if item.name not in self.rows:
                     mapped = list(
                         self.model.hf_to_vllm_mapper.apply([(item.name, item.weight)])
@@ -453,6 +482,17 @@ class ResyncReceiver:
         self.staging.refresh()
         self.finished = True
 
+    def _table_digests(self):
+        from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+
+        return {
+            name: storage_digest(
+                self.model.get_parameter(name),
+                self.model.get_parameter(name[:-6] + 'weight_scale_inv'),
+            )
+            for name in sorted(self.expected_tables)
+        }
+
     def finish(self):
         from vllm.model_executor.model_loader import reload
 
@@ -460,7 +500,8 @@ class ResyncReceiver:
             raise RuntimeError('DS4.1 resync generation already finalized')
         if not self.ended:
             raise ValueError('DS4.1 resync incomplete generation')
-        if self.received_tables != self.expected_tables:
+        required = set() if self.reuse_frozen else self.expected_tables
+        if self.received_tables != required:
             raise ValueError('DS4.1 resync missing Engram tables')
         if self.received_sinks != self.expected_sinks:
             raise ValueError('DS4.1 resync missing attention sinks')
@@ -477,6 +518,14 @@ class ResyncReceiver:
                 self.model._weights_finalized = False
             self.model.process_weights_after_loading()
             self.staging.refresh()
+            if self.frozen_manifest is not None:
+                digests = self._table_digests()
+                previous = getattr(self.model, '_ds41_frozen_tables', None)
+                if self.reuse_frozen and (previous is None or previous[1] != digests):
+                    raise ValueError(
+                        'Receiver frozen Engram storage changed during resync'
+                    )
+                self.model._ds41_frozen_tables = (self.frozen_manifest, digests)
             self.finished = True
         except BaseException:
             self.abort()

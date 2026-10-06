@@ -151,10 +151,49 @@ def export_hf_weights(
             torch.bfloat16,
         ):
             raise ValueError('DS4.1 resync uses official mixed FP32/BF16 dtypes')
-    weights = export_checkpoint(chunks[0], **kwargs)
+    frozen = deployment and (resync_config or {}).get('freeze_engram', False)
+    manifest = None
+    spec = _SPEC
+    if frozen:
+        import torch.distributed as dist
+        from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+
+        from .resync import frozen_tables_transport
+
+        model = chunks[0]
+        manifest = {}
+        for name, binding in model.tensor_bindings.items():
+            if binding.role != 'engram_table':
+                continue
+            storage = _SPEC.frozen_storage(binding.owner)
+            if storage is None:
+                raise ValueError('freeze_engram requires tables without FP32 masters')
+            local = storage_digest(*storage)
+            lookup = _SPEC.row_shard(binding.owner)
+            hashes = [local]
+            if lookup is not None and lookup.group is not None:
+                hashes = [None] * dist.get_world_size(lookup.group)
+                dist.all_gather_object(hashes, local, group=lookup.group)
+            manifest[name] = hashes
+        previous = getattr(model, '_resync_frozen_tables', None)
+        if previous is not None and previous != manifest:
+            raise ValueError('Frozen Engram storage changed since initial resync')
+        reuse = previous is not None
+        if reuse:
+
+            class FrozenSpec(DeepseekV41WeightSpec):
+                @staticmethod
+                def skip_binding(binding):
+                    return binding.role == 'engram_table'
+
+            spec = FrozenSpec()
+        yield frozen_tables_transport(manifest, reuse)
+    weights = _export_checkpoint(chunks[0], spec=spec, **kwargs)
     if deployment:
         weights = transport_weights(weights, deployment=True)
     for count, pair in enumerate(weights, 1):
         yield pair
         if limit is not None and count >= limit:
             break
+    if manifest is not None:
+        chunks[0]._resync_frozen_tables = manifest

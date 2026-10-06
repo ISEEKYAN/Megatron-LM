@@ -314,6 +314,9 @@ def save_hf_weights(
         budget = kwargs.pop('buffer_max_size_bytes', 5 * 1024**3)
         if type(budget) is not int or budget <= 0:
             raise ValueError('Invalid resync buffer budget')
+        # Saved HF checkpoints must be standalone, including frozen tables.
+        resync_config = dict(resync_config or {})
+        resync_config.pop('freeze_engram', None)
         weights = export_hf_weights(
             chunks,
             model_cfg,
