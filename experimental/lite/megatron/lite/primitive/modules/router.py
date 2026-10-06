@@ -38,10 +38,9 @@ def _ordered_topk_from_routing_map(
 
 
 def _reject_aux_loss_during_replay(router_replay: RouterReplay | None) -> None:
-    if (
-        router_replay is not None
-        and router_replay.router_replay_action
-        in (RouterReplayAction.REPLAY_FORWARD, RouterReplayAction.REPLAY_BACKWARD)
+    if router_replay is not None and router_replay.router_replay_action in (
+        RouterReplayAction.REPLAY_FORWARD,
+        RouterReplayAction.REPLAY_BACKWARD,
     ):
         raise RuntimeError(
             "R3 router aux loss must be disabled: replay dispatches the supplied "
@@ -82,7 +81,9 @@ class TopKRouter(nn.Module):
 
         self.gate = nn.Linear(config.hidden_size, config.num_experts, bias=False)
         self.register_buffer(
-            "expert_bias", torch.zeros(config.num_experts, dtype=torch.float32), persistent=False
+            "expert_bias",
+            torch.zeros(config.num_experts, dtype=torch.float32),
+            persistent=False,
         )
 
         self._aux_loss_group = ps.tp_group if ps.tp_size > 1 else None
@@ -146,7 +147,9 @@ class TopKRouter(nn.Module):
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = moe_ops.switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
@@ -223,10 +226,37 @@ class SigmoidTopKRouter(nn.Module):
         )
         return self.route_logits(logits)
 
-    def route_logits(self, logits, *, expert_bias=None):
+    def route_logits(self, logits, *, expert_bias=None, deployment_math=False):
         """Route logits with an optional per-token selection-only bias."""
         logits = logits.view(-1, self.num_experts)
         num_tokens = logits.size(0)
+        if deployment_math:
+            if (
+                not logits.is_cuda
+                or logits.dtype != torch.float32
+                or self.score_function != 'sqrtsoftplus'
+                or self.num_groups is not None
+                or self.use_pre_softmax
+                or self.compute_aux_loss
+                or self.router_replay is not None
+            ):
+                raise ValueError(
+                    'Deployment router requires CUDA FP32 ungrouped sqrtsoftplus without replay/aux'
+                )
+            from megatron.lite.primitive.modules import deployment_math
+
+            providers = deployment_math
+
+            bias = self.expert_bias if expert_bias is None else expert_bias
+            if bias.ndim == 2:
+                if not torch.equal(bias, bias[0].expand_as(bias)):
+                    raise ValueError(
+                        'Deployment router requires one text-only selection bias'
+                    )
+                bias = bias[0]
+            return providers.router_topk(
+                logits, bias, topk=self.topk, scaling_factor=self.scaling_factor or 1.0
+            )
         routing_kwargs = {}
         if self.num_groups is not None and self.group_topk is not None:
             routing_kwargs = {
@@ -280,7 +310,9 @@ class SigmoidTopKRouter(nn.Module):
             total_num_tokens = num_tokens
             if self._aux_loss_group is not None:
                 dist.all_reduce(tokens_per_expert, group=self._aux_loss_group)
-                total_num_tokens = num_tokens * dist.get_world_size(group=self._aux_loss_group)
+                total_num_tokens = num_tokens * dist.get_world_size(
+                    group=self._aux_loss_group
+                )
             aux_loss = moe_ops.switch_load_balancing_loss_func(
                 aux_scores,
                 tokens_per_expert,
