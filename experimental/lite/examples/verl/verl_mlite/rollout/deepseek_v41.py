@@ -482,6 +482,24 @@ class ResyncReceiver:
         self.staging.refresh()
         self.finished = True
 
+    def _preserve_frozen_tables(self):
+        # Native GPUWorker level-2 sleep discards parameters, but saves and
+        # restores named buffers. Nonpersistent aliases use that existing
+        # lifecycle without adding CUDA storage or checkpoint entries. Keep
+        # them inside the table module, which _without_tables excludes from
+        # layerwise reload; the Parameter owners and native loaders stay intact.
+        for name in self.expected_tables:
+            parent_name, _ = name.rsplit('.', 1)
+            table = self.model.get_submodule(parent_name)
+            for field in ('weight', 'weight_scale_inv'):
+                parameter = getattr(table, field)
+                alias = '_ds41_frozen_' + field
+                if alias in table._buffers:
+                    if table._buffers[alias].data_ptr() != parameter.data_ptr():
+                        raise ValueError('Frozen Engram sleep alias lost its owner')
+                else:
+                    table.register_buffer(alias, parameter.detach(), persistent=False)
+
     def _table_digests(self):
         from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
 
@@ -525,6 +543,7 @@ class ResyncReceiver:
                     raise ValueError(
                         'Receiver frozen Engram storage changed during resync'
                     )
+                self._preserve_frozen_tables()
                 self.model._ds41_frozen_tables = (self.frozen_manifest, digests)
             self.finished = True
         except BaseException:

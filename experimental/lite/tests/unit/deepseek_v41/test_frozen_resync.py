@@ -88,10 +88,10 @@ def receiver_model(monkeypatch):
 
 
 def test_receiver_census_reuse_and_byte_corruption(v41_core_te, monkeypatch):
-    from megatron.lite.model.deepseek_v41.lite.resync import (
-        frozen_tables_transport,
-        transport_weights,
-    )
+    import megatron.lite.model.deepseek_v41.lite.resync as resync
+
+    frozen_tables_transport = resync.frozen_tables_transport
+    transport_weights = resync.transport_weights
     from megatron.lite.primitive.ckpt.row_stream import RowChunk
 
     consumer = adapter(v41_core_te)
@@ -125,10 +125,10 @@ def test_receiver_census_reuse_and_byte_corruption(v41_core_te, monkeypatch):
 
 
 def test_receiver_rejects_cold_reuse_and_missing_initial_rows(v41_core_te, monkeypatch):
-    from megatron.lite.model.deepseek_v41.lite.resync import (
-        frozen_tables_transport,
-        transport_weights,
-    )
+    import megatron.lite.model.deepseek_v41.lite.resync as resync
+
+    frozen_tables_transport = resync.frozen_tables_transport
+    transport_weights = resync.transport_weights
 
     consumer = adapter(v41_core_te)
     model = receiver_model(monkeypatch)
@@ -195,3 +195,63 @@ def test_frozen_table_has_no_optimizer_state(v41_core_te, tmp_path):
     for index in (1, 14):
         table = model.layers[index].engram.embed
         assert table.weight.grad is table.scale.grad is None
+
+
+def test_frozen_tables_survive_native_level2_buffer_lifecycle(v41_core_te, monkeypatch):
+    import megatron.lite.model.deepseek_v41.lite.resync as resync
+
+    frozen_tables_transport = resync.frozen_tables_transport
+    transport_weights = resync.transport_weights
+    from megatron.lite.primitive.ckpt.row_stream import RowChunk
+
+    consumer = adapter(v41_core_te)
+    model = receiver_model(monkeypatch)
+    manifest = {'layers.1.engram.embed.weight': ['a' * 64]}
+    model.table.weight.data.view(torch.uint8).fill_(56)
+    first = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    first.receive([frozen_tables_transport(manifest, False)])
+    first.receive(
+        list(
+            transport_weights(
+                [
+                    RowChunk(
+                        'layers.1.engram.embed.weight',
+                        0,
+                        4,
+                        model.table.weight.detach().clone(),
+                        model.table.weight_scale_inv.detach().clone(),
+                    )
+                ],
+                deployment=True,
+            )
+        )
+    )
+    first.finish()
+    original = first._table_digests()
+    # These are the exact named_buffers save/copy operations in GPUWorker
+    # sleep(level=2)/wake_up(tags=['weights']); emulate discarded storage.
+    saved = {name: buffer.cpu().clone() for name, buffer in model.named_buffers()}
+    assert len(saved) == 2
+    assert not any('_ds41_frozen_' in name for name in model.state_dict())
+    model.table.weight.data.view(torch.uint8).zero_()
+    model.table.weight_scale_inv.data.view(torch.uint8).zero_()
+    assert first._table_digests() != original
+    for name, buffer in model.named_buffers():
+        buffer.data.copy_(saved[name].data)
+    assert first._table_digests() == original
+    second = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    second.receive(
+        [
+            frozen_tables_transport(manifest, True),
+            *transport_weights([], deployment=True),
+        ]
+    )
+    second.finish()
+    assert second.received_tables == set()
+    assert len(list(model.named_buffers())) == 2
+    # Wake restoration must not weaken the subsequent byte corruption guard.
+    model.table.weight.data.view(torch.uint8)[0, 0] ^= 1
+    broken = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    with pytest.raises(ValueError, match='storage changed'):
+        broken.receive([frozen_tables_transport(manifest, True)])
+    broken.abort()
