@@ -26,3 +26,12 @@ The frozen tables use native level-2 sleep buffer save/restore; this requires ho
 The corrected recipe has completed two strict-zero steps, an eight-rank checkpoint save, and a new-process resume for twenty consecutive strict-zero GRPO steps. Every resumed step has nonzero advantage and actual parameter updates; saved/restored master, optimizer, scheduler and frozen-table digests match on all eight ranks. Native CUDA regression passes through `tests/run_tests.sh` with six passed and zero skipped.
 
 Post-update GPU allocation stays near 78.602 GiB per training rank. The first DCP save raises training-worker RSS by approximately 18–22 GiB; allow for this host-memory step. An additional four-step resume with a checkpoint saved every step shows subsequent RSS near 50–54 GiB, without repeated accumulation of that first-save increase. These observations cover the tested two-layer, eight-GPU run windows; review host and physical-device samples for your run as well.
+
+For a two-stage deployment proxy, retain the eight-GPU rollout EP8 layout and set the actor/reference layout explicitly:
+
+```bash
+DS41_PP=2 DS41_EP=4 DS41_STEPS=2 DS41_SAVE_FREQ=-1 bash run.sh
+python verify.py /shared/pp2-run --steps 2 --parameter-counts 309,313
+```
+
+Use a fresh `DS41_OUTPUT` for this command. PP2 requires a closed CSA boundary; the two-layer release prefix splits at layer 1, and the full forty-layer configuration splits at layer 20. TP, CP and VPP remain 1. Stage transport preserves materialized hidden states and pending mHC post operands in FP32; the receiving stage retains their reference VJP edges and applies the original Engram reset. Stage-local encoded export is assembled over PP peers before the rollout generation ends, including first-generation frozen-table census and later table reuse checks. These options cover PP2 forward/backward and online resync. The checkpoint/resume and twenty-step stability results above cover PP1.
