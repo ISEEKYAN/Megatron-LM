@@ -110,8 +110,15 @@ assert stage_counts == [args.ranks // len(parameter_counts)] * len(
 ), stage_counts
 for rows in optimizers.values():
     assert [r['ordinal'] for r in rows] == list(range(1, args.steps + 1))
+global_grad_norms = []
+if len(parameter_counts) > 1:
+    for ordinal in range(1, args.steps + 1):
+        norms = {rows[ordinal - 1]["grad_norm"] for rows in optimizers.values()}
+        assert len(norms) == 1, ("PP dense-DP/global clipping mismatch", ordinal, norms)
+        global_grad_norms.append(norms.pop())
+for rows in optimizers.values():
     for a, b in zip(rows, rows[1:]):
-        assert a['master_after'] == b['master_before']
+        assert a["master_after"] == b["master_before"]
 assert len(resync) == args.ranks, len(resync)
 for rows in resync.values():
     assert [r['generation'] for r in rows] == list(range(1, args.steps + 2)), [
@@ -127,6 +134,8 @@ print(
             'raw': raw,
             'advantages': advs,
             'steps': steps,
+            'global_PP_grad_norms': global_grad_norms,
+            'optimizer_stage_ranks': stage_counts,
             'optimizer_ranks': len(optimizers),
             'optimizer_steps': sum(map(len, optimizers.values())),
             'resync_replicas': len(resync),

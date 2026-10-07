@@ -1,6 +1,15 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Synchronize replicated owners while excluding explicitly sharded storage."""
+from functools import partial
+
 import torch
+
+
+def _deferred_ddp_forward(model, *args, **kwargs):
+    # Multiple PP forwards can precede backward. Defer dense reduction until
+    # all microbatches finish; DDP still initializes replicated owners.
+    with model.no_sync():
+        return model(*args, **kwargs)
 
 
 def wrap_owned_ddp(model, ps, *, optimizing, external_device, row_tables, shard_group):
@@ -59,4 +68,6 @@ def wrap_owned_ddp(model, ps, *, optimizing, external_device, row_tables, shard_
             broadcast_buffers=False,
             find_unused_parameters=True,
         )
+        if ps.pp_size > 1:
+            execution_model = partial(_deferred_ddp_forward, execution_model)
     return execution_model

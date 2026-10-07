@@ -254,6 +254,23 @@ class MixedOptimizer:
 
     @torch.no_grad()
     def finalize_grads(self):
+        if self.ps.pp_size > 1 and self.ps.dp_cp_size > 1:
+            # PP warmup/cooldown keeps several DDP forwards in flight. Their
+            # no_sync forwards accumulate locally; average dense owners once
+            # after the complete schedule, before global clipping/commit.
+            for p in self.model.parameters():
+                if not p.requires_grad or id(p) in self.expert_ids | self.row_ids:
+                    continue
+                grad = p.main_grad if p.main_grad is not None else p.grad
+                active = torch.tensor(int(grad is not None), device=p.device)
+                torch.distributed.all_reduce(active, group=self.dp_group)
+                if not active.item():
+                    continue
+                if grad is None:
+                    grad = torch.zeros_like(p)
+                torch.distributed.all_reduce(grad, group=self.dp_group)
+                grad.div_(self.ps.dp_cp_size)
+                p.grad = p.main_grad = grad
         if self.ps.ep_size > 1:
             self.finalize_expert_grads()
         # Lookup backward sums requests from all data/context ranks. Dense DDP

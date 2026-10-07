@@ -184,6 +184,8 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
                     'pp_rank': self.ps.pp_rank,
                     'pp_size': self.ps.pp_size,
                     'ep_size': self.ps.ep_size,
+                    'ep_rank': self.ps.ep_rank,
+                    'dp_rank': self.ps.dp_rank,
                     'resources': resources(),
                 },
             )
