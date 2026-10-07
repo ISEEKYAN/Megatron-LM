@@ -314,3 +314,52 @@ def test_native_shifted_pending_carrier_value_and_vjp():
     print(
         'NATIVE_PP2_PENDING_VALUE_VJP_PASS width=5120 hc=4 outputs=5 all_live_operand_gradients_equal=true'
     )
+
+
+def test_deployment_cast_precedes_pp_and_generation_has_single_end(
+    v41_core_te, monkeypatch
+):
+    from types import SimpleNamespace
+
+    from megatron.lite.model.deepseek_v41.lite import checkpoint, resync
+    from megatron.lite.primitive.ckpt import pipeline_stream
+
+    model = SimpleNamespace(tensor_bindings={})
+    head = torch.randn(5, 32, dtype=torch.float32)
+    control = torch.randn(4, 32, dtype=torch.float32)
+    monkeypatch.setattr(
+        checkpoint,
+        '_export_checkpoint',
+        lambda *args, **kwargs: iter(
+            [('head.weight', head), ('layers.0.hc_attn_fn', control)]
+        ),
+    )
+
+    def assembled(weights, ps):
+        stage = list(weights)
+        assert stage[0][1].dtype == torch.bfloat16
+        assert torch.equal(stage[0][1], head.bfloat16())
+        assert torch.equal(stage[1][1], control) and stage[1][1].dtype == torch.float32
+        assert stage[-1][0].endswith('["end"]')
+        yield from stage
+        yield from resync.transport_weights(
+            [('norm.weight', torch.ones(32))], deployment=True
+        )
+
+    monkeypatch.setattr(pipeline_stream, 'broadcast_stage_stream', assembled)
+    result = list(
+        checkpoint.export_hf_weights(
+            [model],
+            None,
+            SimpleNamespace(pp_size=2),
+            target='mxfp4',
+            include_archival=False,
+        )
+    )
+    assert sum(name.endswith('["end"]') for name, _ in result) == 1
+    assert [name for name, _ in result[:-1]] == [
+        'head.weight',
+        'layers.0.hc_attn_fn',
+        'norm.weight',
+    ]
+    assert result[0][1].dtype == torch.bfloat16

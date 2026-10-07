@@ -209,7 +209,9 @@ def export_hf_weights(
 
         # Encode each local stage before crossing PP; RowChunk planes travel
         # together and never materialize a full Engram table.
-        weights = broadcast_stage_stream(transport_weights(weights), ps)
+        weights = broadcast_stage_stream(
+            transport_weights(weights, deployment=deployment), ps
+        )
         weights = decoded_weights(weights)
     if deployment:
         weights = transport_weights(weights, deployment=True)
