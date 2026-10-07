@@ -12,7 +12,16 @@ def _deferred_ddp_forward(model, *args, **kwargs):
         return model(*args, **kwargs)
 
 
-def wrap_owned_ddp(model, ps, *, optimizing, external_device, row_tables, shard_group):
+def wrap_owned_ddp(
+    model,
+    ps,
+    *,
+    optimizing,
+    external_device,
+    row_tables,
+    shard_group,
+    manual_dense_sync=False
+):
     execution_model = model
     if (ps.dp_size > 1 or ps.cp_size > 1) and optimizing:
         if external_device is not None:
@@ -62,6 +71,19 @@ def wrap_owned_ddp(model, ps, *, optimizing, external_device, row_tables, shard_
                         src=torch.distributed.get_global_rank(ps.ep_dp_group, 0),
                         group=ps.ep_dp_group,
                     )
+        if manual_dense_sync:
+            # Segmented host updates finalize dense gradients explicitly. Keep
+            # initialization synchronization without allocating a second full
+            # dense-gradient bank inside a DDP reducer.
+            excluded = sharded | (expert_ids if ps.ep_size > 1 else set())
+            for parameter in model.parameters():
+                if parameter.requires_grad and id(parameter) not in excluded:
+                    torch.distributed.broadcast(
+                        parameter.data,
+                        src=torch.distributed.get_global_rank(gradient_group, 0),
+                        group=gradient_group,
+                    )
+            return model
         execution_model = DistributedDataParallel(
             model,
             process_group=gradient_group,

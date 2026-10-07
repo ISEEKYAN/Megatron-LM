@@ -37,3 +37,19 @@ python verify.py /shared/pp2-run --steps 2 --parameter-counts 309,313
 Use a fresh `DS41_OUTPUT` for this command. PP2 requires a closed CSA boundary; the two-layer release prefix splits at layer 1, and the full forty-layer configuration splits at layer 20. TP, CP and VPP remain 1. Stage transport preserves materialized hidden states and pending mHC post operands in FP32; the receiving stage retains their reference VJP edges and applies the original Engram reset. Stage-local encoded export is assembled over PP peers before the rollout generation ends, including first-generation frozen-table census and later table reuse checks. These options cover PP2 forward/backward and online resync. The checkpoint/resume and twenty-step stability results above cover PP1.
 
 PP2 training defers DDP gradient reduction during pipeline forwards and averages dense owners after the complete microbatch schedule. Expert and row-sharded gradients retain their separate reductions. The verifier requires all training ranks to agree on the global clipping norm and checks parameter-digest continuity between updates; strict-zero logprobs alone do not establish correct data-parallel training.
+
+For segmented CPU-master/momentum updates, opt in explicitly on either layout:
+
+```bash
+DS41_SEGMENTED_HOST=1 DS41_STEPS=5 DS41_SAVE_FREQ=5 bash run.sh
+DS41_SEGMENTED_HOST=1 DS41_OUTPUT=/shared/resumed DS41_RESUME=/shared/fresh/checkpoints/global_step_5 DS41_STEPS=7 DS41_SAVE_FREQ=-1 bash run.sh
+python verify.py /shared/fresh --steps 5 --segmented-host
+python verify.py /shared/resumed --steps 2 --start-step 6 --segmented-host
+python verify_checkpoint.py /shared/fresh /shared/resumed
+```
+
+For PP2, add `DS41_PP=2 DS41_EP=4` to both commands and `--parameter-counts 309,313` to both strict verifiers. Keep the same optimizer mode across resume. Numerical FP32 masters and all published optimizer moments remain on CPU; native FP32 execution caches and gradients remain on GPU during training. CPU model offload aliases the authoritative master storage and drops completed-window gradients. Dense initialization uses broadcasts and dense gradients are averaged once after the full schedule, avoiding an additional full DDP gradient-buffer bank.
+
+The optimizer first recomputes and checks every owner candidate, then takes one global finite vote. No numerical rejection publishes any owner. It recomputes the same candidates and publishes one owner at a time in a second pass, retaining the existing Muon/Sinkhorn/torch AdamW operations, global clipping and immutable original gradients. This doubles candidate-update computation and adds host transfers. At most one owner's candidate workspace is live; it does not require all model candidates/moments on GPU. Unexpected device failure during publication is fatal and poisons the optimizer; restart from the last complete checkpoint. This is the same process-failure limit as the original transaction's publication copies, not a promise of recovery from a mid-copy hardware failure. Optimizer checkpoints reuse the existing state format; the model checkpoint contains numerical masters, so they are not duplicated in the optimizer file. The strict verifier checks actual backend types, CPU moments, host/master equality, all-rank gradient norms and cross-step continuity.
+
+This mode also saves and loads DCP directly through complete CPU parameter owners, without CUDA reload or a second CPU master bank. PP keys remain stage-specific; frozen buffers and per-rank optimizer state retain their existing save/load paths. The complete-owner path requires frozen Engram tables and TP/CP1; row-sharded trainable owners are rejected. Resume keeps the tested parallel layout and stage split.

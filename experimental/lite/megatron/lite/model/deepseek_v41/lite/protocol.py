@@ -254,11 +254,16 @@ def build_model(model_cfg, *, impl_cfg):
             if b is not None and b.engram is not None
         ],
         shard_group=model.engram_group,
+        manual_dense_sync=optimizing and optimizer.host_update is not None,
     )
     forward_step = partial(
         _forward_step, optimizer=optimizer, execution_model=wrap_execution_model()
     )
     transfer_extras = {}
+    if optimizing and optimizer.host_update is not None:
+        transfer_extras['pre_model_device_transfer_hook'] = (
+            optimizer.host_update.prepare_model_transfer
+        )
     if optimizing and (ps.dp_size > 1 or ps.cp_size > 1):
 
         def post_model_device_transfer(device):

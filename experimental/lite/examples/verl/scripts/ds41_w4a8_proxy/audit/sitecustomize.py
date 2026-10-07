@@ -187,9 +187,50 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
                     'ep_rank': self.ps.ep_rank,
                     'dp_rank': self.ps.dp_rank,
                     'resources': resources(),
+                    'optimizer_mode': (
+                        'segmented_host'
+                        if self.host_update is not None
+                        else 'resident_transaction'
+                    ),
+                    'backend_types': [
+                        type(backend).__name__ for backend in self.optimizers
+                    ],
+                    'host_update': (
+                        self.host_update.last_metrics
+                        if self.host_update is not None
+                        else None
+                    ),
+                    'host_master_digest': (
+                        master_digest([self.host_update.masters[id(p)] for p in params])
+                        if self.host_update is not None
+                        else None
+                    ),
+                    'optimizer_tensors_all_CPU': (
+                        all(
+                            value.device.type == 'cpu'
+                            for backend in self.optimizers
+                            for state in backend.state.values()
+                            for value in state.values()
+                            if isinstance(value, torch.Tensor)
+                        )
+                        if self.host_update is not None
+                        else None
+                    ),
                 },
             )
             assert result[0] and math.isfinite(float(result[1])) and before != after
+            if self.host_update is not None:
+                assert (
+                    master_digest([self.host_update.masters[id(p)] for p in params])
+                    == after
+                )
+                assert all(
+                    value.device.type == 'cpu'
+                    for backend in self.optimizers
+                    for state in backend.state.values()
+                    for value in state.values()
+                    if isinstance(value, torch.Tensor)
+                )
             return result
 
         MixedOptimizer.step = optimizer_step

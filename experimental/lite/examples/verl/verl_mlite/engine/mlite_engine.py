@@ -488,7 +488,10 @@ class MegatronLiteEngine(BaseEngine):
 
         os.makedirs(local_path, exist_ok=True)
         placement_fn, expert_classifier = self._checkpoint_hooks()
-        reload_params_for_save = self.is_param_offload_enabled
+        host_checkpoint = (
+            getattr(self.handle._optimizer, "checkpoint_device", None) == "cpu"
+        )
+        reload_params_for_save = self.is_param_offload_enabled and not host_checkpoint
         if reload_params_for_save:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
@@ -580,7 +583,10 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
 
         placement_fn, expert_classifier = self._checkpoint_hooks()
-        reload_params_for_load = self.is_param_offload_enabled
+        host_checkpoint = (
+            getattr(self.handle._optimizer, "checkpoint_device", None) == "cpu"
+        )
+        reload_params_for_load = self.is_param_offload_enabled and not host_checkpoint
         if reload_params_for_load:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()

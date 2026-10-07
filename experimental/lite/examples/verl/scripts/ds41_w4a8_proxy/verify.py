@@ -12,6 +12,7 @@ p.add_argument('run', type=Path)
 p.add_argument('--steps', type=int, default=5)
 p.add_argument('--start-step', type=int, default=1)
 p.add_argument('--ranks', type=int, default=8)
+p.add_argument('--segmented-host', action='store_true')
 p.add_argument(
     '--parameter-counts',
     default='334',
@@ -94,6 +95,21 @@ for row in events:
             and row['master_before'] != row['master_after']
             and math.isfinite(row['grad_norm'])
         )
+        if args.segmented_host:
+            assert row['optimizer_mode'] == 'segmented_host'
+            assert row['optimizer_tensors_all_CPU']
+            assert row['host_master_digest'] == row['master_after']
+            assert set(row['backend_types']) == {'HeadwiseMuon', 'Sinkhorn', 'AdamW'}
+            assert row['host_update']['segments'] == row['trainable_parameters']
+            assert (
+                row['host_update']['validation_passes']
+                == row['host_update']['publication_passes']
+                == 1
+            )
+            assert (
+                row['host_update']['host_master_bytes'] > 0
+                and row['host_update']['host_state_bytes'] > 0
+            )
         optimizers.setdefault(row['pid'], []).append(row)
     if row['kind'] == 'resync':
         assert row['finished'] and row['staging_current'] == 0
@@ -111,7 +127,7 @@ assert stage_counts == [args.ranks // len(parameter_counts)] * len(
 for rows in optimizers.values():
     assert [r['ordinal'] for r in rows] == list(range(1, args.steps + 1))
 global_grad_norms = []
-if len(parameter_counts) > 1:
+if len(parameter_counts) > 1 or args.segmented_host:
     for ordinal in range(1, args.steps + 1):
         norms = {rows[ordinal - 1]["grad_norm"] for rows in optimizers.values()}
         assert len(norms) == 1, ("PP dense-DP/global clipping mismatch", ordinal, norms)

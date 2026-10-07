@@ -497,6 +497,9 @@ class MegatronLiteRuntime(RuntimeBase):
         training_transfer = model and grad
         if device == "cpu":
             if model:
+                prepare_transfer = handle._extras.get("pre_model_device_transfer_hook")
+                if callable(prepare_transfer):
+                    prepare_transfer("cpu")
                 offload_model_to_cpu(model_chunks)
                 transfer_hook = handle._extras.get("post_model_device_transfer_hook")
                 if callable(transfer_hook):

@@ -8,7 +8,7 @@ import torch
 import torch.distributed as dist
 
 
-def _dense_dp_worker(rank, directory, pp_size):
+def _dense_dp_worker(rank, directory, pp_size, segmented):
     from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
     from megatron.lite.primitive.parallel import pipeline
     from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
@@ -71,10 +71,11 @@ def _dense_dp_worker(rank, directory, pp_size):
             external_device=None,
             row_tables=[],
             shard_group=None,
+            manual_dense_sync=segmented,
         )
         optimizer = MixedOptimizer(
             model,
-            SimpleNamespace(clip_grad=0.25, lr=0.01),
+            SimpleNamespace(clip_grad=0.25, lr=0.01, segmented_host=segmented),
             group_builder=lambda: [{'algorithm': 'adamw', 'params': [model.weight]}],
             owners=lambda: ([], [], [], None),
             stats_factory=None,
@@ -116,7 +117,11 @@ def _dense_dp_worker(rank, directory, pp_size):
 
 
 @pytest.mark.parametrize('pp_size', [1, 2])
-def test_dense_dp_all_microbatches_and_global_clip(tmp_path, pp_size):
+@pytest.mark.parametrize('segmented', [False, True])
+def test_dense_dp_all_microbatches_and_global_clip(tmp_path, pp_size, segmented):
     torch.multiprocessing.spawn(
-        _dense_dp_worker, args=(str(tmp_path), pp_size), nprocs=2 * pp_size, join=True
+        _dense_dp_worker,
+        args=(str(tmp_path), pp_size, segmented),
+        nprocs=2 * pp_size,
+        join=True,
     )

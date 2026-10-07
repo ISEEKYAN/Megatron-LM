@@ -254,7 +254,9 @@ class MixedOptimizer:
 
     @torch.no_grad()
     def finalize_grads(self):
-        if self.ps.pp_size > 1 and self.ps.dp_cp_size > 1:
+        if (
+            self.ps.pp_size > 1 or self.host_update is not None
+        ) and self.ps.dp_cp_size > 1:
             # PP warmup/cooldown keeps several DDP forwards in flight. Their
             # no_sync forwards accumulate locally; average dense owners once
             # after the complete schedule, before global clipping/commit.
@@ -475,6 +477,13 @@ class MixedOptimizer:
                     kwargs = dict(betas=(0.9, 0.95), eps=1e-20, foreach=False)
                 self.optimizers.append(optimizer(selected, lr=config.lr, **kwargs))
         self.tables = list(tables)
+        self.host_update = None
+        self.checkpoint_device = None
+        if getattr(config, 'segmented_host', False):
+            from .segmented_host import SegmentedHostUpdate
+
+            self.host_update = SegmentedHostUpdate(self)
+            self.checkpoint_device = 'cpu'
 
     @property
     def param_groups(self):
@@ -502,6 +511,8 @@ class MixedOptimizer:
     @torch.no_grad()
     def _base_step(self):
         self._validate_trainability()
+        if self.host_update is not None:
+            return self.host_update.step()
         parameters = _parameters(self)
         gradients = [
             p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
@@ -607,10 +618,12 @@ class MixedOptimizer:
 
     def load_state_to_device(self):
         """Restore state beside each owner, retaining AdamW CPU step counters."""
-        self._move_state(None)
+        self._move_state('cpu' if self.host_update is not None else None)
 
     def state_dict(self):
         self._validate_trainability()
+        if self.host_update is not None:
+            self.host_update.require_idle()
         return dict(
             owners=[g['owner_key'] for g in self.param_groups],
             clip_grad=self.config.clip_grad,
@@ -625,8 +638,11 @@ class MixedOptimizer:
             state['optimizers']
         ) != len(self.optimizers):
             raise ValueError('Optimizer owner layout differs')
-        for backend, saved in zip(self.optimizers, state['optimizers']):
-            backend.load_state_dict(saved)
+        if self.host_update is not None:
+            self.host_update.load_state(state)
+        else:
+            for backend, saved in zip(self.optimizers, state['optimizers']):
+                backend.load_state_dict(saved)
 
 
 def _publish_main_grad(parameter):

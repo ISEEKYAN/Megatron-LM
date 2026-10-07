@@ -14,6 +14,9 @@ pp = int(os.environ.get('DS41_PP', '1'))
 if (pp, ep) not in ((1, 8), (2, 4)):
     raise ValueError('Proxy layouts are PP1/EP8 or PP2/EP4, world8')
 world = 8
+segmented_host = os.environ.get('DS41_SEGMENTED_HOST', '0')
+if segmented_host not in ('0', '1'):
+    raise ValueError('DS41_SEGMENTED_HOST must be 0 or 1')
 if not os.environ.get('DS41_DATA'):
     raise ValueError('DS41_DATA must point to the DAPO training parquet')
 os.environ['W4_GRPO_DATA'] = os.environ['DS41_DATA']
@@ -125,7 +128,9 @@ args = [
             'use_deepep': 'false',
             'dtype': 'bfloat16',
             'optimizer': 'muon',
-            'optimizer_config': '{lr:1e-6,ns_steps:2,coefficient_type:quintic}',
+            'optimizer_config': '{lr:1e-6,ns_steps:2,coefficient_type:quintic,segmented_host:'
+            + ('true' if segmented_host == '1' else 'false')
+            + '}',
         }.items()
     ],
     'actor_rollout_ref.ref.engine.load_hf_weights=true',
