@@ -165,7 +165,10 @@ def _stream_worker(rank, directory):
 
         def local():
             for i in range(3):
-                yield f'stage{rank}.{i}', torch.arange(i + 1, dtype=torch.uint8) + rank
+                dtype = (torch.float32, torch.float8_e4m3fn, torch.int8)[i]
+                yield f'stage{rank}.{i}', (
+                    torch.arange(i + 1, dtype=torch.float32) + rank
+                ).to(dtype)
 
         actual = [
             (name, value.clone()) for name, value in broadcast_stage_stream(local(), ps)
@@ -176,7 +179,10 @@ def _stream_worker(rank, directory):
         for (name, value), (s, i) in zip(
             actual, [(s, i) for s in range(2) for i in range(3)], strict=True
         ):
-            assert torch.equal(value, torch.arange(i + 1, dtype=torch.uint8) + s)
+            dtype = (torch.float32, torch.float8_e4m3fn, torch.int8)[i]
+            wanted = (torch.arange(i + 1, dtype=torch.float32) + s).to(dtype)
+            assert value.dtype == dtype
+            assert torch.equal(value.view(torch.uint8), wanted.view(torch.uint8))
     finally:
         dist.destroy_process_group()
 

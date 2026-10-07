@@ -34,6 +34,8 @@ def broadcast_stage_stream(weights, ps):
                 if own
                 else torch.empty(shape, dtype=dtype, device=device)
             )
-            dist.broadcast(value, src=source, group=ps.pp_group)
+            # NCCL/Gloo do not accept every deployment FP8 dtype. Preserve
+            # the header dtype but send its storage bytes, with no numeric cast.
+            dist.broadcast(value.view(torch.uint8), src=source, group=ps.pp_group)
             yield name, value
             del value, item
