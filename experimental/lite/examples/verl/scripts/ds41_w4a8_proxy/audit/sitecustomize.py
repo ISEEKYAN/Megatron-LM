@@ -181,6 +181,9 @@ if os.environ.get('W4_GRPO_AUDIT') == '1':
                     'master_after': after,
                     'changed': before != after,
                     'trainable_parameters': len(params),
+                    'pp_rank': self.ps.pp_rank,
+                    'pp_size': self.ps.pp_size,
+                    'ep_size': self.ps.ep_size,
                     'resources': resources(),
                 },
             )

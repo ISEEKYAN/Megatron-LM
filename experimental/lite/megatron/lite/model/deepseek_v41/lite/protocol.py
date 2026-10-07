@@ -88,23 +88,13 @@ def _validate_parallel(c, p):
         raise NotImplementedError(
             'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training'
         )
-    if p.pp > 1 and c.pipeline_split_layer != 20:
-        raise NotImplementedError(
-            'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state'
-        )
-    if p.pp > 1 and (p.ep != 1 or p.cp != 1):
-        raise NotImplementedError(
-            'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
-        )
-    if p.pp > 1 and c.optimizer is not None:
-        raise NotImplementedError(
-            'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model forward/backward; distributed optimizer training is not validated'
-        )
+    if p.pp > 1 and p.cp != 1:
+        raise NotImplementedError('V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires CP=1')
     if p.pp > 1 and (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != 2
+        or torch.distributed.get_world_size() % (p.pp * p.ep) != 0
     ):
-        raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
+        raise ValueError('V4.1_PP_WORLD: world must be divisible by PP*EP')
     if p.cp != 1 and p.ep != 1:
         raise NotImplementedError(
             'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; use CP-only or EP with CP=1'
@@ -145,6 +135,23 @@ def build_model(model_cfg, *, impl_cfg):
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
     _validate_parallel(c, p)
+    if p.pp > 1:
+        cut = c.pipeline_split_layer
+        count = len(model_cfg.topology)
+        if type(cut) is not int or not 0 < cut < count:
+            raise ValueError('V4.1_PP_SPLIT: split must leave two nonempty stages')
+        for policy in model_cfg.topology[cut:]:
+            if any(
+                owner is not None and owner < cut
+                for owner in (policy.kv_owner, policy.index_owner)
+            ):
+                raise NotImplementedError(
+                    'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: split crosses an attention owner'
+                )
+        if model_cfg.topology[cut].candidate_mode == 'reuse':
+            raise NotImplementedError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: split crosses candidate publisher'
+            )
     from .model import DeepseekV41Model
 
     ps = ParallelState()
@@ -168,10 +175,10 @@ def build_model(model_cfg, *, impl_cfg):
         raise ValueError('Deployment math requires quantized W4A8 experts')
     if c.deployment_math and (
         c.dtype != torch.bfloat16
-        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp'))
+        or any(getattr(p, name) != 1 for name in ('tp', 'cp'))
         or c.use_deepep
     ):
-        raise ValueError('Deployment math requires BF16 and TP/CP/PP=1 without DeepEP')
+        raise ValueError('Deployment math requires BF16 and TP/CP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
         import megatron.lite.primitive.parallel.pp as _imports_pp
@@ -189,6 +196,7 @@ def build_model(model_cfg, *, impl_cfg):
             model_cfg,
             parallel_state=ps,
             layer_range=layer_range,
+            pipeline_split_layer=c.pipeline_split_layer if p.pp > 1 else None,
             **project_fields(
                 vars(c),
                 'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
@@ -540,6 +548,7 @@ def packed_paired_forward(
     input_ids=None,
     image_mask=None,
     cp_context=None,
+    pending=None,
 ):
     """Run a pure sequence callable over each logical sample, preserving its graph.
 
@@ -555,7 +564,7 @@ def packed_paired_forward(
     for tensor in (input_ids, image_mask):
         if tensor is not None and tensor.shape != hidden.shape[:2]:
             raise ValueError("Token inputs must match packed [1,T] dimensions")
-    outputs, mixes = [], []
+    outputs, mixes, posts = [], [], []
     replay = PackedRouterReplay(hidden.shape[1]) if cp_context is None else None
     total = hidden.shape[1] if cp_context is None else cp_context.total_length
     offset = 0
@@ -571,14 +580,31 @@ def packed_paired_forward(
         if image_mask is not None:
             kwargs['image_mask'] = image_mask[:, begin:end]
         with replay.sequence(begin, end) if replay is not None else nullcontext():
-            h, p = sequence_forward(
+            if pending is not None:
+                kwargs['pending'] = tuple(value[:, begin:end] for value in pending)
+            result = sequence_forward(
                 hidden[:, begin:end], pre_mix[:, begin:end], **kwargs
             )
+            h, p = result[:2]
+            if len(result) == 3:
+                posts.append(result[2])
         outputs.append(h)
         mixes.append(p)
     if replay is not None:
         replay.finish()
-    return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
+    result = (torch.cat(outputs, dim=1), torch.cat(mixes, dim=1))
+    if posts:
+        if all(post is None for post in posts):
+            return (*result, None)
+        if any(post is None for post in posts):
+            raise ValueError(
+                'Packed deployment requires consistent pending post operands'
+            )
+        return (
+            *result,
+            tuple(torch.cat(values, dim=1) for values in zip(*posts, strict=True)),
+        )
+    return result
 
 
 def _validate_replay(model, batch):

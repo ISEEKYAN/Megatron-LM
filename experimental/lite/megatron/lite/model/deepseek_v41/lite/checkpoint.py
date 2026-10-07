@@ -175,6 +175,15 @@ def export_hf_weights(
                 hashes = [None] * dist.get_world_size(lookup.group)
                 dist.all_gather_object(hashes, local, group=lookup.group)
             manifest[name] = hashes
+        if ps.pp_size > 1:
+            manifests = [None] * ps.pp_size
+            dist.all_gather_object(manifests, manifest, group=ps.pp_group)
+            merged = {}
+            for stage_manifest in manifests:
+                if merged.keys() & stage_manifest.keys():
+                    raise ValueError('Frozen Engram table has multiple PP owners')
+                merged.update(stage_manifest)
+            manifest = merged
         previous = getattr(model, '_resync_frozen_tables', None)
         if previous is not None and previous != manifest:
             raise ValueError('Frozen Engram storage changed since initial resync')
@@ -188,7 +197,20 @@ def export_hf_weights(
 
             spec = FrozenSpec()
         yield frozen_tables_transport(manifest, reuse)
-    weights = _export_checkpoint(chunks[0], spec=spec, **kwargs)
+    weights = _export_checkpoint(
+        chunks[0], spec=spec, local_stage=ps.pp_size > 1, **kwargs
+    )
+    if ps.pp_size > 1:
+        import megatron.lite.primitive.ckpt.pipeline_stream as _imports_pipeline_stream
+
+        broadcast_stage_stream = _imports_pipeline_stream.broadcast_stage_stream
+
+        from .resync import decoded_weights
+
+        # Encode each local stage before crossing PP; RowChunk planes travel
+        # together and never materialize a full Engram table.
+        weights = broadcast_stage_stream(transport_weights(weights), ps)
+        weights = decoded_weights(weights)
     if deployment:
         weights = transport_weights(weights, deployment=True)
     for count, pair in enumerate(weights, 1):

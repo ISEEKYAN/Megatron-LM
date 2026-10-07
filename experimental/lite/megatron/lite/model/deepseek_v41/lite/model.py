@@ -62,6 +62,7 @@ class DeepseekV41Model(nn.Module):
         bias_rate=0.001,
         enable_dspark_execution=False,
         layer_range=None,
+        pipeline_split_layer=None,
         parallel_state=None,
     ):
         nn.Module.__init__(self)
@@ -79,6 +80,8 @@ class DeepseekV41Model(nn.Module):
             ),
             len(self.topology),
         )
+        if pipeline_split_layer is not None:
+            self.pipeline_cut = pipeline_split_layer
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
             self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
@@ -344,6 +347,8 @@ class DeepseekV41Model(nn.Module):
         image_mask=None,
         modality_loads=None,
         cp_context=None,
+        pending=None,
+        return_pending=False,
     ):
         start, end = self.local_layer_range
         token_mask = None if image_mask is None else ~image_mask
@@ -359,7 +364,7 @@ class DeepseekV41Model(nn.Module):
             else None
         )
         state = AttentionState()
-        previous_post = None
+        previous_post = pending
         for index in range(start, end):
             layer = self.layers[index]
             if layer.engram is not None:
@@ -391,7 +396,7 @@ class DeepseekV41Model(nn.Module):
             hidden, pre, state = result[:3]
             if extra:
                 previous_post = result[3]
-        return hidden, pre
+        return (hidden, pre, previous_post) if return_pending else (hidden, pre)
 
     def set_input_tensor(self, input_tensor):
         """Receive the FP32 paired HC carrier through the shared PP interface."""
@@ -430,18 +435,28 @@ class DeepseekV41Model(nn.Module):
         stream.validate_packed_input(
             input_ids, cu_seqlens, cp_context, self.ps.cp_size, self.engram_group
         )
-        loads = None
+        loads = [[] for _ in self.layers]
+        pending = None
         image_mask = None
         if local_start == cut:
             carrier, self._input_tensor = self._input_tensor, None
-            hidden, pre = stream.unpack_pair(
-                carrier,
-                input_ids.shape,
-                self.hc_mult,
-                self.config.hidden_size,
-                self.pipeline_residual_dtype,
-                'V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix',
-            )
+            if self.deployment_math:
+                hidden, pre, pending = stream.unpack_deployment(
+                    carrier,
+                    input_ids.shape,
+                    self.hc_mult,
+                    self.config.hidden_size,
+                    self.pipeline_residual_dtype,
+                )
+            else:
+                hidden, pre = stream.unpack_pair(
+                    carrier,
+                    input_ids.shape,
+                    self.hc_mult,
+                    self.config.hidden_size,
+                    self.pipeline_residual_dtype,
+                    'V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix',
+                )
         else:
             embeddings = self.embed(input_ids)
             if hasattr(self, 'residual_dtype'):
@@ -453,14 +468,29 @@ class DeepseekV41Model(nn.Module):
                 embeddings = self.merge_image_embeddings(images, embeddings)
             hidden, pre = expand_hc(embeddings, self.hc_mult)
             loads = [[] for _ in self.layers]
-        sequence = partial(self._sequence, modality_loads=loads)
+        carry_pending = self.deployment_math and self.ps.pp_size > 1
+        sequence = partial(
+            self._sequence, modality_loads=loads, return_pending=carry_pending
+        )
         if cu_seqlens is not None:
             sequence = partial(
                 packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
             )
-        hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
+        kwargs = dict(input_ids=input_ids, image_mask=image_mask)
+        if carry_pending:
+            kwargs['pending'] = pending
+        result = sequence(hidden, pre, **kwargs)
+        hidden, pre = result[:2]
         if local_end == cut and cut < count:
-            return {'hidden_states': stream.pack_pair(hidden, pre)}
+            carrier = (
+                stream.pack_deployment(hidden, pre, result[2])
+                if carry_pending
+                else stream.pack_pair(hidden, pre)
+            )
+            return {
+                'hidden_states': carrier,
+                'modality_loads': tuple(tuple(entries) for entries in loads),
+            }
         if self.deployment_math and hidden.is_cuda:
             from megatron.lite.primitive.modules import deployment_math
 

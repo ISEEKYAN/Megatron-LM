@@ -12,6 +12,7 @@ import torch
 
 def release_config():
     from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
     text = dict(
         vocab_size=64,
         hidden_size=32,
@@ -70,14 +71,28 @@ def release_config():
         num_nextn_predict_layers=3,
         dspark_n_routed_experts=2,
     )
-    return DeepseekV41Config(dict(
-        model_type='deepseek_v41', text_config=text,
-        vision_config=dict(hidden_size=8, num_hidden_layers=1, num_attention_heads=1,
-                           intermediate_size=16, patch_size=2, rope_theta=10000,
-                           downsample_ratio=2),
-        quantization_config=dict(quant_method='fp8', activation_scheme='dynamic',
-                                 weight_block_size=[32,32], scale_fmt='ue8m0', expert_dtype='fp4'),
-    ))
+    return DeepseekV41Config(
+        dict(
+            model_type='deepseek_v41',
+            text_config=text,
+            vision_config=dict(
+                hidden_size=8,
+                num_hidden_layers=1,
+                num_attention_heads=1,
+                intermediate_size=16,
+                patch_size=2,
+                rope_theta=10000,
+                downsample_ratio=2,
+            ),
+            quantization_config=dict(
+                quant_method='fp8',
+                activation_scheme='dynamic',
+                weight_block_size=[32, 32],
+                scale_fmt='ue8m0',
+                expert_dtype='fp4',
+            ),
+        )
+    )
 
 
 @pytest.fixture(
@@ -86,6 +101,7 @@ def release_config():
 )
 def bundle(v41_core_te, request, monkeypatch):
     from megatron.lite.model.deepseek_v41.lite import protocol
+
     torch.manual_seed(351)
     monkeypatch.setattr(torch.backends.cuda.matmul, 'allow_tf32', False)
     impl = protocol.ImplConfig(
@@ -104,7 +120,9 @@ def compare_execution(reference, candidates, execute):
     """One value/gradient criterion, independently supplied partition execution."""
     for candidate in candidates:
         owned = candidate.state_dict()
-        candidate.load_state_dict({k: v for k, v in reference.state_dict().items() if k in owned})
+        candidate.load_state_dict(
+            {k: v for k, v in reference.state_dict().items() if k in owned}
+        )
     expected, actual = execute(reference, candidates)
     assert torch.equal(actual, expected)
     expected.square().sum().backward()
@@ -122,6 +140,7 @@ def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
     from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.primitive.parallel.state import ParallelState
     from megatron.lite.runtime.contracts import ParallelConfig
+
     reference_bundle, impl = bundle
     reference = reference_bundle.chunks[0]
     pieces = []
@@ -129,25 +148,34 @@ def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
         patch.setattr(torch.distributed, 'is_initialized', lambda: True)
         patch.setattr(torch.distributed, 'get_world_size', lambda *args: 2)
         for rank in range(2):
-            ps = ParallelState(pp_size=2, pp_rank=rank, pp_is_first=rank==0, pp_is_last=rank==1)
+            ps = ParallelState(
+                pp_size=2, pp_rank=rank, pp_is_first=rank == 0, pp_is_last=rank == 1
+            )
             patch.setattr(protocol, 'init_parallel', lambda _, ps=ps: ps)
-            pieces.append(protocol.build_model(release_config(),
-                impl_cfg=replace(impl, parallel=ParallelConfig(pp=2))).chunks[0])
+            pieces.append(
+                protocol.build_model(
+                    release_config(),
+                    impl_cfg=replace(impl, parallel=ParallelConfig(pp=2)),
+                ).chunks[0]
+            )
     seen = []
-    pieces[1].layers[20].attn.register_forward_pre_hook(lambda _, args: seen.append(args[1]))
+    pieces[1].layers[20].attn.register_forward_pre_hook(
+        lambda _, args: seen.append(args[1])
+    )
     ids = torch.tensor([[2, 3, 9, 4, 11, 7]], device=reference.head.weight.device)
+
     def execute(full, stages):
         expected = full(ids)['logits']
         outgoing = stages[0](ids)['hidden_states']
         assert outgoing.shape == (1, 6, 66)
         stages[1].set_input_tensor(outgoing)
         return expected, stages[1](ids)['logits']
+
     compare_execution(reference, pieces, execute)
     assert len(seen) == 1
     assert all(value is None for value in vars(seen[0]).values())
 
-    # Bypass build_model's optimizer guard: the consumer must reject both stages
-    # explicitly instead of indexing a nonexistent modality_loads key.
+    # Every stage publishes its own loads in the global layer order.
     from unittest.mock import Mock
 
     from megatron.lite.runtime.contracts.data import PackedBatch
@@ -161,18 +189,31 @@ def test_real_pp2_boundary_restarts_attention_state(bundle, monkeypatch):
                 protocol._forward_step(pieces[0], batch)['hidden_states']
             )
         optimizer = Mock()
-        with pytest.raises(NotImplementedError, match='V4.1_PP_OPTIMIZER_UNSUPPORTED'):
-            protocol._forward_step(stage, batch, optimizer=optimizer)
-        optimizer.accumulate_modality_loads.assert_not_called()
+        protocol._forward_step(stage, batch, optimizer=optimizer)
+        optimizer.accumulate_modality_loads.assert_called_once()
+        loads = optimizer.accumulate_modality_loads.call_args.args[0]
+        begin, end = stage.local_layer_range
+        assert len(loads) == 40
+        assert all(
+            not entries
+            for index, entries in enumerate(loads)
+            if not begin <= index < end
+        )
+        assert all(loads[index] for index in range(begin, end))
 
 
 def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
+    import megatron.lite.model.deepseek_v41.lite.optimizer_groups as _imports_optimizer_groups
     import torch.distributed as dist
-    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import V41Optimizer
+
+    V41Optimizer = _imports_optimizer_groups.V41Optimizer
     from megatron.lite.model.deepseek_v41.vision_config import OptimizerConfig
+
     full, _ = bundle
     model = full.chunks[0]
-    optimizer = V41Optimizer(model, OptimizerConfig(lr=1e-4, ns_steps=2, coefficient_type='quintic'))
+    optimizer = V41Optimizer(
+        model, OptimizerConfig(lr=1e-4, ns_steps=2, coefficient_type='quintic')
+    )
     assert optimizer.owns_param_group_policy is True
     ids = torch.tensor([[1, 8, 3, 6]], device=model.head.weight.device)
     initial = {n: p.detach().clone() for n, p in model.named_parameters()}
@@ -184,32 +225,42 @@ def test_optimizer_two_steps_and_nonfinite_transaction(bundle, tmp_path):
         assert optimizer.step()[0]
     assert any(not torch.equal(p, initial[n]) for n, p in model.named_parameters())
     before = {name: p.detach().clone() for name, p in model.named_parameters()}
-    next(p for p in model.parameters() if p.grad is not None).grad.flatten()[0] = float('nan')
+    next(p for p in model.parameters() if p.grad is not None).grad.flatten()[0] = float(
+        'nan'
+    )
     assert not optimizer.step()[0]
     assert all(torch.equal(p, before[name]) for name, p in model.named_parameters())
 
 
 def test_archival_export_is_byte_preserving_and_reloadable(bundle, tmp_path):
-    from safetensors.torch import save_file
-    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
     from megatron.lite.model.deepseek_v41.lite import checkpoint
+    from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
+    from safetensors.torch import save_file
+
     full, impl = bundle
     model = full.chunks[0]
-    archive_dir = tmp_path/'archive'
+    archive_dir = tmp_path / 'archive'
     archive_dir.mkdir()
-    archive = {name: torch.arange(17, dtype=torch.uint8) for name in model.archival_bindings}
-    save_file(archive, str(archive_dir/'model.safetensors'))
+    archive = {
+        name: torch.arange(17, dtype=torch.uint8) for name in model.archival_bindings
+    }
+    save_file(archive, str(archive_dir / 'model.safetensors'))
     model.archival_store = SafeTensorReader(str(archive_dir))
     model.archival_keys = sorted(archive)
-    exported = dict(checkpoint.export_checkpoint(model, export_dtype='float32', cpu=True))
-    assert all(torch.equal(exported[name], original) for name, original in archive.items())
+    exported = dict(
+        checkpoint.export_checkpoint(model, export_dtype='float32', cpu=True)
+    )
+    assert all(
+        torch.equal(exported[name], original) for name, original in archive.items()
+    )
     assert all(exported[name].dtype == torch.uint8 for name in archive)
     with pytest.raises(TypeError):
         list(checkpoint.export_checkpoint(model, invented_option=True))
-    checkpoint.save_model(model, tmp_path/'saved', buffer_max_size_bytes=65536)
+    checkpoint.save_model(model, tmp_path / 'saved', buffer_max_size_bytes=65536)
     from megatron.lite.model.deepseek_v41.lite import protocol
+
     loaded = protocol.build_model(release_config(), impl_cfg=impl).chunks[0]
-    checkpoint.load_model(loaded, tmp_path/'saved')
+    checkpoint.load_model(loaded, tmp_path / 'saved')
     for name, parameter in model.named_parameters():
         assert torch.equal(parameter, dict(loaded.named_parameters())[name]), name
     ids = torch.tensor([[2, 4, 7, 3]], device=model.head.weight.device)
@@ -244,7 +295,9 @@ def test_packed_loss_head_gradient_with_ddp_unused_detection(bundle, tmp_path):
 
 @pytest.mark.parametrize('parallel', [dict(cp_size=2), dict(dp_size=2)])
 def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parallel):
-    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import V41Optimizer
+    import megatron.lite.model.deepseek_v41.lite.optimizer_groups as _imports_optimizer_groups
+
+    V41Optimizer = _imports_optimizer_groups.V41Optimizer
     from megatron.lite.model.deepseek_v41.vision_config import OptimizerConfig
 
     model = bundle[0].chunks[0]
@@ -277,9 +330,14 @@ def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parall
 
 
 def test_image_tokens_backpropagate_into_vision_and_aligner(bundle):
+    import megatron.lite.primitive.modules.image_data as _imports_image_data
     from megatron.lite.model.deepseek_v41.lite import protocol
-    from megatron.lite.primitive.modules.image_data import ImageInput, image_token_types
-    from megatron.lite.primitive.modules.vision_training import VisionTrainability
+
+    ImageInput = _imports_image_data.ImageInput
+    image_token_types = _imports_image_data.image_token_types
+    import megatron.lite.primitive.modules.vision_training as _imports_vision_training
+
+    VisionTrainability = _imports_vision_training.VisionTrainability
 
     impl = replace(
         bundle[1],

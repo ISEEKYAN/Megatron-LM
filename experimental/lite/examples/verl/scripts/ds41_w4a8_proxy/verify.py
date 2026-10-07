@@ -12,7 +12,13 @@ p.add_argument('run', type=Path)
 p.add_argument('--steps', type=int, default=5)
 p.add_argument('--start-step', type=int, default=1)
 p.add_argument('--ranks', type=int, default=8)
+p.add_argument(
+    '--parameter-counts',
+    default='334',
+    help='Expected owned trainable tensors by PP stage, from CPU init receipt',
+)
 args = p.parse_args()
+parameter_counts = [int(value) for value in args.parameter_counts.split(',')]
 root = args.run
 events = []
 for path in sorted((root / 'audit').glob('events-*.jsonl')):
@@ -79,7 +85,9 @@ optimizers = {}
 resync = {}
 for row in events:
     if row['kind'] == 'optimizer':
-        assert row['trainable_parameters'] == 334
+        stage = row.get('pp_rank', 0)
+        assert row.get('pp_size', 1) == len(parameter_counts)
+        assert row['trainable_parameters'] == parameter_counts[stage]
         assert (
             row['success']
             and row['changed']
@@ -93,6 +101,13 @@ for row in events:
         assert row['received_tables'] == (0 if row['frozen_reuse'] else 1)
         resync.setdefault(row['pid'], []).append(row)
 assert len(optimizers) == args.ranks, len(optimizers)
+stage_counts = [
+    sum(rows[0].get('pp_rank', 0) == stage for rows in optimizers.values())
+    for stage in range(len(parameter_counts))
+]
+assert stage_counts == [args.ranks // len(parameter_counts)] * len(
+    parameter_counts
+), stage_counts
 for rows in optimizers.values():
     assert [r['ordinal'] for r in rows] == list(range(1, args.steps + 1))
     for a, b in zip(rows, rows[1:]):

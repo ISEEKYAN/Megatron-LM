@@ -42,9 +42,9 @@ compute_local_shape_and_global_offset = (
     _imports__utils.compute_local_shape_and_global_offset
 )
 
-from megatron.lite.primitive.ckpt.weight_sync_probe import (  # isort: skip
-    get_weight_sync_probe,
-)
+import megatron.lite.primitive.ckpt.weight_sync_probe as _imports_weight_sync_probe
+
+get_weight_sync_probe = _imports_weight_sync_probe.get_weight_sync_probe
 
 
 def _tensor_nbytes(tensor: torch.Tensor) -> int:
@@ -1125,9 +1125,9 @@ def load_hf_weights(
                         if vocab_size is not None and (
                             "embed" in mapped or "head" in mapped
                         ):
-                            from megatron.lite.primitive.parallel import (  # isort: skip
-                                pad_vocab_for_tp,
-                            )
+                            import megatron.lite.primitive.parallel as _imports_parallel
+
+                            pad_vocab_for_tp = _imports_parallel.pad_vocab_for_tp
 
                             padded = pad_vocab_for_tp(vocab_size, ps.tp_size)
                             if tensor.size(0) < padded:
@@ -1909,9 +1909,10 @@ def export_bound_tensors(
     encode_rows=False,
     masters_only=False,
     buffer_max_size_bytes=5 * 1024**3,
+    local_stage=False,
 ):
     """Yield numerical masters and frozen storage for encoding or exact resume."""
-    if model.local_layer_range != (0, len(model.layers)):
+    if model.local_layer_range != (0, len(model.layers)) and not local_stage:
         raise NotImplementedError(
             'Pipeline stage export requires distributed checkpoint assembly'
         )
@@ -2111,11 +2112,21 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     ):
         required_archive = set()
     expected = active | required_archive
-    if not expected <= keys or keys - set(bindings):
+    allowed = set(bindings)
+    global_active = active
+    if model.ps.pp_size > 1:
+        coverage = [None] * model.ps.pp_size
+        dist.all_gather_object(
+            coverage, (expected, allowed, active), group=model.ps.pp_group
+        )
+        expected = set().union(*(item[0] for item in coverage))
+        allowed = set().union(*(item[1] for item in coverage))
+        global_active = set().union(*(item[2] for item in coverage))
+    if not expected <= keys or keys - allowed:
         raise ValueError('Checkpoint key coverage mismatch')
     with reader, ExitStack() as stack:
         master_keys = _keys(stack.enter_context(masters)) if masters else set()
-        if master_keys - active:
+        if master_keys - global_active:
             raise ValueError('Unexpected training master keys')
         for name, binding in model.tensor_bindings.items():
             if binding.role == 'scale':
@@ -2169,6 +2180,7 @@ def export_checkpoint(
     buffer_max_size_bytes=5 * 1024**3,
     row_chunks=False,
     include_archival=True,
+    local_stage=False,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
@@ -2188,6 +2200,7 @@ def export_checkpoint(
         row_chunks=row_chunks,
         encode_rows=True,
         buffer_max_size_bytes=buffer_max_size_bytes // (2 if cpu else 1),
+        local_stage=local_stage,
     ):
         if isinstance(item, RowChunk):
             yield RowChunk(

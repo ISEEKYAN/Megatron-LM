@@ -7,11 +7,11 @@ multimodal assembly; frozen visual and archival MTP owners allocate no state.
 """
 
 
+import megatron.lite.primitive.optimizers.owned_groups as _imports_owned_groups
 from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
-from megatron.lite.primitive.optimizers.owned_groups import (
-    OwnedParameterGroups,
-    add_visual_groups,
-)
+
+OwnedParameterGroups = _imports_owned_groups.OwnedParameterGroups
+add_visual_groups = _imports_owned_groups.add_visual_groups
 
 from ..vision_config import OptimizerConfig, VisionOptimizerConfig
 
@@ -36,10 +36,15 @@ def parameter_groups(model, *, lr, vision_policy=None):
     builder = OwnedParameterGroups(model, _RULES, lr)
     route = builder.route
     bindings, seen = builder.bindings, builder.seen
-    route(model, 'embed.weight', 'embedding')
-    route(model, 'head.weight', 'head')
-    route(model, 'norm.weight', 'norm')
+    if model.embed is not None:
+        route(model, 'embed.weight', 'embedding')
+    if model.head is not None:
+        route(model, 'head.weight', 'head')
+    if model.norm is not None:
+        route(model, 'norm.weight', 'norm')
     for block in model.layers:
+        if block is None:
+            continue
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
             route(a, role + '.weight', role)
@@ -92,11 +97,11 @@ def _optimizer_owners(model):
         for b in model.parameter_bindings()
         if b.role == 'expert' and b.tensor.requires_grad
     ]
-    routers = [block.ffn.gate for block in model.layers]
+    routers = [None if block is None else block.ffn.gate for block in model.layers]
     tables = [
         b.engram.embed
         for b in model.layers
-        if b.engram is not None and b.engram.embed.master is not None
+        if b is not None and b.engram is not None and b.engram.embed.master is not None
     ]
     return experts, routers, tables, model.engram_group
 

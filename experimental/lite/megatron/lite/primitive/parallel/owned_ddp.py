@@ -31,7 +31,11 @@ def wrap_owned_ddp(model, ps, *, optimizing, external_device, row_tables, shard_
                 if id(buffer) in sharded:
                     continue
                 value = buffer.contiguous().reshape(-1).view(torch.uint8)
-                torch.distributed.broadcast(value, src=0, group=gradient_group)
+                torch.distributed.broadcast(
+                    value,
+                    src=torch.distributed.get_global_rank(gradient_group, 0),
+                    group=gradient_group,
+                )
                 buffer.copy_(value.view(buffer.dtype).reshape(buffer.shape))
         if ps.ep_size > 1:
             expert_ids = {

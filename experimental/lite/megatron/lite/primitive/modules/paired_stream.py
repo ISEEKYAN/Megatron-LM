@@ -47,3 +47,52 @@ def unpack_pair(carrier, input_shape, copies, width, dtype, message):
 
 def pack_pair(hidden, pre):
     return torch.cat((hidden.float(), pre.unsqueeze(-1)), dim=-1).flatten(2)
+
+
+def pack_deployment(hidden, pre, pending):
+    """Lossless FP32 PP carrier for the shifted deployment post/pre boundary.
+
+    Materialized hidden is retained for Engram injection. The four pending post
+    operands remain independent graph edges for the next layer's reference VJP.
+    """
+    shape = hidden.shape[:2]
+    copies, width = hidden.shape[-2:]
+    active = pending is not None
+    if not active:
+        pending = (
+            hidden.new_zeros(*shape, width),
+            torch.zeros_like(hidden),
+            pre.new_zeros(*shape, copies),
+            pre.new_zeros(*shape, copies, copies),
+        )
+    return torch.cat(
+        [pack_pair(hidden, pre)]
+        + [value.float().flatten(2) for value in pending]
+        + [pre.new_full((*shape, 1), int(active))],
+        dim=-1,
+    )
+
+
+def unpack_deployment(carrier, input_shape, copies, width, dtype):
+    lengths = (copies * (width + 1), width, copies * width, copies, copies * copies, 1)
+    if (
+        carrier is None
+        or carrier.dtype != torch.float32
+        or carrier.shape != (*input_shape, sum(lengths))
+    ):
+        raise ValueError('V4.1_PP_DEPLOYMENT_INPUT: invalid shifted post/pre carrier')
+    pair, output, residual, post, comb, flag = carrier.split(lengths, dim=-1)
+    if not ((flag == 0).all() or (flag == 1).all()):
+        raise ValueError('V4.1_PP_DEPLOYMENT_INPUT: inconsistent pending post flag')
+    hidden, pre = unpack_pair(
+        pair, input_shape, copies, width, dtype, 'Invalid paired carrier'
+    )
+    pending = None
+    if bool(flag.flatten()[0]):
+        pending = (
+            output.to(dtype).contiguous(),
+            residual.reshape(*input_shape, copies, width).to(dtype).contiguous(),
+            post.contiguous(),
+            comb.reshape(*input_shape, copies, copies).contiguous(),
+        )
+    return hidden, pre, pending

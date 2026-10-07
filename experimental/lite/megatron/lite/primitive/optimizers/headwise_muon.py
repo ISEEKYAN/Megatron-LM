@@ -287,7 +287,9 @@ class MixedOptimizer:
             p.grad = p.main_grad = grad
 
     def _grad_norm(self, parameters, gradients):
-        if self.ps is None or (self.ps.ep_size == 1 and not self.row_parameters):
+        if self.ps is None or (
+            self.ps.ep_size == 1 and not self.row_parameters and self.ps.pp_size == 1
+        ):
             return self._base__grad_norm(parameters, gradients)
         # Dense gradients are replicated. Count each dense owner once and
         # sum the disjoint expert shards across EP, not expert-DP replicas.
@@ -306,17 +308,27 @@ class MixedOptimizer:
             torch.distributed.all_reduce(expert, group=self.ps.ep_group)
         if self.row_parameters:
             torch.distributed.all_reduce(row, group=self.row_group)
-        return (dense + expert + row).sqrt()
+        total = dense + expert + row
+        if self.ps.pp_size > 1:
+            torch.distributed.all_reduce(total, group=self.ps.pp_group)
+        return total.sqrt()
 
     def _all_finite(self, valid):
         if self.dp_group is None and (
-            self.ps is None or (self.ps.ep_size == 1 and self.row_group is None)
+            self.ps is None
+            or (
+                self.ps.ep_size == 1 and self.row_group is None and self.ps.pp_size == 1
+            )
         ):
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
         torch.distributed.all_reduce(
             flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
         )
+        if self.ps is not None and self.ps.pp_size > 1:
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=self.ps.pp_group
+            )
         return bool(flag.item())
 
     def accumulate_modality_loads(self, loads):

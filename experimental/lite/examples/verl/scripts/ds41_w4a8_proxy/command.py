@@ -10,8 +10,10 @@ root = Path(__file__).resolve().parent
 out = Path(os.environ['DS41_OUTPUT'])
 model = Path(os.environ['DS41_MODEL'])
 ep = int(os.environ.get('DS41_EP', '8'))
-if ep != 8:
-    raise ValueError('This validated recipe requires EP8')
+pp = int(os.environ.get('DS41_PP', '1'))
+if (pp, ep) not in ((1, 8), (2, 4)):
+    raise ValueError('Proxy layouts are PP1/EP8 or PP2/EP4, world8')
+world = 8
 if not os.environ.get('DS41_DATA'):
     raise ValueError('DS41_DATA must point to the DAPO training parquet')
 os.environ['W4_GRPO_DATA'] = os.environ['DS41_DATA']
@@ -107,6 +109,10 @@ args = [
     '+actor_rollout_ref.actor.engine.seed=42',
     f'actor_rollout_ref.actor.engine.ep={ep}',
     f'actor_rollout_ref.ref.engine.ep={ep}',
+    f'actor_rollout_ref.actor.engine.pp={pp}',
+    f'actor_rollout_ref.ref.engine.pp={pp}',
+    '++actor_rollout_ref.actor.engine.impl_cfg.pipeline_split_layer=1',
+    '++actor_rollout_ref.ref.engine.impl_cfg.pipeline_split_layer=1',
     'actor_rollout_ref.actor.engine.resync_format=mxfp4',
     '++actor_rollout_ref.actor.engine.resync_config={expert_dtype:fp4,freeze_engram:true}',
     *[
@@ -141,8 +147,8 @@ args = [
     '+actor_rollout_ref.ref.engine.seed=42',
     'actor_rollout_ref.rollout.name=vllm',
     'actor_rollout_ref.rollout.tensor_model_parallel_size=1',
-    f'actor_rollout_ref.rollout.data_parallel_size={ep}',
-    f'actor_rollout_ref.rollout.expert_parallel_size={ep}',
+    f'actor_rollout_ref.rollout.data_parallel_size={world}',
+    f'actor_rollout_ref.rollout.expert_parallel_size={world}',
     'actor_rollout_ref.rollout.agent.num_workers=4',
     'actor_rollout_ref.rollout.n=4',
     f'actor_rollout_ref.rollout.agent.agent_loop_config_path={root}/seeded-agent.yaml',
@@ -182,7 +188,7 @@ args = [
     'trainer.project_name=ds41-w4a8-grpo-strict0',
     f'trainer.experiment_name=w4-real-prefix-grpo-{os.environ["SLURM_JOB_ID"]}',
     f'trainer.n_gpus_per_node={os.environ.get("DS41_GPUS_PER_NODE", "4")}',
-    f'trainer.nnodes={ep//int(os.environ.get("DS41_GPUS_PER_NODE", "4"))}',
+    f'trainer.nnodes={world//int(os.environ.get("DS41_GPUS_PER_NODE", "4"))}',
     f'trainer.total_training_steps={os.environ.get("DS41_STEPS", "20")}',
     f'trainer.save_freq={os.environ.get("DS41_SAVE_FREQ", "10")}',
     'trainer.test_freq=-1',

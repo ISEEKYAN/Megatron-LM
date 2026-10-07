@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Unsupported combinations fail in order before model or process-group setup."""
 
+import megatron.lite.model.deepseek_v41.lite.protocol as _imports_protocol
 import pytest
 import torch
-from megatron.lite.model.deepseek_v41.lite.protocol import (
-    ImplConfig,
-    _validate_parallel,
-    build_model,
-)
+
+ImplConfig = _imports_protocol.ImplConfig
+_validate_parallel = _imports_protocol._validate_parallel
+build_model = _imports_protocol.build_model
 from megatron.lite.runtime.contracts import ParallelConfig
 
 
@@ -53,8 +53,6 @@ def test_several_unsupported_dimensions_are_reported_together():
     [
         (dict(text_only=False), "V4.1_PP_TEXT_ONLY"),
         (dict(external_vision_device="cuda:0"), "V4.1_PP_TEXT_ONLY"),
-        (dict(pipeline_split_layer=10), "V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED"),
-        (dict(optimizer="muon"), "V4.1_PP_OPTIMIZER_UNSUPPORTED"),
     ],
 )
 def test_pp2_rejections_name_their_own_cause(kwargs, key):
@@ -63,7 +61,7 @@ def test_pp2_rejections_name_their_own_cause(kwargs, key):
     assert str(caught.value).startswith(key), str(caught.value)
 
 
-@pytest.mark.parametrize("extra", [dict(ep=2), dict(cp=2)])
+@pytest.mark.parametrize("extra", [dict(cp=2)])
 def test_pp2_rejects_being_combined_with_ep_or_cp(extra):
     with pytest.raises(NotImplementedError) as caught:
         _build(parallel=ParallelConfig(pp=2, **extra))
@@ -77,23 +75,35 @@ def test_cp_and_ep_cannot_be_combined():
         _build(parallel=ParallelConfig(cp=2, ep=2))
 
 
-def test_split_layer_20_is_the_one_accepted_cut(monkeypatch):
-    # The topology table puts every KV owner (2/8/14/20) on the same stage as
-    # its readers only when the cut falls on layer 20; the guard encodes that.
+@pytest.mark.parametrize('cut', [10, 19, 21, 39])
+def test_split_cannot_cross_attention_owner(monkeypatch, v41_core_te, cut):
+    from test_redo_parity import release_config
+
     monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
-    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
-    parallel = ParallelConfig(pp=2)
-    assert _validate_parallel(ImplConfig(pipeline_split_layer=20), parallel) is None
-    for cut in (2, 8, 14, 19, 21, 39):
-        with pytest.raises(
-            NotImplementedError, match='V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED'
-        ):
-            _validate_parallel(ImplConfig(pipeline_split_layer=cut), parallel)
-    # With PP off the cut is irrelevant and must not be rejected.
-    assert (
-        _validate_parallel(ImplConfig(pipeline_split_layer=10), ParallelConfig(pp=1))
-        is None
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda *args: 2)
+    # Validation must reject before any group creation.
+    monkeypatch.setattr(
+        torch.distributed,
+        'new_group',
+        lambda *args, **kwargs: (_ for _ in ()).throw(
+            AssertionError('unexpected setup')
+        ),
     )
+    with pytest.raises(NotImplementedError, match='V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED'):
+        build_model(
+            release_config(),
+            impl_cfg=ImplConfig(
+                parallel=ParallelConfig(pp=2), pipeline_split_layer=cut
+            ),
+        )
+
+
+def test_pp_ep_world_contract(monkeypatch):
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 8)
+    assert _validate_parallel(ImplConfig(), ParallelConfig(pp=2, ep=4)) is None
+    with pytest.raises(ValueError, match='V4.1_PP_WORLD'):
+        _validate_parallel(ImplConfig(), ParallelConfig(pp=2, ep=8))
 
 
 def test_guards_run_before_any_distributed_setup(monkeypatch):
