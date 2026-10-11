@@ -14,7 +14,7 @@ config = replace(config, deployment_math=True, quantized=True, w4a8_experts=True
 ```
 
 The CUDA production-boundary regression injects a BF16 midpoint after KV
-projection and normalization, then compares the actual codec input/output with
-the native serving encoder and decoder. It also checks the ordinary path. CPU
+projection and normalization, then compares the actual encoder code and scale bytes with
+the native serving encoder. The optional decoder is not used. It also checks the ordinary path. CPU
 coverage checks the analytic RoPE VJP and unchanged ordinary arithmetic. CUDA
 coverage requires the native DS4.1 serving operators on Blackwell.
