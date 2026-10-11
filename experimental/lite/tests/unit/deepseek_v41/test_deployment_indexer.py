@@ -112,9 +112,23 @@ def test_native_indexer_original_packet_rounding_and_batch_padding(v41_core_te, 
                 assert (selected[:, 1:] == -1).all()
 
 
+@pytest.fixture
+def native_blas_backend():
+    # Upstream BI disables split-K and selects cuBLASLt. This tiny BF16
+    # projection must own that prerequisite even in a combined test process.
+    previous = torch.backends.cuda.preferred_blas_library()
+    torch.backends.cuda.preferred_blas_library("cublaslt")
+    try:
+        yield
+    finally:
+        torch.backends.cuda.preferred_blas_library(previous)
+
+
 @pytest.mark.gpus(1, min_architecture="blackwell")
 @pytest.mark.parametrize("deployment_math", [False, True])
-def test_csa_index_query_rope_fp4_midpoint(v41_core_te, deployment_math):
+def test_csa_index_query_rope_fp4_midpoint(
+    v41_core_te, native_blas_backend, deployment_math
+):
     """A one-component FP4 midpoint must match native index-Q arithmetic.
 
     Feed a small numerical counterexample through the production CSA index-Q
