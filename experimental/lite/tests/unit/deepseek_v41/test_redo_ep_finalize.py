@@ -32,8 +32,8 @@ def _ep_finalize_worker(rank, ep, directory):
     import megatron.core.transformer.hyper_connection  # noqa: F401
 
     fixtures['transformer_engine_import_stub'].__wrapped__(pytest.MonkeyPatch())()
-    from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE, ModalityRouter
-    from megatron.lite.primitive.optimizers.headwise_muon import MixedOptimizer
+    from megatron.lite.model.deepseek_v41.lite import moe as moe_api
+    from megatron.lite.primitive.optimizers import headwise_muon
     from megatron.lite.primitive.parallel.state import init_parallel
     from megatron.lite.runtime.contracts import ParallelConfig
 
@@ -57,11 +57,11 @@ def _ep_finalize_worker(rank, ep, directory):
         topk_group=1,
         routed_scaling_factor=1.0,
     )
-    router = ModalityRouter(cfg, ps)
+    router = moe_api.ModalityRouter(cfg, ps)
     router.router.gate.weight.data.zero_()
     expert = _LinearExpert(ep)
     modules = [expert if i == ps.ep_rank else None for i in range(ep)]
-    model = DeepseekV41MoE(router, modules, ps=ps, use_deepep=False)
+    model = moe_api.DeepseekV41MoE(router, modules, ps=ps, use_deepep=False)
     # Different source-rank data; every token visits every expert. All reductions
     # are small binary rationals so regrouping does not relax torch.equal.
     x = (torch.eye(ep) * (rank + 1)).requires_grad_()
@@ -83,7 +83,8 @@ def _ep_finalize_worker(rank, ep, directory):
     y = torch.einsum("eoi,ti->eto", bank, global_x).sum(0) / ep
     y.sum().div(global_x.shape[0]).backward()
     expected = bank.grad[ps.ep_rank]
-    opt = MixedOptimizer.__new__(MixedOptimizer)
+    opt = headwise_muon.MixedOptimizer.__new__(headwise_muon.MixedOptimizer)
+    opt.host_update = None
     opt.ps, opt.expert_parameters, opt.row_parameters = ps, [expert.weight], []
     calls, reduce = [], dist.all_reduce
 
