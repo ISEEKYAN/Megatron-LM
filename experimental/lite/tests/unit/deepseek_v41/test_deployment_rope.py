@@ -95,3 +95,195 @@ def test_deployment_q_rope_native_and_vjp(v41_core_te, ratio):
     expected = torch.cat((incoming[..., :-64], expected), -1)
     assert torch.isfinite(gradient).all()
     torch.testing.assert_close(gradient, expected, atol=2e-6, rtol=2e-6)
+
+
+@pytest.mark.gpus(1)
+@pytest.mark.parametrize("num_tokens", [1, 32, 223])
+def test_deployment_swa_kv_rope_native_codec(v41_core_te, num_tokens):
+    """SWA KV must match the native BF16 RoPE then all-dimension FP8 codec."""
+    if os.environ.get("MEGATRON_LITE_REQUIRE_CUDA_TESTS") == "1":
+        assert torch.cuda.is_available(), "SWA KV RoPE evidence requires CUDA"
+    elif not torch.cuda.is_available():
+        pytest.skip("CUDA native SWA KV codec")
+    from megatron.lite.primitive.modules.attention.csa import rotate
+    from megatron.lite.primitive.quantization.mxfp8 import quantize_swa
+    from vllm.models.deepseek_v41.common import ops as native_ops
+
+    config = SimpleNamespace(rope_dim=64, rope_theta=10000)
+    torch.manual_seed(93)
+    kv = torch.randn(num_tokens, 512, device="cuda", dtype=torch.bfloat16)
+    # Cancellation near an FP8 midpoint exposed the missing KV opt-in.
+    kv[:, 488] = 0.259765625
+    kv[:, 489] = -0.09716796875
+    positions = torch.full((num_tokens,), 110, device="cuda", dtype=torch.int64)
+    frequency = 1 / (10000 ** (torch.arange(0, 64, 2, device="cuda").float() / 64))
+    angles = torch.arange(111, device="cuda").float()[:, None] * frequency
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1)
+    block_size = 32
+    num_blocks = (num_tokens + block_size - 1) // block_size
+    storage = torch.zeros(
+        num_blocks, block_size * 528, device="cuda", dtype=torch.uint8
+    )
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        torch.zeros(num_tokens, 1, 512, device="cuda", dtype=kv.dtype),
+        kv,
+        storage,
+        torch.arange(num_tokens, device="cuda"),
+        positions,
+        cos_sin,
+        64,
+        1e-6,
+        block_size,
+        False,
+        True,
+        False,
+        False,
+    )
+    native = torch.empty(1, num_tokens, 512, device="cuda", dtype=kv.dtype)
+    native_ops.dequantize_and_gather_k_cache(
+        native,
+        storage.view(num_blocks, block_size, 528),
+        torch.tensor([num_tokens], device="cuda", dtype=torch.int32),
+        None,
+        torch.arange(num_blocks, device="cuda", dtype=torch.int32)[None],
+        block_size,
+        offset=0,
+        use_fnuz=False,
+    )
+    actual = quantize_swa(
+        rotate(kv[None], positions, config, 0, deployment_math=True)
+    ).decoded
+    assert torch.equal(actual, native)
+
+
+def test_deployment_swa_kv_rope_vjp_and_default(v41_core_te):
+    from megatron.lite.primitive.modules.attention.csa import rotate
+
+    config = SimpleNamespace(rope_dim=64, rope_theta=10000)
+    torch.manual_seed(91)
+    leaf = torch.randn(1, 111, 512, requires_grad=True)
+    positions = torch.arange(111)
+    actual = rotate(leaf, positions, config, 0, deployment_math=True)
+    incoming = torch.randn_like(actual)
+    gradient = torch.autograd.grad(actual, leaf, incoming)[0]
+    frequency = 1 / (10000 ** (torch.arange(0, 64, 2).float() / 64))
+    angles = positions.float()[:, None] * frequency
+    cs, sn = angles.cos()[None], angles.sin()[None]
+    pairs = incoming[..., -64:].unflatten(-1, (-1, 2))
+    tail = torch.stack(
+        (
+            pairs[..., 0] * cs + pairs[..., 1] * sn,
+            pairs[..., 1] * cs - pairs[..., 0] * sn,
+        ),
+        -1,
+    ).flatten(-2)
+    expected = torch.cat((incoming[..., :-64], tail), -1)
+    torch.testing.assert_close(gradient, expected, atol=2e-6, rtol=2e-6)
+    # Default recipe retains its complex multiply and FP32 output.
+    default = rotate(leaf, positions, config, 0)
+    phase = torch.polar(torch.ones_like(angles), angles)[None]
+    original_tail = torch.view_as_complex(
+        leaf[..., -64:].contiguous().unflatten(-1, (-1, 2))
+    )
+    expected_default = torch.cat(
+        (leaf[..., :-64], torch.view_as_real(original_tail * phase).flatten(-2)), -1
+    )
+    assert torch.equal(default, expected_default)
+
+
+@pytest.mark.gpus(1, min_architecture="blackwell")
+@pytest.mark.parametrize("deployment_math", [False, True])
+def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math):
+    """Catch the missing KV opt-in in the actual CSA projection/codec boundary."""
+    if os.environ.get("MEGATRON_LITE_REQUIRE_CUDA_TESTS") == "1":
+        assert torch.cuda.is_available(), "Production SWA boundary requires CUDA"
+    elif not torch.cuda.is_available():
+        pytest.skip("CUDA production SWA boundary")
+    from megatron.lite.primitive.modules.attention import csa
+    from vllm.models.deepseek_v41.common import ops
+
+    class CapturedCodec(Exception):
+        pass
+
+    torch.manual_seed(93)
+    row = torch.randn(1, 512, dtype=torch.bfloat16, device="cuda")
+    row[:, 488], row[:, 489] = 0.259765625, -0.09716796875
+    kv = row.expand(111, 512).contiguous()
+    positions = torch.arange(111, device="cuda", dtype=torch.int64)
+    frequency = 1 / (10000 ** (torch.arange(0, 64, 2, device="cuda").float() / 64))
+    angles = positions.float()[:, None] * frequency
+    block = 32
+    storage = torch.zeros(4, block * 528, device="cuda", dtype=torch.uint8)
+    torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        torch.zeros(111, 1, 512, device="cuda", dtype=kv.dtype),
+        kv,
+        storage,
+        positions,
+        positions,
+        torch.cat((angles.cos(), angles.sin()), -1),
+        64,
+        1e-6,
+        block,
+        False,
+        True,
+        False,
+        False,
+    )
+    native = torch.empty(1, 111, 512, device="cuda", dtype=kv.dtype)
+    ops.dequantize_and_gather_k_cache(
+        native,
+        storage.view(4, block, 528),
+        torch.tensor([111], device="cuda", dtype=torch.int32),
+        None,
+        torch.arange(4, device="cuda", dtype=torch.int32)[None],
+        block,
+        offset=0,
+        use_fnuz=False,
+    )
+    config = csa.CrossLayerAttentionConfig(
+        dim=4,
+        heads=1,
+        q_rank=4,
+        o_rank=4,
+        groups=1,
+        linear_fp8=False,
+        main_qat=False,
+        swa_fp8=True,
+    )
+    captured = []
+
+    def capture(value):
+        captured.append(csa.mxfp8.quantize_swa(value).decoded)
+        raise CapturedCodec
+
+    class FixedKV(torch.nn.Module):
+        def forward(self, x):
+            return kv[None]
+
+    model = csa.CompressedSparseAttention(
+        config,
+        layer_idx=0,
+        ps=None,
+        compress_ratio=0,
+        kv_owner=0,
+        index_owner=0,
+        candidate_mode="none",
+        codecs={
+            "main": csa.fake_quant_main_kv,
+            "index": csa.fake_quant_index,
+            "swa": capture,
+        },
+    ).to(device="cuda", dtype=torch.bfloat16)
+    model.wkv, model.kv_norm = FixedKV(), torch.nn.Identity()
+    model.deployment_math = deployment_math
+    x = torch.zeros(1, 1, 4, device="cuda", dtype=torch.bfloat16)
+    context = SimpleNamespace(start=110, gather=lambda _: x.new_zeros(1, 111, 4))
+    with pytest.raises(CapturedCodec):
+        model._forward_cross_layer(x, csa.AttentionState(), cp_context=context)
+    legacy = csa.mxfp8.quantize_swa(csa.rotate(kv[None], positions, config, 0)).decoded
+    assert not torch.equal(
+        legacy[:, 110], native[:, 110]
+    ), "fixture must cross an FP8 midpoint"
+    assert torch.equal(
+        captured[0][:, 110], (native if deployment_math else legacy)[:, 110]
+    )

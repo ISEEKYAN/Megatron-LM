@@ -519,7 +519,15 @@ class CompressedSparseAttention(nn.Module):
             ratio,
             deployment_math=self.deployment_math,
         )
-        window = rotate(self.kv_norm(self.wkv(full_x)), key_positions, c, ratio)
+        # SWA KV uses the same ordered RoPE multiply-adds as native Q.
+        # Keep BF16 rounding before the FP8 codec, as the receiver does.
+        window = rotate(
+            self.kv_norm(self.wkv(full_x)),
+            key_positions,
+            c,
+            ratio,
+            deployment_math=self.deployment_math,
+        )
         if c.swa_fp8:
             window = swa_codec(window)
         kv = window
