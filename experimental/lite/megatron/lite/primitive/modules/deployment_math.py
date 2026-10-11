@@ -64,6 +64,100 @@ def visible_forward(visible, reference, *inputs):
     return _Visible.apply(visible, reference, *inputs)
 
 
+@torch.no_grad()
+def indexer_scores(query, keys, weights, lengths):
+    """Native FP32 MXFP4 index scores for the discrete deployment selector.
+
+    Inputs are the owned QAT decoded values. Index ranking has no VJP in the
+    CSA recipe; attention keeps its ordinary VJP with the selected slots fixed.
+    """
+    if not all(t.is_cuda for t in (query, keys, weights, lengths)):
+        raise RuntimeError('Deployment index scoring requires CUDA')
+    if query.ndim != 4 or keys.ndim != 3:
+        raise ValueError('Index Q/K must be BSHD/BTD')
+    batch, rows, heads, width = query.shape
+    if heads != 32 or width != 128 or keys.shape[0] != batch or keys.shape[-1] != width:
+        raise ValueError('Deployment index scoring requires paired H32/D128 Q/K')
+    if weights.shape != query.shape[:-1]:
+        raise ValueError('Index head weights must be BSH')
+    columns = keys.shape[1]
+    if rows == 0 or columns == 0:
+        return query.new_empty((batch, rows, columns), dtype=torch.float32)
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_index
+    from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
+
+    q, k = quantize_index(query), quantize_index(keys)
+    q_scale = q.scale.contiguous().view(torch.int32).squeeze(-1)
+    k_scale = k.scale.contiguous().view(torch.int32).squeeze(-1)
+    ends = torch.broadcast_to(lengths, (batch, rows, 1)).to(torch.int32)
+    starts = torch.zeros(rows, device=query.device, dtype=torch.int32)
+    # Preserve row alignment through batching and candidate masking. The
+    # generic prefill selector consumes this same pitch, including short rows.
+    pitch = (columns + 127) // 128 * 128
+    output = query.new_empty((batch, rows, pitch), dtype=torch.float32)
+    for index in range(batch):
+        scores = fp8_fp4_mqa_logits(
+            (q.packed[index], q_scale[index]),
+            (k.packed[index], k_scale[index]),
+            weights[index].float(),
+            starts,
+            ends[index].flatten().contiguous(),
+            clean_logits=True,
+        )
+        output[index, :, :columns].copy_(scores)
+    return output[:, :, :columns]
+
+
+@torch.no_grad()
+def indexer_select_positions(scores, lengths, topk, *, candidates=None):
+    """Use the BI receiver's prefill selector and ascending valid KV positions."""
+    if not scores.is_cuda or scores.dtype != torch.float32 or scores.ndim != 3:
+        raise RuntimeError('Deployment index selection requires CUDA BSN FP32 scores')
+    if topk not in (512, 1024, 2048):
+        raise ValueError('Deployment index Top-K must be 512, 1024, or 2048')
+    batch, rows, columns = scores.shape
+    if rows == 0 or columns == 0:
+        return torch.empty((batch, rows, 0), dtype=torch.int32, device=scores.device)
+    from vllm import _custom_ops as ops
+
+    flat = scores.flatten(0, 1)
+    if candidates is not None:
+        if candidates.shape != scores.shape or candidates.dtype != torch.bool:
+            raise ValueError('Candidate mask must be boolean and match scores')
+        masked = torch.empty_strided(
+            flat.shape, flat.stride(), device=flat.device, dtype=flat.dtype
+        )
+        masked.copy_(flat).masked_fill_(~candidates.flatten(0, 1), -torch.inf)
+        flat = masked
+    ends = (
+        torch.broadcast_to(lengths, (batch, rows, 1))
+        .to(torch.int32)
+        .flatten()
+        .contiguous()
+    )
+    starts = torch.zeros_like(ends)
+    selected = torch.empty(
+        (batch * rows, topk), device=scores.device, dtype=torch.int32
+    )
+    ops.top_k_per_row_prefill(
+        flat,
+        starts,
+        ends,
+        selected,
+        selected.shape[0],
+        flat.stride(0),
+        flat.stride(1),
+        topk,
+    )
+    valid = selected >= 0
+    safe = selected.clamp(min=0, max=columns - 1).long()
+    valid &= flat.gather(1, safe) > -torch.inf
+    selected = (
+        torch.where(valid, selected, columns).sort(-1).values[:, : min(topk, columns)]
+    )
+    return torch.where(selected < columns, selected, -1).reshape(batch, rows, -1)
+
+
 def router_topk(logits, bias, *, topk, scaling_factor):
     """CUDA selection order and FP32 normalization, with an owned score VJP.
 
