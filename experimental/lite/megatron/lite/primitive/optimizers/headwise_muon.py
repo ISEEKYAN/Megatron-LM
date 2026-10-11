@@ -38,9 +38,9 @@ class HeadwiseMuon(torch.optim.Optimizer):
         momentum=0.95,
         update_rms=0.18,
     ):
-        from emerging_optimizers.orthogonalized_optimizers.muon_utils import (
-            newton_schulz,
-        )
+        import emerging_optimizers.orthogonalized_optimizers.muon_utils as _imports_muon_utils
+
+        newton_schulz = _imports_muon_utils.newton_schulz
 
         if type(ns_steps) is not int or ns_steps < 1:
             raise ValueError('ns_steps must be a positive integer')
@@ -184,15 +184,15 @@ class HeadwiseMuon(torch.optim.Optimizer):
         super().load_state_dict(state_dict)
         self._validate_groups()
 
-    from .staged_update import (
-        _idle,
-        _validate_momentum,
-        candidates,
-        commit_step,
-        discard_step,
-        state_dict,
-        step,
-    )
+    from . import staged_update as _imports_staged_update
+
+    _idle = _imports_staged_update._idle
+    _validate_momentum = _imports_staged_update._validate_momentum
+    candidates = _imports_staged_update.candidates
+    commit_step = _imports_staged_update.commit_step
+    discard_step = _imports_staged_update.discard_step
+    state_dict = _imports_staged_update.state_dict
+    step = _imports_staged_update.step
 
 
 class MixedOptimizer:
@@ -254,6 +254,25 @@ class MixedOptimizer:
 
     @torch.no_grad()
     def finalize_grads(self):
+        if (
+            self.ps.pp_size > 1 or self.host_update is not None
+        ) and self.ps.dp_cp_size > 1:
+            # PP warmup/cooldown keeps several DDP forwards in flight. Their
+            # no_sync forwards accumulate locally; average dense owners once
+            # after the complete schedule, before global clipping/commit.
+            for p in self.model.parameters():
+                if not p.requires_grad or id(p) in self.expert_ids | self.row_ids:
+                    continue
+                grad = p.main_grad if p.main_grad is not None else p.grad
+                active = torch.tensor(int(grad is not None), device=p.device)
+                torch.distributed.all_reduce(active, group=self.dp_group)
+                if not active.item():
+                    continue
+                if grad is None:
+                    grad = torch.zeros_like(p)
+                torch.distributed.all_reduce(grad, group=self.dp_group)
+                grad.div_(self.ps.dp_cp_size)
+                p.grad = p.main_grad = grad
         if self.ps.ep_size > 1:
             self.finalize_expert_grads()
         # Lookup backward sums requests from all data/context ranks. Dense DDP
@@ -287,7 +306,9 @@ class MixedOptimizer:
             p.grad = p.main_grad = grad
 
     def _grad_norm(self, parameters, gradients):
-        if self.ps is None or (self.ps.ep_size == 1 and not self.row_parameters):
+        if self.ps is None or (
+            self.ps.ep_size == 1 and not self.row_parameters and self.ps.pp_size == 1
+        ):
             return self._base__grad_norm(parameters, gradients)
         # Dense gradients are replicated. Count each dense owner once and
         # sum the disjoint expert shards across EP, not expert-DP replicas.
@@ -306,17 +327,27 @@ class MixedOptimizer:
             torch.distributed.all_reduce(expert, group=self.ps.ep_group)
         if self.row_parameters:
             torch.distributed.all_reduce(row, group=self.row_group)
-        return (dense + expert + row).sqrt()
+        total = dense + expert + row
+        if self.ps.pp_size > 1:
+            torch.distributed.all_reduce(total, group=self.ps.pp_group)
+        return total.sqrt()
 
     def _all_finite(self, valid):
         if self.dp_group is None and (
-            self.ps is None or (self.ps.ep_size == 1 and self.row_group is None)
+            self.ps is None
+            or (
+                self.ps.ep_size == 1 and self.row_group is None and self.ps.pp_size == 1
+            )
         ):
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
         torch.distributed.all_reduce(
             flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
         )
+        if self.ps is not None and self.ps.pp_size > 1:
+            torch.distributed.all_reduce(
+                flag, op=torch.distributed.ReduceOp.MIN, group=self.ps.pp_group
+            )
         return bool(flag.item())
 
     def accumulate_modality_loads(self, loads):
@@ -366,7 +397,9 @@ class MixedOptimizer:
         empty state. This is an explicit post-training transition, not an
         automatic pretraining unfreeze or LR schedule.
         """
-        from megatron.lite.primitive.modules.vision_training import VisionTrainability
+        import megatron.lite.primitive.modules.vision_training as _imports_vision_training
+
+        VisionTrainability = _imports_vision_training.VisionTrainability
 
         if not isinstance(mask, VisionTrainability):
             raise TypeError('Expected explicit visual trainability mask')
@@ -444,6 +477,13 @@ class MixedOptimizer:
                     kwargs = dict(betas=(0.9, 0.95), eps=1e-20, foreach=False)
                 self.optimizers.append(optimizer(selected, lr=config.lr, **kwargs))
         self.tables = list(tables)
+        self.host_update = None
+        self.checkpoint_device = None
+        if getattr(config, 'segmented_host', False):
+            from .segmented_host import SegmentedHostUpdate
+
+            self.host_update = SegmentedHostUpdate(self)
+            self.checkpoint_device = 'cpu'
 
     @property
     def param_groups(self):
@@ -471,6 +511,8 @@ class MixedOptimizer:
     @torch.no_grad()
     def _base_step(self):
         self._validate_trainability()
+        if self.host_update is not None:
+            return self.host_update.step()
         parameters = _parameters(self)
         gradients = [
             p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
@@ -543,8 +585,45 @@ class MixedOptimizer:
             for p, grad, main in original:
                 p.grad, p.main_grad = grad, main
 
+    def _move_state(self, device):
+        self._validate_trainability()
+        if any(
+            getattr(backend, '_prepared', None) is not None
+            for backend in self.optimizers
+        ):
+            raise RuntimeError('Cannot migrate a prepared optimizer step')
+        for backend in self.optimizers:
+            cpu_steps = {
+                id(parameter)
+                for group in backend.param_groups
+                if isinstance(backend, torch.optim.AdamW)
+                and not group.get('capturable', False)
+                and not group.get('fused', False)
+                for parameter in group['params']
+            }
+            for parameter, state in backend.state.items():
+                for key, value in state.items():
+                    if isinstance(value, torch.Tensor):
+                        target = (
+                            'cpu'
+                            if device == 'cpu'
+                            or (key == 'step' and id(parameter) in cpu_steps)
+                            else parameter.device
+                        )
+                        state[key] = value.to(target)
+
+    def offload_state_to_cpu(self):
+        """Move published state to CPU without changing masters or gradients."""
+        self._move_state('cpu')
+
+    def load_state_to_device(self):
+        """Restore state beside each owner, retaining AdamW CPU step counters."""
+        self._move_state('cpu' if self.host_update is not None else None)
+
     def state_dict(self):
         self._validate_trainability()
+        if self.host_update is not None:
+            self.host_update.require_idle()
         return dict(
             owners=[g['owner_key'] for g in self.param_groups],
             clip_grad=self.config.clip_grad,
@@ -559,8 +638,11 @@ class MixedOptimizer:
             state['optimizers']
         ) != len(self.optimizers):
             raise ValueError('Optimizer owner layout differs')
-        for backend, saved in zip(self.optimizers, state['optimizers']):
-            backend.load_state_dict(saved)
+        if self.host_update is not None:
+            self.host_update.load_state(state)
+        else:
+            for backend, saved in zip(self.optimizers, state['optimizers']):
+                backend.load_state_dict(saved)
 
 
 def _publish_main_grad(parameter):
