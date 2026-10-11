@@ -572,10 +572,23 @@ class CompressedSparseAttention(nn.Module):
                 weights = self.indexer.weights_proj(x) * (
                     c.index_dim**-0.5 * c.index_heads**-0.5
                 )
-                scores = (
-                    torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
-                    * weights.unsqueeze(-1)
-                ).sum(2)
+                native_indexer = (
+                    self.deployment_math
+                    and c.index_qat
+                    and x.is_cuda
+                    and state.index_k.shape[1] > c.topk
+                )
+                if native_indexer:
+                    from megatron.lite.primitive.modules import deployment_math
+
+                    scores = deployment_math.indexer_scores(
+                        iq, state.index_k, weights, lengths
+                    )
+                else:
+                    scores = (
+                        torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
+                        * weights.unsqueeze(-1)
+                    ).sum(2)
                 pool = state.candidates
                 if self.candidate_mode == 'build':
                     pool = candidate_blocks(
@@ -587,7 +600,12 @@ class CompressedSparseAttention(nn.Module):
                 injected_pool = pool if candidate_mask is None else candidate_mask
                 if self.candidate_mode == 'reuse' and injected_pool is None:
                     raise ValueError("Reindex requires the layer-20 candidate pool")
-                selected = select_positions(
+                selector = (
+                    deployment_math.indexer_select_positions
+                    if native_indexer
+                    else select_positions
+                )
+                selected = selector(
                     scores,
                     lengths,
                     c.topk,
