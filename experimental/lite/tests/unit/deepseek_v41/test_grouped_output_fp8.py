@@ -4,17 +4,27 @@ import pytest
 import torch
 
 
-@pytest.mark.skipif(
-    not torch.cuda.is_available(), reason='deployment FP8 GEMM requires CUDA'
-)
 @pytest.mark.parametrize('groups', [1, 2])
 @pytest.mark.parametrize('weight_dtype', [torch.float32, torch.bfloat16])
 def test_grouped_output_uses_fp8_with_master_or_reference_weights(
     v41_core_te, groups, weight_dtype
 ):
+    """CPU integration checks codec ownership, not native FP8 numerics.
+
+    Other projections use CPU reference linears. The actual CSA forward must
+    invoke the supplied grouped codec once and retain FP32 activations and the
+    original master/reference dtype. Native packets/kernel/VJP have CUDA tests.
+    """
+    from types import MethodType
+
+    from megatron.lite.model.deepseek_v41 import codecs
+    from megatron.lite.primitive.modules import native_fp32_linear
     from megatron.lite.primitive.modules.attention import csa
     from megatron.lite.primitive.quantization import mxfp8
 
+    assert (
+        codecs.attention_codecs()['linear_grouped'] is mxfp8.dynamic_fp8_grouped_linear
+    )
     torch.manual_seed(731)
     cfg = csa.CrossLayerAttentionConfig(
         dim=32,
@@ -40,37 +50,35 @@ def test_grouped_output_uses_fp8_with_master_or_reference_weights(
         candidate_mode='none',
         compress_ratio=0,
     )
-    model = model.cuda()
-    model.deployment_math = True
+    model.deployment_math = True  # CPU attention uses the Torch reference branch.
     model.wo_a.weight.data = model.wo_a.weight.data.to(weight_dtype)
-    model.wo_a.native_fp32 = True
-    assert model.wo_a.fp8
-    # A value which changes under the deployment codec makes bypass observable.
-    with torch.no_grad():
-        model.wo_a.weight[0, 0] = 0.7501
     calls = []
 
-    def project(x, weight, *, deployment_math=False):
-        calls.append((x.detach().clone(), weight.detach().clone()))
-        assert deployment_math
-        return mxfp8.dynamic_fp8_linear(x, weight, deployment_math=deployment_math)
+    def reference(self, value):
+        return torch.nn.functional.linear(value.float(), self.weight.float())
 
-    model.wo_a.fp8_operator = project
-    x = torch.randn(1, 3, 32, device='cuda').bfloat16().requires_grad_()
-    y, _ = model(x, csa.AttentionState())
-    assert len(calls) == groups
-    for i, (operand, weight) in enumerate(calls):
-        assert operand.shape == (1, 3, cfg.heads * cfg.head_dim // groups)
-        assert operand.dtype == torch.float32
-        assert weight.dtype == weight_dtype
-        assert torch.equal(
-            weight, model.wo_a.weight[i * cfg.o_rank : (i + 1) * cfg.o_rank]
-        )
-    y.float().square().mean().backward()
+    for module in model.modules():
+        if isinstance(module, native_fp32_linear.Linear) and module is not model.wo_a:
+            module.forward = MethodType(reference, module)
+
+    def grouped_codec(operand, weight):
+        calls.append((operand.detach().clone(), weight.detach().clone()))
+        return torch.einsum('...gk,gnk->...gn', operand, weight.float())
+
+    model.codecs = dict(codecs.attention_codecs(), linear_grouped=grouped_codec)
+    value = torch.randn(1, 3, 32).bfloat16().requires_grad_()
+    output, _ = model(value, csa.AttentionState())
+    assert len(calls) == 1
+    operand, weight = calls[0]
+    assert operand.shape == (1, 3, groups, cfg.heads * cfg.head_dim // groups)
+    assert operand.dtype == torch.float32
+    assert weight.dtype == weight_dtype
+    assert torch.equal(weight, model.wo_a.weight.view(groups, cfg.o_rank, -1))
+    output.float().square().mean().backward()
     assert model.wo_a.weight.grad.dtype == weight_dtype
     assert torch.isfinite(model.wo_a.weight.grad).all()
     assert torch.count_nonzero(model.wo_a.weight.grad) > 0
-    assert x.grad.dtype == torch.bfloat16
+    assert value.grad.dtype == torch.bfloat16
 
 
 def test_inverse_rope_fp8_midpoint_preserves_fp32(v41_core_te):

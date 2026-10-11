@@ -682,15 +682,14 @@ class CompressedSparseAttention(nn.Module):
             # Each output group owns a row slice of the release-layout matrix.
             # Keep the same deployment codec as the other FP8 projections;
             # FP32 optimizer masters must never bypass the forward codec.
-            output = torch.stack(
-                [
-                    self.wo_a.fp8_operator(
-                        grouped[:, :, i], weight[i], deployment_math=True
-                    )
-                    for i in range(c.groups)
-                ],
-                dim=2,
-            ).flatten(2)
+            from megatron.lite.primitive.quantization import mxfp8
+
+            grouped_codec = (
+                mxfp8.dynamic_fp8_grouped_linear
+                if self.codecs is None
+                else self.codecs.get("linear_grouped", mxfp8.dynamic_fp8_grouped_linear)
+            )
+            output = grouped_codec(grouped, weight).flatten(2)
         elif getattr(self.wo_a, 'native_fp32', False):
             output = torch.stack(
                 [
