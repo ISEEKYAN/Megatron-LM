@@ -90,22 +90,26 @@ def indexer_scores(query, keys, weights, lengths):
     q_scale = q.scale.contiguous().view(torch.int32).squeeze(-1)
     k_scale = k.scale.contiguous().view(torch.int32).squeeze(-1)
     ends = torch.broadcast_to(lengths, (batch, rows, 1)).to(torch.int32)
-    starts = torch.zeros(rows, device=query.device, dtype=torch.int32)
-    # Preserve row alignment through batching and candidate masking. The
-    # generic prefill selector consumes this same pitch, including short rows.
+    # Keep each request's KV base aligned to the native 128-column tile.
+    # One native launch covers all query rows; valid ranges exclude other
+    # requests. The native FP32 API returns a dense global score workspace.
     pitch = (columns + 127) // 128 * 128
-    output = query.new_empty((batch, rows, pitch), dtype=torch.float32)
-    for index in range(batch):
-        scores = fp8_fp4_mqa_logits(
-            (q.packed[index], q_scale[index]),
-            (k.packed[index], k_scale[index]),
-            weights[index].float(),
-            starts,
-            ends[index].flatten().contiguous(),
-            clean_logits=True,
-        )
-        output[index, :, :columns].copy_(scores)
-    return output[:, :, :columns]
+    packed_k = torch.nn.functional.pad(k.packed, (0, 0, 0, pitch - columns))
+    packed_scale = torch.nn.functional.pad(k_scale, (0, pitch - columns))
+    starts = torch.arange(batch, device=query.device, dtype=torch.int32) * pitch
+    starts = starts[:, None].expand(batch, rows).contiguous().flatten()
+    scores = fp8_fp4_mqa_logits(
+        (q.packed.flatten(0, 1), q_scale.flatten(0, 1)),
+        (packed_k.flatten(0, 1), packed_scale.flatten(0, 1)),
+        weights.flatten(0, 1).float(),
+        starts,
+        (starts + ends.flatten()).contiguous(),
+        clean_logits=True,
+    )
+    scores = scores.reshape(batch, rows, batch, pitch)
+    request = torch.arange(batch, device=query.device)
+    # Paired advanced indexing extracts local request columns in one launch.
+    return scores[request, :, request, :][:, :, :columns]
 
 
 @torch.no_grad()
@@ -283,70 +287,49 @@ def sparse_attention(
     # Native prefill gathers compressed KV before SWA and preserves selected
     # index order. Construct the same physical row order from the owned state.
     reordered = torch.cat([kv[:, window_size:], kv[:, :window_size]], 1)
-    indices = torch.full((*q.shape[:2], width), -1, device=q.device, dtype=torch.int32)
-    lengths = torch.zeros(q.shape[:2], device=q.device, dtype=torch.int32)
-    for batch in range(q.shape[0]):
-        for token in range(q.shape[1]):
-            selected = (
-                []
-                if main_indices is None
-                else [
-                    v for v in main_indices[batch, token].tolist() if 0 <= v < main_size
-                ]
-            )
-            selected += [
-                main_size + v
-                for v in torch.where(mask[batch, token, :window_size])[0].tolist()
-            ]
-            indices[batch, token, : len(selected)] = torch.tensor(
-                selected, device=q.device, dtype=torch.int32
-            )
-            lengths[batch, token] = len(selected)
+    from megatron.lite.primitive.kernels.sparse_metadata import sparse_metadata
+
+    indices, lengths = sparse_metadata(
+        mask, main_indices, main_size=main_size, window_size=window_size, width=width
+    )
+    batch, rows, heads, dim = q.shape
+    offsets = torch.arange(batch, device=q.device, dtype=torch.int32)[:, None, None]
+    flat_indices = torch.where(indices >= 0, indices + offsets * kv.shape[1], -1)
 
     def reference(query, values, bias):
-        rows = []
-        for batch in range(query.shape[0]):
-            gathered = values[batch][indices[batch].clamp_min(0).long()]
-            logits = (
-                torch.einsum('shd,std->sht', query[batch].float(), gathered.float())
-                * scale
-            )
-            logits = logits.masked_fill((indices[batch] < 0).unsqueeze(1), -torch.inf)
-            probabilities = torch.cat(
-                [logits, bias.expand(query.shape[1], -1).unsqueeze(-1)], -1
-            ).softmax(-1)[..., :-1]
-            rows.append(
-                torch.einsum('sht,std->shd', probabilities, gathered.float()).to(
-                    query.dtype
-                )
-            )
-        return torch.stack(rows)
+        gathered = values.flatten(0, 1)[flat_indices.clamp_min(0).long()]
+        logits = (
+            torch.einsum('bshd,bstd->bsht', query.float(), gathered.float()) * scale
+        )
+        logits = logits.masked_fill((indices < 0).unsqueeze(2), -torch.inf)
+        probabilities = torch.cat(
+            [logits, bias.expand(batch, rows, -1).unsqueeze(-1)], -1
+        ).softmax(-1)[..., :-1]
+        return torch.einsum('bsht,bstd->bshd', probabilities, gathered.float()).to(
+            query.dtype
+        )
 
     def visible(query, values, bias):
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
-        rows = []
-        heads = query.shape[2]
         padded_heads = 64 if heads <= 64 else 128
         padded_sink = torch.nn.functional.pad(
             bias, (0, padded_heads - heads)
         ).contiguous()
-        for batch in range(query.shape[0]):
-            padded_q = torch.nn.functional.pad(
-                query[batch], (0, 0, 0, padded_heads - heads)
-            ).contiguous()
-            output = torch.empty_like(padded_q)
-            flash_mla_sparse_fwd(
-                q=padded_q,
-                kv=values[batch].unsqueeze(1).contiguous(),
-                indices=indices[batch].unsqueeze(1),
-                sm_scale=scale,
-                attn_sink=padded_sink,
-                topk_length=lengths[batch],
-                out=output,
-            )
-            rows.append(output[:, :heads])
-        return torch.stack(rows)
+        padded_q = torch.nn.functional.pad(
+            query.flatten(0, 1), (0, 0, 0, padded_heads - heads)
+        ).contiguous()
+        output = torch.empty_like(padded_q)
+        flash_mla_sparse_fwd(
+            q=padded_q,
+            kv=values.flatten(0, 1).unsqueeze(1).contiguous(),
+            indices=flat_indices.flatten(0, 1).unsqueeze(1),
+            sm_scale=scale,
+            attn_sink=padded_sink,
+            topk_length=lengths.flatten(),
+            out=output,
+        )
+        return output[:, :heads].reshape(batch, rows, heads, dim)
 
     return visible_forward(visible, reference, q, reordered, sink)
 

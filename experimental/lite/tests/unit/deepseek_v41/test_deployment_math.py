@@ -166,3 +166,189 @@ def test_release_router_matches_native_dispatch_and_owned_vjp(experts, tokens):
     (selected / selected.sum(-1, keepdim=True) * 1.5).backward(incoming)
     assert logits.grad.dtype == torch.float32
     assert torch.equal(logits.grad, leaf.grad)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA sparse metadata')
+@pytest.mark.parametrize('has_main', (False, True))
+def test_sparse_metadata_stable_order_batch1_graph_and_one_launch(
+    has_main, monkeypatch
+):
+    from megatron.lite.primitive.kernels import sparse_metadata as module
+
+    torch.manual_seed(1903)
+    batch, rows, window, main_size, topk, width = 3, 7, 65, 41, 32, 128
+    mask = torch.rand(batch, rows, window + main_size, device='cuda') > 0.5
+    main = (
+        torch.randint(
+            -3, main_size + 4, (batch, rows, topk), device='cuda', dtype=torch.int32
+        )
+        if has_main
+        else None
+    )
+    calls = []
+    native = module._compact
+
+    class Launcher:
+        def __getitem__(self, grid):
+            launch = native[grid]
+
+            def call(*args, **kwargs):
+                calls.append(grid)
+                return launch(*args, **kwargs)
+
+            return call
+
+    monkeypatch.setattr(module, '_compact', Launcher())
+    kwargs = dict(main_size=main_size, window_size=window, width=width)
+    indices, lengths = module.sparse_metadata(mask, main, **kwargs)
+    torch.cuda.synchronize()
+    assert calls == [(batch * rows,)]
+    expected = torch.full_like(indices, -1)
+    expected_lengths = torch.zeros_like(lengths)
+    cpu_mask = mask.cpu()
+    cpu_main = main.cpu() if has_main else None
+    for b in range(batch):
+        for s in range(rows):
+            chosen = (
+                [v for v in cpu_main[b, s].tolist() if 0 <= v < main_size]
+                if has_main
+                else []
+            )
+            chosen += [
+                main_size + v for v in torch.where(cpu_mask[b, s, :window])[0].tolist()
+            ]
+            expected[b, s, : len(chosen)] = torch.tensor(
+                chosen, device='cuda', dtype=torch.int32
+            )
+            expected_lengths[b, s] = len(chosen)
+    assert torch.equal(indices, expected)
+    assert torch.equal(lengths, expected_lengths)
+    single = module.sparse_metadata(
+        mask[1:2], main[1:2] if has_main else None, **kwargs
+    )
+    assert torch.equal(single[0], indices[1:2]) and torch.equal(single[1], lengths[1:2])
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        actual = module.sparse_metadata(mask, main, **kwargs)
+    graph.replay()
+    assert torch.equal(actual[0], indices) and torch.equal(actual[1], lengths)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA FlashMLA')
+def test_sparse_attention_one_batched_call_matches_serial_native(monkeypatch):
+    from megatron.lite.primitive.kernels.sparse_metadata import sparse_metadata
+    from megatron.lite.primitive.modules import deployment_math as dm
+    from vllm.v1.attention.ops import flashmla
+
+    torch.manual_seed(1917)
+    batch, rows, heads, dim, window, main_size, width = 2, 5, 32, 512, 65, 19, 128
+    q = torch.randn(
+        batch, rows, heads, dim, device='cuda', dtype=torch.bfloat16
+    ).requires_grad_()
+    kv = torch.randn(
+        batch, window + main_size, dim, device='cuda', dtype=torch.bfloat16
+    ).requires_grad_()
+    sink = torch.randn(heads, device='cuda', dtype=torch.float32).requires_grad_()
+    mask = torch.rand(batch, rows, window + main_size, device='cuda') > 0.5
+    main = torch.randint(
+        -1, main_size, (batch, rows, 16), device='cuda', dtype=torch.int32
+    )
+    indices, lengths = sparse_metadata(
+        mask, main, main_size=main_size, window_size=window, width=width
+    )
+    reordered = torch.cat([kv[:, window:], kv[:, :window]], 1)
+    native = flashmla.flash_mla_sparse_fwd
+    padded_sink = torch.nn.functional.pad(sink.detach(), (0, 64 - heads))
+    expected = []
+    for b in range(batch):
+        query = torch.nn.functional.pad(q[b].detach(), (0, 0, 0, 64 - heads))
+        out = torch.empty_like(query)
+        native(
+            q=query,
+            kv=reordered[b].detach().unsqueeze(1).contiguous(),
+            indices=indices[b].unsqueeze(1),
+            sm_scale=dim**-0.5,
+            attn_sink=padded_sink,
+            topk_length=lengths[b],
+            out=out,
+        )
+        expected.append(out[:, :heads])
+    calls = []
+
+    def counted(*args, **kwargs):
+        calls.append(kwargs['q'].shape[0])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(flashmla, 'flash_mla_sparse_fwd', counted)
+    kwargs = dict(main_size=main_size, window_size=window, width=width, scale=dim**-0.5)
+    actual = dm.sparse_attention(q, kv, sink, mask, main, **kwargs)
+    assert calls == [batch * rows]
+    assert torch.equal(actual.detach(), torch.stack(expected))
+    single = dm.sparse_attention(q[:1], kv[:1], sink, mask[:1], main[:1], **kwargs)
+    assert torch.equal(actual[:1], single)
+    actual.float().sum().backward()
+    assert all(
+        x.grad is not None and torch.isfinite(x.grad).all() for x in (q, kv, sink)
+    )
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA grouped FP8')
+def test_grouped_fp8_one_launch_serial_batch1_and_vllm_bitwise(monkeypatch):
+    from megatron.lite.primitive.kernels import mxfp8_block32
+    from megatron.lite.primitive.quantization import mxfp8
+
+    bi_fp8 = importlib.import_module(
+        'vllm.model_executor.kernels.linear.mxfp8.batch_invariant'
+    )
+    bi_ops = importlib.import_module('vllm.model_executor.determinism.batch_invariant')
+    bi_ops.init_batch_invariance()
+    torch.manual_seed(1931)
+    x = torch.randn(
+        2, 7, 4, 256, device='cuda', dtype=torch.float32, requires_grad=True
+    )
+    weight = torch.randn(
+        4, 64, 256, device='cuda', dtype=torch.float32, requires_grad=True
+    )
+    expected = torch.stack(
+        [mxfp8.dynamic_fp8_linear(x[:, :, g], weight[g]) for g in range(4)], 2
+    )
+    calls = []
+    native = mxfp8_block32._block32_mm
+
+    class Launcher:
+        def __getitem__(self, grid):
+            launch = native[grid]
+
+            def call(*args, **kwargs):
+                calls.append(grid)
+                return launch(*args, **kwargs)
+
+            return call
+
+    monkeypatch.setattr(mxfp8_block32, '_block32_mm', Launcher())
+    actual = mxfp8.dynamic_fp8_grouped_linear(x, weight)
+    assert len(calls) == 1 and calls[0][2] == 4
+    assert torch.equal(actual, expected)
+    assert torch.equal(actual[:1], mxfp8.dynamic_fp8_grouped_linear(x[:1], weight))
+    activation = mxfp8.quantize_linear_activation(x)
+    codes, scales = mxfp8.quantize_block_fp8(weight, (32, 32), scale_format='e8m0')
+    # Native rollout stores four E8M0 bytes in each INT32 scale word.
+    sa = (
+        activation.scale.view(torch.uint8)
+        .reshape(-1, 4, 8)
+        .contiguous()
+        .view(torch.int32)
+    )
+    sw = (
+        scales.view(torch.uint8).repeat_interleave(32, 1).contiguous().view(torch.int32)
+    )
+    deployed = bi_fp8.packed_block32_grouped_mm(
+        activation.values.reshape(-1, 4, 256), sa, codes, sw, torch.float32
+    )
+    assert torch.equal(actual, deployed.reshape_as(actual))
+    expected_gradients = torch.autograd.grad(expected.sum(), (x, weight))
+    actual.sum().backward()
+    assert torch.equal(x.grad, expected_gradients[0])
+    assert torch.equal(weight.grad, expected_gradients[1])
+    assert x.grad is not None and weight.grad.dtype == torch.float32
+    assert torch.isfinite(x.grad).all() and torch.isfinite(weight.grad).all()
