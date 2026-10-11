@@ -112,23 +112,9 @@ def test_native_indexer_original_packet_rounding_and_batch_padding(v41_core_te, 
                 assert (selected[:, 1:] == -1).all()
 
 
-@pytest.fixture
-def native_blas_backend():
-    # Upstream BI disables split-K and selects cuBLASLt. This tiny BF16
-    # projection must own that prerequisite even in a combined test process.
-    previous = torch.backends.cuda.preferred_blas_library()
-    torch.backends.cuda.preferred_blas_library("cublaslt")
-    try:
-        yield
-    finally:
-        torch.backends.cuda.preferred_blas_library(previous)
-
-
 @pytest.mark.gpus(1, min_architecture="blackwell")
 @pytest.mark.parametrize("deployment_math", [False, True])
-def test_csa_index_query_rope_fp4_midpoint(
-    v41_core_te, native_blas_backend, deployment_math
-):
+def test_csa_index_query_rope_fp4_midpoint(v41_core_te, deployment_math):
     """A one-component FP4 midpoint must match native index-Q arithmetic.
 
     Feed a small numerical counterexample through the production CSA index-Q
@@ -184,6 +170,21 @@ def test_csa_index_query_rope_fp4_midpoint(
             "swa": csa.mxfp8.fake_quant_swa,
         },
     ).to(device="cuda", dtype=torch.bfloat16)
+
+    # Isolate the index-Q rotation/codec boundary. These unrelated query/KV
+    # projections are not under test; fixed tensors avoid a tiny-BF16 BLAS
+    # fallback inheriting process-wide split-K settings from other tests.
+    class FixedProjection(torch.nn.Module):
+        def __init__(self, width):
+            super().__init__()
+            self.width = width
+
+        def forward(self, value):
+            return value.new_zeros(*value.shape[:-1], self.width)
+
+    model.wq_a = FixedProjection(config.q_rank)
+    model.wq_b = FixedProjection(config.heads * config.head_dim)
+    model.wkv = FixedProjection(config.head_dim)
     model.indexer.wq_b = FixedQuery()
     model.deployment_math = deployment_math
     query = torch.zeros(1, 1, 4, device="cuda", dtype=torch.bfloat16)
