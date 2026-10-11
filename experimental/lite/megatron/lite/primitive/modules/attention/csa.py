@@ -568,7 +568,14 @@ class CompressedSparseAttention(nn.Module):
             lengths = ((positions + 1) // ratio).unsqueeze(-1)
             if self.owns_index:
                 iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
-                iq = index_codec(rotate(iq, positions, c, ratio), enabled=c.index_qat)
+                # Native index-Q rounds ordered FP32 RoPE multiply-adds to
+                # BF16 before FP4. Complex arithmetic can cross a midpoint.
+                iq = index_codec(
+                    rotate(
+                        iq, positions, c, ratio, deployment_math=self.deployment_math
+                    ),
+                    enabled=c.index_qat,
+                )
                 weights = self.indexer.weights_proj(x) * (
                     c.index_dim**-0.5 * c.index_heads**-0.5
                 )
