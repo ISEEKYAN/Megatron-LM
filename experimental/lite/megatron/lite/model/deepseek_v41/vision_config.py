@@ -31,3 +31,8 @@ class OptimizerConfig:
     coefficient_type: str
     clip_grad: float = 1.0
     vision_policy: VisionOptimizerConfig | None = None
+    segmented_host: bool = False
+
+    def __post_init__(self):
+        if type(self.segmented_host) is not bool:
+            raise TypeError("segmented_host must be an explicit boolean")

@@ -248,14 +248,25 @@ def build_model(model_cfg, *, impl_cfg):
             if b is not None and b.engram is not None
         ],
         shard_group=model.engram_group,
+        manual_dense_sync=optimizing and optimizer.host_update is not None,
     )
+    transfer_extras = {}
+    if optimizing and optimizer.host_update is not None:
+        transfer_extras['pre_model_device_transfer_hook'] = (
+            optimizer.host_update.prepare_model_transfer
+        )
     return ModelBundle(
         [model],
         ps,
         optimizer=optimizer,
         finalize_grads=(
             optimizer.finalize_grads
-            if optimizing and (ps.ep_size > 1 or model.engram_group is not None)
+            if optimizing
+            and (
+                ps.ep_size > 1
+                or model.engram_group is not None
+                or optimizer.host_update is not None
+            )
             else None
         ),
         forward_step=partial(
@@ -273,6 +284,7 @@ def build_model(model_cfg, *, impl_cfg):
             ),
             'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
+            **transfer_extras,
         },
     )
 

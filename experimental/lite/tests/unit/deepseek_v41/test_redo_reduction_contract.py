@@ -56,7 +56,10 @@ def test_cp_experts_use_ddp_and_cannot_reach_expert_finalize(
         side_effect=AssertionError('EP=1 reached expert-only reduction')
     )
     optimizer = SimpleNamespace(
-        ps=ps, row_parameters=[model.row], finalize_expert_grads=expert_finalize
+        ps=ps,
+        host_update=None,
+        row_parameters=[model.row],
+        finalize_expert_grads=expert_finalize,
     )
     MixedOptimizer.finalize_grads(optimizer)
     expert_finalize.assert_not_called()
