@@ -34,12 +34,10 @@ def test_native_indexer_original_packet_rounding_and_batch_padding(v41_core_te, 
     from megatron.lite.primitive.modules import deployment_math as dm
     from megatron.lite.primitive.quantization.mxfp4 import quantize_index
     from vllm import _custom_ops as ops
-    from vllm.model_executor.determinism.batch_invariant import (
-        enable_batch_invariant_mode,
-    )
+    from vllm.model_executor.determinism import batch_invariant as bi
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
-    enable_batch_invariant_mode()
+    bi.enable_batch_invariant_mode()
     torch.manual_seed(1031)
     raw_q = torch.randn(batch, 7, 32, 128, device="cuda", dtype=torch.bfloat16)
     raw_k = torch.randn(batch, 640, 128, device="cuda", dtype=torch.bfloat16)
