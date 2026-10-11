@@ -10,6 +10,7 @@ CODECS = MappingProxyType(
         ("index", 32, "e8m0", "e2m1"): mxfp4.fake_quant_index,
         ("swa", 32, "e8m0", "e4m3"): mxfp8.fake_quant_swa,
         ("linear", 32, "e8m0", "e4m3"): mxfp8.dynamic_fp8_linear,
+        ("linear_grouped", 32, "e8m0", "e4m3"): mxfp8.dynamic_fp8_grouped_linear,
         ("linear_activation", 32, "e8m0", "e4m3"): mxfp8.fake_quant_swa,
     }
 )
@@ -20,4 +21,5 @@ def attention_codecs():
         "main": CODECS[("main_kv", 16, "e4m3", "e2m1")],
         "index": CODECS[("index", 32, "e8m0", "e2m1")],
         "swa": CODECS[("swa", 32, "e8m0", "e4m3")],
+        "linear_grouped": CODECS[("linear_grouped", 32, "e8m0", "e4m3")],
     }

@@ -684,7 +684,12 @@ class CompressedSparseAttention(nn.Module):
             # FP32 optimizer masters must never bypass the forward codec.
             from megatron.lite.primitive.quantization import mxfp8
 
-            output = mxfp8.dynamic_fp8_grouped_linear(grouped, weight).flatten(2)
+            grouped_codec = (
+                mxfp8.dynamic_fp8_grouped_linear
+                if self.codecs is None
+                else self.codecs.get("linear_grouped", mxfp8.dynamic_fp8_grouped_linear)
+            )
+            output = grouped_codec(grouped, weight).flatten(2)
         elif getattr(self.wo_a, 'native_fp32', False):
             output = torch.stack(
                 [
