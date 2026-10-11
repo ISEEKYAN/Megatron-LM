@@ -185,3 +185,49 @@ def test_csa_index_query_rope_fp4_midpoint(v41_core_te, deployment_math):
     # Native fused_indexer_q uses ordered FP32 multiply-adds, then BF16 and
     # FP4 rounding. The ordinary complex-RoPE recipe retains its old result.
     assert captured[0][0, 0, 31, 77].item() == (0.75 if deployment_math else 0.5)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA native FP32 MQA')
+def test_indexer_batched_requests_one_launch_and_serial_bitwise(monkeypatch):
+    from megatron.lite.primitive.modules import deployment_math as dm
+    from vllm.utils import deep_gemm
+
+    torch.manual_seed(1943)
+    q = torch.randn(3, 7, 32, 128, device='cuda', dtype=torch.bfloat16)
+    k = torch.randn(3, 139, 128, device='cuda', dtype=torch.bfloat16)
+    w = torch.randn(3, 7, 32, device='cuda', dtype=torch.float32)
+    lengths = torch.randint(1, 140, (3, 7, 1), device='cuda', dtype=torch.int32)
+    expected = torch.cat(
+        [
+            dm.indexer_scores(
+                q[b : b + 1], k[b : b + 1], w[b : b + 1], lengths[b : b + 1]
+            )
+            for b in range(3)
+        ]
+    )
+    calls = []
+    native = deep_gemm.fp8_fp4_mqa_logits
+
+    def counted(*args, **kwargs):
+        calls.append(args[0][0].shape[0])
+        return native(*args, **kwargs)
+
+    monkeypatch.setattr(deep_gemm, 'fp8_fp4_mqa_logits', counted)
+    actual = dm.indexer_scores(q, k, w, lengths)
+    assert calls == [21]
+    assert torch.equal(actual, expected)
+    assert actual.stride(1) == 256
+    selected = dm.indexer_select_positions(actual, lengths, 512)
+    wanted = torch.cat(
+        [
+            dm.indexer_select_positions(
+                dm.indexer_scores(
+                    q[b : b + 1], k[b : b + 1], w[b : b + 1], lengths[b : b + 1]
+                ),
+                lengths[b : b + 1],
+                512,
+            )
+            for b in range(3)
+        ]
+    )
+    assert torch.equal(selected, wanted)

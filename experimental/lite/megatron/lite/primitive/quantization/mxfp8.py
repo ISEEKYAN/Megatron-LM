@@ -44,25 +44,11 @@ def fake_quant_swa(post_rope):
 
 def _fp8_gemm(a, a_scale, b, b_scale):
     """FP8 products per K block, followed by FP32 scale correction/accumulation."""
-    rows, columns = a.shape[0], b.shape[0]
-    output = torch.zeros(rows, columns, device=a.device, dtype=torch.float32)
-    unit = torch.ones((), device=a.device, dtype=torch.float32)
-    for group, start in enumerate(range(0, a.shape[1], 32)):
-        # Scalar unit scales ensure native FP8 multiplication; actual block scales
-        # are applied separately, as in the published blockwise accumulation.
-        product = torch._scaled_mm(
-            a[:, start : start + 32].contiguous(),
-            b[:, start : start + 32].contiguous().T,
-            unit,
-            unit,
-            out_dtype=torch.float32,
-        )
-        output += (
-            product
-            * a_scale[:, group].float()[:, None]
-            * b_scale[:, group].float().repeat_interleave(32)[None, :]
-        )
-    return output
+    from megatron.lite.primitive.kernels import mxfp8_block32
+
+    return mxfp8_block32.batched_block32_mm(
+        a, a_scale, b, b_scale, torch.float32, weight_scale_group_rows=32
+    )
 
 
 class _DynamicLinear(torch.autograd.Function):
@@ -127,3 +113,68 @@ def dynamic_fp8_linear(x, weight):
             "activation and weight must share device and compute dtype, use an FP32 master, or pair FP32 activations with BF16 reference weights"
         )
     return _DynamicLinear.apply(x, weight)
+
+
+class _DynamicGroupedLinear(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, weight):
+        from megatron.lite.primitive.kernels import mxfp8_block32
+
+        activation = quantize_linear_activation(x)
+        codes, scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
+        decoded = dequantize_block_fp8(codes, scales, (32, 32)).to(x.dtype)
+        ctx.weight_dtype = weight.dtype
+        ctx.input_shape = x.shape
+        ctx.save_for_backward(activation.decoded, decoded)
+        groups, outputs, inner = weight.shape
+        result = mxfp8_block32.batched_block32_mm(
+            activation.values.reshape(-1, groups, inner),
+            activation.scale.reshape(-1, groups, inner // 32),
+            codes,
+            scales,
+            torch.float32,
+            grouped=True,
+            weight_scale_group_rows=32,
+        )
+        return result.reshape(*x.shape[:-1], outputs).to(x.dtype)
+
+    @staticmethod
+    def backward(ctx, grad):
+        activation, weight = ctx.saved_tensors
+        groups, outputs, inner = weight.shape
+        g = grad.reshape(-1, groups, outputs).transpose(0, 1).float()
+        a = activation.reshape(-1, groups, inner).transpose(0, 1).float()
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            dx = (
+                torch.bmm(g, weight.float())
+                .transpose(0, 1)
+                .reshape(ctx.input_shape)
+                .to(activation.dtype)
+            )
+            dw = torch.bmm(g.transpose(1, 2), a).to(ctx.weight_dtype)
+        return dx, dw
+
+
+def dynamic_fp8_grouped_linear(x, weight):
+    """One grouped K32 launch; each group retains its independent forward codec."""
+    if not x.is_cuda or not weight.is_cuda:
+        raise RuntimeError("dynamic grouped FP8 Linear requires CUDA")
+    _validate_input(x, 32)
+    _validate_input(weight, 32)
+    if (
+        x.ndim < 3
+        or weight.ndim != 3
+        or x.shape[-2] != weight.shape[0]
+        or x.shape[-1] != weight.shape[-1]
+        or weight.shape[1] % 32
+    ):
+        raise ValueError(
+            "Grouped Linear requires matching groups/K and N divisible by 32"
+        )
+    if x.device != weight.device or weight.dtype not in (
+        x.dtype,
+        torch.float32,
+        torch.bfloat16,
+    ):
+        raise ValueError("Grouped activation/master device or dtype mismatch")
+    return _DynamicGroupedLinear.apply(x, weight)
