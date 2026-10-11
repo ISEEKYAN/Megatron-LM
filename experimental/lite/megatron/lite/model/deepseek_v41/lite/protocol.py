@@ -285,7 +285,6 @@ def build_model(model_cfg, *, impl_cfg):
             'optimizer_backend': 'none' if optimizer is None else 'v41',
             'parameter_bindings': model.parameter_bindings,
             **transfer_extras,
-            **transfer_extras,
         },
     )
 

@@ -335,3 +335,25 @@ def test_real_DCP_host_checkpoint_and_restored_updates_match_reference(tmp_path)
         assert update(restored, restored_opt, i) == update(reference, resident, i)
         equal(restored.state_dict(), reference.state_dict())
         equal(restored_opt.state_dict(), resident.state_dict())
+
+
+@pytest.mark.parametrize("segmented", [False, True])
+def test_dense_sync_is_owned_only_by_host_backend(monkeypatch, segmented):
+    model, opt = build(segmented)
+    opt.ps = SimpleNamespace(ep_size=1, pp_size=2, dp_cp_size=2)
+    opt.dp_group = "dense"
+    calls = []
+
+    def reduce(tensor, *, group):
+        calls.append(group)
+        tensor.mul_(2)
+
+    monkeypatch.setattr(torch.distributed, "all_reduce", reduce)
+    for parameter in model.parameters():
+        parameter.grad = torch.ones_like(parameter)
+        parameter.main_grad = None
+    opt.finalize_grads()
+    # Resident parameters have already been reduced by DDP. Host owners skip
+    # DDP and must perform one active vote plus one dense sum per parameter.
+    assert calls == (["dense"] * (2 * len(model)) if segmented else [])
+    assert all(torch.equal(p.grad, torch.ones_like(p)) for p in model.parameters())

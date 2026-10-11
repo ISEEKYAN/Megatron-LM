@@ -254,12 +254,9 @@ class MixedOptimizer:
 
     @torch.no_grad()
     def finalize_grads(self):
-        if (
-            self.ps.pp_size > 1 or self.host_update is not None
-        ) and self.ps.dp_cp_size > 1:
-            # PP warmup/cooldown keeps several DDP forwards in flight. Their
-            # no_sync forwards accumulate locally; average dense owners once
-            # after the complete schedule, before global clipping/commit.
+        if self.host_update is not None and self.ps.dp_cp_size > 1:
+            # Host owners bypass DDP; average their dense gradients once.
+            # Resident owners retain DDP's existing synchronization.
             for p in self.model.parameters():
                 if not p.requires_grad or id(p) in self.expert_ids | self.row_ids:
                     continue
@@ -307,7 +304,9 @@ class MixedOptimizer:
 
     def _grad_norm(self, parameters, gradients):
         if self.ps is None or (
-            self.ps.ep_size == 1 and not self.row_parameters and self.ps.pp_size == 1
+            self.ps.ep_size == 1
+            and not self.row_parameters
+            and (self.ps.pp_size == 1 or self.host_update is None)
         ):
             return self._base__grad_norm(parameters, gradients)
         # Dense gradients are replicated. Count each dense owner once and
@@ -328,7 +327,7 @@ class MixedOptimizer:
         if self.row_parameters:
             torch.distributed.all_reduce(row, group=self.row_group)
         total = dense + expert + row
-        if self.ps.pp_size > 1:
+        if self.host_update is not None and self.ps.pp_size > 1:
             torch.distributed.all_reduce(total, group=self.ps.pp_group)
         return total.sqrt()
 
@@ -336,7 +335,9 @@ class MixedOptimizer:
         if self.dp_group is None and (
             self.ps is None
             or (
-                self.ps.ep_size == 1 and self.row_group is None and self.ps.pp_size == 1
+                self.ps.ep_size == 1
+                and self.row_group is None
+                and (self.ps.pp_size == 1 or self.host_update is None)
             )
         ):
             return valid
@@ -344,7 +345,7 @@ class MixedOptimizer:
         torch.distributed.all_reduce(
             flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
         )
-        if self.ps is not None and self.ps.pp_size > 1:
+        if self.host_update is not None and self.ps is not None and self.ps.pp_size > 1:
             torch.distributed.all_reduce(
                 flag, op=torch.distributed.ReduceOp.MIN, group=self.ps.pp_group
             )
