@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """DS4.1 deployment stream: bounded row pairs and byte-preserving transport."""
 import json
+from dataclasses import dataclass
 
 import torch
 from megatron.lite.primitive.ckpt.row_stream import RowChunk
@@ -15,9 +16,27 @@ def validate_target(target, options):
     if target not in ('mxfp4', 'vllm'):
         raise ValueError('DS4.1 resync requires target=mxfp4 (or vllm)')
     options = dict(options or {})
-    if options.keys() - {'expert_dtype'} or options.get('expert_dtype', 'fp4') != 'fp4':
+    if (
+        options.keys() - {'expert_dtype', 'freeze_engram'}
+        or options.get('expert_dtype', 'fp4') != 'fp4'
+    ):
         raise ValueError('DS4.1 resync supports only expert_dtype=fp4')
+    if type(options.get('freeze_engram', False)) is not bool:
+        raise ValueError('freeze_engram must be bool')
     return True
+
+
+@dataclass(frozen=True)
+class FrozenTables:
+    reuse: bool
+    manifest: dict
+
+
+def frozen_tables_transport(manifest, reuse):
+    meta = ['frozen_tables', reuse, manifest]
+    return _PREFIX + json.dumps(meta, separators=(',', ':')), torch.empty(
+        0, dtype=torch.uint8
+    )
 
 
 def transport_weights(weights, *, deployment=False):
@@ -92,6 +111,10 @@ def decode_transport(name, tensor):
     meta = json.loads(name[len(_PREFIX) :])
     if tensor.dtype != torch.uint8 or not tensor.is_contiguous():
         raise ValueError('DS4.1 transport requires contiguous uint8 payloads')
+    if len(meta) == 3 and meta[0] == 'frozen_tables':
+        if tensor.numel() or type(meta[1]) is not bool or not isinstance(meta[2], dict):
+            raise ValueError('Invalid frozen table manifest')
+        return FrozenTables(meta[1], meta[2])
     if meta == ['end'] and tensor.numel() == 0:
         return None
     if len(meta) == 2 and meta[1] in _DTYPES:

@@ -1939,6 +1939,8 @@ def export_bound_tensors(
                         'ROW_STREAM_REQUIRED: full row tensor exceeds export buffer'
                     )
     for name, binding in model.tensor_bindings.items():
+        if getattr(spec, 'skip_binding', lambda binding: False)(binding):
+            continue
         if binding.role == 'scale':
             continue
         if model.ps.ep_size > 1 and binding.role == 'expert':
