@@ -162,7 +162,6 @@ def export_hf_weights(
         import torch.distributed as dist
         from megatron.lite.primitive.ckpt.frozen_storage import (
             storage_census,
-            storage_digest,
             validate_storage_census,
         )
 
@@ -191,6 +190,7 @@ def export_hf_weights(
                     )
                 boundaries = tuple(lookup.boundaries)
             hasher = getattr(model, 'engram_hash', None)
+            cuts = set(boundaries)
             if hasher is not None:
                 layer_id = int(name.split('.')[1])
                 index = model.engram_layer_ids.index(layer_id)
@@ -200,19 +200,16 @@ def export_hf_weights(
                     head_cuts.append(head_cuts[-1] + rows)
                 if head_cuts[-1] > boundaries[-1]:
                     raise ValueError('Engram hash heads exceed frozen table rows')
-                cuts = sorted(set(boundaries).union(head_cuts))
-                local = storage_census(
-                    *storage, start=boundaries[rank], boundaries=cuts
-                )
-            else:
-                local = storage_digest(*storage)
+                cuts.update(head_cuts)
+            local = storage_census(
+                *storage, start=boundaries[rank], boundaries=sorted(cuts)
+            )
             hashes = [local]
             if size > 1:
                 hashes = [None] * size
                 dist.all_gather_object(hashes, local, group=lookup.group)
-            if hasher is not None:
-                hashes = [piece for pieces in hashes for piece in pieces]
-                validate_storage_census(hashes, boundaries[-1])
+            hashes = [piece for pieces in hashes for piece in pieces]
+            validate_storage_census(hashes, boundaries[-1])
             manifest[name] = hashes
         previous = getattr(model, '_resync_frozen_tables', None)
         if previous is not None and previous != manifest:

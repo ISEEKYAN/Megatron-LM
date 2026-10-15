@@ -30,7 +30,8 @@ def exports(model, frozen=True):
     )
 
 
-def test_frozen_export_and_mutation(v41_core_te, tmp_path):
+@pytest.mark.parametrize('hasher', [True, False])
+def test_frozen_export_and_mutation(v41_core_te, tmp_path, hasher):
     import megatron.lite.model.deepseek_v41.lite.resync as resync
 
     decode_transport = resync.decode_transport
@@ -38,11 +39,18 @@ def test_frozen_export_and_mutation(v41_core_te, tmp_path):
     from megatron.lite.primitive.ckpt.row_stream import RowChunk
 
     model = make_model(tmp_path / 'archive', False)
+    if not hasher:
+        model.engram_hash = None
     first = [decode_transport(*x) for x in exports(model)]
     second = [decode_transport(*x) for x in exports(model)]
     assert isinstance(first[0], FrozenTables) and not first[0].reuse
     assert isinstance(second[0], FrozenTables) and second[0].reuse
     assert first[0].manifest == second[0].manifest
+    assert all(
+        isinstance(piece, dict)
+        for pieces in first[0].manifest.values()
+        for piece in pieces
+    )
     assert any(isinstance(x, RowChunk) for x in first)
     assert not any(isinstance(x, RowChunk) for x in second)
     # Actual table is a buffer: no master, gradients or AdamW/Muon owner/state.
@@ -90,15 +98,15 @@ def receiver_model(monkeypatch):
 
 
 def receiver_manifest(model):
-    from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+    from megatron.lite.primitive.ckpt.frozen_storage import storage_census
 
     return {
-        'layers.1.engram.embed.weight': [
-            storage_digest(
-                model.table.weight.view(torch.float8_e4m3fn),
-                model.table.weight_scale_inv.view(torch.float8_e8m0fnu),
-            )
-        ]
+        'layers.1.engram.embed.weight': storage_census(
+            model.table.weight,
+            model.table.weight_scale_inv,
+            start=0,
+            boundaries=(0, len(model.table.weight)),
+        )
     }
 
 
@@ -285,7 +293,16 @@ def test_receiver_rejects_fabricated_initial_shard_census(v41_core_te, monkeypat
     model = receiver_model(monkeypatch)
     receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
     receiver.receive(
-        [frozen_tables_transport({'layers.1.engram.embed.weight': ['a' * 64]}, False)]
+        [
+            frozen_tables_transport(
+                {
+                    'layers.1.engram.embed.weight': [
+                        dict(start=0, end=4, sha256='a' * 64)
+                    ]
+                },
+                False,
+            )
+        ]
     )
     receiver.receive(
         list(
@@ -332,6 +349,7 @@ def _ep8_frozen_census_worker(rank, directory):
         TensorBinding,
         validate_parameter_bindings,
     )
+    from megatron.lite.primitive.ckpt.frozen_storage import verify_storage_census
     from megatron.lite.primitive.ckpt.row_stream import RowChunk
     from megatron.lite.primitive.modules.engram_lookup import (
         RowLookup,
@@ -407,6 +425,7 @@ def _ep8_frozen_census_worker(rank, directory):
         for reuse in (False, True):
             receiver = consumer.ResyncReceiver(target, NS(cpu_offload_gb=0))
             row_count = 0
+            received = []
             for pair in export_hf_weights(
                 [model],
                 model.config,
@@ -421,11 +440,46 @@ def _ep8_frozen_census_worker(rank, directory):
                     assert item.manifest == {key: expected} and item.reuse == reuse
                     manifest = item.manifest
                     receiver.receive([pair])
+                    received.append(pair)
                 elif isinstance(item, RowChunk):
                     row_count += 1
                     receiver.receive([pair])
+                    received.append(pair)
                 elif pair[0].startswith('__'):
                     receiver.receive([pair])
+                    received.append(pair)
+            # The census comes from the real exporter on both generations.
+            # Damage only one installed DP shard; other ranks remain valid.
+            for plane in (target.table.weight, target.table.weight_scale_inv):
+                if rank == 7:
+                    plane.view(torch.uint8)[0, 0] ^= 1
+                    with pytest.raises(
+                        ValueError, match='shard census digest mismatch'
+                    ):
+                        verify_storage_census(
+                            manifest[key],
+                            target.table.weight,
+                            target.table.weight_scale_inv,
+                            start=begin,
+                            total_rows=17,
+                        )
+                    if not reuse:
+                        with pytest.raises(
+                            ValueError, match='shard census digest mismatch'
+                        ):
+                            receiver.finish()
+                    plane.view(torch.uint8)[0, 0] ^= 1
+                    if not reuse:
+                        receiver = consumer.ResyncReceiver(target, NS(cpu_offload_gb=0))
+                        receiver.receive(received)
+                else:
+                    verify_storage_census(
+                        manifest[key],
+                        target.table.weight,
+                        target.table.weight_scale_inv,
+                        start=begin,
+                        total_rows=17,
+                    )
             receiver.finish()
             assert bool(row_count) != reuse
             assert torch.equal(target.table.weight.view(torch.uint8), raw[begin:end])
@@ -463,7 +517,7 @@ def _ep8_frozen_census_worker(rank, directory):
 
 
 def test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption(tmp_path):
-    """EP8 row transport verifies unequal DP4 head spans, reuse and rank7 corruption."""
+    """Real fresh/reuse exports reject single-DP-shard W/S damage at census."""
     torch.multiprocessing.spawn(
         _ep8_frozen_census_worker, args=(str(tmp_path),), nprocs=8, join=True
     )
