@@ -359,7 +359,9 @@ def test_dense_sync_is_owned_only_by_host_backend(monkeypatch, segmented):
     assert all(torch.equal(p.grad, torch.ones_like(p)) for p in model.parameters())
 
 
-def _process_resume_with_frozen_buffers(rank, directory, resumed):
+def _process_resume_with_frozen_buffers(
+    rank, directory, resumed, world_size=1, row_group_size=1
+):
     import os
     from pathlib import Path
 
@@ -377,17 +379,51 @@ def _process_resume_with_frozen_buffers(rank, directory, resumed):
     ):
         target.fp32_precision = 'ieee'
     root = Path(directory)
+    if world_size > 1:
+        from datetime import timedelta
+
+        torch.distributed.init_process_group(
+            'gloo',
+            init_method='file://' + str(root / f'rendezvous-{resumed}'),
+            rank=rank,
+            world_size=world_size,
+            timeout=timedelta(seconds=120),
+        )
+    group = None
+    if world_size > 1:
+        row_group_size = row_group_size if resumed else world_size
+        for begin in range(0, world_size, row_group_size):
+            candidate = torch.distributed.new_group(
+                list(range(begin, begin + row_group_size))
+            )
+            if begin <= rank < begin + row_group_size:
+                group = candidate
+    row_rank = rank % row_group_size
+    rank_root = root / str(rank)
+    rank_root.mkdir(exist_ok=True)
 
     def model_and_optimizer(segmented):
         model, optimizer = build(segmented)
-        raw = torch.arange(128, dtype=torch.uint8).reshape(4, 32).remainder(63) + 32
-        scales = torch.tensor([[126], [127], [128], [129]], dtype=torch.uint8)
-        model.add_module(
-            'frozen',
-            EngramTable(
-                raw.view(torch.float8_e4m3fn), scales.view(torch.float8_e8m0fnu)
-            ),
+        from megatron.lite.primitive.modules.engram_lookup import (
+            RowLookup,
+            ShardedEngramTable,
         )
+
+        rows = 17 if world_size > 1 else 4
+        raw = (torch.arange(rows * 32).reshape(rows, 32) % 63 + 32).to(torch.uint8)
+        scales = (126 + torch.arange(rows) % 4).to(torch.uint8).reshape(rows, 1)
+        cuts = tuple(rows * i // row_group_size for i in range(row_group_size + 1))
+        start, end = cuts[row_rank : row_rank + 2]
+        arguments = (
+            raw[start:end].view(torch.float8_e4m3fn),
+            scales[start:end].view(torch.float8_e8m0fnu),
+        )
+        table = (
+            ShardedEngramTable(*arguments, RowLookup(cuts, group))
+            if world_size > 1
+            else EngramTable(*arguments)
+        )
+        model.add_module('frozen', table)
         model.register_buffer('recomputed_cache', torch.tensor([-1]), persistent=False)
         return model, optimizer
 
@@ -399,7 +435,11 @@ def _process_resume_with_frozen_buffers(rank, directory, resumed):
             optimizer=deepcopy(optimizer.state_dict()),
             weight=model.frozen.weight.view(torch.uint8).clone(),
             scale=model.frozen.scale.view(torch.uint8).clone(),
-            first_forward=model.frozen(torch.tensor([0, 3, 1])).float(),
+            # CPU validates the installed shard through the production local
+            # decoder; distributed request routing itself requires CUDA.
+            first_forward=EngramTable(model.frozen.weight, model.frozen.scale)(
+                torch.tensor([0, model.frozen.weight.shape[0] - 1, 0])
+            ).float(),
         )
 
     ps = SimpleNamespace(pp_size=1, pp_rank=0)
@@ -422,14 +462,26 @@ def _process_resume_with_frozen_buffers(rank, directory, resumed):
                     ps=ps,
                     save_rng=False,
                 )
-                (root / 'saved.pid').write_text(str(os.getpid()))
+                (rank_root / 'saved.pid').write_text(str(os.getpid()))
             if iteration >= 2:
                 torch.save(
-                    snapshot(reference, resident), root / f'expected-{iteration+1}.pt'
+                    snapshot(reference, resident),
+                    rank_root / f'expected-{iteration+1}.pt',
                 )
+        if world_size > 1:
+            torch.distributed.destroy_process_group()
         return
-    assert int((root / 'saved.pid').read_text()) != os.getpid()
+    assert int((rank_root / 'saved.pid').read_text()) != os.getpid()
     model, optimizer = model_and_optimizer(True)
+    installed = snapshot(model, optimizer)
+
+    def expected(iteration):
+        state = torch.load(rank_root / f'expected-{iteration}.pt', weights_only=False)
+        if row_group_size != world_size:
+            for key in ('weight', 'scale', 'first_forward'):
+                state[key] = installed[key]
+        return state
+
     model.frozen.weight.view(torch.uint8).zero_()
     model.frozen.scale.view(torch.uint8).zero_()
     with torch.no_grad():
@@ -446,33 +498,34 @@ def _process_resume_with_frozen_buffers(rank, directory, resumed):
         )
         == 3
     )
-    equal(
-        snapshot(model, optimizer),
-        torch.load(root / 'expected-3.pt', weights_only=False),
-    )
+    equal(snapshot(model, optimizer), expected(3))
     assert model.recomputed_cache.item() == -1
     for iteration in range(3, 6):
         assert update(model, optimizer, iteration)[0]
-        equal(
-            snapshot(model, optimizer),
-            torch.load(root / f'expected-{iteration+1}.pt', weights_only=False),
-        )
-    (root / 'loaded.pid').write_text(str(os.getpid()))
+        equal(snapshot(model, optimizer), expected(iteration + 1))
+    (rank_root / 'loaded.pid').write_text(str(os.getpid()))
+    if world_size > 1:
+        torch.distributed.destroy_process_group()
 
 
-def test_real_dcp_fresh_process_resume_restores_frozen_buffers_and_updates(tmp_path):
+@pytest.mark.parametrize('world_size,row_group_size', [(1, 1), (8, 8), (8, 4)])
+def test_real_dcp_fresh_process_resume_restores_frozen_buffers_and_updates(
+    tmp_path, world_size, row_group_size
+):
     """After process exit, restore FP8 bytes and match three resident-reference updates."""
     for resumed in (False, True):
         torch.multiprocessing.spawn(
             _process_resume_with_frozen_buffers,
-            args=(str(tmp_path), resumed),
-            nprocs=1,
+            args=(str(tmp_path), resumed, world_size, row_group_size),
+            nprocs=world_size,
             join=True,
         )
-    assert (tmp_path / 'saved.pid').read_text() != (tmp_path / 'loaded.pid').read_text()
+    for rank in range(world_size):
+        root = tmp_path / str(rank)
+        assert (root / 'saved.pid').read_text() != (root / 'loaded.pid').read_text()
 
 
-def test_host_dcp_rejects_sharded_persistent_buffers(tmp_path):
+def test_host_dcp_rejects_sharded_buffers_without_row_metadata(tmp_path):
     from megatron.lite.primitive.ckpt.dcp import save_training_checkpoint
 
     model, optimizer = build(True)
@@ -480,7 +533,7 @@ def test_host_dcp_rejects_sharded_persistent_buffers(tmp_path):
     model.table.lookup = SimpleNamespace(group=object())
     model.table.register_buffer('weight', torch.ones(2, 32, dtype=torch.uint8))
     optimizer.host_update.prepare_model_transfer('cpu')
-    with pytest.raises(ValueError, match='unsharded persistent buffers'):
+    with pytest.raises(ValueError, match='explicit row shard metadata'):
         save_training_checkpoint(
             model,
             optimizer,

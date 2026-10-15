@@ -23,6 +23,8 @@ import torch.distributed.checkpoint as dcp  # pyright: ignore[reportMissingImpor
 import torch.distributed.device_mesh as _imports_device_mesh
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 from megatron.lite.primitive.parallel import ParallelState
+from torch.distributed._shard.metadata import ShardMetadata
+from torch.distributed._shard.sharded_tensor import Shard, ShardedTensor
 from torch.distributed.tensor import DTensor
 
 ExpertClassifierFn = _protocols.ExpertClassifierFn
@@ -34,7 +36,7 @@ DeviceMesh = _imports_device_mesh.DeviceMesh
 
 
 def _host_buffer_state(model, prefix):
-    """Alias complete persistent CPU buffers as bytes, including FP8 planes."""
+    """Alias persistent CPU byte planes with global offsets for row shards."""
     result = {}
     for path, module in model.named_modules():
         buffers = [
@@ -42,11 +44,20 @@ def _host_buffer_state(model, prefix):
             for name, value in module.named_buffers(recurse=False)
             if name not in module._non_persistent_buffers_set
         ]
-        if (
-            buffers
-            and getattr(getattr(module, 'lookup', None), 'group', None) is not None
-        ):
-            raise ValueError('Host checkpoint requires unsharded persistent buffers')
+        lookup = getattr(module, 'lookup', None)
+        sharded = getattr(lookup, 'group', None) is not None
+        if buffers and sharded:
+            cuts = getattr(lookup, 'boundaries', ())
+            if not cuts:
+                raise ValueError('Host checkpoint requires explicit row shard metadata')
+            size, rank = dist.get_world_size(lookup.group), dist.get_rank(lookup.group)
+            if (
+                len(cuts) != size + 1
+                or cuts[0] != 0
+                or any(a > b for a, b in zip(cuts, cuts[1:]))
+            ):
+                raise ValueError('Invalid host checkpoint row shard boundaries')
+            start, end = cuts[rank : rank + 2]
         for name, value in buffers:
             if (
                 value.device.type != 'cpu'
@@ -57,7 +68,25 @@ def _host_buffer_state(model, prefix):
                     'Host checkpoint requires contiguous plain CPU buffers'
                 )
             key = '.'.join(part for part in (prefix, path, name) if part)
-            result[key] = value.detach().reshape(-1).view(torch.uint8)
+            if not sharded:
+                result[key] = value.detach().reshape(-1).view(torch.uint8)
+                continue
+            if value.ndim != 2 or value.shape[0] != end - start:
+                raise ValueError('Host buffer rows do not match row shard metadata')
+            # Preserve the global row coordinate, as MCore ShardedTensor does.
+            # A plain tensor here would let DCP deduplicate distinct EP owners.
+            byte_rows = value.detach().view(torch.uint8)
+            shards = []
+            if end > start:
+                metadata = ShardMetadata(
+                    shard_offsets=[start, 0],
+                    shard_sizes=list(byte_rows.shape),
+                    placement=f'rank:{dist.get_rank()}/cpu',
+                )
+                shards.append(Shard(byte_rows, metadata))
+            result[key] = ShardedTensor._init_from_local_shards(
+                shards, cuts[-1], byte_rows.shape[1], process_group=lookup.group
+            )
     return result
 
 
