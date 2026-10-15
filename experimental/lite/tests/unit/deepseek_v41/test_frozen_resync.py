@@ -366,6 +366,8 @@ def _ep8_frozen_census_worker(rank, directory):
         model.archival_store = None
         model.ps = NS(ep_size=8, ep_group=dist.group.WORLD)
         model.config = NS(to_hf_dict=lambda: {'text_config': {'n_routed_experts': 8}})
+        model.engram_layer_ids = (1,)
+        model.engram_hash = NS(primes=torch.tensor([[[3, 4, 5, 5]]]))
         key = 'layers.1.engram.embed.weight'
         model.tensor_bindings = {
             'anchor': TensorBinding('anchor', model, 'anchor', 'norm'),
@@ -375,12 +377,15 @@ def _ep8_frozen_census_worker(rank, directory):
         model.validate_parameter_bindings = lambda: validate_parameter_bindings(model)
         consumer = adapter(None)
         target = receiver_model(monkeypatch)
+        head_cuts = (0, 3, 7, 12, 17)
+        begin, end = head_cuts[rank % 4 : rank % 4 + 2]
         target.table.weight = torch.nn.Parameter(
-            torch.zeros_like(raw).view(torch.float8_e4m3fn), requires_grad=False
+            torch.zeros_like(raw[begin:end]).view(torch.float8_e4m3fn),
+            requires_grad=False,
         )
-        target.table.weight.engram_vocab_start = 0
+        target.table.weight.engram_vocab_start = begin
         target.table.weight_scale_inv = torch.nn.Parameter(
-            torch.zeros_like(scale), requires_grad=False
+            torch.zeros_like(scale[begin:end]), requires_grad=False
         )
 
         def independent_digest(begin, end):
@@ -393,8 +398,11 @@ def _ep8_frozen_census_worker(rank, directory):
                 digest.update(value.numpy().tobytes())
             return digest.hexdigest()
 
-        expected = [independent_digest(a, b) for a, b in zip(cuts, cuts[1:])]
-        assert len(set(expected)) == 8
+        census_cuts = sorted(set(cuts).union(head_cuts))
+        expected = [
+            dict(start=a, end=b, sha256=independent_digest(a, b))
+            for a, b in zip(census_cuts, census_cuts[1:])
+        ]
         manifest = None
         for reuse in (False, True):
             receiver = consumer.ResyncReceiver(target, NS(cpu_offload_gb=0))
@@ -420,8 +428,10 @@ def _ep8_frozen_census_worker(rank, directory):
                     receiver.receive([pair])
             receiver.finish()
             assert bool(row_count) != reuse
-            assert torch.equal(target.table.weight.view(torch.uint8), raw)
-            assert torch.equal(target.table.weight_scale_inv.view(torch.uint8), scale)
+            assert torch.equal(target.table.weight.view(torch.uint8), raw[begin:end])
+            assert torch.equal(
+                target.table.weight_scale_inv.view(torch.uint8), scale[begin:end]
+            )
         target.table.weight.data.view(torch.uint8)[0, 0] ^= 1
         from megatron.lite.model.deepseek_v41.lite.resync import frozen_tables_transport
 
@@ -429,27 +439,105 @@ def _ep8_frozen_census_worker(rank, directory):
         with pytest.raises(ValueError, match='storage changed'):
             broken.receive([frozen_tables_transport(manifest, True)])
         broken.abort()
-        if rank == 7:
-            table.weight.view(torch.uint8)[0, 0] ^= 1
-        with pytest.raises(ValueError, match='storage changed'):
-            next(
-                export_hf_weights(
-                    [model],
-                    model.config,
-                    model.ps,
-                    target='mxfp4',
-                    resync_config={'expert_dtype': 'fp4', 'freeze_engram': True},
-                    include_archival=False,
-                    buffer_max_size_bytes=65536,
+        for plane in (table.weight, table.scale):
+            if rank == 7:
+                plane.view(torch.uint8)[0, 0] ^= 1
+            with pytest.raises(ValueError, match='storage changed'):
+                next(
+                    export_hf_weights(
+                        [model],
+                        model.config,
+                        model.ps,
+                        target='mxfp4',
+                        resync_config={'expert_dtype': 'fp4', 'freeze_engram': True},
+                        include_archival=False,
+                        buffer_max_size_bytes=65536,
+                    )
                 )
-            )
+            if rank == 7:
+                plane.view(torch.uint8)[0, 0] ^= 1
+
     finally:
         dist.destroy_process_group()
         monkeypatch.undo()
 
 
 def test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption(tmp_path):
-    """Real EP8 row transport installs exactly the eight independently hashed shards."""
+    """EP8 row transport verifies unequal DP4 head spans, reuse and rank7 corruption."""
     torch.multiprocessing.spawn(
         _ep8_frozen_census_worker, args=(str(tmp_path),), nprocs=8, join=True
     )
+
+
+@pytest.mark.parametrize('span', [(0, 3), (3, 7), (7, 12), (12, 17)])
+@pytest.mark.parametrize('damage', [None, 'weight', 'scale', 'gap'])
+def test_sharded_initial_census_checks_installed_bytes(
+    v41_core_te, monkeypatch, span, damage
+):
+    """Check actual resident DP slices, including corruption after the copy."""
+    import hashlib
+
+    from megatron.lite.model.deepseek_v41.lite.resync import (
+        frozen_tables_transport,
+        transport_weights,
+    )
+    from megatron.lite.primitive.ckpt.row_stream import RowChunk
+
+    raw = ((torch.arange(17 * 32).reshape(17, 32) % 63) + 32).to(torch.uint8)
+    scales = (118 + torch.arange(17) % 17).to(torch.uint8).reshape(17, 1)
+    cuts = sorted(set(17 * i // 8 for i in range(9)).union((0, 3, 7, 12, 17)))
+    census = []
+    for a, b in zip(cuts, cuts[1:]):
+        digest = hashlib.sha256()
+        for value, dtype in [
+            (raw[a:b], torch.float8_e4m3fn),
+            (scales[a:b], torch.float8_e8m0fnu),
+        ]:
+            digest.update(str((tuple(value.shape), dtype)).encode())
+            digest.update(value.numpy().tobytes())
+        census.append(dict(start=a, end=b, sha256=digest.hexdigest()))
+    consumer = adapter(v41_core_te)
+    model = receiver_model(monkeypatch)
+    a, b = span
+    model.table.weight = torch.nn.Parameter(
+        torch.zeros_like(raw[a:b]).view(torch.float8_e4m3fn), requires_grad=False
+    )
+    model.table.weight.engram_vocab_start = a
+    model.table.weight_scale_inv = torch.nn.Parameter(
+        torch.zeros_like(scales[a:b]), requires_grad=False
+    )
+    receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    key = 'layers.1.engram.embed.weight'
+    if damage == 'gap':
+        with pytest.raises(ValueError, match='Invalid frozen Engram shard census'):
+            receiver.receive([frozen_tables_transport({key: census[1:]}, False)])
+        receiver.abort()
+        return
+    receiver.receive([frozen_tables_transport({key: census}, False)])
+    receiver.receive(
+        list(
+            transport_weights(
+                [
+                    RowChunk(
+                        key,
+                        0,
+                        17,
+                        raw.view(torch.float8_e4m3fn),
+                        scales.view(torch.float8_e8m0fnu),
+                    )
+                ],
+                deployment=True,
+            )
+        )
+    )
+    if damage is not None:
+        tensor = (
+            model.table.weight if damage == 'weight' else model.table.weight_scale_inv
+        )
+        tensor.data.view(torch.uint8)[0, 0] ^= 1
+        with pytest.raises(ValueError, match='shard census digest mismatch'):
+            receiver.finish()
+        return
+    receiver.finish()
+    assert torch.equal(model.table.weight.view(torch.uint8), raw[a:b])
+    assert torch.equal(model.table.weight_scale_inv.view(torch.uint8), scales[a:b])

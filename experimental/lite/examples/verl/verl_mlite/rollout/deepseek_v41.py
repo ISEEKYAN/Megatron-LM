@@ -398,6 +398,10 @@ class ResyncReceiver:
             import megatron.lite.model.deepseek_v41.lite.resync as resync
 
             if isinstance(item, resync.FrozenTables):
+                from megatron.lite.primitive.ckpt.frozen_storage import (
+                    validate_storage_census,
+                )
+
                 if self.frozen_manifest is not None or self.rows or self.received_sinks:
                     raise ValueError('Frozen table manifest must precede weights')
                 mapped = {
@@ -408,18 +412,24 @@ class ResyncReceiver:
                 }
                 if set(mapped) != self.expected_tables:
                     raise ValueError('Frozen Engram manifest census mismatch')
-                if any(
-                    not isinstance(hashes, list)
-                    or not hashes
-                    or any(
-                        not isinstance(h, str)
-                        or len(h) != 64
-                        or any(c not in '0123456789abcdef' for c in h)
-                        for h in hashes
-                    )
-                    for hashes in mapped.values()
-                ):
-                    raise ValueError('Invalid frozen Engram shard digests')
+                for hashes in mapped.values():
+                    if (
+                        isinstance(hashes, list)
+                        and hashes
+                        and isinstance(hashes[0], dict)
+                    ):
+                        validate_storage_census(hashes)
+                    elif (
+                        not isinstance(hashes, list)
+                        or not hashes
+                        or any(
+                            not isinstance(h, str)
+                            or len(h) != 64
+                            or any(c not in '0123456789abcdef' for c in h)
+                            for h in hashes
+                        )
+                    ):
+                        raise ValueError('Invalid frozen Engram shard digests')
                 previous = getattr(self.model, '_ds41_frozen_tables', None)
                 if item.reuse:
                     if previous is None or previous[0] != mapped:
@@ -524,13 +534,25 @@ class ResyncReceiver:
         }
 
     def _verify_initial_frozen_census(self):
-        from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+        from megatron.lite.primitive.ckpt.frozen_storage import (
+            storage_digest,
+            verify_storage_census,
+        )
 
         for source_name, receiver in self.rows.items():
             name = next(
                 iter(self.model.hf_to_vllm_mapper.apply([(source_name, None)]))
             )[0]
             hashes = self.frozen_manifest[name]
+            if isinstance(hashes[0], dict):
+                verify_storage_census(
+                    hashes,
+                    receiver.weight,
+                    receiver.scale,
+                    start=receiver.start,
+                    total_rows=receiver.total_rows,
+                )
+                continue
             if receiver.start != 0 or receiver.weight.shape[0] != receiver.total_rows:
                 raise NotImplementedError(
                     'Frozen Engram census requires unsharded inference tables'

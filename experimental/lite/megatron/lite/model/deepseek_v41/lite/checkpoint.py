@@ -160,7 +160,11 @@ def export_hf_weights(
     spec = _SPEC
     if frozen:
         import torch.distributed as dist
-        from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
+        from megatron.lite.primitive.ckpt.frozen_storage import (
+            storage_census,
+            storage_digest,
+            validate_storage_census,
+        )
 
         from .resync import frozen_tables_transport
 
@@ -172,11 +176,12 @@ def export_hf_weights(
             storage = _SPEC.frozen_storage(binding.owner)
             if storage is None:
                 raise ValueError('freeze_engram requires tables without FP32 masters')
-            local = storage_digest(*storage)
             lookup = _SPEC.row_shard(binding.owner)
-            hashes = [local]
+            size, rank = 1, 0
+            boundaries = (0, storage[0].shape[0])
             if lookup is not None and lookup.group is not None:
                 size = dist.get_world_size(lookup.group)
+                rank = dist.get_rank(lookup.group)
                 expected = tuple(
                     lookup.boundaries[-1] * i // size for i in range(size + 1)
                 )
@@ -184,8 +189,30 @@ def export_hf_weights(
                     raise ValueError(
                         'Frozen Engram census requires balanced row ownership'
                     )
-                hashes = [None] * dist.get_world_size(lookup.group)
+                boundaries = tuple(lookup.boundaries)
+            hasher = getattr(model, 'engram_hash', None)
+            if hasher is not None:
+                layer_id = int(name.split('.')[1])
+                index = model.engram_layer_ids.index(layer_id)
+                heads = hasher.primes[index].reshape(-1).cpu().tolist()
+                head_cuts = [0]
+                for rows in heads:
+                    head_cuts.append(head_cuts[-1] + rows)
+                if head_cuts[-1] > boundaries[-1]:
+                    raise ValueError('Engram hash heads exceed frozen table rows')
+                cuts = sorted(set(boundaries).union(head_cuts))
+                local = storage_census(
+                    *storage, start=boundaries[rank], boundaries=cuts
+                )
+            else:
+                local = storage_digest(*storage)
+            hashes = [local]
+            if size > 1:
+                hashes = [None] * size
                 dist.all_gather_object(hashes, local, group=lookup.group)
+            if hasher is not None:
+                hashes = [piece for pieces in hashes for piece in pieces]
+                validate_storage_census(hashes, boundaries[-1])
             manifest[name] = hashes
         previous = getattr(model, '_resync_frozen_tables', None)
         if previous is not None and previous != manifest:
