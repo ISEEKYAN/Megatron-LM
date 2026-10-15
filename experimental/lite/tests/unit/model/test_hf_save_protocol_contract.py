@@ -3,38 +3,14 @@
 
 from __future__ import annotations
 
-import ast
 import importlib
-from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
-
+import torch
 from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
 
-
-LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
-
-
-@pytest.mark.parametrize(
-    ("runtime_name", "module_name"),
-    _REGISTERED_PROTOCOLS,
-    ids=[runtime_name for runtime_name, _ in _REGISTERED_PROTOCOLS],
-)
-def test_registered_protocol_exposes_hf_save(
-    runtime_name: str, module_name: str
-) -> None:
-    protocol_path = LITE_ROOT / Path(*module_name.split(".")).with_suffix(".py")
-    tree = ast.parse(protocol_path.read_text())
-    functions = {
-        node.name
-        for node in tree.body
-        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
-    }
-
-    assert "save_hf_weights" in functions, (
-        f"{runtime_name} ({module_name}) cannot honor save_contents=['hf_model']"
-    )
 
 
 @pytest.mark.parametrize("model_name", ["kimi_k2", "qwen3_moe"])
@@ -56,19 +32,9 @@ def test_new_hf_save_protocols_delegate_all_arguments(
     )
     chunks, model_cfg, parallel_state = object(), object(), object()
 
-    protocol.save_hf_weights(
-        chunks,
-        "/tmp/hf-save-contract",
-        model_cfg,
-        parallel_state,
-    )
+    protocol.save_hf_weights(chunks, "/tmp/hf-save-contract", model_cfg, parallel_state)
 
-    assert calls == [
-        (
-            (chunks, "/tmp/hf-save-contract", model_cfg, parallel_state),
-            {},
-        )
-    ]
+    assert calls == [((chunks, "/tmp/hf-save-contract", model_cfg, parallel_state), {})]
 
 
 # Engine-side ``save_contents=['hf_model']`` unconditionally forwards
@@ -82,28 +48,59 @@ _ENGINE_EXPORT_KWARGS = {
 
 
 @pytest.mark.parametrize(
-    "model_name", ["kimi_k2", "qwen3_moe", "qwen3_5", "deepseek_v4"]
+    ("runtime_name", "module_name"),
+    _REGISTERED_PROTOCOLS,
+    ids=[runtime_name for runtime_name, _ in _REGISTERED_PROTOCOLS],
 )
-def test_hf_save_protocols_accept_engine_export_kwargs(
-    model_name: str, monkeypatch: pytest.MonkeyPatch, transformer_engine_import_stub
+def test_registered_protocol_honors_engine_export_kwargs(
+    runtime_name: str,
+    module_name: str,
+    tmp_path,
+    monkeypatch: pytest.MonkeyPatch,
+    transformer_engine_import_stub,
 ) -> None:
     transformer_engine_import_stub()
-    if model_name == "deepseek_v4":
-        # DS4 protocol drags in megatron.core via the CSA module at import time.
-        pytest.importorskip(
-            "megatron.core",
-            reason="deepseek_v4 protocol needs megatron.core in the test env",
-        )
-    protocol = importlib.import_module(
-        f"megatron.lite.model.{model_name}.lite.protocol"
-    )
-    checkpoint = importlib.import_module(
-        f"megatron.lite.model.{model_name}.lite.checkpoint"
-    )
+    protocol = importlib.import_module(module_name)
+    checkpoint = importlib.import_module(module_name.rsplit('.', 1)[0] + '.checkpoint')
     calls = []
 
     def _record(*args, **kwargs):
         calls.append((args, kwargs))
+
+    if runtime_name == "deepseek_v41":
+        import megatron.lite.model.deepseek_v41.lite.resync as _imports_resync
+
+        decoded_weights = _imports_resync.decoded_weights
+        from megatron.lite.primitive.ckpt import hf_weights
+
+        tensor = torch.ones(2, dtype=torch.bfloat16)
+
+        def export(model, **kwargs):
+            calls.append((model, kwargs))
+            yield 'embed.weight', tensor
+
+        saved = []
+        monkeypatch.setattr(checkpoint, "export_checkpoint", export)
+        monkeypatch.setattr(
+            hf_weights,
+            "stream_export_to_shards",
+            lambda weights, *args, **kwargs: saved.extend(weights),
+        )
+        model = SimpleNamespace(
+            tensor_bindings={}, config=SimpleNamespace(to_hf_dict=lambda: {})
+        )
+        protocol.save_hf_weights([model], tmp_path, None, None, **_ENGINE_EXPORT_KWARGS)
+        online = list(
+            decoded_weights(
+                protocol.export_hf_weights([model], None, None, **_ENGINE_EXPORT_KWARGS)
+            )
+        )
+        assert len(saved) == len(online) == 1
+        assert saved[0][0] == online[0][0] == 'embed.weight'
+        assert torch.equal(saved[0][1], tensor) and torch.equal(online[0][1], tensor)
+        assert len(calls) == 2 and calls[0] == calls[1]
+        assert calls[0][1]['row_chunks'] is True
+        return
 
     # kimi_k2 / qwen3_moe use function-local imports of the checkpoint
     # writer; qwen3_5 aliases it at module load as ``_save_hf_weights_impl``.

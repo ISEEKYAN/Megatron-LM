@@ -29,17 +29,22 @@ class PackedSeqParams:
 
     def __post_init__(self) -> None:
         cu_seqlens = (
-            self.cu_seqlens_q_padded if self.cu_seqlens_q_padded is not None else self.cu_seqlens_q
+            self.cu_seqlens_q_padded
+            if self.cu_seqlens_q_padded is not None
+            else self.cu_seqlens_q
         )
         if isinstance(cu_seqlens, Tensor) and self.total_tokens is not None:
             total_tokens_tensor = torch.tensor(
                 [self.total_tokens], dtype=cu_seqlens.dtype, device=cu_seqlens.device
             )
             cu_seqlens_with_max = torch.cat([cu_seqlens, total_tokens_tensor])
-            seq_lengths = (cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]).clamp(min=0)
+            seq_lengths = (cu_seqlens_with_max[1:] - cu_seqlens_with_max[:-1]).clamp(
+                min=0
+            )
             self.seq_idx = (
                 torch.repeat_interleave(
-                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device), seq_lengths
+                    torch.arange(seq_lengths.numel(), device=cu_seqlens.device),
+                    seq_lengths,
                 )
                 .to(torch.int32)
                 .unsqueeze(0)
@@ -59,3 +64,24 @@ class PackedSeqParams:
 
 
 __all__ = ["PackedSeqParams"]
+
+
+def packed_sequence_ranges(
+    cu_seqlens: Tensor, total_tokens: int
+) -> list[tuple[int, int]]:
+    """Validate and split an unpadded single-rank THD sequence partition.
+
+    This shared helper is for sequence-local semantic execution; padded CP
+    partitions must first go through the parallel THD transport helpers.
+    """
+    if cu_seqlens.ndim != 1 or cu_seqlens.dtype not in (torch.int32, torch.int64):
+        raise ValueError("Expected one-dimensional integer cu_seqlens")
+    bounds = cu_seqlens.tolist()
+    if (
+        len(bounds) < 2
+        or bounds[0] != 0
+        or bounds[-1] != total_tokens
+        or any(end <= start for start, end in zip(bounds, bounds[1:]))
+    ):
+        raise ValueError("cu_seqlens must strictly partition all tokens")
+    return list(zip(bounds, bounds[1:]))

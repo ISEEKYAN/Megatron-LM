@@ -1,0 +1,54 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""Deployment-visible autograd arithmetic and owned gradients."""
+
+import torch
+from torch.autograd.function import once_differentiable
+
+
+class _Visible(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, visible, reference, *inputs):
+        ctx.reference = reference
+        ctx.save_for_backward(*inputs)
+        return visible(*inputs)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, *grad_outputs):
+        tensors = ctx.saved_tensors
+        with torch.enable_grad(), torch.autocast(
+            device_type=tensors[0].device.type, enabled=False
+        ):
+            leaves = [
+                x.detach().requires_grad_(needed)
+                for x, needed in zip(tensors, ctx.needs_input_grad[2:])
+            ]
+            outputs = ctx.reference(*leaves)
+            if isinstance(outputs, torch.Tensor):
+                outputs = (outputs,)
+            active = [
+                (y, g)
+                for y, g in zip(outputs, grad_outputs)
+                if g is not None and y.requires_grad
+            ]
+            wanted = [x for x in leaves if x.requires_grad]
+            grads = (
+                torch.autograd.grad(
+                    [y for y, _ in active],
+                    wanted,
+                    [g for _, g in active],
+                    allow_unused=True,
+                )
+                if active and wanted
+                else [None] * len(wanted)
+            )
+        cursor = iter(grads)
+        return (
+            None,
+            None,
+            *(next(cursor) if x.requires_grad else None for x in leaves),
+        )
+
+
+def visible_forward(visible, reference, *inputs):
+    return _Visible.apply(visible, reference, *inputs)
