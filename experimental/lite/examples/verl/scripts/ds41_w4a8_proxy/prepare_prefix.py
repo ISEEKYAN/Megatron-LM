@@ -20,8 +20,10 @@ layers = int(os.environ.get('DS41_LAYERS', '2'))
 precision = os.environ.get('DS41_PRECISION', 'release')
 if precision not in ('release', 'official'):
     raise ValueError('DS41_PRECISION must be release or official')
-if layers not in (2, 4):
-    raise ValueError('Only closed release 2L/4L prefixes are supported')
+if layers not in (2, 4, 40):
+    raise ValueError(
+        'Only closed release 2L/4L prefixes or the full 40L release are supported'
+    )
 model.mkdir(parents=True, exist_ok=True)
 receipts = {
     v['file']: v
@@ -47,16 +49,17 @@ assert (
 assert t['compress_ratios'][:2] == [0, 0] and t['engram_layer_ids'][0] == 1
 # A closed text prefix: CR0/0 has no outside owner or borrowed state; retain
 # the 3 archival MTP metadata slots and all release matrix dimensions.
-t.update(
-    num_hidden_layers=layers,
-    compress_ratios=original['text_config']['compress_ratios'][:layers]
-    + original['text_config']['compress_ratios'][-3:],
-    candidate_source_layer_id=-1,
-    kv_source_layer_ids=[2] if layers == 4 else [],
-    index_source_layer_ids=[2] if layers == 4 else [],
-    engram_layer_ids=[1],
-    engram_num_embeddings=[original['text_config']['engram_num_embeddings'][0]],
-)
+if layers != 40:
+    t.update(
+        num_hidden_layers=layers,
+        compress_ratios=original['text_config']['compress_ratios'][:layers]
+        + original['text_config']['compress_ratios'][-3:],
+        candidate_source_layer_id=-1,
+        kv_source_layer_ids=[2] if layers == 4 else [],
+        index_source_layer_ids=[2] if layers == 4 else [],
+        engram_layer_ids=[1],
+        engram_num_embeddings=[original['text_config']['engram_num_embeddings'][0]],
+    )
 if precision == 'official':
     t.update(expert_activation_group_size=32, wo_a_dtype='bf16')
 allowed = {
