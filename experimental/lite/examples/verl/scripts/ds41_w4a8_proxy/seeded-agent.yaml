@@ -1,0 +1,2 @@
+- name: ds41_seeded_single_turn
+  _target_: seeded_agent.SeededSingleTurnAgentLoop

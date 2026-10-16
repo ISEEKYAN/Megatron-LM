@@ -33,7 +33,7 @@ def _parallel_state(model) -> ParallelState:
     return parallel_state_from_model(model) or ParallelState()
 
 
-def router_replay_roots(chunk) -> list:
+def router_replay_roots(chunk, *, contiguous=False) -> list:
     """Select decoder layers for R3, excluding MTP-only routers.
 
     The current rollout configuration does not run MTP, so route tensors have
@@ -42,12 +42,26 @@ def router_replay_roots(chunk) -> list:
     future rollout enables MTP speculative decoding, this assumption must be
     reevaluated.
     """
+    while hasattr(chunk, "module"):
+        chunk = chunk.module
     model = getattr(chunk, "model", chunk)
     layers = getattr(model, "layers", None)
     if layers is None:
         return [chunk]
     values = getattr(layers, "values", None)
-    return list(values()) if callable(values) else list(layers)
+    layers = list(values()) if callable(values) else list(layers)
+    if contiguous:
+        start, end = getattr(model, "local_layer_range", (0, len(layers)))
+        if not 0 <= start < end <= len(layers):
+            raise ValueError("Invalid replay layer interval")
+        if any(
+            (layer is not None) != (start <= i < end) for i, layer in enumerate(layers)
+        ):
+            raise ValueError(
+                "Replay requires contiguous stage-owned global layer slots"
+            )
+        return layers[start:end]
+    return layers
 
 
 def nested_from_packed(tensor: torch.Tensor | None, seq_lens: torch.Tensor):
@@ -111,30 +125,66 @@ def pack_thd_forward_kwargs(model, batch: PackedBatch) -> dict[str, Any]:
 
 
 def unpack_thd_forward_output(
-    model, batch: PackedBatch, output: torch.Tensor
+    model, batch: PackedBatch, output: torch.Tensor, *, contiguous=False, unpadded=False
 ) -> torch.Tensor:
     """Reverse a zigzag-CP THD model output back to jagged true-length form."""
+    if isinstance(output, dict):
+        return {
+            key: unpack_thd_forward_output(
+                model, batch, value, contiguous=contiguous, unpadded=unpadded
+            )
+            for key, value in output.items()
+        }
+    if not isinstance(output, torch.Tensor) or output.ndim == 0:
+        return output
     ps = _parallel_state(model)
+    if unpadded:
+        if ps.cp_size > 1:
+            from megatron.lite.primitive.modules.attention.cp import (
+                ContiguousCPSequence,
+            )
+
+            output = ContiguousCPSequence(
+                batch.total_tokens, ps.cp_rank, ps.cp_size, ps.cp_group
+            ).gather(output, seq_dim=0)
+        if output.shape[0] != batch.total_tokens:
+            return output
+        return torch.nested.as_nested_tensor(
+            list(output.split(batch.seq_lens.tolist()))
+        )
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
+        contiguous=contiguous,
     )
-    return unpack_thd_to_nested(output, meta, contiguous=False)
+    return unpack_thd_to_nested(output, meta, contiguous=contiguous)
 
 
 def pack_routed_experts(
-    model, batch: PackedBatch, routed_experts, *, contiguous: bool = False
+    model,
+    batch: PackedBatch,
+    routed_experts,
+    *,
+    contiguous: bool = False,
+    contiguous_padding: bool = False,
 ) -> list[torch.Tensor]:
-    """Pack jagged ``[batch, seq, layers, topk]`` R3 routes for local routers."""
+    """Pack jagged ``[batch, seq, layers, topk]`` R3 routes for local routers.
 
+    Existing DS4/GLM paths use zigzag alignment with contiguous slicing.
+    ``contiguous_padding=True`` opts into TP*CP alignment for protocols whose
+    token packer explicitly uses ``thd_pack_meta(..., contiguous=True)``.
+    """
+    if contiguous_padding and not contiguous:
+        raise ValueError("Contiguous padding requires contiguous CP slicing")
     ps = _parallel_state(model)
     meta = thd_pack_meta(
         batch.seq_lens,
         tp_size=ps.tp_size,
         cp_size=ps.cp_size,
         cp_group=ps.cp_group if ps.cp_size > 1 else None,
+        contiguous=contiguous_padding,
     )
     rows = (
         list(routed_experts.unbind(0))
@@ -190,7 +240,11 @@ def pack_routed_experts(
 
 
 def pack_r3_replay_mask(
-    model, batch: PackedBatch, *, contiguous: bool = False
+    model,
+    batch: PackedBatch,
+    *,
+    contiguous: bool = False,
+    contiguous_padding: bool = False,
 ) -> torch.Tensor:
     """Pack a caller-provided causal R3 replay mask for the local layout.
 
@@ -213,9 +267,13 @@ def pack_r3_replay_mask(
         rows.append(row.to(device=batch.input_ids.device)[:, None, None])
         offset += length
     nested = torch.nested.as_nested_tensor(rows, layout=torch.jagged)
-    return pack_routed_experts(model, batch, nested, contiguous=contiguous)[0][
-        :, 0
-    ].bool()
+    return pack_routed_experts(
+        model,
+        batch,
+        nested,
+        contiguous=contiguous,
+        contiguous_padding=contiguous_padding,
+    )[0][:, 0].bool()
 
 
 def add_loss_context_kwargs(

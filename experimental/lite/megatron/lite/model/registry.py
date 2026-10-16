@@ -82,7 +82,9 @@ register_model(
 )
 
 register_model(
-    "qwen3_moe", package="megatron.lite.model.qwen3_moe", impls={"lite": _QWEN3_MOE_LITE}
+    "qwen3_moe",
+    package="megatron.lite.model.qwen3_moe",
+    impls={"lite": _QWEN3_MOE_LITE},
 )
 
 register_model(
@@ -114,6 +116,14 @@ register_model(
 )
 
 
+register_model(
+    "deepseek_v41",
+    package="megatron.lite.model.deepseek_v41",
+    hf_model_types=["deepseek_v41"],
+    impls={"lite": "megatron.lite.model.deepseek_v41.lite.protocol"},
+)
+
+
 # ---------------------------------------------------------------------------
 # Lookup functions
 # ---------------------------------------------------------------------------
@@ -121,7 +131,9 @@ register_model(
 
 def get_model_package(model_name: str):
     if model_name not in MODEL_PACKAGES:
-        raise ValueError(f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}")
+        raise ValueError(
+            f"Unknown model: {model_name!r}. Available: {list(MODEL_PACKAGES)}"
+        )
     return importlib.import_module(MODEL_PACKAGES[model_name])
 
 
@@ -135,7 +147,8 @@ def resolve_runtime_model_name(model_name: str, impl: str) -> str:
     key = (model_name, impl)
     if key not in _IMPL_TO_RUNTIME_MODEL:
         raise ValueError(
-            f"No runtime for ({model_name!r}, {impl!r}). " f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"
+            f"No runtime for ({model_name!r}, {impl!r}). "
+            f"Known: {list(_IMPL_TO_RUNTIME_MODEL)}"
         )
     return _IMPL_TO_RUNTIME_MODEL[key]
 

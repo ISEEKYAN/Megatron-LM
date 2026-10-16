@@ -2,45 +2,52 @@
 import math
 from typing import Any
 
-import torch
-import torch.nn as nn
-
-from megatron.lite.primitive import transformer_engine as te
 # Zero-copy imports of the DSv4 THD-CP helpers that live in Megatron Core. The
 # lite CSA module reuses Core's differentiable kernels, CP row-mapping utilities,
 # and CuTeDSL layout kernels rather than vendoring them; see the module docstring
 # of ``csa_cp_utils`` / ``csa_cp_layout_kernels`` for the exact contracts.
-from megatron.core.tensor_parallel.mappings import gather_from_sequence_parallel_region
-from megatron.core.transformer.experimental_attention_variant import (
-    csa_cp_layout_kernels,
-    csa_cp_utils as cp_utils,
-)
-from megatron.core.transformer.experimental_attention_variant.csa import (
-    _unfused_indexer_sparse_attn_from_topk,
-    unfused_compressed_sparse_attn,
-)
-# MCore moved the fused CSA entry points in the development branch. Keep the
-# Lite adapter compatible with both layouts while downstream snapshots migrate.
+import megatron.core.tensor_parallel.mappings as _tp_mappings
+import torch
+import torch.nn as nn
+from megatron.lite.primitive import transformer_engine as te
+
+gather_from_sequence_parallel_region = _tp_mappings.gather_from_sequence_parallel_region
+
 try:
-    from megatron.core.transformer.experimental_attention_variant.csa_kernels import (
-        FusedCSAIndexerSparseAttnFromTopkFunc,
-        csa_sparse_attn,
-    )
+    import megatron.core.transformer.experimental_attention_variant.csa_cp_layout_kernels as csa_cp_layout_kernels
+    import megatron.core.transformer.experimental_attention_variant.csa_cp_utils as cp_utils
+
+    _MODERN_CSA_LAYOUT = False
 except ImportError:
-    from megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention import (
-        FusedCSAIndexerSparseAttnFromTopkFunc,
-        csa_sparse_attn,
-    )
-from megatron.core.transformer.experimental_attention_variant.dsa import (
-    DSAIndexerLossAutoScaler,
-    DSAIndexerLossLoggingHelper,
+    import megatron.core.transformer.experimental_attention_variant.csa_utils.cp_layout_kernels as csa_cp_layout_kernels
+    import megatron.core.transformer.experimental_attention_variant.csa_utils.cp_utils as cp_utils
+
+    _MODERN_CSA_LAYOUT = True
+import megatron.core.transformer.experimental_attention_variant.csa as _csa_ops
+
+_unfused_indexer_sparse_attn_from_topk = _csa_ops._unfused_indexer_sparse_attn_from_topk
+unfused_compressed_sparse_attn = _csa_ops.unfused_compressed_sparse_attn
+
+# Support both Core layouts without duplicating the attention primitives.
+try:
+    import megatron.core.transformer.experimental_attention_variant.csa_kernels as _csa_kernels
+except ImportError:
+    import megatron.core.transformer.experimental_attention_variant.csa_utils.fused_sparse_attention as _csa_kernels
+
+FusedCSAIndexerSparseAttnFromTopkFunc = (
+    _csa_kernels.FusedCSAIndexerSparseAttnFromTopkFunc
 )
+csa_sparse_attn = _csa_kernels.csa_sparse_attn
+
+import megatron.core.transformer.experimental_attention_variant.dsa as _dsa_ops
 from megatron.lite.primitive.modules.attention.dsa import rotate_activation
 from megatron.lite.primitive.parallel.state import ParallelState
-from megatron.lite.primitive.utils.rotary import (
-    _yarn_find_correction_range,
-    _yarn_linear_ramp_mask,
-)
+from megatron.lite.primitive.utils import rotary as _rotary
+
+DSAIndexerLossAutoScaler = _dsa_ops.DSAIndexerLossAutoScaler
+DSAIndexerLossLoggingHelper = _dsa_ops.DSAIndexerLossLoggingHelper
+_yarn_find_correction_range = _rotary._yarn_find_correction_range
+_yarn_linear_ramp_mask = _rotary._yarn_linear_ramp_mask
 
 
 class GroupedLinear(nn.Module):
@@ -57,7 +64,9 @@ class GroupedLinear(nn.Module):
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out_per_group = self.out_features // self.n_groups
-        weight = self.weight.view(self.n_groups, out_per_group, self.in_features_per_group)
+        weight = self.weight.view(
+            self.n_groups, out_per_group, self.in_features_per_group
+        )
         return torch.einsum("...gd,god->...go", x, weight)
 
 
@@ -71,7 +80,10 @@ def build_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     inv_freq = 1.0 / (
         rope_theta
-        ** (torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32) / rope_head_dim)
+        ** (
+            torch.arange(0, rope_head_dim, 2, device=device, dtype=torch.float32)
+            / rope_head_dim
+        )
     )
     freqs = torch.einsum("bs,d->bsd", position_ids.to(torch.float32), inv_freq)
     emb = torch.cat([freqs, freqs], dim=-1)
@@ -89,11 +101,13 @@ def build_yarn_rope_cos_sin(
 ) -> tuple[torch.Tensor, torch.Tensor]:
     dim = rope_head_dim
     inv_freq_extra = 1.0 / (
-        rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     inv_freq_inter = 1.0 / (
         config.rotary_scaling_factor
-        * rope_theta ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
+        * rope_theta
+        ** (torch.arange(0, dim, 2, device=device, dtype=torch.float32) / dim)
     )
     low, high = _yarn_find_correction_range(
         config.beta_fast,
@@ -128,7 +142,9 @@ def build_compressed_rope_cos_sin(
             device=device,
             dtype=dtype,
         )
-    return build_rope_cos_sin(position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype)
+    return build_rope_cos_sin(
+        position_ids, rope_head_dim, rope_theta, device=device, dtype=dtype
+    )
 
 
 def apply_partial_rope(
@@ -152,7 +168,9 @@ def apply_partial_rope(
 
 
 class CompressedSequenceCompressor(nn.Module):
-    def __init__(self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False):
+    def __init__(
+        self, config: Any, compress_ratio: int, head_dim: int, *, rotate: bool = False
+    ):
         super().__init__()
         self.config = config
         self.compress_ratio = compress_ratio
@@ -173,7 +191,9 @@ class CompressedSequenceCompressor(nn.Module):
     def reset_parameters(self) -> None:
         nn.init.normal_(self.ape, mean=0.0, std=self.initializer_range)
 
-    def _overlap_transform(self, tensor: torch.Tensor, fill_value: float) -> torch.Tensor:
+    def _overlap_transform(
+        self, tensor: torch.Tensor, fill_value: float
+    ) -> torch.Tensor:
         bsz, n_blocks, ratio, _, head_dim = tensor.shape
         out = tensor.new_full((bsz, n_blocks, 2 * ratio, head_dim), fill_value)
         out[:, :, ratio:] = tensor[:, :, :, 1]
@@ -193,7 +213,9 @@ class CompressedSequenceCompressor(nn.Module):
         gate = self.wgate(x[:, :cutoff])
         content = content.view(bsz, n_blocks, ratio, self.coff, self.head_dim)
         gate = gate.view_as(content)
-        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(gate.device)
+        gate = gate + self.ape.view(1, 1, ratio, self.coff, self.head_dim).to(
+            gate.device
+        )
         if self.overlap:
             content = self._overlap_transform(content, 0.0)
             gate = self._overlap_transform(gate, float("-inf"))
@@ -269,17 +291,23 @@ class CompressedSequenceCompressor(nn.Module):
         gate = self.wgate(hidden_compact)
         kv_grouped = kv.reshape(total_comp, ratio, 1, -1)
         gate_grouped = gate.reshape(total_comp, ratio, 1, -1)
-        gate_grouped = gate_grouped + self.ape.view(1, ratio, 1, -1).to(gate_grouped.device)
+        gate_grouped = gate_grouped + self.ape.view(1, ratio, 1, -1).to(
+            gate_grouped.device
+        )
         if self.overlap:
             is_first = compressed_group_ids[:total_comp] == 0
             kv_grouped = self._overlap_transform_thd(kv_grouped, is_first, 0.0)
-            gate_grouped = self._overlap_transform_thd(gate_grouped, is_first, float("-inf"))
+            gate_grouped = self._overlap_transform_thd(
+                gate_grouped, is_first, float("-inf")
+            )
         # Non-overlap (coff == 1): kv_grouped/gate_grouped are already
         # (total_comp, ratio, 1, head_dim); no windowing needed.
         weights = torch.softmax(gate_grouped.float(), dim=1).to(kv_grouped.dtype)
         compressed = (kv_grouped * weights).sum(dim=1)  # (total_comp, 1, head_dim)
         compressed = self.norm(compressed)
-        positions = compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        positions = (
+            compressed_group_ids[:total_comp].clamp_min(0).to(torch.long) * ratio
+        )
         cos, sin = build_compressed_rope_cos_sin(
             positions.view(1, total_comp),
             self.rope_head_dim,
@@ -327,7 +355,9 @@ class CompressedSparseAttentionIndexer(nn.Module):
         self.wq_b = nn.Linear(
             config.q_lora_rank, config.index_n_heads * config.index_head_dim, bias=False
         )
-        self.weights_proj = nn.Linear(config.hidden_size, config.index_n_heads, bias=False)
+        self.weights_proj = nn.Linear(
+            config.hidden_size, config.index_n_heads, bias=False
+        )
         self.compressor = CompressedSequenceCompressor(
             config, compress_ratio, config.index_head_dim, rotate=True
         )
@@ -344,8 +374,34 @@ class CompressedSparseAttention(nn.Module):
         dsa_indexer_loss_coeff: float = 0.0,
         dsa_indexer_use_sparse_loss: bool = False,
         calculate_per_token_loss: bool = False,
+        kv_owner: int | None = None,
+        index_owner: int | None = None,
+        candidate_mode: str | None = None,
+        compress_ratio: int | None = None,
+        codecs=None,
     ):
         super().__init__()
+        self.deployment_math = False
+        self.cross_layer = candidate_mode is not None
+        self.codecs = codecs
+        if self.cross_layer:
+            if (
+                candidate_mode not in ("none", "build", "reuse")
+                or compress_ratio is None
+            ):
+                raise ValueError(
+                    "Cross-layer attention requires a ratio and candidate mode"
+                )
+            self.ps = ps
+            self._init_cross_layer(
+                config,
+                layer_idx,
+                ratio=compress_ratio,
+                kv_owner=kv_owner,
+                index_owner=index_owner,
+                candidate_mode=candidate_mode,
+            )
+            return
         self.config = config
         self.ps = ps
         self.layer_idx = layer_idx
@@ -374,7 +430,9 @@ class CompressedSparseAttention(nn.Module):
             self.compress_ratio = 0
         self.wq_a = nn.Linear(config.hidden_size, config.q_lora_rank, bias=False)
         self.q_norm = te.RMSNorm(config.q_lora_rank, eps=config.rms_norm_eps)
-        self.wq_b = nn.Linear(config.q_lora_rank, self.num_heads * self.head_dim, bias=False)
+        self.wq_b = nn.Linear(
+            config.q_lora_rank, self.num_heads * self.head_dim, bias=False
+        )
         self.wkv = nn.Linear(config.hidden_size, self.head_dim, bias=False)
         self.kv_norm = te.RMSNorm(config.head_dim, eps=config.rms_norm_eps)
         self.wo_a = GroupedLinear(
@@ -382,7 +440,9 @@ class CompressedSparseAttention(nn.Module):
             config.o_groups * config.o_lora_rank,
             config.o_groups,
         )
-        self.wo_b = nn.Linear(config.o_groups * config.o_lora_rank, config.hidden_size, bias=False)
+        self.wo_b = nn.Linear(
+            config.o_groups * config.o_lora_rank, config.hidden_size, bias=False
+        )
         self.sinks = nn.Parameter(torch.zeros(self.num_heads))
         self.compressor = (
             CompressedSequenceCompressor(config, self.compress_ratio, self.head_dim)
@@ -395,14 +455,340 @@ class CompressedSparseAttention(nn.Module):
             else None
         )
 
+    def _init_cross_layer(
+        self, config, layer_id, *, ratio, kv_owner, index_owner, candidate_mode
+    ):
+        if (
+            config.heads % config.groups
+            or config.rope_dim % 2
+            or not 0 < config.rope_dim <= min(config.head_dim, config.index_dim)
+        ):
+            raise ValueError("Invalid grouped-head or rotary dimensions")
+        self.config, self.layer_id = config, layer_id
+        self.ratio, self.kv_owner, self.index_owner = ratio, kv_owner, index_owner
+        self.candidate_mode = candidate_mode
+        self.owns_kv, self.owns_index = layer_id == kv_owner, layer_id == index_owner
+        from functools import partial
+
+        linear = partial(Linear, fp8_operator=mxfp8.dynamic_fp8_linear)
+        self.wq_a = linear(config.dim, config.q_rank, fp8=config.linear_fp8)
+        self.q_norm = RMSNorm(config.q_rank, config.eps)
+        self.wq_b = linear(
+            config.q_rank, config.heads * config.head_dim, fp8=config.linear_fp8
+        )
+        self.wkv = linear(config.dim, config.head_dim, fp8=config.linear_fp8)
+        self.kv_norm = RMSNorm(config.head_dim, config.eps)
+        self.attn_sink = nn.Parameter(torch.zeros(config.heads, dtype=torch.float32))
+        self.wo_a = linear(
+            config.heads * config.head_dim // config.groups,
+            config.groups * config.o_rank,
+            fp8=config.linear_fp8,
+        )
+        self.wo_b = linear(
+            config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
+        )
+        self.compressor = (
+            CrossLayerCompressor(config, self.ratio) if self.owns_kv else None
+        )
+        self.indexer = (
+            CrossLayerIndexer(config, self.owns_kv) if self.owns_index else None
+        )
+
+    def _forward_cross_layer(self, x, state, *, candidate_mask=None, cp_context=None):
+        c, layer, ratio = self.config, self.layer_id, self.ratio
+        main_codec = fake_quant_main_kv if self.codecs is None else self.codecs["main"]
+        index_codec = fake_quant_index if self.codecs is None else self.codecs["index"]
+        swa_codec = mxfp8.fake_quant_swa if self.codecs is None else self.codecs["swa"]
+        b, length, _ = x.shape
+        full_x = x if cp_context is None else cp_context.gather(x)
+        global_length = full_x.shape[1]
+        start = 0 if cp_context is None else cp_context.start
+        positions = torch.arange(start, start + length, device=x.device)
+        key_positions = torch.arange(global_length, device=x.device)
+        qr = self.q_norm(self.wq_a(x))
+        # V4.1 deliberately has no per-query-head RMS after wq_b.
+        unrotated_q = self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim))
+        unrotated_kv = self.kv_norm(self.wkv(full_x))
+        native_cache = self.deployment_math and x.is_cuda
+        if native_cache:
+            from megatron.lite.primitive.modules.deployment_math.cache import (
+                rotary_cache,
+                swa_cache,
+            )
+
+            if cp_context is not None or not (c.swa_fp8 and c.main_qat and c.index_qat):
+                raise ValueError("Deployment cache requires CP1 and enabled KV codecs")
+            cos_sin = rotary_cache(c, ratio, x.device)
+
+            def swa_vjp(query, values):
+                return (
+                    rotate(query, positions, c, ratio, deployment_math=True),
+                    rotate(values, key_positions, c, ratio, deployment_math=True),
+                )
+
+            q, window = swa_cache(
+                unrotated_q, unrotated_kv, key_positions, cos_sin, c.eps, swa_vjp
+            )
+        else:
+            q = rotate(
+                unrotated_q, positions, c, ratio, deployment_math=self.deployment_math
+            )
+            # SWA KV uses the same ordered RoPE multiply-adds as native Q.
+            # Keep BF16 rounding before the FP8 codec, as the receiver does.
+            window = rotate(
+                unrotated_kv,
+                key_positions,
+                c,
+                ratio,
+                deployment_math=self.deployment_math,
+            )
+            if c.swa_fp8:
+                window = swa_codec(window)
+        kv = window
+        visible = (key_positions[None, :] <= positions[:, None]) & (
+            key_positions[None, :] > positions[:, None] - c.window
+        )
+        mask = visible.expand(b, -1, -1)
+        if ratio:
+            if self.owns_kv:
+                latent = self.compressor(full_x)
+                cp = torch.arange(latent.shape[1], device=x.device) * ratio
+                if native_cache:
+                    from megatron.lite.primitive.modules.deployment_math.cache import (
+                        compressed_cache,
+                        index_cache,
+                    )
+
+                    index_k = index_cache(
+                        _indexer_linear(self.indexer.wk, latent, self.deployment_math),
+                        self.indexer.k_norm.weight,
+                        self.indexer.k_norm.eps,
+                        ratio,
+                        cos_sin,
+                    )
+
+                    def main_vjp(values):
+                        return rotate(values, cp, c, ratio, deployment_math=True)
+
+                    main = compressed_cache(latent, ratio, cos_sin, main_vjp)
+                else:
+                    # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
+                    index_k = self.indexer.k_norm(
+                        _indexer_linear(self.indexer.wk, latent, self.deployment_math)
+                    )
+                    index_k = index_codec(
+                        rotate(index_k, cp, c, ratio), enabled=c.index_qat
+                    )
+                    # Native NVFP4 rotates FP32 values directly into the codec;
+                    # rounding RoPE to BF16 first can cross an E2M1 midpoint.
+                    main = main_codec(
+                        rotate(
+                            latent,
+                            cp,
+                            c,
+                            ratio,
+                            output_dtype=(
+                                torch.float32 if self.deployment_math else None
+                            ),
+                        ),
+                        enabled=c.main_qat,
+                    ).to(x.dtype)
+                state = AttentionState(kv_owner=layer, main_kv=main, index_k=index_k)
+            if (
+                state.kv_owner != self.kv_owner
+                or state.main_kv is None
+                or state.index_k is None
+            ):
+                raise ValueError("Missing or incorrect CSA2 KV source state")
+            if state.main_kv.shape[:2] != (b, global_length // ratio):
+                raise ValueError("Shared KV belongs to a different sequence shape")
+            lengths = ((positions + 1) // ratio).unsqueeze(-1)
+            if self.owns_index:
+                iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
+                if native_cache:
+                    from megatron.lite.primitive.modules.deployment_math.cache import (
+                        index_query,
+                    )
+
+                    iq, weights = index_query(
+                        iq,
+                        _indexer_linear(
+                            self.indexer.weights_proj, x, self.deployment_math
+                        ),
+                        positions,
+                        cos_sin,
+                    )
+                else:
+                    iq = index_codec(
+                        rotate(
+                            iq,
+                            positions,
+                            c,
+                            ratio,
+                            deployment_math=self.deployment_math,
+                        ),
+                        enabled=c.index_qat,
+                    )
+                    weights = _indexer_linear(
+                        self.indexer.weights_proj, x, self.deployment_math
+                    ) * (c.index_dim**-0.5 * c.index_heads**-0.5)
+                native_indexer = (
+                    self.deployment_math
+                    and c.index_qat
+                    and x.is_cuda
+                    and (native_cache or state.index_k.shape[1] > c.topk)
+                )
+                if native_indexer:
+                    from megatron.lite.primitive.modules import deployment_math
+
+                    scores = deployment_math.indexer_scores(
+                        iq, state.index_k, weights, lengths
+                    )
+                else:
+                    scores = (
+                        torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
+                        * weights.unsqueeze(-1)
+                    ).sum(2)
+                pool = state.candidates
+                if self.candidate_mode == "build":
+                    pool = candidate_blocks(
+                        scores,
+                        lengths,
+                        topk_blocks=c.candidate_blocks,
+                        block_size=c.block_size,
+                    )
+                injected_pool = pool if candidate_mask is None else candidate_mask
+                if self.candidate_mode == "reuse" and injected_pool is None:
+                    raise ValueError("Reindex requires the layer-20 candidate pool")
+                selector = (
+                    deployment_math.indexer_select_positions
+                    if native_indexer
+                    else select_positions
+                )
+                selected = selector(
+                    scores,
+                    lengths,
+                    c.topk,
+                    candidates=(
+                        injected_pool if self.candidate_mode == "reuse" else None
+                    ),
+                )
+                state = replace(
+                    state, index_owner=layer, indices=selected, candidates=pool
+                )
+            elif state.index_owner != self.index_owner or state.indices is None:
+                raise ValueError("Missing or incorrect CSA2 index source state")
+            kv = torch.cat([window, state.main_kv], 1)
+            counts = torch.zeros(
+                b, length, state.main_kv.shape[1], dtype=torch.int32, device=x.device
+            )
+            # Additive scatter keeps padded -1 slots from erasing a valid position zero.
+            if counts.shape[-1]:
+                counts.scatter_add_(
+                    -1, state.indices.clamp_min(0).long(), (state.indices >= 0).int()
+                )
+            mask = torch.cat([mask, counts > 0], -1)
+        if self.deployment_math and x.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            width = (
+                ((c.topk + c.window + 127) // 128) * 128
+                if ratio
+                else ((c.window + 127) // 128) * 128
+            )
+            output = deployment_math.sparse_attention(
+                q,
+                kv,
+                self.attn_sink,
+                mask,
+                None if ratio == 0 else state.indices,
+                main_size=0 if ratio == 0 else state.main_kv.shape[1],
+                window_size=global_length,
+                width=width,
+                scale=c.head_dim**-0.5,
+            )
+        else:
+            logits = (
+                torch.einsum('bshd,btd->bsht', q.float(), kv.float()) * c.head_dim**-0.5
+            )
+            logits = logits.masked_fill(~mask.unsqueeze(2), -torch.inf)
+            sink = self.attn_sink.expand(b, length, -1).unsqueeze(-1)
+            probabilities = torch.cat([logits, sink], -1).softmax(-1)[..., :-1]
+            output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(
+                x.dtype
+            )
+        native_activation = None
+        if self.deployment_math and self.wo_a.fp8 and output.is_cuda:
+            native_activation = _native_inverse_rope_activation(
+                output, positions, c, ratio
+            )
+        output = rotate(
+            output,
+            positions,
+            c,
+            ratio,
+            inverse=True,
+            output_dtype=(
+                torch.float32
+                if self.deployment_math and self.wo_a.fp8
+                else output.dtype
+            ),
+            deployment_math=native_activation is not None,
+        )
+        grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
+        weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
+        if self.deployment_math and self.wo_a.fp8:
+            # Each output group owns a row slice of the release-layout matrix.
+            # Keep the same deployment codec as the other FP8 projections;
+            # FP32 optimizer masters must never bypass the forward codec.
+            from megatron.lite.primitive.quantization import mxfp8
+
+            grouped_codec = (
+                mxfp8.dynamic_fp8_grouped_linear
+                if self.codecs is None
+                else self.codecs.get("linear_grouped", mxfp8.dynamic_fp8_grouped_linear)
+            )
+            if native_activation is None:
+                output = grouped_codec(grouped, weight).flatten(2)
+            else:
+                # The native inverse-RoPE kernel owns the FP8 activation; the
+                # rotated reference above only carries the VJP.
+                output = grouped_codec(
+                    grouped, weight, activation=native_activation
+                ).flatten(2)
+        elif getattr(self.wo_a, 'native_fp32', False):
+            output = torch.stack(
+                [
+                    native_fp32_linear(grouped[:, :, i], weight[i])
+                    for i in range(c.groups)
+                ],
+                dim=2,
+            ).flatten(2)
+        else:
+            output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
+        # Deployment grouped GEMM retains FP32 inverse-RoPE values through
+        # activation quantization, then writes a BF16 projection result.
+        return self.wo_b(output.to(x.dtype)), state
+
     def forward(
         self,
         x: torch.Tensor,
+        state=None,
         *,
-        position_ids: torch.Tensor,
+        position_ids: torch.Tensor | None = None,
+        candidate_mask=None,
+        cp_context=None,
         attention_mask: torch.Tensor | None = None,
         packed_seq_params: Any = None,
     ) -> torch.Tensor:
+        if self.cross_layer:
+            if state is None:
+                raise ValueError(
+                    "Cross-layer attention requires explicit AttentionState"
+                )
+            return self._forward_cross_layer(
+                x, state, candidate_mask=candidate_mask, cp_context=cp_context
+            )
         # THD packed sequences take the primary DSv4 CP path. THD is the only
         # sequence-parallel route now: the BSHD dense fallback has been removed.
         if packed_seq_params is not None:
@@ -413,10 +799,14 @@ class CompressedSparseAttention(nn.Module):
                 )
             return self._forward_thd_packed(x, position_ids, packed_seq_params)
         if self.ps.cp_size > 1 and attention_mask is not None:
-            raise ValueError("CP expects attention_mask=None; masks are derived from position_ids.")
+            raise ValueError(
+                "CP expects attention_mask=None; masks are derived from position_ids."
+            )
         batch, seq_len, _ = x.shape
         attention_rope_theta = (
-            self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
         )
         cos, sin = build_compressed_rope_cos_sin(
             position_ids,
@@ -428,11 +818,19 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.wq_b(q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = q * torch.rsqrt(
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_norm(self.wkv(x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
         use_sparse_backend = self.attention_backend not in {"local", "eager", "torch"}
@@ -455,12 +853,7 @@ class CompressedSparseAttention(nn.Module):
             )
         if use_sparse_backend and self.ps.cp_size == 1 and attention_mask is None:
             return self._forward_fused_sparse_no_indexer_cp1(
-                x,
-                q,
-                kv,
-                position_ids=position_ids,
-                cos=cos,
-                sin=sin,
+                x, q, kv, position_ids=position_ids, cos=cos, sin=sin
             )
 
         # The BSHD dense-softmax fallback (and its CP all-gather loop) has been
@@ -476,10 +869,15 @@ class CompressedSparseAttention(nn.Module):
     def _project_context(
         self, context: torch.Tensor, cos: torch.Tensor, sin: torch.Tensor
     ) -> torch.Tensor:
-        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(1, 2)
+        context = apply_partial_rope(context, cos, -sin, self.rope_head_dim).transpose(
+            1, 2
+        )
         batch, seq_len = context.shape[:2]
         grouped = context.reshape(
-            batch, seq_len, self.config.o_groups, self.num_heads_per_group * self.head_dim
+            batch,
+            seq_len,
+            self.config.o_groups,
+            self.num_heads_per_group * self.head_dim,
         )
         return self.wo_b(self.wo_a(grouped).flatten(2))
 
@@ -499,22 +897,19 @@ class CompressedSparseAttention(nn.Module):
         kv_full = kv.squeeze(1)
         kv_full = kv_full.transpose(0, 1).contiguous()
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
 
         compressed = None
         if self.compressor is not None and self.compress_ratio > 1:
             compressed = self.compressor(
-                x,
-                position_ids=position_ids,
-                rope_theta=self.config.compress_rope_theta,
+                x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
             )
             if compressed is not None:
                 compressed_kv = compressed.squeeze(1)
-                kv_full = torch.cat([kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0)
+                kv_full = torch.cat(
+                    [kv_full, compressed_kv.transpose(0, 1).contiguous()], dim=0
+                )
 
         if compressed is not None:
             n_compressed = compressed.size(2)
@@ -538,20 +933,16 @@ class CompressedSparseAttention(nn.Module):
             )
         else:
             flat_idxs, _flat_tlen = dsa_kernels.build_flat_topk_idxs(
-                window_idxs,
-                batch_size=batch,
-                seqlen_kv=kv_full.size(0),
+                window_idxs, batch_size=batch, seqlen_kv=kv_full.size(0)
             )
 
         out = dsa_kernels.dsa_sparse_attn(
-            query,
-            kv_full,
-            self.sinks.float(),
-            flat_idxs,
-            self.head_dim**-0.5,
+            query, kv_full, self.sinks.float(), flat_idxs, self.head_dim**-0.5
         )
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         return self._project_context(context, cos, sin)
 
@@ -567,8 +958,6 @@ class CompressedSparseAttention(nn.Module):
         sin: torch.Tensor,
         attention_mask: torch.Tensor | None,
     ) -> torch.Tensor:
-        if self.ps.cp_size != 1:
-            raise NotImplementedError("DeepSeek V4 fused DSA path currently supports CP=1 only.")
         if attention_mask is not None:
             raise NotImplementedError(
                 "DeepSeek V4 fused DSA path currently supports causal masking only."
@@ -593,17 +982,15 @@ class CompressedSparseAttention(nn.Module):
             kv = torch.nn.functional.pad(kv, (0, 0, 0, pad))
         batch, seq_len, _ = x.shape
         compressed = self.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         index_comp = self.indexer.compressor(
-            x,
-            position_ids=position_ids,
-            rope_theta=self.config.compress_rope_theta,
+            x, position_ids=position_ids, rope_theta=self.config.compress_rope_theta
         )
         if compressed is None or index_comp is None:
-            raise RuntimeError("DeepSeek V4 fused DSA requires at least one compressed KV entry.")
+            raise RuntimeError(
+                "DeepSeek V4 fused DSA requires at least one compressed KV entry."
+            )
         compressed_kv = compressed.squeeze(1)
         index_k = index_comp.squeeze(1).transpose(0, 1).contiguous()
         kv_full = torch.cat([kv.squeeze(1), compressed_kv], dim=1)
@@ -622,11 +1009,18 @@ class CompressedSparseAttention(nn.Module):
             batch, seq_len, self.indexer.index_n_heads, self.indexer.index_head_dim
         )
         q_indexer = q_indexer.transpose(1, 2)
-        q_indexer = apply_partial_rope(q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim)
+        q_indexer = apply_partial_rope(
+            q_indexer, idx_cos, idx_sin, self.indexer.rope_head_dim
+        )
         q_indexer = rotate_activation(q_indexer)
         q_indexer = q_indexer.transpose(1, 2).transpose(0, 1).contiguous()
         weights_indexer = (
-            (self.indexer.weights_proj(x).to(dtype=x.dtype) * (self.indexer.index_n_heads**-0.5))
+            (
+                _indexer_linear(self.indexer.weights_proj, x, self.deployment_math).to(
+                    dtype=x.dtype
+                )
+                * (self.indexer.index_n_heads**-0.5)
+            )
             .transpose(0, 1)
             .contiguous()
         )
@@ -634,10 +1028,7 @@ class CompressedSparseAttention(nn.Module):
         if indexer_topk <= 0:
             raise RuntimeError("DeepSeek V4 fused DSA requires positive indexer_topk.")
         window_idxs = _window_topk_indices(
-            batch,
-            seq_len,
-            self.config.sliding_window,
-            device=x.device,
+            batch, seq_len, self.config.sliding_window, device=x.device
         )
         query = q.transpose(1, 2).transpose(0, 1).contiguous()
         sink = self.sinks.float()
@@ -670,9 +1061,7 @@ class CompressedSparseAttention(nn.Module):
                 indexer_softmax_scale=self.indexer.softmax_scale,
             )
             topk_indices = torch.where(
-                topk_indices >= 0,
-                topk_indices + seq_len,
-                topk_indices,
+                topk_indices >= 0, topk_indices + seq_len, topk_indices
             ).to(torch.int32)
             flat_idxs, flat_tlen = dsa_kernels.build_flat_topk_idxs(
                 window_idxs,
@@ -691,7 +1080,9 @@ class CompressedSparseAttention(nn.Module):
             )
 
         context = (
-            out.view(seq_len, batch, self.num_heads, self.head_dim).permute(1, 2, 0, 3).contiguous()
+            out.view(seq_len, batch, self.num_heads, self.head_dim)
+            .permute(1, 2, 0, 3)
+            .contiguous()
         )
         if pad:
             context = context[:, :, :orig_seq_len, :].contiguous()
@@ -726,8 +1117,12 @@ class CompressedSparseAttention(nn.Module):
         ``boundary_kv.squeeze(-2).squeeze(1)`` contract in ``_forward_thd_cp``.
         """
         d_window = boundary_hidden.shape[0]
-        bkv = self.kv_norm(self.wkv(boundary_hidden.reshape(d_window, -1)))  # (d_window, head_dim)
-        b_pos = cp_utils._thd_cp_position_ids(cu_seqlens, int(global_start) - d_window, d_window)
+        bkv = self.kv_norm(
+            self.wkv(boundary_hidden.reshape(d_window, -1))
+        )  # (d_window, head_dim)
+        b_pos = cp_utils._thd_cp_position_ids(
+            cu_seqlens, int(global_start) - d_window, d_window
+        )
         cos, sin = build_compressed_rope_cos_sin(
             b_pos.view(1, d_window).long(),
             self.rope_head_dim,
@@ -737,15 +1132,14 @@ class CompressedSparseAttention(nn.Module):
             device=bkv.device,
             dtype=bkv.dtype,
         )
-        bkv = bkv.view(1, 1, d_window, self.head_dim)  # (batch=1, head=1, seq=d_window, hd)
+        bkv = bkv.view(
+            1, 1, d_window, self.head_dim
+        )  # (batch=1, head=1, seq=d_window, hd)
         bkv = apply_partial_rope(bkv, cos, sin, self.rope_head_dim)
         return bkv.permute(2, 0, 1, 3).contiguous()  # (d_window, 1, 1, head_dim)
 
     def _forward_thd_packed(
-        self,
-        x: torch.Tensor,
-        position_ids: torch.Tensor,
-        packed_seq_params: Any,
+        self, x: torch.Tensor, position_ids: torch.Tensor, packed_seq_params: Any
     ) -> torch.Tensor:
         """Build THD-packed q/key/x/qr, exchange boundaries, and run CP attention.
 
@@ -765,13 +1159,17 @@ class CompressedSparseAttention(nn.Module):
         global_start = cp_rank * seq_len
 
         attention_rope_theta = (
-            self.config.compress_rope_theta if self.compress_ratio > 1 else self.config.rope_theta
+            self.config.compress_rope_theta
+            if self.compress_ratio > 1
+            else self.config.rope_theta
         )
         # Positions come from cu_seqlens + this rank's global offset (CP-correct
         # within-sequence positions), not the raw position_ids tensor, so the
         # mapping is identical to the unsharded reference at cp_size == 1.
         del position_ids
-        local_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, seq_len).view(1, seq_len)
+        local_pos = cp_utils._thd_cp_position_ids(
+            cu_seqlens, global_start, seq_len
+        ).view(1, seq_len)
         cos, sin = build_compressed_rope_cos_sin(
             local_pos.long(),
             self.rope_head_dim,
@@ -782,11 +1180,19 @@ class CompressedSparseAttention(nn.Module):
             dtype=x.dtype,
         )
         q_low = self.q_norm(self.wq_a(x))
-        q = self.wq_b(q_low).view(batch, seq_len, self.num_heads, self.head_dim).transpose(1, 2)
+        q = (
+            self.wq_b(q_low)
+            .view(batch, seq_len, self.num_heads, self.head_dim)
+            .transpose(1, 2)
+        )
         q = q * torch.rsqrt(
             q.float().pow(2).mean(dim=-1, keepdim=True) + self.config.rms_norm_eps
         ).to(dtype=q.dtype)
-        kv = self.kv_norm(self.wkv(x)).view(batch, seq_len, 1, self.head_dim).transpose(1, 2)
+        kv = (
+            self.kv_norm(self.wkv(x))
+            .view(batch, seq_len, 1, self.head_dim)
+            .transpose(1, 2)
+        )
         q = apply_partial_rope(q, cos, sin, self.rope_head_dim)
         kv = apply_partial_rope(kv, cos, sin, self.rope_head_dim)
 
@@ -807,7 +1213,9 @@ class CompressedSparseAttention(nn.Module):
             # through the same method, so materialize the zero boundary directly
             # (matching ``cp_utils.exchange_cp_boundary_hidden``'s D_window sizing).
             d_comp = (
-                8 if self.compress_ratio == 4 else self.compress_ratio if self.compress_ratio > 1 else 0
+                8
+                if self.compress_ratio == 4
+                else self.compress_ratio if self.compress_ratio > 1 else 0
             )
             d_window = max(int(self.config.sliding_window), d_comp)
             boundary_hidden = x_thd.new_zeros((d_window,) + tuple(x_thd.shape[1:]))
@@ -816,7 +1224,13 @@ class CompressedSparseAttention(nn.Module):
         )
 
         context = self._forward_thd_cp(
-            query_thd, key_thd, x_thd, qr_thd, boundary_hidden, boundary_kv, packed_seq_params
+            query_thd,
+            key_thd,
+            x_thd,
+            qr_thd,
+            boundary_hidden,
+            boundary_kv,
+            packed_seq_params,
         )
         # context: (total, 1, np * hn). Reshape to (1, np, total, hn) for the shared
         # output projection (inverse RoPE + wo), then return (1, total, hidden).
@@ -855,7 +1269,9 @@ class CompressedSparseAttention(nn.Module):
 
         l_local = query.shape[0]
         if l_local != key.shape[0]:
-            raise RuntimeError("DSv4 THD CP path currently supports self-attention only.")
+            raise RuntimeError(
+                "DSv4 THD CP path currently supports self-attention only."
+            )
         cu_seqlens = self._thd_cu_seqlens(packed_seq_params)
         max_seqlen_q = int(packed_seq_params.max_seqlen_q)
 
@@ -891,17 +1307,30 @@ class CompressedSparseAttention(nn.Module):
                     torch.cumsum(compressed_lens, dim=0, dtype=torch.int32),
                 )
             )
-            hidden_compact, compressed_group_ids, seq_to_rank_row = (
-                cp_utils.prepare_cp_compressor_input(
-                    x,
-                    boundary_hidden,
-                    cu_seqlens,
+            if _MODERN_CSA_LAYOUT:
+                (
+                    hidden_compact,
+                    compressed_group_ids,
+                    _,
+                    _,
+                    _,
                     cu_seqlens_compressed,
-                    global_start,
-                    cp_size,
-                    ratio,
+                    seq_to_rank_row,
+                ) = cp_utils.prepare_cp_compressor_input(
+                    x, boundary_hidden, cu_seqlens, global_start, cp_size, ratio
                 )
-            )
+            else:
+                hidden_compact, compressed_group_ids, seq_to_rank_row = (
+                    cp_utils.prepare_cp_compressor_input(
+                        x,
+                        boundary_hidden,
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        cp_size,
+                        ratio,
+                    )
+                )
 
             if indexer is not None:
                 indexer_x, indexer_qr = x.detach(), qr.detach()
@@ -912,7 +1341,9 @@ class CompressedSparseAttention(nn.Module):
                 q_indexer_cp = indexer.wq_b(indexer_qr.squeeze(1)).view(
                     l_local, indexer.index_n_heads, indexer.index_head_dim
                 )
-                idx_pos = cp_utils._thd_cp_position_ids(cu_seqlens, global_start, l_local)
+                idx_pos = cp_utils._thd_cp_position_ids(
+                    cu_seqlens, global_start, l_local
+                )
                 idx_cos, idx_sin = build_compressed_rope_cos_sin(
                     idx_pos.view(1, l_local).long(),
                     indexer.rope_head_dim,
@@ -924,7 +1355,9 @@ class CompressedSparseAttention(nn.Module):
                 )
                 # lite RoPE wants the sequence axis at dim -2: (1, n_heads, l_local, hd).
                 q_rope = q_indexer_cp.permute(1, 0, 2).unsqueeze(0)
-                q_rope = apply_partial_rope(q_rope, idx_cos, idx_sin, indexer.rope_head_dim)
+                q_rope = apply_partial_rope(
+                    q_rope, idx_cos, idx_sin, indexer.rope_head_dim
+                )
                 q_indexer_cp = q_rope.squeeze(0).permute(1, 0, 2).contiguous()
                 q_indexer_cp = rotate_activation(q_indexer_cp)
                 weights_indexer_cp = indexer.weights_proj(indexer_x.squeeze(1)) * (
@@ -943,10 +1376,31 @@ class CompressedSparseAttention(nn.Module):
                 k_indexer_seq_major = torch.index_select(
                     k_indexer_rank_major, 0, seq_to_rank_row.clamp_min(0)
                 )
-                compressed_topk, indexer_layout = cp_utils.compute_cp_indexer_topk(
+                topk_options = {}
+                topk_keys = k_indexer_seq_major
+                if _MODERN_CSA_LAYOUT:
+                    logical = cp_utils.build_cp_indexer_layout(
+                        cu_seqlens,
+                        cu_seqlens_compressed,
+                        global_start,
+                        l_local,
+                        k_indexer_seq_major.shape[0],
+                    )
+                    layout = logical
+                    if self.apply_dsa_kernel_fusion:
+                        layout, row_map = cp_utils.build_cp_compact_indexer_layout(
+                            logical, cu_seqlens_compressed, topk_keys.shape[0], ratio
+                        )
+                        topk_keys = cp_utils.pack_cp_compact_indexer_k(
+                            topk_keys, row_map
+                        )
+                    topk_options = dict(
+                        indexer_layout=layout, logical_indexer_layout=logical
+                    )
+                topk_result = cp_utils.compute_cp_indexer_topk(
                     q_indexer_cp,
                     weights_indexer_cp,
-                    k_indexer_seq_major,
+                    topk_keys,
                     cu_seqlens,
                     cu_seqlens_compressed,
                     global_start,
@@ -955,7 +1409,9 @@ class CompressedSparseAttention(nn.Module):
                     indexer.softmax_scale,
                     max_seqlen_q=max_seqlen_q,
                     use_fused=self.apply_dsa_kernel_fusion,
+                    **topk_options,
                 )
+                compressed_topk, indexer_layout = topk_result[:2]
 
             compressed_kv_local, _ = self.compressor._forward_thd(
                 hidden_compact,
@@ -967,30 +1423,37 @@ class CompressedSparseAttention(nn.Module):
                 compressed_kv_local.squeeze(1), group=cp_group
             )
 
-        kv_full_thd = torch.cat((boundary_kv, kv_local, compressed_kv_rank_major), dim=0)
+        kv_full_thd = torch.cat(
+            (boundary_kv, kv_local, compressed_kv_rank_major), dim=0
+        )
         use_indexer_loss = (
-            training_with_grad and indexer_loss_coeff > 0 and compressed_topk is not None
+            training_with_grad
+            and indexer_loss_coeff > 0
+            and compressed_topk is not None
         )
         compressed_width = (
             compressed_topk.shape[-1]
             if compressed_topk is not None
             else (max_seqlen_q // ratio if ratio > 1 else 0)
         )
-        topk_idxs, topk_length, indexer_topk_rank_major = (
-            csa_cp_layout_kernels.build_attention_indices(
-                cu_seqlens,
-                global_start,
-                l_local,
-                d_window,
-                self.config.sliding_window,
-                ratio,
-                compressed_width,
-                compressed_topk,
-                cu_seqlens_compressed=cu_seqlens_compressed,
-                seq_to_rank_row=seq_to_rank_row,
-                for_indexer_loss=use_indexer_loss,
-            )
+        attention_indices = csa_cp_layout_kernels.build_attention_indices(
+            cu_seqlens,
+            global_start,
+            l_local,
+            d_window,
+            self.config.sliding_window,
+            ratio,
+            compressed_width,
+            compressed_topk,
+            cu_seqlens_compressed=cu_seqlens_compressed,
+            seq_to_rank_row=seq_to_rank_row,
+            for_indexer_loss=use_indexer_loss,
+            # nv/dev now requires the physical capacity of the compressed buffer
+            # the indices will address; it is the gathered rank-major KV itself.
+            compressed_rows=compressed_kv_rank_major.shape[0],
         )
+
+        topk_idxs, topk_length, indexer_topk_rank_major = attention_indices[:3]
 
         if use_indexer_loss:
             k_indexer_for_loss = k_indexer_rank_major
@@ -1073,3 +1536,268 @@ class CompressedSparseAttention(nn.Module):
                 query, kv_full_thd, self.sinks.float(), topk_idxs, self.softmax_scale
             )
         return output.unsqueeze(1)
+
+
+from dataclasses import dataclass, replace
+
+import megatron.lite.primitive.modules.native_fp32_linear as _native_linear
+from megatron.lite.primitive.modules.attention.mhc import RMSNorm
+
+Linear = _native_linear.Linear
+native_fp32_linear = _native_linear.native_fp32_linear
+from megatron.lite.primitive.quantization import mxfp8
+from megatron.lite.primitive.quantization.mxfp4 import fake_quant_index
+from megatron.lite.primitive.quantization.nvfp4 import fake_quant_main_kv
+from megatron.lite.primitive.utils.rotary import _yarn_find_correction_range
+from torch.nn import functional as F
+
+
+@dataclass(frozen=True)
+class CrossLayerAttentionConfig:
+    dim: int = 5120
+    heads: int = 64
+    head_dim: int = 512
+    rope_dim: int = 64
+    q_rank: int = 1280
+    o_rank: int = 1024
+    groups: int = 8
+    index_heads: int = 32
+    index_dim: int = 128
+    topk: int = 512
+    window: int = 128
+    candidate_blocks: int = 2048
+    block_size: int = 8
+    eps: float = 1e-20
+    rope_theta: float = 10000
+    compress_rope_theta: float = 160000
+    original_length: int = 65536
+    factor: float = 16
+    beta_fast: float = 32
+    beta_slow: float = 1
+    linear_fp8: bool = True
+    main_qat: bool = True
+    index_qat: bool = True
+    swa_fp8: bool = True
+    deployment_hf_config: dict | None = None
+
+
+@dataclass(frozen=True)
+class AttentionState:
+    kv_owner: int | None = None
+    index_owner: int | None = None
+    main_kv: torch.Tensor | None = None
+    index_k: torch.Tensor | None = None
+    indices: torch.Tensor | None = None
+    candidates: torch.Tensor | None = None
+
+
+def _indexer_linear(linear, x, deployment_math):
+    """Replicated BF16 indexer projection (wk, weights_proj).
+
+    vLLM's batch-invariant ReplicatedLinear runs the fixed-order BF16 GEMM with
+    FP32 accumulation and rounds the result to BF16; cuBLAS can differ in the
+    last bit, which moves index keys and weights before Top-K.
+    """
+    if deployment_math and x.is_cuda:
+        from megatron.lite.primitive.modules import deployment_math as native
+
+        return native.bf16_fp32_linear(x, linear.weight).to(x.dtype)
+    return linear(x)
+
+
+def rope_cos_sin_cache(length, config, ratio, device):
+    """FP32 cos||sin rows for positions [0, length), deployment frequencies."""
+    rd = config.rope_dim
+    probe = torch.zeros(1, length, rd, device=device)
+    probe[..., ::2] = 1
+    rotated = rotate(
+        probe,
+        torch.arange(length, device=device),
+        config,
+        ratio,
+        output_dtype=torch.float32,
+        deployment_math=True,
+    )[0]
+    return torch.cat((rotated[:, ::2], rotated[:, 1::2]), -1).contiguous()
+
+
+def _native_inverse_rope_activation(output, positions, config, ratio):
+    """vLLM's fused inverse RoPE + block32 E8M0 FP8 codec for the wo_a input."""
+    from megatron.lite.primitive.quantization.mxfp8 import FP8Values
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+
+    b, length, heads, head_dim = output.shape
+    groups = config.groups
+    width = heads * head_dim // groups
+    cache = rope_cos_sin_cache(int(positions.max()) + 1, config, ratio, output.device)
+    values, scales = fused_inv_rope_fp8_quant(
+        output.reshape(b * length, heads, head_dim),
+        positions.to(torch.int64).repeat(b),
+        cache,
+        n_groups=groups,
+        heads_per_group=heads // groups,
+        nope_dim=head_dim - config.rope_dim,
+        rope_dim=config.rope_dim,
+        quant_group_size=32,
+        tma_aligned_scales=False,
+    )
+    values = values.contiguous().reshape(b, length, groups, width)
+    scales = scales.contiguous().reshape(b, length, groups, width // 32)
+    exponent = torch.log2(scales)
+    decoded = (values.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1)).flatten(
+        -2
+    )
+    return FP8Values(
+        values, (exponent + 127).to(torch.uint8).view(torch.float8_e8m0fnu), decoded
+    )
+
+
+def rotate(
+    x,
+    positions,
+    config,
+    ratio,
+    *,
+    inverse=False,
+    output_dtype=None,
+    deployment_math=False,
+):
+    rd = config.rope_dim
+    theta = config.compress_rope_theta if ratio != 0 else config.rope_theta
+    dims = torch.arange(0, rd, 2, device=x.device, dtype=torch.float32)
+    pos_freqs = theta ** (dims / rd)
+    freqs = 1 / pos_freqs
+    if ratio != 0 and config.original_length > 0:
+        low, high = _yarn_find_correction_range(
+            config.beta_fast, config.beta_slow, rd, theta, config.original_length
+        )
+        ramp = (
+            (torch.arange(rd // 2, device=x.device) - low) / max(high - low, 1e-3)
+        ).clamp(0, 1)
+        if deployment_math:
+            mask = 1 - ramp
+            freqs = (1 / (config.factor * pos_freqs)) * (1 - mask) + freqs * mask
+        else:
+            freqs = freqs / config.factor * ramp + freqs * (1 - ramp)
+    angles = positions.float().unsqueeze(-1) * freqs
+    if deployment_math:
+        # Match the deployed FP32 Q RoPE multiply-add order before BF16 rounding.
+        # addcmul retains the ordinary Torch VJP; the default complex path is unchanged.
+        shape = (1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
+        cosine = angles.cos().reshape(shape)
+        sine = angles.sin().reshape(shape)
+        if inverse:
+            sine = -sine
+        pairs = x[..., -rd:].float().unflatten(-1, (-1, 2))
+        even, odd = pairs[..., 0], pairs[..., 1]
+        real = torch.addcmul(-(odd * sine), even, cosine)
+        imag = torch.addcmul(odd * cosine, even, sine)
+        dtype = x.dtype if output_dtype is None else output_dtype
+        rotated = torch.stack((real, imag), -1).flatten(-2).to(dtype)
+        return torch.cat((x[..., :-rd].to(dtype), rotated), -1)
+    phase = torch.polar(torch.ones_like(angles), -angles if inverse else angles)
+    phase = phase.reshape(1, positions.numel(), *([1] * (x.ndim - 3)), rd // 2)
+    tail = torch.view_as_complex(
+        x[..., -rd:].float().contiguous().unflatten(-1, (-1, 2))
+    )
+    dtype = x.dtype if output_dtype is None else output_dtype
+    rotated = torch.view_as_real(tail * phase).flatten(-2).to(dtype)
+    return torch.cat([x[..., :-rd].to(dtype), rotated], -1)
+
+
+class CrossLayerCompressor(nn.Module):
+    def __init__(self, config, ratio):
+        super().__init__()
+        self.ratio = ratio
+        self.deployment_math = False
+        dtype = torch.float32 if ratio > 1 else torch.bfloat16
+        self.wkv = Linear(config.dim, config.head_dim, dtype=dtype)
+        self.norm = RMSNorm(config.head_dim, config.eps)
+        if ratio > 1:
+            self.wgate = Linear(config.dim, config.head_dim, dtype=torch.float32)
+
+    def forward(self, x):
+        if self.deployment_math and x.is_cuda:
+            from megatron.lite.primitive.modules import deployment_math
+
+            return deployment_math.compressor(
+                x,
+                self.wkv.weight,
+                getattr(self, 'wgate', None).weight if self.ratio == 2 else None,
+                self.norm.weight,
+                self.ratio,
+                self.norm.eps,
+            )
+        if self.ratio == 1:
+            return self.norm(self.wkv(x))
+        cutoff = x.shape[1] // self.ratio * self.ratio
+        values = self.wkv(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
+        gates = self.wgate(x[:, :cutoff].float()).unflatten(1, (-1, self.ratio))
+        return self.norm((values * gates.softmax(2)).sum(2).to(x.dtype))
+
+
+class CrossLayerIndexer(nn.Module):
+    def __init__(self, config, owns_k):
+        super().__init__()
+        self.wq_b = Linear(
+            config.q_rank,
+            config.index_heads * config.index_dim,
+            fp8=config.linear_fp8,
+            fp8_operator=mxfp8.dynamic_fp8_linear,
+        )
+        self.weights_proj = Linear(config.dim, config.index_heads)
+        if owns_k:
+            self.wk = Linear(config.head_dim, config.index_dim)
+            self.k_norm = RMSNorm(config.index_dim, config.eps)
+        # Post-training port policy: selection is frozen, with no indexer loss.
+        # Shared compressor/Q projections outside this module remain trainable.
+        self.requires_grad_(False)
+
+
+def _visible(scores, lengths):
+    lengths = torch.as_tensor(lengths, device=scores.device)
+    return torch.arange(scores.shape[-1], device=scores.device) < lengths
+
+
+def candidate_blocks(
+    scores, lengths, *, topk_blocks=2048, block_size=8, phase="post-training"
+):
+    if phase != "post-training":
+        raise ValueError("Two-level candidates are a post-training policy")
+    if block_size <= 0 or topk_blocks <= 0:
+        raise ValueError("Candidate block size and count must be positive")
+    width = scores.shape[-1]
+    if width == 0:
+        return torch.zeros_like(scores, dtype=torch.bool)
+    masked = scores.masked_fill(~_visible(scores, lengths), -torch.inf)
+    maxima = F.pad(masked, (0, -width % block_size), value=-torch.inf)
+    maxima = maxima.unflatten(-1, (-1, block_size)).amax(-1)
+    last = (torch.as_tensor(lengths, device=scores.device) - 1) // block_size
+    blocks = torch.arange(maxima.shape[-1], device=scores.device)
+    maxima = maxima.masked_fill(blocks == last, torch.inf)
+    top = maxima.topk(min(topk_blocks, maxima.shape[-1]), dim=-1)
+    keep = torch.zeros_like(maxima, dtype=torch.bool).scatter_(
+        -1, top.indices, top.values > -torch.inf
+    )
+    # Preserve complete block membership; consumers independently apply causal
+    # visibility, including the unfinished portion of the newest block.
+    return keep.repeat_interleave(block_size, dim=-1)[..., :width]
+
+
+def select_positions(scores, lengths, topk, *, offset=0, candidates=None):
+    if topk < 0:
+        raise ValueError("Top-K must be nonnegative")
+    visible = _visible(scores, lengths)
+    masked = scores.masked_fill(~visible, -torch.inf)
+    if candidates is not None:
+        if candidates.shape != scores.shape or candidates.dtype != torch.bool:
+            raise ValueError("Candidate mask must be boolean and match scores")
+        masked = masked.masked_fill(~candidates, -torch.inf)
+    indices = masked.topk(min(topk, scores.shape[-1]), dim=-1, sorted=False).indices
+    indices = indices.sort(-1).values
+    # An empty/small pool must never reintroduce an excluded position through
+    # the arbitrary tail of topk(-inf). Invalid slots are represented by -1.
+    valid = masked.gather(-1, indices) > -torch.inf
+    return torch.where(valid, indices + offset, -1).to(torch.int32)
