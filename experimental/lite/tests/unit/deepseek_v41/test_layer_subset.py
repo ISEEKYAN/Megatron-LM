@@ -268,3 +268,18 @@ def test_inference_candidate_audit_counts_dropped_blocks(monkeypatch, tmp_path):
 
     (row,) = [e for e in _events(tmp_path) if e['kind'] == 'candidate_blocks_call']
     assert row['owner'] == 'inference' and row['dropped'] == 1
+
+
+def test_first_layer_broadcast_only_without_engram():
+    from megatron.lite.model.deepseek_v41 import topology
+
+    release = topology.V41_TOPOLOGY
+    assert release[0].broadcasts_embedding
+    assert not any(policy.broadcasts_embedding for policy in release[1:])
+
+    text = _layer_subset().subset_config(release_config().to_hf_dict(), P6)[
+        'text_config'
+    ]
+    proxy = topology.build_topology(_layer_subset()._spec(text))
+    # Layer 0 is release layer 1: Engram injects first, so the copies differ.
+    assert proxy[0].engram_slot == 0 and not proxy[0].broadcasts_embedding

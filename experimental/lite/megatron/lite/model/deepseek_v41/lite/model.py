@@ -199,7 +199,7 @@ class DeepseekV41Model(nn.Module):
             block.attn_norm.deployment_math = deployment_math
             block.ffn_norm.deployment_math = deployment_math
             block.attn_mixes.deployment_math = deployment_math
-            block.attn_mixes.broadcast_projection = layer_id == 0
+            block.attn_mixes.broadcast_projection = policy.broadcasts_embedding
             block.ffn_mixes.deployment_math = deployment_math
             block.engram = None
             self.layers[layer_id] = block

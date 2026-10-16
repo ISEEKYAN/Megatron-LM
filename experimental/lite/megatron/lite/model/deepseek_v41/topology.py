@@ -29,6 +29,13 @@ class LayerPolicy:
     engram_slot: int | None
     is_ced_boundary: bool
 
+    @property
+    def broadcasts_embedding(self) -> bool:
+        # The first layer may project one embedding copy with summed mix
+        # weights only while all hc copies are equal; an Engram injection
+        # before its mixes makes them differ.
+        return self.index == 0 and self.engram_slot is None
+
 
 def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
     """Validate sources once, then assign the last published owner to each layer.
