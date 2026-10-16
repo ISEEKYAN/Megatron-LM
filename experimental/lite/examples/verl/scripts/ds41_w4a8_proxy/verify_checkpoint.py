@@ -7,6 +7,7 @@ from pathlib import Path
 p = argparse.ArgumentParser()
 p.add_argument('saved', type=Path)
 p.add_argument('resumed', type=Path)
+p.add_argument('--ranks', type=int, default=8)
 args = p.parse_args()
 
 
@@ -21,10 +22,10 @@ def events(root, kind):
 
 saved = events(args.saved, 'checkpoint_save')
 loaded = events(args.resumed, 'checkpoint_load')
-assert len(saved) == len(loaded) == 8, (len(saved), len(loaded))
+assert len(saved) == len(loaded) == args.ranks, (len(saved), len(loaded))
 left = {x['rank']: x for x in saved}
 right = {x['rank']: x for x in loaded}
-assert set(left) == set(right) == set(range(8))
+assert set(left) == set(right) == set(range(args.ranks))
 rows = []
 for rank in sorted(left):
     a, b = left[rank], right[rank]

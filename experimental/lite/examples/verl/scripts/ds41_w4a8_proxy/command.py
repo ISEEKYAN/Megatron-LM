@@ -16,7 +16,13 @@ model = Path(os.environ['DS41_MODEL'])
 rollout = rollout_settings(json.loads((model / 'config.json').read_text()), os.environ)
 if rollout['breakable']:
     os.environ['VLLM_USE_BREAKABLE_CUDAGRAPH'] = '1'
-ep, pp, world = 8, 1, 8
+ep = int(os.environ.get('DS41_EP', '8'))
+cp = int(os.environ.get('DS41_CP', '1'))
+pp = 1
+world = int(os.environ.get('DS41_WORLD', str(ep * cp)))
+# Prompts per step; each of the world's data-parallel ranks needs >=1 sequence.
+train_batch = int(os.environ.get('DS41_TRAIN_BATCH', '8'))
+kv_cache_bytes = int(os.environ.get('DS41_KV_CACHE_BYTES', str(256 * 2**20)))
 segmented_host = '1'
 bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
@@ -27,10 +33,16 @@ prompt_length = int(
 )
 response_length = int(os.environ.get('DS41_RESPONSE_LENGTH', '128'))
 context_length = prompt_length + response_length
-if layers not in (2, 4, 6) or min(prompt_length, response_length) <= 0:
+if layers not in (2, 4, 6, 40) or min(prompt_length, response_length) <= 0:
     raise ValueError(
-        'Expected a 2L/4L prefix or the 6L release subset and positive '
-        'prompt/response lengths'
+        'Expected a 2L/4L prefix, the 6L release subset or the full 40L model '
+        'and positive prompt/response lengths'
+    )
+if min(ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
+    raise ValueError('DS41_WORLD must be divisible by DS41_EP and DS41_CP')
+if train_batch < 1 or (train_batch * 4) % (world // cp):
+    raise ValueError(
+        'DS41_TRAIN_BATCH x n=4 must divide evenly over data-parallel ranks'
     )
 if not os.environ.get('DS41_DATA'):
     raise ValueError('DS41_DATA must point to the DAPO training parquet')
@@ -91,7 +103,7 @@ args = [
     'algorithm.rollout_correction.rollout_rs=null',
     f'data.train_files={os.environ["W4_GRPO_DATA"]}',
     f'data.val_files={os.environ["W4_GRPO_DATA"]}',
-    'data.train_batch_size=8',
+    f'data.train_batch_size={train_batch}',
     f'data.max_prompt_length={prompt_length}',
     f'data.max_response_length={response_length}',
     'data.truncation=left',
@@ -102,7 +114,7 @@ args = [
     'actor_rollout_ref.model.trust_remote_code=true',
     'actor_rollout_ref.model.use_remove_padding=true',
     'actor_rollout_ref.model.use_fused_kernels=false',
-    'actor_rollout_ref.actor.ppo_mini_batch_size=8',
+    f'actor_rollout_ref.actor.ppo_mini_batch_size={train_batch}',
     'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1',
     'actor_rollout_ref.actor.use_dynamic_bsz=false',
     'actor_rollout_ref.actor.ppo_epochs=1',
@@ -199,7 +211,7 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
     + hydra_mapping(rollout['compilation_config']),
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:false,embedding_across_dp:true,dp_shared_memory:false}',
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=268435456',
+    f'+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes={kv_cache_bytes}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:0}',
     'critic.enable=false',
@@ -266,6 +278,20 @@ for key in (
         args.append(
             f'++ray_kwargs.ray_init.runtime_env.env_vars.{key}={json.dumps(os.environ[key])}'
         )
+# Opt-in knobs append arguments only when set, so default runs keep the
+# exact argument list of the validated 2L/4L recipe.
+if cp != 1:
+    args += [
+        f'actor_rollout_ref.actor.engine.cp={cp}',
+        f'actor_rollout_ref.ref.engine.cp={cp}',
+    ]
+if os.environ.get('DS41_RECOMPUTE'):
+    # Long sequences: full activation recompute of CSA-state-consuming layers.
+    args += [
+        f'++actor_rollout_ref.{role}.engine.impl_cfg.recompute='
+        + os.environ['DS41_RECOMPUTE']
+        for role in ('actor', 'ref')
+    ]
 if os.environ.get('DS41_RESUME'):
     args += [
         'trainer.resume_mode=resume_path',

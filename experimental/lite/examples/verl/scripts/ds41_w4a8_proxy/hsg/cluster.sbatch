@@ -34,7 +34,8 @@ export RAY_AUTH_MODE=token
 export RAY_AUTH_TOKEN=$(openssl rand -hex 32)
 unset RAY_AUTH_TOKEN_PATH
 mapfile -t RECIPE_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
-test "${#RECIPE_NODES[@]}" -eq 2
+export RECIPE_NNODES=${#RECIPE_NODES[@]}
+test "$RECIPE_NNODES" -ge 2
 RECIPE_HEAD_IP=$(getent ahostsv4 "${RECIPE_NODES[0]}" | awk 'NR==1 {print $1}')
 RECIPE_OUTPUT="$RECIPE_ROOT/logs/$RECIPE_STAGE"
 mkdir -p "$RECIPE_OUTPUT"
@@ -42,17 +43,22 @@ srun --exact -N1 -n1 -w "${RECIPE_NODES[0]}" \
  bash "$DS41_BUNDLE/recipe/hsg/node.sh" "$RECIPE_ROOT" "$RECIPE_OUTPUT" head "$RECIPE_HEAD_IP" \
  >"$RECIPE_OUTPUT/head.log" 2>&1 &
 RECIPE_HEAD_PID=$!
-srun --exact -N1 -n1 -w "${RECIPE_NODES[1]}" \
- bash "$DS41_BUNDLE/recipe/hsg/node.sh" "$RECIPE_ROOT" "$RECIPE_OUTPUT" worker "$RECIPE_HEAD_IP" \
- >"$RECIPE_OUTPUT/worker.log" 2>&1 &
-RECIPE_WORKER_PID=$!
+RECIPE_WORKER_PIDS=()
+for RECIPE_WORKER in "${RECIPE_NODES[@]:1}"; do
+ srun --exact -N1 -n1 -w "$RECIPE_WORKER" \
+  bash "$DS41_BUNDLE/recipe/hsg/node.sh" "$RECIPE_ROOT" "$RECIPE_OUTPUT" worker "$RECIPE_HEAD_IP" \
+  >"$RECIPE_OUTPUT/worker-$RECIPE_WORKER.log" 2>&1 &
+ RECIPE_WORKER_PIDS+=($!)
+done
 cleanup() {
  touch "$RECIPE_OUTPUT/stop-workers"
- kill -TERM "$RECIPE_HEAD_PID" "$RECIPE_WORKER_PID" 2>/dev/null || true
+ kill -TERM "$RECIPE_HEAD_PID" "${RECIPE_WORKER_PIDS[@]}" 2>/dev/null || true
 }
 trap cleanup TERM INT
 RECIPE_RESULT=0
 wait "$RECIPE_HEAD_PID" || RECIPE_RESULT=$?
 touch "$RECIPE_OUTPUT/stop-workers"
-wait "$RECIPE_WORKER_PID" || RECIPE_RESULT=$?
+for RECIPE_WORKER_PID in "${RECIPE_WORKER_PIDS[@]}"; do
+ wait "$RECIPE_WORKER_PID" || RECIPE_RESULT=$?
+done
 exit "$RECIPE_RESULT"

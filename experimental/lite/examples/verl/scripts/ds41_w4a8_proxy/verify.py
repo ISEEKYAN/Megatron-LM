@@ -14,7 +14,10 @@ p.add_argument('--start-step', type=int, default=1)
 p.add_argument('--ranks', type=int, default=8)
 p.add_argument('--segmented-host', action='store_true')
 p.add_argument(
-    '--frozen-tables', type=int, default=1, help='Frozen Engram tables per resync'
+    '--frozen-tables',
+    type=int,
+    default=1,
+    help='Frozen Engram tables in the model (2L/4L prefixes: 1; 6L subset and 40L: 2)',
 )
 p.add_argument(
     '--parameter-counts',

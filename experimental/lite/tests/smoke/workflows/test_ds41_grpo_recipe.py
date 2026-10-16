@@ -26,11 +26,12 @@ RECIPE = Path(__file__).resolve().parents[3] / 'examples/verl/scripts/ds41_w4a8_
 def _idle_cluster(address):
     import ray
 
+    gpus = int(os.environ.get('DS41_C8_GPUS', '8'))
     ray.init(address=address, ignore_reinit_error=True)
     deadline = time.monotonic() + 90
     try:
-        assert ray.cluster_resources().get('GPU') == 8
-        while ray.available_resources().get('GPU', 0) != 8:
+        assert ray.cluster_resources().get('GPU') == gpus
+        while ray.available_resources().get('GPU', 0) != gpus:
             assert time.monotonic() < deadline, ray.available_resources()
             time.sleep(2)
     finally:
@@ -52,12 +53,13 @@ LONG_PROMPTS = {
     6: 'c8-candidate-long-prompts.parquet',
 }
 PROMPT_LENGTHS = {4: '12800', 6: '17408'}
-FROZEN_TABLES = {6: '2'}
+FROZEN_TABLES = {6: '2', 40: '2'}
 
 
 def _parameter_counts(layers):
-    # 6L trainable leaves come from its CPU init receipt, not a guess.
-    known = {2: '334', 4: '665'}
+    # 6L trainable leaves come from its CPU init receipt, not a guess
+    # (40L: EP64 CONFIG_ONLY, 1540 on every rank).
+    known = {2: '334', 4: '665', 40: '1540'}
     return known.get(layers) or os.environ['DS41_PARAMETER_COUNTS']
 
 
@@ -79,6 +81,10 @@ def production_environment(layers, bi, inputs):
         DS41_INDEXER_DIAGNOSTIC=str(int(layers == 4)),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
+    if layers == 40:
+        # Full model: EP64/DP64 over 16 nodes; four sequences per prompt need
+        # 16 prompts so that every data-parallel rank receives one sequence.
+        base.update(DS41_EP='64', DS41_WORLD='64', DS41_TRAIN_BATCH='16')
     base['PYTHONPATH'] = str(RECIPE.parents[1]) + ':' + base.get('PYTHONPATH', '')
     return base
 
@@ -92,7 +98,7 @@ def stage_environment(base, run, steps, resume):
     return env
 
 
-@pytest.mark.parametrize('layers,bi', [(2, 1), (4, 1), (6, 1), (2, 0)])
+@pytest.mark.parametrize('layers,bi', [(2, 1), (4, 1), (6, 1), (2, 0), (40, 1)])
 def test_two_updates_and_checkpoint_resume(layers, bi):
     """Require raw token equality and exact saved owner/state on a fresh process."""
     if os.environ.get('DS41_C8_ENABLED') != '1':
@@ -117,7 +123,9 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             ['bash', str(RECIPE / 'run.sh')],
             run / 'train.log',
             env,
-            timeout=(2700 if layers >= 4 else (2400 if stage == 'resumed' else 1500)),
+            timeout={2: 2400 if stage == 'resumed' else 1500, 4: 2700, 6: 2700, 40: 6600}[
+                layers
+            ],
         )
         events = [
             json.loads(line)
@@ -142,6 +150,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                     _parameter_counts(layers),
                     '--frozen-tables',
                     FROZEN_TABLES.get(layers, '1'),
+                    *(['--ranks', '64'] if layers == 40 else []),
                 ],
                 run / 'verified.json',
                 base,
@@ -201,6 +210,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                 str(RECIPE / 'verify_checkpoint.py'),
                 str(output / 'fresh'),
                 str(output / 'resumed'),
+                *(['--ranks', '64'] if layers == 40 else []),
             ],
             output / 'checkpoint-verified.json',
             base,

@@ -9,6 +9,8 @@ export DS41_OUTPUT=/run-artifacts/cpu-config DS41_LAYERS=$RECIPE_LAYERS
 if [[ "$RECIPE_LAYERS" == 6 ]]; then
  # Renumbered release subset instead of a closed prefix (see README).
  export DS41_VARIANT_LAYERS=1,14,15,20,21,24
+elif [[ "$RECIPE_LAYERS" == 40 ]]; then
+ export DS41_EP=64 DS41_WORLD=64 DS41_TRAIN_BATCH=16
 fi
 export DS41_DATA=/data/${DS41_DATA_FILE:-dapo-math-17k-cleaned.parquet}
 export PYTHONPATH=/opt/src/mlite/experimental/lite/examples/verl:${PYTHONPATH:-}
@@ -18,4 +20,9 @@ if [[ "$RECIPE_LAYERS" == 6 ]]; then
  "$DS41_PYTHON" /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/prepare_long_prompts.py \
   --data "$DS41_DATA" --model "$DS41_MODEL" --output /run-artifacts/inputs/c8-candidate-long-prompts.parquet \
   --min-tokens 17408 --limit 16 --repeat-to-limit --repeat-content-to-min
+elif [[ "$RECIPE_LAYERS" == 4 ]]; then
+ # The 4L C8 crosses the 12288-row indexer boundary with long prompts.
+ "$DS41_PYTHON" /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/prepare_long_prompts.py \
+  --data "$DS41_DATA" --model "$DS41_MODEL" --output /run-artifacts/inputs/c8-boundary-long-prompts.parquet \
+  --min-tokens 12800 --limit 16 --repeat-to-limit --repeat-content-to-min
 fi

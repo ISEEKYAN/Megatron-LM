@@ -3,7 +3,7 @@ set -euo pipefail
 source /recipe/runtime-cache-env.sh
 export RAY_worker_register_timeout_seconds=180
 RECIPE_C8_MODE=${RECIPE_C8_MODE:---c8-2l}
-case "$RECIPE_C8_MODE" in --c8-2l|--c8-6l) ;; *) exit 2 ;; esac
+case "$RECIPE_C8_MODE" in --c8-2l|--c8-4l|--c8-6l|--c8-40l) ;; *) exit 2 ;; esac
 printf 'RECIPE_C8_MODE=%s\n' "$RECIPE_C8_MODE"
 sha256sum /recipe/node.sh /recipe/container-node.sh \
  /recipe/run-c8.py /recipe/ray_ports.py /recipe/runtime-cache-env.sh \
@@ -98,8 +98,9 @@ assert ray._config.worker_register_timeout_seconds()==180
 print('RECIPE_RAY_NATIVE_WORKER_REGISTRATION_WAIT',180,flush=True)
 ray.init(address=os.environ['DS41_RAY_ADDRESS'])
 deadline=time.monotonic()+180
-expected=0 if os.environ.get('RECIPE_CPU_COLLECTION')=='1' else 8
-while ray.cluster_resources().get('GPU',0)!=expected or len([n for n in ray.nodes() if n['Alive']])!=2:
+nodes=int(os.environ.get('RECIPE_NNODES','2'))
+expected=0 if os.environ.get('RECIPE_CPU_COLLECTION')=='1' else 4*nodes
+while ray.cluster_resources().get('GPU',0)!=expected or len([n for n in ray.nodes() if n['Alive']])!=nodes:
  assert time.monotonic()<deadline,ray.cluster_resources()
  time.sleep(2)
 print('RECIPE_RAY_CLUSTER_READY',ray.cluster_resources(),flush=True)
@@ -108,7 +109,7 @@ if os.environ.get('RECIPE_CPU_COLLECTION')=='1':
  runpy.run_path('/recipe/preflight-optimizer-workers.py',run_name='__main__')
 ray.shutdown()
 PY
-export DS41_C8_ENABLED=1 DS41_C8_INPUTS=/run-artifacts/inputs
+export DS41_C8_ENABLED=1 DS41_C8_INPUTS=/run-artifacts/inputs DS41_C8_GPUS=$((4 * ${RECIPE_NNODES:-2}))
 export DS41_C8_OUTPUT=/test-output/c8
 export DS41_C8_SHORT_DATA=/data/${DS41_DATA_FILE:-dapo-math-17k-cleaned.parquet}
 mkdir -p "$DS41_C8_OUTPUT"
