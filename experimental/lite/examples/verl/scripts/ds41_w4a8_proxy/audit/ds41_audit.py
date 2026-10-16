@@ -227,6 +227,14 @@ def _optimizer(module):
                 'master_after': after,
                 'changed': before != after,
                 'trainable_parameters': len(params),
+                **(
+                    {
+                        'global_rank': torch.distributed.get_rank(),
+                        'world_size': torch.distributed.get_world_size(),
+                    }
+                    if self.ps.pp_size > 1
+                    else {}
+                ),
                 'pp_rank': self.ps.pp_rank,
                 'pp_size': self.ps.pp_size,
                 'ep_size': self.ps.ep_size,

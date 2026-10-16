@@ -72,9 +72,12 @@ for path in sorted((root / 'audit').glob('grad-*.pt')):
     assert payload['input_ids'], path
     grad_tokens += actor.numel()
     grad_updates.add((payload['rank'], payload['update']))
-assert grad_updates == {
-    (rank, update) for rank in range(args.ranks) for update in range(1, args.steps + 1)
-}, grad_updates
+if len(parameter_counts) == 1:
+    assert grad_updates == {
+        (rank, update)
+        for rank in range(args.ranks)
+        for update in range(1, args.steps + 1)
+    }, grad_updates
 assert grad_tokens == sum(row['tokens'] for row in raw), (grad_tokens, raw)
 advs = []
 for path in sorted((root / 'audit').glob('adv-*.pt')):
@@ -147,6 +150,22 @@ for row in events:
         )
         resync.setdefault(row['pid'], []).append(row)
 assert len(optimizers) == args.ranks, len(optimizers)
+if len(parameter_counts) > 1:
+    import sys
+
+    sys.path.insert(0, str(Path(__file__).resolve().parent / 'audit'))
+    from grad_forward import expected_pp_updates
+
+    assert grad_updates == expected_pp_updates(
+        optimizers, ranks=args.ranks, pp_size=len(parameter_counts), steps=args.steps
+    ), grad_updates
+    # Pair each persisted C5 tensor with the optimizer process owning its rank.
+    rank_by_pid = {pid: rows[0]['global_rank'] for pid, rows in optimizers.items()}
+    for path in sorted((root / 'audit').glob('grad-*.pt')):
+        payload = torch.load(path, map_location='cpu', weights_only=False)
+        pid = int(path.name.split('-')[1])
+        assert payload['rank'] == rank_by_pid[pid], ('C5 process/rank mismatch', path)
+
 stage_counts = [
     sum(rows[0].get('pp_rank', 0) == stage for rows in optimizers.values())
     for stage in range(len(parameter_counts))

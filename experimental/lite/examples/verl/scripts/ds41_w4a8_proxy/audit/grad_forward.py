@@ -70,3 +70,29 @@ def install(module, save, event, counters):
         return original(config, model_output, data, dp_group)
 
     module.ppo_loss = loss
+
+
+def expected_pp_updates(optimizer_rows, *, ranks, pp_size, steps):
+    """Validate every stage owner, then require C5 only from the head stage."""
+    assert pp_size > 1 and ranks > 0 and ranks % pp_size == 0 and steps > 0
+    assert len(optimizer_rows) == ranks, 'PP optimizer census incomplete'
+    owners = {}
+    for rows in optimizer_rows.values():
+        identities = {
+            (r['global_rank'], r['pp_rank'], r['pp_size'], r['world_size'])
+            for r in rows
+        }
+        assert len(identities) == 1, 'PP optimizer identity changed'
+        rank, stage, size, world = identities.pop()
+        assert type(rank) is int and type(stage) is int
+        assert 0 <= rank < ranks and size == pp_size and world == ranks
+        assert stage == rank // (ranks // pp_size), 'PP stage/rank mapping differs'
+        assert rank not in owners, 'Duplicate PP optimizer rank'
+        owners[rank] = stage
+    assert set(owners) == set(range(ranks)), 'PP optimizer rank missing'
+    return {
+        (rank, update)
+        for rank, stage in owners.items()
+        if stage == pp_size - 1
+        for update in range(1, steps + 1)
+    }
