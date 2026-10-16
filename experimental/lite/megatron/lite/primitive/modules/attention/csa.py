@@ -757,7 +757,6 @@ class CompressedSparseAttention(nn.Module):
             # Each output group owns a row slice of the release-layout matrix.
             # Keep the same deployment codec as the other FP8 projections;
             # FP32 optimizer masters must never bypass the forward codec.
-            from megatron.lite.primitive.quantization import mxfp8
 
             grouped_codec = (
                 mxfp8.dynamic_fp8_grouped_linear
