@@ -220,66 +220,21 @@ class StagingBudget:
         self.peak_bytes = max(self.peak_bytes, total)
 
 
-class MegaAttnReload:
-    """Apply native checkpoint permutations before per-projection packing.
-
-    Cold load finalizes MegaAttn inside model.load_weights, before the loader
-    processes quant methods. Layerwise reload instead processes each completed
-    projection immediately. Run the same native permutations at that boundary;
-    the model-level finalizer must then skip these already fused weights.
-    """
-
-    def __init__(self, model):
-        self.groups, self.methods = [], []
-        for attention in model.modules():
-            if type(attention).__name__ != 'DeepseekV4MegaAttnAttention':
-                continue
-            from vllm.models.deepseek_v41.common.ops import fused_layout
-
-            completed = set()
-            self.groups.append((attention, completed))
-            attention._fused_layouts_ready = False
-            for name, permute, heads in (
-                ('wq_b', fused_layout.permute_wq_b_, attention.n_local_heads),
-                (
-                    'wo_a',
-                    fused_layout.permute_wo_a_,
-                    attention.n_local_heads // attention.n_local_groups,
-                ),
-            ):
-                projection = getattr(attention, name)
-                # Isolate hooks even if two projections share a quant method.
-                method = copy(projection.quant_method)
-                method.__dict__.pop('process_weights_after_loading', None)
-                process = method.process_weights_after_loading
-
-                def before_pack(
-                    layer,
-                    process=process,
-                    permute=permute,
-                    heads=heads,
-                    name=name,
-                    attention=attention,
-                    completed=completed,
-                ):
-                    if name in completed:
-                        raise RuntimeError('DS4.1 MegaAttn projection processed twice')
-                    permute(layer.weight.data, layer.weight_scale.data, heads)
-                    process(layer)
-                    completed.add(name)
-                    attention._fused_layouts_ready = completed == {'wq_b', 'wo_a'}
-
-                method.process_weights_after_loading = before_pack
-                projection.quant_method = method
-                self.methods.append(method)
-
-    def finish(self):
-        if any(done != {'wq_b', 'wo_a'} for _, done in self.groups):
-            raise ValueError('DS4.1 resync incomplete MegaAttn projections')
-
-    def restore(self):
-        for method in self.methods:
-            method.__dict__.pop('process_weights_after_loading', None)
+def reject_mega_attn(model=None, vllm_config=None):
+    """Reject unsupported rollout layouts before loading or resynchronizing."""
+    config = getattr(vllm_config, 'attention_config', None)
+    backend = getattr(config, 'backend', None)
+    if 'MEGA' in str(backend).upper() or (
+        model is not None
+        and any(
+            type(layer).__name__ == 'DeepseekV4MegaAttnAttention'
+            for layer in model.modules()
+        )
+    ):
+        raise NotImplementedError(
+            'MegaAttn rollout backend unsupported in v1.4 (planned v1.5); '
+            'use FLASHMLA_SPARSE_DSV41'
+        )
 
 
 @contextmanager
@@ -314,8 +269,12 @@ def install_reload_metadata_hook():
 
     @wraps(original)
     def create(self, vllm_config, model_config, prefix=''):
+        is_ds41 = getattr(model_config.hf_config, 'model_type', '') == 'deepseek_v41'
+        if is_ds41:
+            reject_mega_attn(vllm_config=vllm_config)
         model = original(self, vllm_config, model_config, prefix)
-        if getattr(model_config.hf_config, 'model_type', '') == 'deepseek_v41':
+        if is_ds41:
+            reject_mega_attn(model=model)
             set_mxfp4_load_numel(model)
             for layer in model.modules():
                 # Every DS4.1 attention backend direct-copies this parameter;
@@ -383,7 +342,7 @@ class ResyncReceiver:
         self.staging.infos = [layerwise.get_layerwise_info(m) for m in model.modules()]
         self.expected_sinks = restore_attn_sink_parameters(model, layerwise)
         self.received_sinks = set()
-        self.mega_attn = MegaAttnReload(model)
+        reject_mega_attn(model=model)
 
     @torch.no_grad()
     def receive(self, weights):
@@ -486,7 +445,6 @@ class ResyncReceiver:
             layerwise.LOADING_LAYERS.discard(layer)
         for module, hook in self.hooks:
             module.process_weights_after_loading = hook
-        self.mega_attn.restore()
         self.staging.refresh()
         self.finished = True
 
@@ -559,8 +517,6 @@ class ResyncReceiver:
                 self._verify_initial_frozen_census()
             with _without_tables(self.model):
                 reload.finalize_layerwise_reload(self.model, self.model_config)
-            self.mega_attn.finish()
-            self.mega_attn.restore()
             for module, hook in self.hooks:
                 module.process_weights_after_loading = hook
             if hasattr(self.model, '_weights_finalized'):
