@@ -57,7 +57,6 @@ def test_several_unsupported_dimensions_are_reported_together():
         (dict(text_only=False), "V4.1_PP_TEXT_ONLY"),
         (dict(external_vision_device="cuda:0"), "V4.1_PP_TEXT_ONLY"),
         (dict(pipeline_split_layer=10), "V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED"),
-        (dict(optimizer="muon"), "V4.1_PP_OPTIMIZER_UNSUPPORTED"),
     ],
 )
 def test_pp2_rejections_name_their_own_cause(kwargs, key):
@@ -66,8 +65,8 @@ def test_pp2_rejections_name_their_own_cause(kwargs, key):
     assert str(caught.value).startswith(key), str(caught.value)
 
 
-@pytest.mark.parametrize("extra", [dict(ep=2), dict(cp=2)])
-def test_pp2_rejects_being_combined_with_ep_or_cp(extra):
+@pytest.mark.parametrize("extra", [dict(cp=2)])
+def test_pp2_rejects_being_combined_with_cp(extra):
     with pytest.raises(NotImplementedError) as caught:
         _build(parallel=ParallelConfig(pp=2, **extra))
     assert str(caught.value).startswith("V4.1_PP_COMBINATION_UNSUPPORTED")

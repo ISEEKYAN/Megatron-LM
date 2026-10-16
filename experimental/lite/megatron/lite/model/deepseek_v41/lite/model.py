@@ -165,6 +165,7 @@ class DeepseekV41Model(nn.Module):
         enable_dspark_execution=False,
         layer_range=None,
         parallel_state=None,
+        pipeline_split_layer=None,
     ):
         nn.Module.__init__(self)
         if deployment_math and (not w4a8_experts or not quantized):
@@ -173,7 +174,7 @@ class DeepseekV41Model(nn.Module):
         self.config = config
         self.deployment_math = deployment_math
         self.topology = config.topology
-        self.pipeline_cut = pipeline_cut(self.topology)
+        self.pipeline_cut = pipeline_cut(self.topology, pipeline_split_layer)
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
             self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
@@ -245,6 +246,7 @@ class DeepseekV41Model(nn.Module):
                 SimpleNamespace(tp_size=1),
                 gate_temperature=gate_temperature,
                 bias_rate=bias_rate,
+                bias_group=self.ps.dp_cp_group if self.ps.pp_size > 1 else None,
             )
             router.deployment_math = deployment_math
             experts = [
@@ -571,7 +573,9 @@ class DeepseekV41Model(nn.Module):
         stream.validate_packed_input(
             input_ids, cu_seqlens, cp_context, self.ps.cp_size, self.engram_group
         )
-        loads = None
+        # Stats are stage-local, just like the DS4 stage-local layer inventory.
+        # _sequence indexes by global layer id; publish only the local interval.
+        loads = [[] for _ in self.layers]
         image_mask = None
         if local_start == cut:
             carrier, self._input_tensor = self._input_tensor, None
@@ -593,7 +597,6 @@ class DeepseekV41Model(nn.Module):
             if images is not None:
                 embeddings = self.merge_image_embeddings(images, embeddings)
             hidden, pre = expand_hc(embeddings, self.hc_mult)
-            loads = [[] for _ in self.layers]
         sequence = partial(self._sequence, modality_loads=loads)
         if cu_seqlens is not None:
             sequence = partial(
@@ -601,7 +604,12 @@ class DeepseekV41Model(nn.Module):
             )
         hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
         if local_end == cut and cut < count:
-            return {'hidden_states': stream.pack_pair(hidden, pre)}
+            return {
+                'hidden_states': stream.pack_pair(hidden, pre),
+                'modality_loads': tuple(
+                    tuple(entries) for entries in loads[local_start:local_end]
+                ),
+            }
         if self.deployment_math and hidden.is_cuda:
             from megatron.lite.primitive.modules import deployment_math
 
@@ -625,7 +633,9 @@ class DeepseekV41Model(nn.Module):
                 'logits': deployment_math.bf16_fp32_linear(collapsed, self.head.weight)
             }
             if loads is not None:
-                result['modality_loads'] = tuple(tuple(entries) for entries in loads)
+                result['modality_loads'] = tuple(
+                    tuple(entries) for entries in loads[local_start:local_end]
+                )
             return result
 
         result = (
@@ -642,7 +652,9 @@ class DeepseekV41Model(nn.Module):
             }
         )
         if loads is not None:
-            result['modality_loads'] = tuple(tuple(entries) for entries in loads)
+            result['modality_loads'] = tuple(
+                tuple(entries) for entries in loads[local_start:local_end]
+            )
         return result
 
     _restore_vision_trainability = staticmethod(visual.restore_vision_trainability)

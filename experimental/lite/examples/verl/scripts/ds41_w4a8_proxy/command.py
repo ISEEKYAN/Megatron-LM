@@ -18,7 +18,7 @@ if rollout['breakable']:
     os.environ['VLLM_USE_BREAKABLE_CUDAGRAPH'] = '1'
 ep = int(os.environ.get('DS41_EP', '8'))
 cp = int(os.environ.get('DS41_CP', '1'))
-pp = 1
+pp = int(os.environ.get('DS41_PP', '1'))
 world = int(os.environ.get('DS41_WORLD', str(ep * cp)))
 # Prompts per step; each of the world's data-parallel ranks needs >=1 sequence.
 train_batch = int(os.environ.get('DS41_TRAIN_BATCH', '8'))
@@ -28,6 +28,7 @@ bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
 layers = int(os.environ.get('DS41_LAYERS', '2'))
+pp_cut = int(os.environ.get('DS41_PIPELINE_SPLIT_LAYER', '2' if layers == 4 else '20'))
 prompt_length = int(
     os.environ.get(
         'DS41_PROMPT_LENGTH',
@@ -41,8 +42,8 @@ if layers not in (2, 4, 6, 8, 9, 40) or min(prompt_length, response_length) <= 0
         'Expected a 2L/4L prefix, a 6L/8L/9L release subset or the full 40L model '
         'and positive prompt/response lengths'
     )
-if min(ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
-    raise ValueError('DS41_WORLD must be divisible by DS41_EP and DS41_CP')
+if pp not in (1, 2) or min(ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
+    raise ValueError('DS41_PP must be 1/2 and DS41_WORLD divisible by EP*PP and CP*PP')
 if train_batch < 1 or (train_batch * 4) % (world // cp):
     raise ValueError(
         'DS41_TRAIN_BATCH x n=4 must divide evenly over data-parallel ranks'
@@ -156,6 +157,7 @@ args = [
             'trainable_engram': 'false',
             'use_deepep': 'false',
             'dtype': 'bfloat16',
+            **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
             'optimizer': 'muon',
             'optimizer_config': '{lr:1e-6,ns_steps:2,coefficient_type:quintic,segmented_host:'
             + ('true' if segmented_host == '1' else 'false')
@@ -174,6 +176,7 @@ args = [
             'trainable_engram': 'false',
             'use_deepep': 'false',
             'dtype': 'bfloat16',
+            **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
         }.items()
     ],
     'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1',

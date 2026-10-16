@@ -118,12 +118,33 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
     return tuple(policies)
 
 
-def pipeline_cut(policies: tuple[LayerPolicy, ...]) -> int:
-    """The only PP split that keeps every CSA owner with its readers: the
-    candidate publisher (release layer 20), or no split without one."""
-    return next(
-        (p.index for p in policies if p.candidate_mode == "build"), len(policies)
-    )
+def pipeline_cut(
+    policies: tuple[LayerPolicy, ...], requested: int | None = None
+) -> int:
+    """Select a stage boundary without transporting cross-layer attention state.
+
+    Like DS4's stage-local layer inventory, every consumer must own its sources
+    on the same stage. Keep the release's candidate-publisher default; explicit
+    cuts also permit closed prefixes (e.g. four layers split before owner 2).
+    """
+    if requested is None:
+        return next(
+            (p.index for p in policies if p.candidate_mode == "build"), len(policies)
+        )
+    if type(requested) is not int or not 0 < requested < len(policies):
+        raise ValueError('V4.1_PP_SPLIT: split must leave two nonempty stages')
+    candidate = next((p.index for p in policies if p.candidate_mode == 'build'), None)
+    for policy in policies[requested:]:
+        owners = (policy.kv_owner, policy.index_owner)
+        if any(owner is not None and owner < requested for owner in owners) or (
+            policy.candidate_mode == 'reuse'
+            and candidate is not None
+            and candidate < requested
+        ):
+            raise NotImplementedError(
+                'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: split crosses an attention owner'
+            )
+    return requested
 
 
 V41_TOPOLOGY = build_topology(TopologySpec())

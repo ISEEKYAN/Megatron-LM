@@ -36,10 +36,12 @@ def parameter_groups(model, *, lr, vision_policy=None):
     builder = OwnedParameterGroups(model, _RULES, lr)
     route = builder.route
     bindings, seen = builder.bindings, builder.seen
-    route(model, 'embed.weight', 'embedding')
-    route(model, 'head.weight', 'head')
-    route(model, 'norm.weight', 'norm')
+    for name, role in (('embed', 'embedding'), ('head', 'head'), ('norm', 'norm')):
+        if getattr(model, name) is not None:
+            route(model, name + '.weight', role)
     for block in model.layers:
+        if block is None:
+            continue
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
             route(a, role + '.weight', role)
@@ -92,11 +94,11 @@ def _optimizer_owners(model):
         for b in model.parameter_bindings()
         if b.role == 'expert' and b.tensor.requires_grad
     ]
-    routers = [block.ffn.gate for block in model.layers]
+    routers = [block.ffn.gate for block in model.layers if block is not None]
     tables = [
         b.engram.embed
         for b in model.layers
-        if b.engram is not None and b.engram.embed.master is not None
+        if b is not None and b.engram is not None and b.engram.embed.master is not None
     ]
     return experts, routers, tables, model.engram_group
 

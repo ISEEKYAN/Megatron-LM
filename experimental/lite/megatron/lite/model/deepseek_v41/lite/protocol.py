@@ -91,30 +91,28 @@ def build_model_config(source, **overrides):
 
 
 def _validate_parallel(c, p, cut=20):
-    """`cut` is the model's candidate-publisher layer (20 in the release)."""
+    """`cut` is the topology-validated stage boundary."""
     if p.pp > 1 and (not c.text_only or c.external_vision_device is not None):
         raise NotImplementedError(
             'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training'
         )
     if p.pp > 1 and c.pipeline_split_layer != cut:
         raise NotImplementedError(
-            f'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer {cut} (the candidate publisher) is supported; other cuts require transporting CSA2 owner state'
+            f'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: expected topology-validated split {cut}'
         )
-    if p.pp > 1 and (p.ep != 1 or p.cp != 1):
+    if p.pp > 1 and p.cp != 1:
         raise NotImplementedError(
-            'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 requires EP=CP=1'
+            'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 currently requires CP=1'
         )
-    if p.pp > 1 and c.optimizer is not None:
-        raise NotImplementedError(
-            'V4.1_PP_OPTIMIZER_UNSUPPORTED: PP2 currently supports model forward/backward; distributed optimizer training is not validated'
-        )
-    if p.pp > 1 and (
-        not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != 2
-    ):
-        raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError('EP size must be a positive integer')
+    if p.pp > 1 and (
+        not torch.distributed.is_initialized()
+        or torch.distributed.get_world_size() % (p.pp * p.ep) != 0
+    ):
+        raise ValueError(
+            'V4.1_PP_WORLD: PP requires an initialized world divisible by PP * EP'
+        )
     if type(p.cp) is not int or p.cp < 1:
         raise ValueError('CP size must be a positive integer')
     # EP-over-CP as in MCore and DeepSeek V4: dense ranks decompose as
@@ -141,6 +139,9 @@ def _construct_model(model_cfg, impl_cfg, ps, layer_range):
             model_cfg,
             parallel_state=ps,
             layer_range=layer_range,
+            pipeline_split_layer=(
+                c.pipeline_split_layer if c.parallel.pp > 1 else None
+            ),
             **project_fields(
                 vars(c),
                 'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
@@ -168,7 +169,8 @@ def build_model(model_cfg, *, impl_cfg):
             'supported: DP, EP, contiguous CP (alone or with EP), or text-only PP2; '
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
-    _validate_parallel(c, p, cut=pipeline_cut(model_cfg.topology))
+    cut = pipeline_cut(model_cfg.topology, c.pipeline_split_layer if p.pp > 1 else None)
+    _validate_parallel(c, p, cut=cut)
     ps = ParallelState()
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         ps = init_parallel(replace(p, etp=1))
@@ -188,14 +190,10 @@ def build_model(model_cfg, *, impl_cfg):
         raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
     if c.deployment_math and (not c.w4a8_experts or not c.quantized):
         raise ValueError('Deployment math requires quantized W4A8 experts')
-    if c.deployment_math and (
-        c.dtype != torch.bfloat16
-        or any(getattr(p, name) != 1 for name in ('tp', 'pp'))
-        or c.use_deepep
-    ):
+    if c.deployment_math and (c.dtype != torch.bfloat16 or p.tp != 1 or c.use_deepep):
         # Contiguous CP is supported (gathered KV/compressor, split SWA writer);
         # each rank evaluates the deployment head on its own rows.
-        raise ValueError('Deployment math requires BF16 and TP/PP=1 without DeepEP')
+        raise ValueError('Deployment math requires BF16 and TP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
         import megatron.lite.primitive.parallel.pp as _imports_pp

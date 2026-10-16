@@ -40,7 +40,9 @@ def reduce_modality_load(indices, image_mask, num_experts, group=None):
 
 
 class ModalityRouter(nn.Module):
-    def __init__(self, config, ps, *, gate_temperature=1.0, bias_rate=0.001):
+    def __init__(
+        self, config, ps, *, gate_temperature=1.0, bias_rate=0.001, bias_group=None
+    ):
         super().__init__()
         if gate_temperature <= 0 or bias_rate < 0:
             raise ValueError("Require positive temperature and nonnegative bias rate")
@@ -48,6 +50,7 @@ class ModalityRouter(nn.Module):
         self.deployment_math = False
         self.gate_temperature = gate_temperature
         self.bias_rate = bias_rate
+        self.bias_group = bias_group
         self.world_size = max(
             math.prod(
                 getattr(ps, name, 1)
@@ -134,7 +137,14 @@ class ModalityRouter(nn.Module):
                     continue
                 bias.copy_(
                     get_updated_expert_bias(
-                        counts, bias, self.bias_rate, dist.group.WORLD
+                        counts,
+                        bias,
+                        self.bias_rate,
+                        (
+                            self.bias_group
+                            if self.bias_group is not None
+                            else dist.group.WORLD
+                        ),
                     )
                 )
 
