@@ -53,6 +53,11 @@ before submission; both preparation and GPU workers receive these settings.
 does not require or grant GPU authorization. The default submits the CPU gate
 and its dependent GPU job.
 
+For a source/native overlay runtime, set `DS41_OVERLAY_SETUP` to its published
+shell setup file. Both CPU and GPU stages source that same file before Enroot;
+it must pin the runtime mounts, not replace the recipe workflow.
+`DS41_ENROOT_DATA_PATH` can select an already expanded, verified runtime.
+
 Resource overrides use `DS41_CPU_TIME`, `DS41_GPU_TIME` (Slurm time format),
 `DS41_CPU_CPUS`, `DS41_GPU_CPUS`, `DS41_CPU_MEM`, `DS41_GPU_MEM`,
 `DS41_CPU_PARTITION`, `DS41_GPU_PARTITION`, and `DS41_CPU_QOS`.
@@ -68,7 +73,7 @@ DS41_CPU_QOS=cpu-short DS41_CPU_MEM=0 DS41_GPU_CPUS=64 DS41_GPU_TIME=01:30:00 \
 
 The launcher first submits a **zero-GPU, two-node CPU gate**. It checks image/files, expands the image before any GPU allocation, prepares the 2L prefix, resolves the production config, exercises real optimizer workers and collects the exact C8 test. Its dependent GPU job runs only after success and is automatically cancelled if the dependency fails.
 
-The account comes from `DS41_SLURM_ACCOUNT`; it is not embedded in the recipe. The GPU submission uses `sbatch --account=<ACCOUNT> -p batch --qos interactive`, **2 nodes × 4 GPUs, `--mem=0`, 60 minutes**. It does not pin nodes or increase scale to bypass a queue. Ray ports derive from the job ID, are checked before startup, and the dashboard is disabled. During GPU execution, JIT caches and container Python/Torch temporary files use a fixed, versioned node-local `/tmp` path without a job ID. Enroot stores the CPU-expanded image at `<OUTPUT>/enroot`, image-preparation staging at `<OUTPUT>/enroot-tmp`, and per-node container startup staging (both CPU and GPU stages) at `<OUTPUT>/gpu-temp/<JOBID>/<HOST>` on shared storage; these are distinct from runtime JIT caches. If your cluster administrator requires excluding CPU nodes, pass `DS41_CPU_EXCLUDE=<OPTIONAL_NODE_LIST>`; no host is embedded in the launcher. GPU/model workers share the eight-card allocation; the proxy reward is CPU code, with no GPU sandbox service.
+The account comes from `DS41_SLURM_ACCOUNT`; it is not embedded in the recipe. The GPU submission uses `sbatch --account=<ACCOUNT> -p batch --qos interactive`, **2 nodes × 4 GPUs, `--mem=0`, 60 minutes**. It does not pin nodes or increase scale to bypass a queue. Ray ports derive from the job ID, are checked before startup, and the dashboard is disabled. During GPU execution, JIT caches and container Python/Torch temporary files use a fixed, versioned node-local `/var/tmp` path without a job ID. Enroot stores the CPU-expanded image at `<OUTPUT>/enroot`, image-preparation staging at node-local `/var/tmp/<USER>-ds41-enroot-cpu`, and GPU container startup staging at node-local `/var/tmp/<USER>-ds41-enroot/<JOBID>/<HOST>`; these are distinct from runtime JIT caches. If your cluster administrator requires excluding CPU nodes, pass `DS41_CPU_EXCLUDE=<OPTIONAL_NODE_LIST>`; no host is embedded in the launcher. GPU/model workers share the eight-card allocation; the proxy reward is CPU code, with no GPU sandbox service.
 
 ## Results and strict acceptance
 

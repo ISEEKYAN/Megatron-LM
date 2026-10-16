@@ -1,5 +1,6 @@
 #!/usr/bin/env bash
 set -euo pipefail
+if [[ -n "${DS41_OVERLAY_SETUP:-}" ]]; then source "$DS41_OVERLAY_SETUP"; fi
 RECIPE_ROOT=${1:?root}
 RECIPE_OUTPUT=${2:?shared output}
 RECIPE_ROLE=${3:?head or worker}
@@ -12,9 +13,9 @@ if [[ "${RECIPE_CPU_COLLECTION:-0}" == 1 ]]; then
 else
  nvidia-smi --query-gpu=uuid,name,driver_version --format=csv,noheader
 fi
-export ENROOT_DATA_PATH="$RECIPE_ROOT/enroot"
-export ENROOT_TEMP_PATH="$RECIPE_ROOT/gpu-temp/$SLURM_JOB_ID/$(hostname)"
-RECIPE_LOCAL_CACHE=/tmp/${USER}-ds41-fp4-v1
+export ENROOT_DATA_PATH="${DS41_ENROOT_DATA_PATH:-$RECIPE_ROOT/enroot}"
+export ENROOT_TEMP_PATH="/var/tmp/${USER}-ds41-enroot/$SLURM_JOB_ID/$(hostname)"
+RECIPE_LOCAL_CACHE=/var/tmp/${USER}-ds41-fp4-v1
 RECIPE_WARM_CACHE="$RECIPE_ROOT/warm-cache"
 mkdir -p "$ENROOT_TEMP_PATH" "$RECIPE_LOCAL_CACHE/tmp" "$RECIPE_WARM_CACHE"
 case "$(findmnt -T "$RECIPE_LOCAL_CACHE" -n -o FSTYPE)" in
@@ -27,6 +28,7 @@ rsync -a --ignore-existing --exclude=locks/ --exclude='*.lock' --exclude=lock \
 export PYTHONPATH=/opt/runtime/.venv/lib/python3.12/site-packages:/opt/src/vllm
 export PYTHONDONTWRITEBYTECODE=1
 export WANDB_MODE=online VLLM_BATCH_INVARIANT=1
+export WANDB_ENTITY=${WANDB_ENTITY:-megatron-core-moe-dev}
 export CUDA_HOME=/usr/local/cuda TORCH_CUDA_ARCH_LIST=10.0 MAX_JOBS=8
 export RECIPE_ALLOCATED_GPU_COUNT=$((4 * ${RECIPE_NNODES:-2}))
 if [[ "${RECIPE_CPU_COLLECTION:-0}" == 1 ]]; then
@@ -43,7 +45,7 @@ export RECIPE_NODE_IP=$(getent ahostsv4 "$(hostname)" | awk 'NR==1 {print $1}')
 set +e
 enroot start --root --rw \
  --env CUDA_VISIBLE_DEVICES --env NVIDIA_VISIBLE_DEVICES --env PYTHONPATH \
- --env PYTHONDONTWRITEBYTECODE --env DS41_DATA_FILE --env WANDB_API_KEY --env WANDB_MODE \
+ --env PYTHONDONTWRITEBYTECODE --env DS41_DATA_FILE --env WANDB_API_KEY --env WANDB_MODE --env WANDB_ENTITY \
  --env RAY_AUTH_MODE --env RAY_AUTH_TOKEN \
  --env DS41_PRECISION --env DS41_CUDAGRAPH --env DS41_CUDAGRAPH_MAX_CAPTURE \
  --env VLLM_USE_BREAKABLE_CUDAGRAPH --env VLLM_BATCH_INVARIANT --env CUDA_HOME --env TORCH_CUDA_ARCH_LIST --env MAX_JOBS \

@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 #SBATCH --export=ALL
 set -euo pipefail
+if [[ -n "${DS41_OVERLAY_SETUP:-}" ]]; then source "$DS41_OVERLAY_SETUP"; fi
 RECIPE_ROOT=${1:?run directory}
 RECIPE_STAGE=${2:?cpu or gpu}
 : "${DS41_BUNDLE:?shared release directory}"
@@ -9,7 +10,7 @@ export RECIPE_CPU_COLLECTION=0 RECIPE_C8_MODE=--c8-${RECIPE_LAYERS}l
 if [[ "$RECIPE_STAGE" == cpu ]]; then
  export RECIPE_CPU_COLLECTION=1 CUDA_VISIBLE_DEVICES=''
  (cd "$DS41_BUNDLE" && sha256sum -c SHA256SUMS)
- export ENROOT_DATA_PATH="$RECIPE_ROOT/enroot" ENROOT_TEMP_PATH="$RECIPE_ROOT/enroot-tmp"
+ export ENROOT_DATA_PATH="${DS41_ENROOT_DATA_PATH:-$RECIPE_ROOT/enroot}" ENROOT_TEMP_PATH=/var/tmp/${USER}-ds41-enroot-cpu
  mkdir -p "$ENROOT_DATA_PATH" "$ENROOT_TEMP_PATH" "$RECIPE_ROOT/inputs/${RECIPE_LAYERS}l/model"
  mkdir -p "$RECIPE_ROOT/warm-cache"
  if test -d "$DS41_BUNDLE/warm-cache"; then
