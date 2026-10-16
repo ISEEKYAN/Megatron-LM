@@ -37,6 +37,12 @@ export DS41_SLURM_ACCOUNT='<ACCOUNT>'
 bash "$DS41_BUNDLE/recipe/hsg/submit.sh" /path/to/your/new-c8-output
 ```
 
+For the 6L release subset, pass `--layers 6` and the trainable count from its CPU init receipt; the CPU gate then writes the renumbered shards and 17408-token prompts (2 h CPU, 2.5 h GPU limits):
+
+```bash
+DS41_PARAMETER_COUNTS=<count> bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 6 /path/to/your/new-c8-output
+```
+
 The launcher first submits a **zero-GPU, two-node CPU gate**. It checks image/files, expands the image before any GPU allocation, prepares the 2L prefix, resolves the production config, exercises real optimizer workers and collects the exact C8 test. Its dependent GPU job runs only after success and is automatically cancelled if the dependency fails.
 
 The account comes from `DS41_SLURM_ACCOUNT`; it is not embedded in the recipe. The GPU submission uses `sbatch --account=<ACCOUNT> -p batch --qos interactive`, **2 nodes × 4 GPUs, `--mem=0`, 60 minutes**. It does not pin nodes or increase scale to bypass a queue. Ray ports derive from the job ID, are checked before startup, and the dashboard is disabled. During GPU execution, JIT caches and container Python/Torch temporary files use a fixed, versioned node-local `/tmp` path without a job ID. Enroot stores the CPU-expanded image at `<OUTPUT>/enroot`, image-preparation staging at `<OUTPUT>/enroot-tmp`, and per-node container startup staging (both CPU and GPU stages) at `<OUTPUT>/gpu-temp/<JOBID>/<HOST>` on shared storage; these are distinct from runtime JIT caches. If your cluster administrator requires excluding CPU nodes, pass `DS41_CPU_EXCLUDE=<OPTIONAL_NODE_LIST>`; no host is embedded in the launcher. GPU/model workers share the eight-card allocation; the proxy reward is CPU code, with no GPU sandbox service.

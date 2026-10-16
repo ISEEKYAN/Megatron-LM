@@ -3,7 +3,7 @@ set -euo pipefail
 source /recipe/runtime-cache-env.sh
 export RAY_worker_register_timeout_seconds=180
 RECIPE_C8_MODE=${RECIPE_C8_MODE:---c8-2l}
-case "$RECIPE_C8_MODE" in --c8-2l) ;; *) exit 2 ;; esac
+case "$RECIPE_C8_MODE" in --c8-2l|--c8-6l) ;; *) exit 2 ;; esac
 printf 'RECIPE_C8_MODE=%s\n' "$RECIPE_C8_MODE"
 sha256sum /recipe/node.sh /recipe/container-node.sh \
  /recipe/run-c8.py /recipe/ray_ports.py /recipe/runtime-cache-env.sh \

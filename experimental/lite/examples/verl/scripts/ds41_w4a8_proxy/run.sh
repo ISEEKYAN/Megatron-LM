@@ -9,7 +9,11 @@ DS41_RECIPE=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$DS41_OUTPUT"
 if [[ -n "${DS41_RELEASE:-}" ]]; then
  export DS41_MODEL="${DS41_MODEL:-$DS41_OUTPUT/model}"
- "$DS41_PYTHON" "$DS41_RECIPE/prepare_prefix.py"
+ if [[ -n "${DS41_VARIANT_LAYERS:-}" ]]; then
+  "$DS41_PYTHON" "$DS41_RECIPE/prepare_variant.py"
+ else
+  "$DS41_PYTHON" "$DS41_RECIPE/prepare_prefix.py"
+ fi
 fi
 : "${DS41_MODEL:?prepared release prefix directory required}"
 export VLLM_BATCH_INVARIANT="${VLLM_BATCH_INVARIANT:-1}"
