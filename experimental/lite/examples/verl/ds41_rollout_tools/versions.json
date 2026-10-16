@@ -1,0 +1,85 @@
+{
+ "_about": "Runtime the reference in reference/ was produced and checked with. Measured inside the container; \"unknown\" = not recorded in the image.",
+ "runtime_image": {
+  "squashfs_sha256": "2f8431085e9e027cc3896479e28137075aed54b5c47e50a9457b578abb3b70ac",
+  "base_image_sha256": "503314df68a80ba5a339e1105479c06b86d683b9c0687d6e0b66761880cc1c9e",
+  "base_image_tag": {
+   "value": "nvcr.io/nvidia/pytorch:26.09-py3 (ARM64)",
+   "note": "build record; the image carries no label to confirm it"
+  },
+  "source_heads_in_image": {
+   "vllm": "cda88702e630961edb1bac373dd8607b13d51ede",
+   "mlite": "3edbc7e3fe4d912b813e89d4577507dbdfb93f06",
+   "verl": "45cbfcfa776740224dbd764b09f9ae06d110cc7e"
+  }
+ },
+ "sources_used": {
+  "megatron_lite": "62c25c0757721e2abd246318a699aa503709547c",
+  "vllm": "b2531ae20615472ca0a96957114fe46b137c21b6 (Python sources over the image wheel; csrc tree 2638205ac90d936f6339462e9394e7e46c00fcde)",
+  "vllm_batch_invariant_extension_sha256": "c34b5060f9d8ccd9cb8cf101be0e23e080f2243820c176609b5fdbc0e6135f89"
+ },
+ "os": {
+  "value": "Ubuntu 24.04.4 LTS, aarch64, glibc 2.39",
+  "source": "/etc/os-release"
+ },
+ "python": {
+  "value": "3.12.3",
+  "source": "sys.version"
+ },
+ "cuda_toolkit": {
+  "value": "13.4 (nvcc V13.4.59; CUDA_VERSION=13.4.1.012)",
+  "source": "nvcc --version"
+ },
+ "cuda_driver_requirement": {
+  "value": "unknown",
+  "source": "not recorded in the image"
+ },
+ "torch": {
+  "value": "2.14.0+cu130 (CUDA 13.0, git 08187d9e0fba026dc8217405802ab5381dc88d90, CXX11 ABI=True)",
+  "source": "torch.__version__ / torch.version"
+ },
+ "nccl": {
+  "value": "2.30.7 used by torch (pip nvidia-nccl 2.30.7); image system lib NCCL_VERSION=2.31.2",
+  "source": "torch.cuda.nccl.version()"
+ },
+ "transformer_engine": {
+  "value": "2.19.0+5e52befd (local build from /workspace/TransformerEngine; full commit unknown)",
+  "source": "transformer_engine.__version__"
+ },
+ "flashinfer": {
+  "value": "0.7.0.post1 (git commit unknown)",
+  "source": "flashinfer.__version__"
+ },
+ "deep_gemm": {
+  "value": "vllm.third_party.deep_gemm 2.8.1, vendored in the vLLM wheel (no git metadata; build commit unknown). The source tree pins vllm-project/DeepGEMM @ 6ce1c5ec6627a6bf11dbcc698b0b1e19c9248432",
+  "source": "vllm.third_party.deep_gemm.__version__; vLLM cmake/external_projects/deepgemm.cmake"
+ },
+ "triton": {
+  "value": "3.8.0",
+  "source": "triton.__version__"
+ },
+ "ray": {
+  "value": "2.59.0",
+  "source": "ray.__version__"
+ },
+ "verl": {
+  "value": "0.10.0.dev @ 45cbfcfa776740224dbd764b09f9ae06d110cc7e",
+  "source": "verl.__version__ + image source heads"
+ },
+ "vllm_wheel_base": {
+  "value": "0.32.0rc1.dev137+g9e2b579aa @ 9e2b579aabe9f289791867de539f999c188b63cd",
+  "source": "vllm dist direct_url.json"
+ },
+ "megatron_core": {
+  "value": "0.20.0+d9c876ffa",
+  "source": "megatron.core version"
+ },
+ "cutlass_cute_dsl": {
+  "value": "nvidia-cutlass-dsl 4.8.0",
+  "source": "importlib.metadata nvidia-cutlass-dsl"
+ },
+ "tilelang": {
+  "value": "0.1.12",
+  "source": "tilelang.__version__"
+ }
+}
