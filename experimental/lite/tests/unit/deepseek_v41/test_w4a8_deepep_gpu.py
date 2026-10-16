@@ -7,7 +7,10 @@
   an identical repeat is bitwise on each transport, dX included.
 * ``transport``: identity experts and known per-route gradients isolate the dX
   reduction. Each transport repeats bitwise and stays within two BF16 ulps of
-  the FP64 sum; all-to-all is also run under deterministic algorithms.
+  the FP64 sum.
+
+Everything runs in the recipe's deterministic mode; the all-to-all repeat
+outside it is only recorded.
 """
 import copy
 import json
@@ -39,9 +42,15 @@ class _Expert(torch.nn.Module):
         self.swiglu_limit = 10.0
 
 
+def _production_determinism():
+    # What the recipe's full_determinism sets (verl enable_full_determinism).
+    torch.use_deterministic_algorithms(True, warn_only=True)
+
+
 def _worker(rank, store, directory, mode):
     try:
         _setup(rank, store)
+        _production_determinism()
         report = _MODES[mode](rank)
         Path(directory, f'report-{mode}-{rank}.json').write_text(
             json.dumps(report, indent=1)
@@ -207,16 +216,16 @@ def _transport(rank):
         report[f'{name}_repeat_dx_bitwise'] = torch.equal(a, b)
         report[f'{name}_within_2ulp_fp64'] = bool((err <= bound).all())
         report[f'{name}_max_err_over_bound'] = (err / bound).max().item()
-    torch.use_deterministic_algorithms(True)
+    # Recorded only: outside deterministic mode the all-to-all unpermute VJP
+    # (index_add_) uses atomics and need not repeat bitwise.
+    torch.use_deterministic_algorithms(False)
     try:
-        det = run(paths['alltoall']())
+        d = paths['alltoall']()
+        report['info_alltoall_default_mode_repeat_dx_bitwise'] = str(
+            torch.equal(run(d), run(d))
+        )
     finally:
-        torch.use_deterministic_algorithms(False)
-    err = (det.double() - exact).abs()
-    report['alltoall_deterministic_within_2ulp_fp64'] = bool((err <= bound).all())
-    report['alltoall_deterministic_equals_default'] = torch.equal(
-        det, first['alltoall']
-    )
+        _production_determinism()
     report['dx_max_abs_across_transports'] = (
         (first['alltoall'].float() - first['deepep'].float()).abs().max().item()
     )
@@ -249,11 +258,5 @@ def test_w4a8_deepep_ep4(v41_core_te, tmp_path, monkeypatch, mode):
         for rank in range(EP)
     ]
     for rank, report in enumerate(reports):
-        failed = {
-            k: v
-            for k, v in report.items()
-            if isinstance(v, bool)
-            and not v
-            and k != 'alltoall_deterministic_equals_default'
-        }
+        failed = {k: v for k, v in report.items() if isinstance(v, bool) and not v}
         assert not failed, (rank, report)
