@@ -482,7 +482,7 @@ class CompressedSparseAttention(nn.Module):
         self.wo_a = linear(
             config.heads * config.head_dim // config.groups,
             config.groups * config.o_rank,
-            fp8=config.linear_fp8,
+            fp8=config.linear_fp8 and not config.wo_a_bf16,
         )
         self.wo_b = linear(
             config.groups * config.o_rank, config.dim, fp8=config.linear_fp8
@@ -717,6 +717,9 @@ class CompressedSparseAttention(nn.Module):
             output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(
                 x.dtype
             )
+        if self.deployment_math and c.wo_a_bf16:
+            output = _bf16_wo_a(output, positions, c, ratio, self.wo_a.weight)
+            return self.wo_b(output.to(x.dtype)), state
         native_activation = None
         if self.deployment_math and self.wo_a.fp8 and output.is_cuda:
             native_activation = _native_inverse_rope_activation(
@@ -1578,6 +1581,8 @@ class CrossLayerAttentionConfig:
     main_qat: bool = True
     index_qat: bool = True
     swa_fp8: bool = True
+    # Reference-inference BF16 wo_a (``wo_a_dtype="bf16"``); see ``_bf16_wo_a``.
+    wo_a_bf16: bool = False
     deployment_hf_config: dict | None = None
 
 
@@ -1652,6 +1657,70 @@ def _native_inverse_rope_activation(output, positions, config, ratio):
     return FP8Values(
         values, (exponent + 127).to(torch.uint8).view(torch.float8_e8m0fnu), decoded
     )
+
+
+def _native_inverse_rope_bf16(output, positions, config, ratio):
+    """vLLM's fused inverse RoPE for a BF16 wo_a: FP32 rotation, one BF16 store."""
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+
+    b, length, heads, head_dim = output.shape
+    cache = rope_cos_sin_cache(int(positions.max()) + 1, config, ratio, output.device)
+    values, _ = fused_inv_rope_fp8_quant(
+        output.reshape(b * length, heads, head_dim),
+        positions.to(torch.int64).repeat(b),
+        cache,
+        n_groups=config.groups,
+        heads_per_group=heads // config.groups,
+        nope_dim=head_dim - config.rope_dim,
+        rope_dim=config.rope_dim,
+        quantize=False,
+    )
+    return values.contiguous().reshape(b, length, config.groups, -1)
+
+
+def _bf16_wo_a(output, positions, config, ratio, weight):
+    """Reference BF16 wo_a: per group, FP32 accumulation then one BF16 rounding.
+
+    Matches vLLM's batch-invariant BF16 wo_a: the inverse RoPE kernel's BF16
+    output feeds ``bf16_fixed_mm`` group by group. The deployment-order FP32
+    rotation carries the inverse RoPE VJP.
+    """
+    b, length = output.shape[:2]
+    groups = config.groups
+
+    def reference(o):
+        return rotate(
+            o,
+            positions,
+            config,
+            ratio,
+            inverse=True,
+            output_dtype=torch.bfloat16,
+            deployment_math=True,
+        ).reshape(b, length, groups, -1)
+
+    weights = weight.reshape(groups, config.o_rank, -1)
+    if output.is_cuda:
+        from megatron.lite.primitive.modules import deployment_math as native
+
+        grouped = native.visible_forward(
+            lambda o: _native_inverse_rope_bf16(o, positions, config, ratio),
+            reference,
+            output,
+        )
+        projected = [
+            native.bf16_fp32_linear(grouped[:, :, i].contiguous(), weights[i])
+            for i in range(groups)
+        ]
+    else:
+        grouped = reference(output)
+        projected = [
+            F.linear(grouped[:, :, i].float(), weights[i].bfloat16().float())
+            for i in range(groups)
+        ]
+    return torch.stack([p.to(torch.bfloat16) for p in projected], dim=2).flatten(2)
 
 
 def rotate(

@@ -14,6 +14,12 @@ source = Path(os.environ['DS41_RELEASE'])
 out = Path(os.environ['DS41_OUTPUT'])
 model = Path(os.environ['DS41_MODEL'])
 layers = int(os.environ.get('DS41_LAYERS', '2'))
+# release: the checkpoint's own precision. official: the reference inference
+# contract (group-32 expert activations, BF16 wo_a), read by both trainer and
+# rollout from the prepared config.
+precision = os.environ.get('DS41_PRECISION', 'release')
+if precision not in ('release', 'official'):
+    raise ValueError('DS41_PRECISION must be release or official')
 if layers not in (2, 4):
     raise ValueError('Only closed release 2L/4L prefixes are supported')
 model.mkdir(parents=True, exist_ok=True)
@@ -51,7 +57,11 @@ t.update(
     engram_layer_ids=[1],
     engram_num_embeddings=[original['text_config']['engram_num_embeddings'][0]],
 )
+if precision == 'official':
+    t.update(expert_activation_group_size=32, wo_a_dtype='bf16')
 allowed = {
+    'expert_activation_group_size',
+    'wo_a_dtype',
     'num_hidden_layers',
     'compress_ratios',
     'candidate_source_layer_id',
@@ -60,7 +70,7 @@ allowed = {
     'engram_layer_ids',
     'engram_num_embeddings',
 }
-assert {k for k in t if t[k] != original['text_config'][k]} <= allowed
+assert {k for k in t if t[k] != original['text_config'].get(k)} <= allowed
 # Existing VERL generic-HF adapter reads this root metadata alias. Its value
 # is identical to the release's nested context limit; no resizing/scaling.
 cfg['max_position_embeddings'] = t['max_position_embeddings']
@@ -132,7 +142,9 @@ record = {
     'release_revision': revision,
     'source_config_sha256': receipts['config.json']['sha256'],
     'prefix_config': cfg,
-    'changed_text_fields': sorted(k for k in t if t[k] != original['text_config'][k]),
+    'changed_text_fields': sorted(
+        k for k in t if t[k] != original['text_config'].get(k)
+    ),
     'weights': lineage,
     'active_and_archival_index_keys': len(weights),
     'tokenizer_sha256': receipts['tokenizer.json']['sha256'],

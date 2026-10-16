@@ -72,7 +72,13 @@ class DeepseekV41Config:
         return deepcopy(self._release)
 
     def attention_config(
-        self, *, linear_fp8=True, main_qat=True, index_qat=True, swa_fp8=True
+        self,
+        *,
+        linear_fp8=True,
+        main_qat=True,
+        index_qat=True,
+        swa_fp8=True,
+        wo_a_bf16=False,
     ):
         from megatron.lite.primitive.modules.attention.csa import (
             CrossLayerAttentionConfig,
@@ -96,5 +102,6 @@ class DeepseekV41Config:
             main_qat=main_qat,
             index_qat=index_qat,
             swa_fp8=swa_fp8,
+            wo_a_bf16=wo_a_bf16,
             deployment_hf_config=self.to_hf_dict(),
         )

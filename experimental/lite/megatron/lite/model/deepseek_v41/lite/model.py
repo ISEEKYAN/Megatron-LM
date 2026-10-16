@@ -106,6 +106,12 @@ class DeepseekV41Model(nn.Module):
         if act_group not in (32, 128):
             raise ValueError(f'Unsupported expert_activation_group_size {act_group}')
         official_expert_contract = act_group == 32
+        wo_a_dtype = getattr(t, 'wo_a_dtype', 'fp8')
+        if wo_a_dtype not in ('fp8', 'bf16'):
+            raise ValueError(f'Unsupported wo_a_dtype {wo_a_dtype!r}')
+        self.wo_a_bf16 = wo_a_dtype == 'bf16'
+        if self.wo_a_bf16 and not deployment_math:
+            raise ValueError('A BF16 wo_a requires deployment math')
         if official_expert_contract and not (w4a8_experts and deployment_math):
             raise ValueError(
                 'The official expert contract requires deployment-math W4A8 experts'
@@ -132,7 +138,8 @@ class DeepseekV41Model(nn.Module):
         ac = config.attention_config(
             **dict.fromkeys(
                 ('linear_fp8', 'main_qat', 'index_qat', 'swa_fp8'), quantized
-            )
+            ),
+            wo_a_bf16=self.wo_a_bf16,
         )
         for layer_id in range(start, end):
             policy = self.topology[layer_id]
@@ -254,7 +261,9 @@ class DeepseekV41Model(nn.Module):
         self.validate_parameter_bindings()
 
     def _scale_binding(self, key, owner, attribute, role, encoding):
-        if encoding in ('I8', 'F8_E4M3') and role != 'engram_table':
+        # A BF16 wo_a exports no scale but still accepts the release FP8 pair,
+        # which loads as its exact BF16 value.
+        if (encoding in ('I8', 'F8_E4M3') and role != 'engram_table') or role == 'wo_a':
             return TensorBinding(
                 key[:-6] + 'scale', owner, attribute, 'scale', encoding='F8_E8M0'
             )
@@ -309,6 +318,8 @@ class DeepseekV41Model(nn.Module):
             (f'layers.*.attn.{n}', Rule('weight', n, fp8))
             for n in ('wq_a', 'wkv', 'wo_a', 'wo_b')
         )
+        if self.wo_a_bf16:
+            rules['layers.*.attn.wo_a'] = Rule('weight', 'wo_a')
         rules.update(
             (f'layers.*.attn.{n}_norm', Rule('weight', 'norm')) for n in ('q', 'kv')
         )
