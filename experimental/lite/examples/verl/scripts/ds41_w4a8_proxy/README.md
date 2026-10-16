@@ -43,6 +43,12 @@ For the 6L release subset, pass `--layers 6` and the trainable count from its CP
 DS41_PARAMETER_COUNTS=<count> bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 6 /path/to/your/new-c8-output
 ```
 
+For the long-sequence proxy, pass `--layers 9`: release layers `0,1,2,14,15,19,20,21,24` (every 40L layer role, including the ratio-2 layer 19 that reads layer 14's caches), trained at 17408 + 128 tokens with EP8 over CP2 on the same 8 GPUs and full activation recompute. `--layers 8` drops layer 15 and is the labelled fallback. The C8 additionally requires that recompute ran inside backward (2 h CPU, 3 h GPU limits):
+
+```bash
+DS41_PARAMETER_COUNTS=<count> bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 9 /path/to/your/new-c8-output
+```
+
 The same launcher accepts `--layers 2`, `--layers 4`, `--layers 6`, and
 `--layers 9`. The 6L and 9L variants require `DS41_PARAMETER_COUNTS` from
 that variant's CPU construction receipt. Set `DS41_PRECISION=official`,
@@ -68,7 +74,6 @@ or authorize additional resources. For example:
 ```bash
 DS41_CPU_QOS=cpu-short DS41_CPU_MEM=0 DS41_GPU_CPUS=64 DS41_GPU_TIME=01:30:00 \
   bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 4 /path/to/new-4l-output
-
 ```
 
 The launcher first submits a **zero-GPU, two-node CPU gate**. It checks image/files, expands the image before any GPU allocation, prepares the 2L prefix, resolves the production config, exercises real optimizer workers and collects the exact C8 test. Its dependent GPU job runs only after success and is automatically cancelled if the dependency fails.

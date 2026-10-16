@@ -316,3 +316,21 @@ def test_pp_guard_accepts_the_proxy_candidate_publisher(monkeypatch):
     )
     with pytest.raises(NotImplementedError, match='only split layer 3'):
         _validate_parallel(ImplConfig(pipeline_split_layer=20), parallel, cut=3)
+
+
+def test_recompute_audit_records_backward_recompute(monkeypatch, tmp_path):
+    from megatron.lite.primitive import recompute
+
+    audit = _audit(monkeypatch, tmp_path)
+    monkeypatch.setattr(
+        recompute.CheckpointFunction,
+        'backward',
+        recompute.CheckpointFunction.__dict__['backward'],
+    )
+    audit._recompute(recompute)
+    x = torch.ones(3, requires_grad=True)
+    recompute.CheckpointFunction.apply(lambda t: t * 2, False, x).sum().backward()
+    recompute.CheckpointFunction.apply(lambda t: t * 2, False, x).sum().backward()
+    rows = [row for row in _events(tmp_path) if row['kind'] == 'recompute_backward']
+    assert len(rows) == 1
+    assert torch.equal(x.grad, torch.full((3,), 4.0))
