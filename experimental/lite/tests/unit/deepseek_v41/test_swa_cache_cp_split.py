@@ -45,6 +45,26 @@ def test_split_call_matches_cp1_rows(v41_core_te, monkeypatch, cp):
         assert torch.equal(local_q, full_q[:, start : start + rows]), rank
 
 
+def test_rank_without_rows_skips_the_local_kernel_call(v41_core_te, monkeypatch):
+    from megatron.lite.primitive.modules.deployment_math import cache
+
+    def no_empty_launch(query, values, positions, cos_sin, eps, block_size):
+        assert query.shape[1] > 0 and values.shape[1] > 0, 'zero-row native launch'
+        return _stand_in(query, values, positions, cos_sin, eps, block_size)
+
+    monkeypatch.setattr(cache, '_swa_insert', no_empty_launch)
+    q = torch.randn(1, 5, 3, 8, dtype=torch.float64)
+    kv = torch.randn(1, 5, 8, dtype=torch.float64)
+    _, full_window = cache.swa_cache(
+        q, kv, torch.arange(5), None, 1e-6, lambda a, b: (a, b)
+    )
+    local_q, window = cache.swa_cache(
+        q[:, 5:], kv, torch.arange(5, 5), None, 1e-6, lambda a, b: (a, b), start=5
+    )
+    assert local_q.shape == (1, 0, 3, 8)
+    assert torch.equal(window, full_window)
+
+
 def test_kernel_call_still_requires_cuda_bf16(v41_core_te):
     from megatron.lite.primitive.modules.deployment_math import cache
 

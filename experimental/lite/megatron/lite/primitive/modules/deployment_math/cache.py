@@ -296,6 +296,10 @@ def swa_cache(q, kv, positions, cos_sin, eps, reference, *, block_size=64, start
         _, window = _swa_insert(
             placeholder, values, key_positions, cos_sin, eps, block_size
         )
+        if rows == 0:
+            # A CP rank can own no rows of a short document; the native joint
+            # Q+KV entry has no zero-token early exit (its grid would be empty).
+            return query.new_empty(query.shape), window
         local_values = values[:, start : start + rows]
         rotated, _ = _swa_insert(
             query, local_values, positions, cos_sin, eps, block_size
