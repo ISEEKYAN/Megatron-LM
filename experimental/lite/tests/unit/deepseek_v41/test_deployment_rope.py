@@ -184,12 +184,15 @@ def test_deployment_swa_kv_rope_vjp_and_default(v41_core_te):
 
 @pytest.mark.gpus(1, min_architecture="blackwell")
 @pytest.mark.parametrize("deployment_math", [False, True])
-def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math):
-    """Catch the missing KV opt-in in the actual CSA projection/codec boundary."""
+def test_production_swa_codec_receives_native_rope(
+    v41_core_te, deployment_math, monkeypatch
+):
+    """Check legacy codecs and CP1 native cache against the deployment writer."""
     if os.environ.get("MEGATRON_LITE_REQUIRE_CUDA_TESTS") == "1":
         assert torch.cuda.is_available(), "Production SWA boundary requires CUDA"
     elif not torch.cuda.is_available():
         pytest.skip("CUDA production SWA boundary")
+    import vllm._C_stable_libtorch  # noqa: F401
     from megatron.lite.primitive.modules.attention import csa
 
     class CapturedCodec(Exception):
@@ -202,6 +205,7 @@ def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math)
     positions = torch.arange(111, device="cuda", dtype=torch.int64)
     frequency = 1 / (10000 ** (torch.arange(0, 64, 2, device="cuda").float() / 64))
     angles = positions.float()[:, None] * frequency
+    cos_sin = torch.cat((angles.cos(), angles.sin()), -1)
     block = 32
     storage = torch.zeros(4, block * 528, device="cuda", dtype=torch.uint8)
     torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
@@ -210,7 +214,7 @@ def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math)
         storage,
         positions,
         positions,
-        torch.cat((angles.cos(), angles.sin()), -1),
+        cos_sin,
         64,
         1e-6,
         block,
@@ -229,7 +233,7 @@ def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math)
         o_rank=4,
         groups=1,
         linear_fp8=False,
-        main_qat=False,
+        main_qat=deployment_math,
         swa_fp8=True,
     )
     captured = []
@@ -260,6 +264,37 @@ def test_production_swa_codec_receives_native_rope(v41_core_te, deployment_math)
     model.deployment_math = deployment_math
     x = torch.zeros(1, 1, 4, device="cuda", dtype=torch.bfloat16)
     context = SimpleNamespace(start=110, gather=lambda _: x.new_zeros(1, 111, 4))
+    if deployment_math:
+        from megatron.lite.primitive.modules.deployment_math import cache
+
+        # Native mode has no torch-codec boundary: capture its actual gather.
+        writer = cache.swa_cache
+        table = torch.arange(4, device="cuda", dtype=torch.int32)[None]
+        lengths = torch.tensor([111], device="cuda", dtype=torch.int32)
+        expected = cache.gather_main(
+            storage.view(4, block, 528), table, lengths, 111, block
+        )
+
+        def capture_native(*args, **kwargs):
+            _, actual = writer(*args, **kwargs)
+            captured.append(actual)
+            raise CapturedCodec
+
+        monkeypatch.setattr(cache, "rotary_cache", lambda *args: cos_sin)
+        monkeypatch.setattr(cache, "swa_cache", capture_native)
+        with pytest.raises(ValueError, match="requires CP1"):
+            model._forward_cross_layer(x, csa.AttentionState(), cp_context=context)
+        x = x.expand(1, 111, 4).contiguous()
+        from dataclasses import replace
+
+        model.config = replace(config, main_qat=False)
+        with pytest.raises(ValueError, match="enabled KV codecs"):
+            model._forward_cross_layer(x, csa.AttentionState())
+        model.config = config
+        with pytest.raises(CapturedCodec):
+            model._forward_cross_layer(x, csa.AttentionState())
+        assert torch.equal(captured[0], expected)
+        return
     with pytest.raises(CapturedCodec):
         model._forward_cross_layer(x, csa.AttentionState(), cp_context=context)
     legacy = csa.mxfp8.quantize_swa(csa.rotate(kv[None], positions, config, 0))

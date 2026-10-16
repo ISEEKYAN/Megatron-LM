@@ -8,9 +8,14 @@ import subprocess
 import sys
 from pathlib import Path
 
+from recipe_contract import hydra_mapping, rollout_settings
+
 root = Path(__file__).resolve().parent
 out = Path(os.environ['DS41_OUTPUT'])
 model = Path(os.environ['DS41_MODEL'])
+rollout = rollout_settings(json.loads((model / 'config.json').read_text()), os.environ)
+if rollout['breakable']:
+    os.environ['VLLM_USE_BREAKABLE_CUDAGRAPH'] = '1'
 ep, pp, world = 8, 1, 8
 segmented_host = '1'
 bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
@@ -176,7 +181,7 @@ args = [
     'actor_rollout_ref.rollout.max_num_seqs=4',
     f'actor_rollout_ref.rollout.max_num_batched_tokens={context_length}',
     'actor_rollout_ref.rollout.gpu_memory_utilization=0.2',
-    'actor_rollout_ref.rollout.enforce_eager=true',
+    f'actor_rollout_ref.rollout.enforce_eager={str(rollout["enforce_eager"]).lower()}',
     'actor_rollout_ref.rollout.enable_prefix_caching=false',
     'actor_rollout_ref.rollout.load_format=dummy',
     'actor_rollout_ref.rollout.checkpoint_engine.update_weights_bucket_megabytes=64',
@@ -184,10 +189,12 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=FLASHMLA_SPARSE_DSV41',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_dtype=nvfp4_ds_mla',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config={indexer_kv_dtype:mxfp4,indexer_sparse_logits:false}',
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype:float32}',
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides='
+    + hydra_mapping(rollout['hf_overrides']),
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend=allgather_reducescatter',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm',
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config={mode:0,cudagraph_mode:NONE}',
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
+    + hydra_mapping(rollout['compilation_config']),
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:false,embedding_across_dp:true,dp_shared_memory:false}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes=268435456',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true',
@@ -224,6 +231,10 @@ args = [
     f'+ray_kwargs.ray_init.runtime_env.env_vars.W4_GRPO_OUT={out}',
 ]
 for key in (
+    'VLLM_USE_BREAKABLE_CUDAGRAPH',
+    'DS41_PRECISION',
+    'DS41_CUDAGRAPH',
+    'DS41_CUDAGRAPH_MAX_CAPTURE',
     'DS41_INDEXER_DIAGNOSTIC',
     'DS41_INDEXER_DIAGNOSTIC_LIMIT',
     'WANDB_ENTITY',
@@ -284,6 +295,7 @@ command = [
             'batch_invariant': int(bi),
             'seed': 42,
             'layers': layers,
+            'rollout_settings': rollout,
             'prompt_length': prompt_length,
             'response_length': response_length,
             'generator_imported_torch': 'torch' in sys.modules,
