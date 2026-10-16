@@ -27,6 +27,51 @@ def test_private_cache_pages_isolate_requests_and_preserve_partial_pages(
         assert not set(table[0].tolist()) & set(table[1].tolist())
 
 
+@pytest.mark.parametrize("batch, rows", [(1, 5), (2, 7), (1, 0)])
+def test_native_index_query_preserves_packed_scale_bytes(
+    v41_core_te, monkeypatch, batch, rows
+):
+    """Native index-Q returns one int32 word per head, consumed as four bytes."""
+    import sys
+    import types
+
+    from megatron.lite.primitive.modules.deployment_math import cache
+
+    class Query(torch.Tensor):
+        @property
+        def is_cuda(self):
+            return True
+
+    heads, width = 32, 128
+    query = torch.zeros(batch, rows, heads, width, dtype=torch.bfloat16).as_subclass(
+        Query
+    )
+    values = torch.zeros(batch * rows, heads, width // 2, dtype=torch.uint8)
+    scale_bytes = (
+        torch.arange(batch * rows * heads * 4, dtype=torch.int64)
+        .remainder(256)
+        .byte()
+        .reshape(batch * rows, heads, 4)
+    )
+    packed_scales = scale_bytes.view(torch.int32).squeeze(-1)
+    weights = torch.ones(batch, rows, heads, dtype=torch.bfloat16)
+    native = types.ModuleType("vllm.models.deepseek_v4.common.ops.fused_indexer_q")
+    native.fused_indexer_q_rope_quant = lambda *args, **kwargs: (
+        (values, packed_scales),
+        weights.flatten(0, 1),
+    )
+    monkeypatch.setitem(sys.modules, native.__name__, native)
+    actual, actual_weights = cache.index_query(query, weights, torch.arange(rows), None)
+    assert actual.scale.dtype == torch.uint8
+    assert torch.equal(actual.scale, scale_bytes.reshape(batch, rows, heads, 4))
+    assert torch.equal(actual_weights, weights)
+    if rows:
+        assert torch.equal(
+            actual.scale.view(torch.int32).squeeze(-1),
+            packed_scales.reshape(batch, rows, heads),
+        )
+
+
 def test_private_cache_cpu_rejects_native_execution_without_cuda(v41_core_te):
     from megatron.lite.primitive.modules.deployment_math import cache
 
@@ -156,9 +201,9 @@ def test_native_indexer_original_packet_rounding_and_batch_padding(v41_core_te, 
 def test_csa_index_query_rope_fp4_midpoint(v41_core_te, deployment_math):
     """A one-component FP4 midpoint must match native index-Q arithmetic.
 
-    Feed a small numerical counterexample through the production CSA index-Q
-    branch, including its real codec. Stop at that boundary: scoring and
-    attention are independent contracts covered by the tests above.
+    Check the deployment native writer and the reference CSA codec separately.
+    The reference uses a synthetic CP offset; the native writer owns CP1 pages.
+    Scoring and attention are independent contracts covered above.
     """
     from types import SimpleNamespace
 
@@ -195,6 +240,24 @@ def test_csa_index_query_rope_fp4_midpoint(v41_core_te, deployment_math):
         main_qat=False,
         swa_fp8=False,
     )
+    if deployment_math:
+        from megatron.lite.primitive.modules.deployment_math.cache import index_query
+        from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+        # The production native branch owns a CP1 cache and bypasses codecs.
+        query = torch.zeros(1, 1, 4, device="cuda", dtype=torch.bfloat16)
+        raw = FixedQuery()(query).unflatten(-1, (32, 128))
+        packet, _ = index_query(
+            raw,
+            torch.ones(1, 1, 32, device="cuda", dtype=torch.bfloat16),
+            torch.tensor([2670], device="cuda"),
+            csa.rope_cos_sin_cache(2671, config, 2, "cuda"),
+        )
+        scales = torch.exp2(packet.scale.float() - 127)
+        decoded = dequantize_mxfp4(packet.packed.view(torch.int8), scales)
+        assert decoded[0, 0, 31, 77].item() == 0.75
+        return
+
     model = csa.CompressedSparseAttention(
         config,
         layer_idx=1,

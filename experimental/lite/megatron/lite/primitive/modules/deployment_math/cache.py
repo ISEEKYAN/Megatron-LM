@@ -153,7 +153,9 @@ def index_query(query, raw_weights, positions, cos_sin):
     return (
         IndexCache(
             packed.reshape(batch, rows, heads, width // 2),
-            scales.reshape(batch, rows, heads, width // 32),
+            scales.contiguous()
+            .view(torch.uint8)
+            .reshape(batch, rows, heads, width // 32),
         ),
         weights.reshape(batch, rows, heads),
     )
