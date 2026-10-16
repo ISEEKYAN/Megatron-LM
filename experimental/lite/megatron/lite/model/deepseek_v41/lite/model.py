@@ -5,6 +5,7 @@ Vision/aligner have live differentiable owners; DSpark remains archival.
 The floating diagnostic mode is explicit; it is not native quantized parity.
 """
 
+from dataclasses import replace
 from functools import partial
 from types import SimpleNamespace
 
@@ -57,6 +58,93 @@ def sentinel_routing_mask(input_ids, routes_image_sentinels):
     if not routes_image_sentinels:
         return None
     return (input_ids >= 129264) & (input_ids < 129269)
+
+
+_STATE_TENSORS = ('main_kv', 'index_k', 'indices', 'candidates')
+
+
+def owns_attention_state(layer):
+    """KV/index source layers publish CSA state that later layers consume."""
+    return bool(
+        getattr(layer.attn, 'owns_kv', False)
+        or getattr(layer.attn, 'owns_index', False)
+    )
+
+
+def _first_call_only_sink(ffn_kwargs, calls):
+    # Router statistics are published by the original forward only, never by
+    # the backward-time recomputation.
+    return ffn_kwargs if calls == 1 else {**ffn_kwargs, 'load_sink': None}
+
+
+def recomputed_layer(layer, hidden, pre, state, attention_kwargs, ffn_kwargs, extra):
+    """Full activation recompute of a layer that only consumes CSA state.
+
+    The reentrant checkpoint routes gradients through positional tensor inputs
+    only, so the consumed state tensors and the deployment HC carrier are passed
+    explicitly; their gradients then reach the owner layer through this node
+    instead of re-entering the owner's graph during recomputation.
+    """
+    from megatron.lite.primitive.recompute import CheckpointFunction
+    from torch.utils._pytree import tree_flatten, tree_unflatten
+
+    has_previous = 'previous_post' in extra
+    # State fields may be containers (deployment IndexCache) and the carrier a
+    # tuple; checkpoint the tensor leaves and rebuild the structure inside.
+    consumed = (
+        [getattr(state, name) for name in _STATE_TENSORS],
+        extra.get('previous_post'),
+    )
+    leaves, spec = tree_flatten(consumed)
+    slots = [i for i, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
+    calls = [0]
+
+    def run(h, p, *tensors):
+        calls[0] += 1
+        values = list(leaves)
+        for slot, tensor in zip(slots, tensors):
+            values[slot] = tensor
+        fields, previous = tree_unflatten(values, spec)
+        inner = replace(state, **dict(zip(_STATE_TENSORS, fields)))
+        carrier = {'previous_post': previous} if has_previous else {}
+        result = layer.forward(
+            h,
+            p,
+            inner,
+            attention_kwargs=attention_kwargs,
+            ffn_kwargs=_first_call_only_sink(ffn_kwargs, calls[0]),
+            **carrier,
+        )
+        if result[2] is not inner:
+            raise RuntimeError(
+                'V4.1_RECOMPUTE_OWNER: a state-consuming layer changed CSA state'
+            )
+        return (result[0], result[1], *(result[3] if has_previous else ()))
+
+    outputs = CheckpointFunction.apply(
+        run, False, hidden, pre, *(leaves[slot] for slot in slots)
+    )
+    if has_previous:
+        return outputs[0], outputs[1], state, tuple(outputs[2:])
+    return outputs[0], outputs[1], state
+
+
+def recompute_ffn(module):
+    """FFN-only recompute for CSA state owners (their attention keeps its graph)."""
+    from megatron.lite.primitive.recompute import CheckpointFunction
+
+    original = module.forward
+
+    def forward(x, **kwargs):
+        calls = [0]
+
+        def run(value):
+            calls[0] += 1
+            return original(value, **_first_call_only_sink(kwargs, calls[0]))
+
+        return CheckpointFunction.apply(run, False, x)
+
+    module.forward = forward
 
 
 class DeepseekV41Model(nn.Module):
@@ -417,19 +505,30 @@ class DeepseekV41Model(nn.Module):
                 if self.deployment_math and hidden.is_cuda
                 else {}
             )
-            result = layer.forward(
-                hidden,
-                pre,
-                state,
-                attention_kwargs={'cp_context': cp_context},
-                ffn_kwargs={
-                    'image_mask': routing_mask,
-                    'load_sink': (
-                        None if modality_loads is None else modality_loads[index]
-                    ),
-                },
-                **extra,
-            )
+            attention_kwargs = {'cp_context': cp_context}
+            ffn_kwargs = {
+                'image_mask': routing_mask,
+                'load_sink': (
+                    None if modality_loads is None else modality_loads[index]
+                ),
+            }
+            if (
+                getattr(self, 'recompute', None) == 'full'
+                and torch.is_grad_enabled()
+                and not owns_attention_state(layer)
+            ):
+                result = recomputed_layer(
+                    layer, hidden, pre, state, attention_kwargs, ffn_kwargs, extra
+                )
+            else:
+                result = layer.forward(
+                    hidden,
+                    pre,
+                    state,
+                    attention_kwargs=attention_kwargs,
+                    ffn_kwargs=ffn_kwargs,
+                    **extra,
+                )
             hidden, pre, state = result[:3]
             if extra:
                 previous_post = result[3]

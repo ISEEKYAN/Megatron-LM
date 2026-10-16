@@ -236,40 +236,70 @@ def compressed_cache(latent, ratio, cos_sin, reference, *, block_size=64):
     return visible_forward(visible, reference, latent)
 
 
-def swa_cache(q, kv, positions, cos_sin, eps, reference, *, block_size=64):
-    """Call the joint native Q/SWA writer and the deployment MXFP8 gather."""
+def _swa_insert(query, values, positions, cos_sin, eps, block_size):
+    """One joint native Q-norm/RoPE + SWA KV RoPE/quant/insert call (row-paired)."""
+    if (
+        not query.is_cuda
+        or query.dtype != torch.bfloat16
+        or values.dtype != torch.bfloat16
+    ):
+        raise ValueError("Deployment SWA cache requires CUDA BF16 Q/KV")
+    batch, rows, heads, width = query.shape
+    table, slots, lengths = cache_geometry(
+        batch, rows, block_size, device=values.device
+    )
+    cache = torch.zeros(
+        (table.numel(), block_size, 528), dtype=torch.uint8, device=values.device
+    )
+    padded_heads = 64 if heads <= 64 else 128
+    output = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
+        query.flatten(0, 1).contiguous(),
+        values.flatten(0, 1).contiguous(),
+        cache.view(cache.shape[0], -1),
+        slots.flatten(),
+        positions.repeat(batch),
+        cos_sin,
+        padded_heads,
+        eps,
+        block_size,
+        False,
+        True,
+        True,
+        False,
+    )
+    return (
+        output[:, :heads].reshape(batch, rows, heads, width),
+        gather_main(cache, table, lengths, rows, block_size),
+    )
+
+
+def swa_cache(q, kv, positions, cos_sin, eps, reference, *, block_size=64, start=None):
+    """Call the joint native Q/SWA writer and the deployment MXFP8 gather.
+
+    With contiguous CP, ``q`` holds this rank's rows (at ``positions``) and
+    ``kv`` the whole gathered sequence (rows ``0..L``) starting at ``start``.
+    The kernel pairs Q and KV rows under one position array, so it runs twice:
+    once over the full KV with a zero placeholder query (the SWA cache), and
+    once over the local rows (only its query output is used). Both outputs are
+    row-wise, so the bytes equal the CP1 call's corresponding rows.
+    """
     from .autograd import visible_forward
 
-    if not q.is_cuda or q.dtype != torch.bfloat16 or kv.dtype != torch.bfloat16:
-        raise ValueError("Deployment SWA cache requires CUDA BF16 Q/KV")
-
     def visible(query, values):
-        batch, rows, heads, width = query.shape
-        table, slots, lengths = cache_geometry(
-            batch, rows, block_size, device=values.device
+        if start is None:
+            return _swa_insert(query, values, positions, cos_sin, eps, block_size)
+        batch, rows = query.shape[:2]
+        key_positions = torch.arange(values.shape[1], device=values.device)
+        # Same head count as the real query: the joint writer is only exercised
+        # with real (padded 64/128) head layouts.
+        placeholder = query.new_zeros((batch, values.shape[1], *query.shape[2:]))
+        _, window = _swa_insert(
+            placeholder, values, key_positions, cos_sin, eps, block_size
         )
-        cache = torch.zeros(
-            (table.numel(), block_size, 528), dtype=torch.uint8, device=values.device
+        local_values = values[:, start : start + rows]
+        rotated, _ = _swa_insert(
+            query, local_values, positions, cos_sin, eps, block_size
         )
-        padded_heads = 64 if heads <= 64 else 128
-        output = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-            query.flatten(0, 1).contiguous(),
-            values.flatten(0, 1).contiguous(),
-            cache.view(cache.shape[0], -1),
-            slots.flatten(),
-            positions.repeat(batch),
-            cos_sin,
-            padded_heads,
-            eps,
-            block_size,
-            False,
-            True,
-            True,
-            False,
-        )
-        return (
-            output[:, :heads].reshape(batch, rows, heads, width),
-            gather_main(cache, table, lengths, rows, block_size),
-        )
+        return rotated, window
 
     return visible_forward(visible, reference, q, kv)

@@ -89,7 +89,9 @@ def _unpack_ue8m0_scales(packed: torch.Tensor, groups: int) -> torch.Tensor:
     """Packed int32 UE8M0 bytes (four groups per word) -> float32 powers of two."""
     rows = packed.shape[0]
     # flatten() copies a column-major (or single-group) layout into row order.
-    exponent = packed.flatten().view(torch.uint8).reshape(rows, -1)[:, :groups]
+    # Explicit width: an expert can receive zero rows.
+    width = 4 * packed.numel() // rows if rows else 4 * max(1, (groups + 3) // 4)
+    exponent = packed.flatten().view(torch.uint8).reshape(rows, width)[:, :groups]
     return (exponent.to(torch.int32) << 23).view(torch.float32)
 
 

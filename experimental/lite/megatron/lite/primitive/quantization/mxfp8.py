@@ -25,7 +25,8 @@ def _quantize_rows(x):
     decoded = dequantize_block_fp8(values, scale, (1, 32)).to(x.dtype)
     return FP8Values(
         values.reshape(x.shape),
-        scale.reshape(*x.shape[:-1], -1),
+        # Explicit group count: a CP rank can hold zero rows of a document.
+        scale.reshape(*x.shape[:-1], scale.shape[-1]),
         decoded.reshape(x.shape),
     )
 

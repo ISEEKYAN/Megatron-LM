@@ -73,11 +73,15 @@ def test_pp2_rejects_being_combined_with_ep_or_cp(extra):
     assert str(caught.value).startswith("V4.1_PP_COMBINATION_UNSUPPORTED")
 
 
-def test_cp_and_ep_cannot_be_combined():
-    with pytest.raises(
-        NotImplementedError, match="CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED"
-    ):
-        _build(parallel=ParallelConfig(cp=2, ep=2))
+def test_cp_and_ep_combine_like_mcore(monkeypatch):
+    # EP-over-CP passes the guards; numerical parity is in test_cp_ep_parity.py.
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 4)
+    protocol._validate_parallel(
+        protocol.ImplConfig(device="cpu"), ParallelConfig(cp=2, ep=2)
+    )
 
 
 def test_split_layer_20_is_the_one_accepted_cut(monkeypatch):
@@ -118,8 +122,13 @@ def test_guards_run_before_any_distributed_setup(monkeypatch):
         (ParallelConfig(pp=2), False, 1, 'V4.1_PP_WORLD'),
         (ParallelConfig(ep=0), False, 1, 'EP size must be a positive integer'),
         (ParallelConfig(cp=0), False, 1, 'CP size must be a positive integer'),
-        (ParallelConfig(cp=2), False, 2, 'CP requires an initialized CP-only world'),
-        (ParallelConfig(cp=2), True, 4, 'CP requires an initialized CP-only world'),
+        (
+            ParallelConfig(cp=2),
+            False,
+            2,
+            'CP requires an initialized distributed world',
+        ),
+        (ParallelConfig(cp=2), True, 3, 'CP requires an initialized distributed world'),
         (
             ParallelConfig(ep=2),
             False,

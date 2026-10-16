@@ -63,6 +63,9 @@ class ImplConfig:
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
     pipeline_split_layer: int = 20
+    # 'full': recompute every CSA-state-consuming layer and the FFN of each
+    # KV/index source layer in backward (MCore full/uniform/1 granularity).
+    recompute: str | None = None
 
     def __post_init__(self):
         # Runtime/VERL configurations arrive as serialized mappings.
@@ -110,19 +113,18 @@ def _validate_parallel(c, p, cut=20):
         or torch.distributed.get_world_size() != 2
     ):
         raise ValueError('V4.1_PP_WORLD: PP2 requires an initialized two-rank world')
-    if p.cp != 1 and p.ep != 1:
-        raise NotImplementedError(
-            'CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED: V4.1 requires EP=1 with CP>1; use CP-only or EP with CP=1'
-        )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError('EP size must be a positive integer')
     if type(p.cp) is not int or p.cp < 1:
         raise ValueError('CP size must be a positive integer')
+    # EP-over-CP as in MCore and DeepSeek V4: dense ranks decompose as
+    # (TP, CP, DP, PP) and experts as (ETP, EP, EDP, PP); the MoE dispatcher
+    # exchanges every CP shard's tokens within the EP group.
     if p.cp > 1 and (
         not torch.distributed.is_initialized()
-        or torch.distributed.get_world_size() != p.cp
+        or torch.distributed.get_world_size() % p.cp != 0
     ):
-        raise ValueError('CP requires an initialized CP-only world')
+        raise ValueError('CP requires an initialized distributed world divisible by cp')
     if p.ep > 1 and (
         not torch.distributed.is_initialized()
         or torch.distributed.get_world_size() % p.ep != 0
@@ -163,7 +165,7 @@ def build_model(model_cfg, *, impl_cfg):
     if unsupported:
         raise NotImplementedError(
             f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
-            'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
+            'supported: DP, EP, contiguous CP (alone or with EP), or text-only PP2; '
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
     _validate_parallel(c, p, cut=pipeline_cut(model_cfg.topology))
@@ -188,10 +190,12 @@ def build_model(model_cfg, *, impl_cfg):
         raise ValueError('Deployment math requires quantized W4A8 experts')
     if c.deployment_math and (
         c.dtype != torch.bfloat16
-        or any(getattr(p, name) != 1 for name in ('tp', 'cp', 'pp'))
+        or any(getattr(p, name) != 1 for name in ('tp', 'pp'))
         or c.use_deepep
     ):
-        raise ValueError('Deployment math requires BF16 and TP/CP/PP=1 without DeepEP')
+        # Contiguous CP is supported (gathered KV/compressor, split SWA writer);
+        # each rank evaluates the deployment head on its own rows.
+        raise ValueError('Deployment math requires BF16 and TP/PP=1 without DeepEP')
     layer_range = None
     if p.pp > 1:
         import megatron.lite.primitive.parallel.pp as _imports_pp
@@ -206,6 +210,15 @@ def build_model(model_cfg, *, impl_cfg):
         layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
     model = _construct_model(model_cfg, impl_cfg, ps, layer_range)
     model.pipeline_residual_dtype = impl_cfg.dtype
+    if impl_cfg.recompute not in (None, 'full'):
+        raise ValueError('V4.1 recompute must be None or "full"')
+    model.recompute = impl_cfg.recompute
+    if impl_cfg.recompute == 'full':
+        from .model import owns_attention_state, recompute_ffn
+
+        for layer in model.layers:
+            if layer is not None and owns_attention_state(layer):
+                recompute_ffn(layer.ffn)
     import megatron.lite.primitive.modules.native_fp32_linear as _imports_native_fp32_linear
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
@@ -391,8 +404,8 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
     if logits is not None:
         from megatron.lite.primitive.modules import deployment_math
 
-        if cp_context is not None:
-            raise ValueError('Deployment head probabilities require CP1')
+        # Under CP each rank holds the logits of its own rows; labels and the
+        # loss mask are sliced to the same rows by _cp_targets.
         if tp_group is not None and torch.distributed.get_world_size(tp_group) != 1:
             raise ValueError('Deployment head probabilities require full-vocab TP1')
         logits = logits.float() / temperature

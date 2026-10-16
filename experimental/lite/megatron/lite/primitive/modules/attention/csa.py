@@ -516,8 +516,8 @@ class CompressedSparseAttention(nn.Module):
                 swa_cache,
             )
 
-            if cp_context is not None or not (c.swa_fp8 and c.main_qat and c.index_qat):
-                raise ValueError("Deployment cache requires CP1 and enabled KV codecs")
+            if not (c.swa_fp8 and c.main_qat and c.index_qat):
+                raise ValueError("Deployment cache requires enabled KV codecs")
             cos_sin = rotary_cache(c, ratio, x.device)
 
             def swa_vjp(query, values):
@@ -526,8 +526,20 @@ class CompressedSparseAttention(nn.Module):
                     rotate(values, key_positions, c, ratio, deployment_math=True),
                 )
 
-            q, window = swa_cache(
-                unrotated_q, unrotated_kv, key_positions, cos_sin, c.eps, swa_vjp
+            q, window = (
+                swa_cache(
+                    unrotated_q, unrotated_kv, key_positions, cos_sin, c.eps, swa_vjp
+                )
+                if cp_context is None
+                else swa_cache(
+                    unrotated_q,
+                    unrotated_kv,
+                    positions,
+                    cos_sin,
+                    c.eps,
+                    swa_vjp,
+                    start=start,
+                )
             )
         else:
             q = rotate(

@@ -3,7 +3,9 @@
 
 from __future__ import annotations
 
+import sys
 from collections.abc import Callable
+from contextlib import contextmanager
 from typing import Any
 
 import torch  # pyright: ignore[reportMissingImports]
@@ -65,7 +67,9 @@ class _CheckpointWithoutOutputFn(torch.autograd.Function):
             ctx.cpu_rng_state = torch.get_rng_state()
             ctx.cuda_rng_state = torch.cuda.get_rng_state()
 
-        ctx.tensor_indices = [i for i, a in enumerate(args) if isinstance(a, torch.Tensor)]
+        ctx.tensor_indices = [
+            i for i, a in enumerate(args) if isinstance(a, torch.Tensor)
+        ]
         ctx.non_tensor_args = [
             (i, a) for i, a in enumerate(args) if not isinstance(a, torch.Tensor)
         ]
@@ -87,7 +91,9 @@ class _CheckpointWithoutOutputFn(torch.autograd.Function):
         torch.autograd.backward(outputs, grad_outputs)
         ctx.outputs = None
         ctx.inputs = None
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in inputs
+        )
         return (None, None) + grads
 
 
@@ -124,7 +130,9 @@ class CheckpointWithoutOutput:
             self._cuda_rng = torch.cuda.get_rng_state()
 
         outputs = _CheckpointWithoutOutputFn.apply(run_function, self, *args)
-        self.outputs = (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+        self.outputs = (
+            (outputs,) if isinstance(outputs, torch.Tensor) else tuple(outputs)
+        )
         return outputs
 
     def _recompute(self, _) -> None:
@@ -207,17 +215,23 @@ def apply_recompute(
                 if mod_name in module_map:
                     submod = module_map[mod_name](layer)
                     if submod is not None:
-                        wrap_checkpoint(submod, preserve_rng_state=mod_name not in no_rng)
+                        wrap_checkpoint(
+                            submod, preserve_rng_state=mod_name not in no_rng
+                        )
 
 
-def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap) -> None:
+def apply_offload(
+    layers: nn.ModuleList, module_names: list[str], module_map: ModuleMap
+) -> None:
     """Wrap specified sub-modules with activation offloading to CPU."""
     if not module_names:
         return
     try:
         from torch.utils.checkpoint import CheckpointPolicy  # noqa: F401
     except ImportError:
-        log_rank0("WARNING: torch.utils.checkpoint policy_fn not available, skipping offload")
+        log_rank0(
+            "WARNING: torch.utils.checkpoint policy_fn not available, skipping offload"
+        )
         return
     for layer in layers:
         for mod_name in module_names:
@@ -225,6 +239,30 @@ def apply_offload(layers: nn.ModuleList, module_names: list[str], module_map: Mo
                 submod = module_map[mod_name](layer)
                 if submod is not None:
                     wrap_offload(submod)
+
+
+@contextmanager
+def _vllm_stream_follows_torch():
+    """Launch vLLM kernels on the stream autograd uses for this recomputation.
+
+    vLLM keeps its own thread-local current stream (vllm/utils/torch_utils.py
+    current_stream); on first use in a thread it creates a new stream, waits on
+    the current one once and installs it. Backward runs on the autograd thread,
+    so kernels recomputed there (e.g. the CuTe DSL batch-invariant GEMM) would
+    otherwise run on a stream that is not ordered with autograd's, giving
+    corrupted gradients. Restored afterwards.
+    """
+    module = sys.modules.get("vllm.utils.torch_utils")
+    tls = getattr(module, "_current_stream_tls", None)
+    if tls is None or not torch.cuda.is_available() or not torch.cuda.is_initialized():
+        yield
+        return
+    previous = getattr(tls, "value", None)
+    tls.value = torch.cuda.current_stream()
+    try:
+        yield
+    finally:
+        tls.value = previous
 
 
 class CheckpointFunction(torch.autograd.Function):
@@ -274,10 +312,14 @@ class CheckpointFunction(torch.autograd.Function):
 
         # Recompute forward pass with gradients enabled.
         detached = tuple(
-            t.detach().requires_grad_(t.requires_grad) if isinstance(t, torch.Tensor) else t
+            (
+                t.detach().requires_grad_(t.requires_grad)
+                if isinstance(t, torch.Tensor)
+                else t
+            )
             for t in inputs
         )
-        with torch.enable_grad():
+        with torch.enable_grad(), _vllm_stream_follows_torch():
             outputs = ctx.run_function(*detached)
 
         # Restore RNG states.
@@ -297,9 +339,12 @@ class CheckpointFunction(torch.autograd.Function):
                 grad_for_outputs.append(grad)
 
         if outputs_with_grad:
-            torch.autograd.backward(outputs_with_grad, grad_for_outputs)
+            with _vllm_stream_follows_torch():
+                torch.autograd.backward(outputs_with_grad, grad_for_outputs)
 
-        grads = tuple(inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached)
+        grads = tuple(
+            inp.grad if isinstance(inp, torch.Tensor) else None for inp in detached
+        )
         # None for run_function, None for preserve_rng_state, then grads for each input.
         return (None, None) + grads
 
