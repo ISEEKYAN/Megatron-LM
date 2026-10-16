@@ -119,4 +119,8 @@ if [[ "${RECIPE_CPU_COLLECTION:-0}" == 1 ]]; then
  RECIPE_ENTRY_ARGS+=(--collect-only --runtime-preflight)
 fi
 "$RECIPE_PYTHON" -u /recipe/run-c8.py "${RECIPE_ENTRY_ARGS[@]}" || exec_stage=$?
+if [[ "$exec_stage" == 0 && "${RECIPE_CPU_COLLECTION:-0}" == 1 ]]; then
+ "$RECIPE_PYTHON" /recipe/check-cpu-receipts.py --config /run-artifacts/cpu-config \
+  --output /test-output --world "${DS41_WORLD:-8}" --pp "${DS41_PP:-1}" || exec_stage=$?
+fi
 exit "$exec_stage"

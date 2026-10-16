@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """The official/graph recipe rejects silently reused release configurations."""
 import importlib.util
+import json
 from pathlib import Path
 
 import pytest
@@ -12,6 +13,67 @@ SPEC = importlib.util.spec_from_file_location(
 )
 CONTRACT = importlib.util.module_from_spec(SPEC)
 SPEC.loader.exec_module(CONTRACT)
+
+
+@pytest.mark.parametrize(
+    'failure',
+    [
+        None,
+        'rank_failed',
+        'rank_missing',
+        'rank_duplicate',
+        'replay',
+        'replay_config',
+        'replay_missing',
+        'pytest_failed',
+    ],
+)
+def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
+    """A successful process exit cannot hide a failed rank or enabled replay."""
+    import subprocess
+    import sys
+
+    config, output = tmp_path / 'config', tmp_path / 'output'
+    config.mkdir()
+    output.mkdir()
+    result = dict(passed=True, collect_only=True, pytest_exit=0)
+    if failure == 'pytest_failed':
+        result['passed'] = False
+    (output / 'result.json').write_text(json.dumps(result))
+    if failure != 'replay_missing':
+        (config / 'vllm-cli.json').write_text(
+            json.dumps({'swa_bounded_replay': failure == 'replay_config'})
+        )
+    for prefix in ('model-counts', 'checkpoint-headers'):
+        for rank in range(2):
+            if failure == 'rank_missing' and rank == 1:
+                continue
+            row = dict(passed=True, global_rank=rank)
+            if failure == 'rank_failed' and rank == 1:
+                row['ok'] = False
+            if failure == 'rank_duplicate':
+                row['global_rank'] = 0
+            (config / f'{prefix}-rank-{rank}.json').write_text(json.dumps(row))
+    if failure == 'replay':
+        (output / 'events-123.jsonl').write_text(
+            json.dumps({'kind': 'decoder_replay_enabled', 'window': 128}) + '\n'
+        )
+    command = [
+        sys.executable,
+        str(ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/hsg/check-cpu-receipts.py'),
+        '--config',
+        str(config),
+        '--output',
+        str(output),
+        '--world',
+        '2',
+        '--pp',
+        '2',
+    ]
+    completed = subprocess.run(command, capture_output=True, text=True)
+    receipt = json.loads((output / 'receipt-validation.json').read_text())
+    assert completed.returncode == (0 if failure is None else 1)
+    assert receipt['passed'] is (failure is None)
 
 
 def test_official_graph_uses_native_precision_and_breakable_capture():

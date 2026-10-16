@@ -42,6 +42,7 @@ else
  test "$RECIPE_STAGE" = gpu
  grep -q '"passed": true' "$RECIPE_ROOT/logs/cpu/result.json"
  grep -q '"collect_only": true' "$RECIPE_ROOT/logs/cpu/result.json"
+ grep -q '"passed": true' "$RECIPE_ROOT/logs/cpu/receipt-validation.json"
 fi
 export RAY_AUTH_MODE=token
 export RAY_AUTH_TOKEN=$(openssl rand -hex 32)
