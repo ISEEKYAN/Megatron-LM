@@ -10,6 +10,15 @@ class _Visible(torch.autograd.Function):
     def forward(ctx, visible, reference, *inputs):
         ctx.reference = reference
         ctx.save_for_backward(*inputs)
+        if inputs[0].numel() == 0:
+            # A CP rank can own no rows of a document. Native kernels launched
+            # with an empty grid fail or leave a CUDA error for the next checked
+            # launch; the reference gives the same empty rows and the backward
+            # already runs the reference.
+            outputs = reference(*inputs)
+            if isinstance(outputs, torch.Tensor):
+                return outputs.detach().clone()
+            return tuple(y.detach().clone() for y in outputs)
         return visible(*inputs)
 
     @staticmethod
