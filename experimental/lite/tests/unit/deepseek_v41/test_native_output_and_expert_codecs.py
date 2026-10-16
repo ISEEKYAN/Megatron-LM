@@ -76,7 +76,7 @@ def test_wo_a_input_is_native_inverse_rope_fp8(ratio):
             grouped=True,
             weight_scale_group_rows=32,
         )
-        .reshape(b, length, config.o_rank)
+        .reshape(b, length, config.groups * config.o_rank)
         .to(grouped.dtype)
     )
     assert torch.equal(actual.flatten(2), expected)
