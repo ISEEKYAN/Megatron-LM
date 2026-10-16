@@ -43,6 +43,25 @@ For the 6L release subset, pass `--layers 6` and the trainable count from its CP
 DS41_PARAMETER_COUNTS=<count> bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 6 /path/to/your/new-c8-output
 ```
 
+The same launcher accepts `--layers 2`, `--layers 4`, `--layers 6`, and
+`--layers 9`. The 6L and 9L variants require `DS41_PARAMETER_COUNTS` from
+that variant's CPU construction receipt. Set `DS41_PRECISION=official`,
+`DS41_CUDAGRAPH=full_and_piecewise`, and `DS41_CUDAGRAPH_MAX_CAPTURE=16`
+before submission; both preparation and GPU workers receive these settings.
+
+Resource overrides use `DS41_CPU_TIME`, `DS41_GPU_TIME` (Slurm time format),
+`DS41_CPU_CPUS`, `DS41_GPU_CPUS`, `DS41_CPU_MEM`, `DS41_GPU_MEM`,
+`DS41_CPU_PARTITION`, `DS41_GPU_PARTITION`, and `DS41_CPU_QOS`.
+`DS41_GPU_QOS` defaults to `interactive`; set it to an empty string to use
+the partition default. These options do not change the variant's node count
+or authorize additional resources. For example:
+
+```bash
+DS41_CPU_QOS=cpu-short DS41_CPU_MEM=0 DS41_GPU_CPUS=64 DS41_GPU_TIME=01:30:00 \
+  bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 4 /path/to/new-4l-output
+
+```
+
 The launcher first submits a **zero-GPU, two-node CPU gate**. It checks image/files, expands the image before any GPU allocation, prepares the 2L prefix, resolves the production config, exercises real optimizer workers and collects the exact C8 test. Its dependent GPU job runs only after success and is automatically cancelled if the dependency fails.
 
 The account comes from `DS41_SLURM_ACCOUNT`; it is not embedded in the recipe. The GPU submission uses `sbatch --account=<ACCOUNT> -p batch --qos interactive`, **2 nodes × 4 GPUs, `--mem=0`, 60 minutes**. It does not pin nodes or increase scale to bypass a queue. Ray ports derive from the job ID, are checked before startup, and the dashboard is disabled. During GPU execution, JIT caches and container Python/Torch temporary files use a fixed, versioned node-local `/tmp` path without a job ID. Enroot stores the CPU-expanded image at `<OUTPUT>/enroot`, image-preparation staging at `<OUTPUT>/enroot-tmp`, and per-node container startup staging (both CPU and GPU stages) at `<OUTPUT>/gpu-temp/<JOBID>/<HOST>` on shared storage; these are distinct from runtime JIT caches. If your cluster administrator requires excluding CPU nodes, pass `DS41_CPU_EXCLUDE=<OPTIONAL_NODE_LIST>`; no host is embedded in the launcher. GPU/model workers share the eight-card allocation; the proxy reward is CPU code, with no GPU sandbox service.
