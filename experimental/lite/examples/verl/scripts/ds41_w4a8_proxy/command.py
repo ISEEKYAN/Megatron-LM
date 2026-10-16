@@ -28,6 +28,17 @@ segmented_host = '1'
 engram_host = os.environ.get('DS41_ENGRAM_HOST', '0')
 if engram_host not in ('0', '1'):
     raise ValueError('DS41_ENGRAM_HOST must be 0 or 1')
+# Training MoE transport (DS4 recipe: ACTOR_MOE_DISPATCHER=deepep) and the
+# rollout all2all backend (DS4 aligned mode: deepep_low_latency).
+dispatcher = os.environ.get('ACTOR_MOE_DISPATCHER', 'alltoall')
+if dispatcher not in ('alltoall', 'deepep'):
+    raise ValueError('ACTOR_MOE_DISPATCHER must be alltoall or deepep')
+use_deepep = 'true' if dispatcher == 'deepep' else 'false'
+all2all = os.environ.get('ROLLOUT_ALL2ALL_BACKEND', 'allgather_reducescatter')
+if all2all not in ('allgather_reducescatter', 'deepep_low_latency'):
+    raise ValueError(
+        'ROLLOUT_ALL2ALL_BACKEND must be allgather_reducescatter or deepep_low_latency'
+    )
 bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
@@ -164,6 +175,7 @@ args = [
             'trainable_engram': 'false',
             **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
+            'use_deepep': use_deepep,
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
             'optimizer': 'muon',
@@ -184,6 +196,7 @@ args = [
             'trainable_engram': 'false',
             **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
+            'use_deepep': use_deepep,
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
         }.items()
@@ -221,7 +234,7 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config={indexer_kv_dtype:mxfp4,indexer_sparse_logits:false}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides='
     + hydra_mapping(rollout['hf_overrides']),
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend=allgather_reducescatter',
+    f'+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend={all2all}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
     + hydra_mapping(rollout['compilation_config']),
