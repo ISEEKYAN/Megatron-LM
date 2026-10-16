@@ -62,6 +62,15 @@ LONG_SEQUENCE = {8, 9}
 
 
 def _parameter_counts(layers):
+    pp = int(os.environ.get('DS41_PP', '1'))
+    if pp > 1:
+        counts = os.environ['DS41_PARAMETER_COUNTS']
+        values = counts.split(',')
+        if len(values) != pp or any(int(value) <= 0 for value in values):
+            raise ValueError(
+                'PP parameter counts must contain one positive count per stage'
+            )
+        return counts
     # 6L trainable leaves come from its CPU init receipt, not a guess
     # (40L: EP64 CONFIG_ONLY, 1540 on every rank).
     known = {2: '334', 4: '665', 40: '1540'}

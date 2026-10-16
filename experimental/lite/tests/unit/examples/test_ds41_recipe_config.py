@@ -60,8 +60,9 @@ def test_release_defaults_keep_eager_and_head_only_override():
 @pytest.mark.parametrize(
     ('layers', 'cpu_only'), [(2, False), (4, False), (6, False), (9, False), (40, True)]
 )
+@pytest.mark.parametrize('pp', [1, 2])
 def test_hsg_submit_preserves_variant_and_resource_overrides(
-    tmp_path, layers, cpu_only
+    tmp_path, layers, cpu_only, pp
 ):
     """The delivered entry submits both stages with the requested resources."""
     import os
@@ -79,6 +80,9 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(
     stub.write_text(
         '#!/bin/bash\n'
         'printf "%s\\n" "$DS41_LAYERS" "$@" >> "$CALL_LOG"\n'
+        'printf "TOPOLOGY=%s/%s/%s/%s/%s/%s\\n" "$DS41_PP" '
+        '"$DS41_PIPELINE_SPLIT_LAYER" "$DS41_EP" "$DS41_CP" '
+        '"$DS41_WORLD" "$DS41_PARAMETER_COUNTS" >> "$CALL_LOG"\n'
         'echo 12345\n'
     )
     stub.chmod(0o755)
@@ -89,7 +93,12 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(
         'DS41_BUNDLE': str(bundle),
         'DS41_SLURM_ACCOUNT': 'test-account',
         'WANDB_API_KEY': 'test-placeholder',
-        'DS41_PARAMETER_COUNTS': '123',
+        'DS41_PARAMETER_COUNTS': '123' if pp == 1 else '101,202',
+        'DS41_PP': str(pp),
+        'DS41_PIPELINE_SPLIT_LAYER': '2',
+        'DS41_EP': '4',
+        'DS41_CP': '1',
+        'DS41_WORLD': '8',
         'DS41_CPU_QOS': 'cpu-short',
         'DS41_CPU_TIME': '00:30:00',
         'DS41_GPU_TIME': '01:30:00',
@@ -115,6 +124,8 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(
     )
     calls = call_log.read_text().splitlines()
     expected_jobs = 1 if cpu_only else 2
+    counts = '123' if pp == 1 else '101,202'
+    assert calls.count(f'TOPOLOGY={pp}/2/4/1/8/{counts}') == expected_jobs
     assert calls.count(str(layers)) == expected_jobs
     assert '--time=00:30:00' in calls and '--cpus-per-task=24' in calls
     assert calls.count('--mem=0') == expected_jobs
@@ -126,3 +137,29 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(
     else:
         assert '--time=01:30:00' in calls and '--cpus-per-task=64' in calls
         assert '--dependency=afterok:12345' in calls
+
+
+@pytest.mark.parametrize('counts', ['665', '1,2,3', '0,2'])
+def test_pp_verifier_rejects_non_stage_parameter_counts(monkeypatch, counts):
+    spec = importlib.util.spec_from_file_location(
+        'ds41_c8_counts', ROOT / 'tests/smoke/workflows/test_ds41_grpo_recipe.py'
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv('DS41_PP', '2')
+    monkeypatch.setenv('DS41_PARAMETER_COUNTS', counts)
+    with pytest.raises(ValueError, match='one positive count per stage'):
+        module._parameter_counts(4)
+
+
+def test_pp_verifier_uses_stage_counts_instead_of_full_model(monkeypatch):
+    spec = importlib.util.spec_from_file_location(
+        'ds41_c8_counts', ROOT / 'tests/smoke/workflows/test_ds41_grpo_recipe.py'
+    )
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    monkeypatch.setenv('DS41_PP', '2')
+    monkeypatch.setenv('DS41_PARAMETER_COUNTS', '301,364')
+    assert module._parameter_counts(4) == '301,364'
+    monkeypatch.setenv('DS41_PP', '1')
+    assert module._parameter_counts(4) == '665'

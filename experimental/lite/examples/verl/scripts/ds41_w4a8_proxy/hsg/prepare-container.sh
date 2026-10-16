@@ -21,6 +21,9 @@ fi
 export DS41_DATA=/data/${DS41_DATA_FILE:-dapo-math-17k-cleaned.parquet}
 export PYTHONPATH=/opt/src/mlite/experimental/lite/examples/verl:${PYTHONPATH:-}
 bash /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/run.sh --config-only
+if [[ "${DS41_PP:-1}" != 1 ]]; then
+ "$DS41_PYTHON" /recipe/verify-parallel-config.py "$DS41_OUTPUT/resolved.yaml"
+fi
 if [[ "$RECIPE_LAYERS" == 6 || "$RECIPE_LAYERS" == 8 || "$RECIPE_LAYERS" == 9 ]]; then
  # Past the 2048x8 candidate pool, so the two-level Top-K drops blocks.
  "$DS41_PYTHON" /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/prepare_long_prompts.py \

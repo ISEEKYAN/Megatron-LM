@@ -60,6 +60,18 @@ test "${DS41_OUTPUT:0:1}" = /
 test ! -e "$DS41_OUTPUT"
 source "$DS41_BUNDLE/paths.env"
 export DS41_BUNDLE DS41_RELEASE DS41_DATA_DIR DS41_DATA_FILE DS41_LAYERS
+export DS41_PP=${DS41_PP:-1}
+for DS41_TOPOLOGY_KEY in DS41_PIPELINE_SPLIT_LAYER DS41_EP DS41_CP DS41_WORLD; do
+ if [[ -v "$DS41_TOPOLOGY_KEY" ]]; then export "$DS41_TOPOLOGY_KEY"; fi
+done
+if [[ "$DS41_PP" != 1 ]]; then
+ [[ "$DS41_PP" == 2 ]] || { echo 'DS41_PP takes 1 or 2' >&2; exit 2; }
+ if [[ "$DS41_CPU_ONLY" != 1 || -n "${DS41_PARAMETER_COUNTS:-}" ]]; then
+ [[ "${DS41_PARAMETER_COUNTS:-}" =~ ^[1-9][0-9]*,[1-9][0-9]*$ ]] || {
+  echo 'PP2 needs DS41_PARAMETER_COUNTS=count_stage0,count_stage1 from its CPU construction receipt' >&2; exit 2;
+ }
+ fi
+fi
 if [[ -n "${DS41_PARAMETER_COUNTS:-}" ]]; then export DS41_PARAMETER_COUNTS; fi
 mkdir -p "$DS41_OUTPUT/logs"
 DS41_CPU_ARGS=()
