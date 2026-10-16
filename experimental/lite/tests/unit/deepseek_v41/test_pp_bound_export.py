@@ -139,7 +139,7 @@ def _real_pp_export_worker(rank, world, ep, directory):
             resync_config={'freeze_engram': True},
         )
 
-        def receive(pairs, *, reuse=False):
+        def receive(pairs, *, reuse=False, resend=False):
             received, ended, row_receivers, census = {}, False, {}, None
             for pair in pairs:
                 assert not ended, 'Tensors after the generation terminator'
@@ -176,6 +176,7 @@ def _real_pp_export_worker(rank, world, ep, directory):
                 received[name] = value.clone()
             assert ended, 'Missing generation terminator'
             assert census is not None and census.reuse is reuse
+            assert census.resend is resend
             assert bool(row_receivers) is not reuse
             for receiver in row_receivers.values():
                 receiver.finish()
@@ -221,9 +222,19 @@ def _real_pp_export_worker(rank, world, ep, directory):
         load_bound_model(full, baseline, checkpoint._SPEC, allow_missing_archive=True)
         for name, binding in restored.tensor_bindings.items():
             if name in full.tensor_bindings:
+                expected_owner = full.tensor_bindings[name].tensor
+                if expected_owner.shape != binding.tensor.shape:
+                    lookup = checkpoint._SPEC.row_shard(binding.owner)
+                    assert lookup is not None, name
+                    expected_owner = expected_owner[
+                        lookup.boundaries[lookup.rank] : lookup.boundaries[
+                            lookup.rank + 1
+                        ]
+                    ]
+                assert binding.tensor.shape == expected_owner.shape, name
+                assert binding.tensor.dtype == expected_owner.dtype, name
                 assert torch.equal(
-                    binding.tensor.view(torch.uint8),
-                    full.tensor_bindings[name].tensor.view(torch.uint8),
+                    binding.tensor.view(torch.uint8), expected_owner.view(torch.uint8)
                 ), name
         # A second real generation must reuse the frozen table, not resend it.
         reused_expected = receive(
@@ -237,6 +248,25 @@ def _real_pp_export_worker(rank, world, ep, directory):
             assert torch.equal(
                 reused[name].view(torch.uint8), reused_expected[name].view(torch.uint8)
             ), name
+        # Production resends frozen rows every generation (sleep/offload).
+        resend_options = dict(
+            options, resync_config={'freeze_engram': True, 'resend_frozen_engram': True}
+        )
+        for _ in range(2):
+            resent_expected = receive(
+                checkpoint.export_hf_weights([full], cfg, full.ps, **resend_options),
+                resend=True,
+            )
+            resent = receive(
+                checkpoint.export_hf_weights([model], cfg, ps, **resend_options),
+                resend=True,
+            )
+            assert resent.keys() == resent_expected.keys() == expected.keys()
+            for name in resent:
+                assert torch.equal(
+                    resent[name].view(torch.uint8),
+                    resent_expected[name].view(torch.uint8),
+                ), name
         receipt = dict(
             passed=True,
             rank=rank,
@@ -249,6 +279,7 @@ def _real_pp_export_worker(rank, world, ep, directory):
             sha256=digest.hexdigest(),
             stage_local_keys=len(local_keys),
             initial_and_reuse=True,
+            production_resend_twice=True,
             pp1_bytes_equal=True,
             receiver_loaded=True,
             payload='real CPU tensors',
@@ -257,3 +288,19 @@ def _real_pp_export_worker(rank, world, ep, directory):
         (Path(directory) / f'rank-{rank}.json').write_text(json.dumps(receipt))
     finally:
         dist.destroy_process_group()
+
+
+def test_real_pp_bound_generation_and_stage_load(tmp_path):
+    import json
+
+    import torch.multiprocessing as mp
+
+    mp.spawn(_real_pp_export_worker, args=(2, 1, str(tmp_path)), nprocs=2, join=True)
+    rows = [
+        json.loads((tmp_path / f'rank-{rank}.json').read_text()) for rank in range(2)
+    ]
+    assert all(
+        row['passed'] and row['receiver_loaded'] and row['production_resend_twice']
+        for row in rows
+    )
+    assert len({row['sha256'] for row in rows}) == 1
