@@ -22,8 +22,8 @@ def main():
     if args.min_tokens <= 1024 or args.limit < 16:
         parser.error('Use >1024 prompt tokens and at least sixteen prompts')
     config = json.loads((args.model / 'config.json').read_text())['text_config']
-    if config['num_hidden_layers'] != 4:
-        parser.error('The index audit requires the four-layer prefix')
+    if not config['index_source_layer_ids']:
+        parser.error('The index audit requires a model with an index source')
     tokenizer = AutoTokenizer.from_pretrained(args.model, local_files_only=True)
     data = pd.read_parquet(args.data)
     template = "{{ bos_token }}{% for message in messages %}{{ message['content'] }}{% endfor %}"

@@ -45,6 +45,22 @@ def _command(command, destination, env, *, timeout=1500):
     assert result.returncode == 0, (destination, destination.read_text()[-10000:])
 
 
+# 6L is the release subset [1, 14, 15, 20, 21, 24]; its prompts exceed the
+# 2048x8 candidate pool so the two-level Top-K actually drops blocks.
+LONG_PROMPTS = {
+    4: 'c8-boundary-long-prompts.parquet',
+    6: 'c8-candidate-long-prompts.parquet',
+}
+PROMPT_LENGTHS = {4: '12800', 6: '17408'}
+FROZEN_TABLES = {6: '2'}
+
+
+def _parameter_counts(layers):
+    # 6L trainable leaves come from its CPU init receipt, not a guess.
+    known = {2: '334', 4: '665'}
+    return known.get(layers) or os.environ['DS41_PARAMETER_COUNTS']
+
+
 def production_environment(layers, bi, inputs):
     base = os.environ.copy()
     base.pop('DS41_RELEASE', None)
@@ -53,12 +69,12 @@ def production_environment(layers, bi, inputs):
         DS41_PYTHON=sys.executable,
         DS41_MODEL=str(inputs / f'{layers}l/model'),
         DS41_DATA=(
-            str(inputs / 'c8-boundary-long-prompts.parquet')
-            if layers == 4
+            str(inputs / LONG_PROMPTS[layers])
+            if layers in LONG_PROMPTS
             else os.environ['DS41_C8_SHORT_DATA']
         ),
         DS41_LAYERS=str(layers),
-        DS41_PROMPT_LENGTH='12800' if layers == 4 else '256',
+        DS41_PROMPT_LENGTH=PROMPT_LENGTHS.get(layers, '256'),
         VLLM_BATCH_INVARIANT=str(bi),
         DS41_INDEXER_DIAGNOSTIC=str(int(layers == 4)),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
@@ -76,7 +92,7 @@ def stage_environment(base, run, steps, resume):
     return env
 
 
-@pytest.mark.parametrize('layers,bi', [(2, 1), (4, 1), (2, 0)])
+@pytest.mark.parametrize('layers,bi', [(2, 1), (4, 1), (6, 1), (2, 0)])
 def test_two_updates_and_checkpoint_resume(layers, bi):
     """Require raw token equality and exact saved owner/state on a fresh process."""
     if os.environ.get('DS41_C8_ENABLED') != '1':
@@ -101,7 +117,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             ['bash', str(RECIPE / 'run.sh')],
             run / 'train.log',
             env,
-            timeout=2700 if layers == 4 else (2400 if stage == 'resumed' else 1500),
+            timeout=(2700 if layers >= 4 else (2400 if stage == 'resumed' else 1500)),
         )
         events = [
             json.loads(line)
@@ -123,12 +139,14 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                     '1' if stage == 'fresh' else '3',
                     '--segmented-host',
                     '--parameter-counts',
-                    '665' if layers == 4 else '334',
+                    _parameter_counts(layers),
+                    '--frozen-tables',
+                    FROZEN_TABLES.get(layers, '1'),
                 ],
                 run / 'verified.json',
                 base,
             )
-        if layers == 4:
+        if layers in LONG_PROMPTS:
             coverage = [
                 row
                 for row in events
@@ -143,6 +161,24 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             (run / 'indexer-boundary-coverage.json').write_text(
                 json.dumps(coverage, indent=2) + '\n'
             )
+        if layers == 6:
+            candidates = [
+                row
+                for row in events
+                if row['kind'] == 'candidate_blocks_call' and row['dropped'] > 0
+            ]
+            # The two-level Top-K must actually drop blocks on both sides.
+            assert {row['owner'] for row in candidates} >= {'training', 'inference'}, (
+                'Candidate filtering stayed the identity',
+                candidates,
+            )
+            assert any(
+                row['kind'] == 'decoder_replay_batch_used' for row in events
+            ), 'vLLM decoder SWA bounded replay did not run'
+            (run / 'candidate-coverage.json').write_text(
+                json.dumps(candidates, indent=2) + '\n'
+            )
+        if layers == 4:
             probes = [
                 row for row in events if row['kind'] == 'indexer_fp32_definition_probe'
             ]

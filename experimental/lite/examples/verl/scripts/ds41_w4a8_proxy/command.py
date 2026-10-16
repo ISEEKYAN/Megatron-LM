@@ -23,12 +23,15 @@ if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
 layers = int(os.environ.get('DS41_LAYERS', '2'))
 prompt_length = int(
-    os.environ.get('DS41_PROMPT_LENGTH', '1536' if layers == 4 else '256')
+    os.environ.get('DS41_PROMPT_LENGTH', {4: '1536', 6: '17408'}.get(layers, '256'))
 )
 response_length = int(os.environ.get('DS41_RESPONSE_LENGTH', '128'))
 context_length = prompt_length + response_length
-if layers not in (2, 4) or min(prompt_length, response_length) <= 0:
-    raise ValueError('Expected a 2L/4L prefix and positive prompt/response lengths')
+if layers not in (2, 4, 6) or min(prompt_length, response_length) <= 0:
+    raise ValueError(
+        'Expected a 2L/4L prefix or the 6L release subset and positive '
+        'prompt/response lengths'
+    )
 if not os.environ.get('DS41_DATA'):
     raise ValueError('DS41_DATA must point to the DAPO training parquet')
 os.environ['W4_GRPO_DATA'] = os.environ['DS41_DATA']

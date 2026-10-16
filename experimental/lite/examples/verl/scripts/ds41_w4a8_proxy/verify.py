@@ -14,6 +14,9 @@ p.add_argument('--start-step', type=int, default=1)
 p.add_argument('--ranks', type=int, default=8)
 p.add_argument('--segmented-host', action='store_true')
 p.add_argument(
+    '--frozen-tables', type=int, default=1, help='Frozen Engram tables per resync'
+)
+p.add_argument(
     '--parameter-counts',
     default='334',
     help='Expected owned trainable tensors by PP stage, from CPU init receipt',
@@ -129,8 +132,10 @@ for row in events:
         optimizers.setdefault(row['pid'], []).append(row)
     if row['kind'] == 'resync':
         assert row['finished'] and row['staging_current'] == 0
-        assert row['frozen_tables'] == 1
-        assert row['received_tables'] == (0 if row['frozen_reuse'] else 1)
+        assert row['frozen_tables'] == args.frozen_tables
+        assert row['received_tables'] == (
+            0 if row['frozen_reuse'] else args.frozen_tables
+        )
         resync.setdefault(row['pid'], []).append(row)
 assert len(optimizers) == args.ranks, len(optimizers)
 stage_counts = [

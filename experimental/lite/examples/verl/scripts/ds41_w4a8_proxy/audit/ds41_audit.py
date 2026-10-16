@@ -501,7 +501,104 @@ def _grad_forward(module):
         install(module, tensors, event, counters)
 
 
+def _capturing(tensor):
+    # Reading counts back would sync inside a CUDA graph capture.
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
+def _candidate_event(owner, seen, record):
+    coverage = (owner, record['dropped'] > 0)
+    if coverage not in seen:
+        seen.add(coverage)
+        event('candidate_blocks_call', dict(record, owner=owner))
+
+
+def _training_candidates(module):
+    original = module.candidate_blocks
+    seen = set()
+
+    def candidate_blocks(scores, lengths, **kwargs):
+        keep = original(scores, lengths, **kwargs)
+        if not _capturing(scores):
+            width = scores.shape[-1]
+            visible = torch.arange(width, device=scores.device) < torch.as_tensor(
+                lengths, device=scores.device
+            )
+            _candidate_event(
+                'training',
+                seen,
+                {
+                    'columns': width,
+                    'pool_blocks': kwargs.get('topk_blocks'),
+                    'block_size': kwargs.get('block_size'),
+                    # Visible positions the first level excluded.
+                    'dropped': int((visible & ~keep).sum()),
+                },
+            )
+        return keep
+
+    module.candidate_blocks = candidate_blocks
+
+
+def _inference_candidates(module):
+    original = module._select_candidate_blocks
+    signature = inspect.signature(original)
+    seen = set()
+
+    def select_candidate_blocks(*args, **kwargs):
+        original(*args, **kwargs)
+        bound = signature.bind(*args, **kwargs)
+        bound.apply_defaults()
+        a = bound.arguments
+        if not _capturing(a['logits']):
+            rows = a['logits'].shape[0]
+            ends = a['row_ke'].repeat_interleave(a['row_repeat'])[:rows]
+            starts = (
+                torch.zeros_like(ends)
+                if a['row_ks'] is None
+                else a['row_ks'].repeat_interleave(a['row_repeat'])[:rows]
+            )
+            reachable = (ends - starts + a['block_size'] - 1) // a['block_size']
+            kept = (a['out'][:rows] >= 0).sum(-1)
+            _candidate_event(
+                'inference',
+                seen,
+                {
+                    'columns': a['logits'].shape[1],
+                    'pool_blocks': a['topk_blocks'],
+                    'block_size': a['block_size'],
+                    # Reachable blocks the first level excluded.
+                    'dropped': int((reachable - kept).clamp_min(0).sum()),
+                },
+            )
+
+    module._select_candidate_blocks = select_candidate_blocks
+
+
+def _decoder_replay(module):
+    cls = module.DecoderReplayLayers
+    init, call = cls.__init__, cls.__call__
+    used = []
+
+    def __init__(self, *args, **kwargs):
+        init(self, *args, **kwargs)
+        event('decoder_replay_enabled', {'window': self.window})
+
+    def __call__(self, *args):
+        replay = self.uses_replay_batch()
+        result = call(self, *args)
+        if replay and not used:
+            used.append(True)
+            event('decoder_replay_batch_used', {'window': self.window})
+        return result
+
+    cls.__init__, cls.__call__ = __init__, __call__
+
+
 _callbacks = {
+    'megatron.lite.primitive.modules.attention.csa': _training_candidates,
+    'vllm.model_executor.layers.sparse_attn_indexer': _inference_candidates,
+    'vllm.models.deepseek_v41.decoder_replay_layers': _decoder_replay,
     'vllm.model_executor.kernels.batch_invariant': _selector,
     'vllm._custom_ops': _legacy_guard,
     'verl.utils.debug.metrics': _debug,

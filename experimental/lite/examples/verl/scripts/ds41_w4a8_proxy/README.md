@@ -12,6 +12,21 @@ Use HSG GB200 (SM100), Enroot, Slurm, and an online W&B account. The release bun
 
 The required release revision is **`dba1be0a40aa45a94ad051997016db3960a90277`**. Reuse the cluster's existing verified weights. `prepare_prefix.py` checks revision/SHA sidecars and links the original shards; it preserves all release matrix and Engram dimensions. A replacement download must provide the same verified sidecars, tokenizer and shard index. Do not substitute a differently quantized checkpoint.
 
+### Release layer subset (6L)
+
+The 2L/4L prefixes reach neither ratio-1 compression nor the two-level candidate Top-K, the second Engram table, or vLLM's decoder SWA bounded replay. `prepare_variant.py` builds a proxy from release layers `DS41_VARIANT_LAYERS=1,14,15,20,21,24`: the first and second Engram tables, a ratio-2 KV/index owner and consumer, the ratio-1 owner and candidate publisher, a ratio-1 consumer and a candidate-reusing index layer. Layers are renumbered 0-5; each keeps its release KV/index owner, candidate mode and Engram slot, and `engram_hash_layer_ids` keeps the release hash seeds. Tensors are copied byte for byte into new shards under the new names (about 0.27 TB), so no release layer can be read under a proxy index.
+
+```bash
+DS41_RELEASE=<release dir> DS41_MODEL=<out>/6l/model DS41_OUTPUT=<out> \
+DS41_DATA=<DAPO parquet> DS41_VARIANT_LAYERS=1,14,15,20,21,24 \
+python prepare_variant.py
+python prepare_long_prompts.py --model <out>/6l/model --min-tokens 17408 \
+  --repeat-content-to-min --data <DAPO parquet> \
+  --output <inputs>/c8-candidate-long-prompts.parquet
+```
+
+Run it with `DS41_LAYERS=6` (prompt 17408 + response 128, so the candidate pool of 2048 blocks of 8 actually drops blocks). The 6L C8 additionally requires the vLLM first-local-layer Engram fix, `DS41_PARAMETER_COUNTS` from the 6L CPU init receipt, two frozen tables per resync, training and inference candidate calls that dropped blocks, and a used bounded-replay batch.
+
 ## One command
 
 Export `WANDB_API_KEY` without putting it in a script or command-line argument. Choose a new absolute output directory on shared Lustre, writable by your account:
