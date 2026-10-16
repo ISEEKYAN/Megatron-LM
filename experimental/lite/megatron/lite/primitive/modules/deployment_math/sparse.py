@@ -2,8 +2,7 @@
 """Deployment-visible sparse arithmetic and owned gradients."""
 
 import torch
-
-from .autograd import visible_forward
+from torch.autograd.function import once_differentiable
 
 
 @torch.no_grad()
@@ -110,6 +109,70 @@ def indexer_select_positions(scores, lengths, topk, *, candidates=None):
     return torch.where(selected < columns, selected, -1).reshape(batch, rows, -1)
 
 
+# Query rows per reference VJP chunk. The fp32 reference gathers
+# [rows, width, dim] KV, which is 15.8 GiB for 12928 rows at width 640.
+SPARSE_VJP_ROW_CHUNK = 1024
+
+
+class _ChunkedRowVJP(torch.autograd.Function):
+    """Visible forward; the reference VJP is replayed over query-row chunks.
+
+    Each output row depends only on its own query row and the shared values and
+    sink, so per-chunk VJPs sum to the full one. Shared gradients accumulate in
+    FP32 in a fixed chunk order and round to the input dtype once.
+    """
+
+    @staticmethod
+    def forward(ctx, visible, reference_rows, chunk, query, values, bias):
+        if chunk <= 0:
+            raise ValueError("Sparse VJP chunk must be positive")
+        ctx.reference_rows, ctx.chunk = reference_rows, chunk
+        ctx.save_for_backward(query, values, bias)
+        return visible(query, values, bias)
+
+    @staticmethod
+    @once_differentiable
+    def backward(ctx, grad):
+        query, values, bias = ctx.saved_tensors
+        need_q, need_v, need_b = ctx.needs_input_grad[3:]
+        grad_q = torch.empty_like(query) if need_q else None
+        grad_v = torch.zeros_like(values, dtype=torch.float32) if need_v else None
+        grad_b = torch.zeros_like(bias, dtype=torch.float32) if need_b else None
+        if need_q or need_v or need_b:
+            with torch.enable_grad(), torch.autocast(
+                device_type=query.device.type, enabled=False
+            ):
+                # FP32 leaf: the reference reads values.float(), so the forward
+                # is unchanged and each chunk's gradient stays unrounded.
+                shared_v = values.detach().float().requires_grad_(need_v)
+                shared_b = bias.detach().requires_grad_(need_b)
+                rows = query.shape[1]
+                for start in range(0, rows, ctx.chunk):
+                    stop = min(start + ctx.chunk, rows)
+                    rows_q = query[:, start:stop].detach().requires_grad_(need_q)
+                    output = ctx.reference_rows(rows_q, shared_v, shared_b, start, stop)
+                    wanted = [
+                        t for t in (rows_q, shared_v, shared_b) if t.requires_grad
+                    ]
+                    grads = iter(
+                        torch.autograd.grad(output, wanted, grad[:, start:stop])
+                    )
+                    if need_q:
+                        grad_q[:, start:stop] = next(grads)
+                    if need_v:
+                        grad_v += next(grads).float()
+                    if need_b:
+                        grad_b += next(grads).float()
+        return (
+            None,
+            None,
+            None,
+            grad_q,
+            None if grad_v is None else grad_v.to(values.dtype),
+            None if grad_b is None else grad_b.to(bias.dtype),
+        )
+
+
 def sparse_attention(
     q, kv, sink, mask, main_indices, *, main_size, window_size, width, scale
 ):
@@ -125,14 +188,15 @@ def sparse_attention(
     offsets = torch.arange(batch, device=q.device, dtype=torch.int32)[:, None, None]
     flat_indices = torch.where(indices >= 0, indices + offsets * kv.shape[1], -1)
 
-    def reference(query, values, bias):
-        gathered = values.flatten(0, 1)[flat_indices.clamp_min(0).long()]
+    def reference_rows(query, values, bias, start, stop):
+        selected = flat_indices[:, start:stop]
+        gathered = values.flatten(0, 1)[selected.clamp_min(0).long()]
         logits = (
             torch.einsum('bshd,bstd->bsht', query.float(), gathered.float()) * scale
         )
-        logits = logits.masked_fill((indices < 0).unsqueeze(2), -torch.inf)
+        logits = logits.masked_fill((selected < 0).unsqueeze(2), -torch.inf)
         probabilities = torch.cat(
-            [logits, bias.expand(batch, rows, -1).unsqueeze(-1)], -1
+            [logits, bias.expand(batch, stop - start, -1).unsqueeze(-1)], -1
         ).softmax(-1)[..., :-1]
         return torch.einsum('bsht,bstd->bshd', probabilities, gathered.float()).to(
             query.dtype
@@ -160,4 +224,6 @@ def sparse_attention(
         )
         return output[:, :heads].reshape(batch, rows, heads, dim)
 
-    return visible_forward(visible, reference, q, reordered, sink)
+    return _ChunkedRowVJP.apply(
+        visible, reference_rows, SPARSE_VJP_ROW_CHUNK, q, reordered, sink
+    )
