@@ -2090,18 +2090,14 @@ def load_bound_weight(reader, name, spec, *, output_dtype=torch.bfloat16):
     return decoded.to(output_dtype)
 
 
-@torch.no_grad()
-def load_bound_model(model, path, spec, *, allow_missing_archive=False):
-    path = Path(path)
-    if json.loads((path / 'config.json').read_text()) != model.config.to_hf_dict():
-        raise ValueError('Checkpoint config differs from the constructed model')
-    reader = SafeTensorReader(str(path))
-    master_path = path / 'mlite_masters'
-    masters = SafeTensorReader(str(master_path)) if master_path.is_dir() else None
-    keys = _keys(reader)
+def validate_bound_checkpoint_keys(model, keys, spec, *, allow_missing_archive=False):
+    """Production key gate, also usable against payload-free shard headers."""
     bindings = spec.expand_bindings(
         model, {**model.tensor_bindings, **model.archival_bindings}
     )
+    scope = getattr(spec, 'checkpoint_keys', None)
+    if scope is not None:
+        keys = scope(model, keys, bindings)
     active = {
         name for name, b in bindings.items() if b.role not in ('scale', 'archival')
     }
@@ -2113,8 +2109,26 @@ def load_bound_model(model, path, spec, *, allow_missing_archive=False):
     expected = active | required_archive
     if not expected <= keys or keys - set(bindings):
         raise ValueError('Checkpoint key coverage mismatch')
+    return active, required_archive
+
+
+@torch.no_grad()
+def load_bound_model(model, path, spec, *, allow_missing_archive=False):
+    path = Path(path)
+    if json.loads((path / 'config.json').read_text()) != model.config.to_hf_dict():
+        raise ValueError('Checkpoint config differs from the constructed model')
+    reader = SafeTensorReader(str(path))
+    master_path = path / 'mlite_masters'
+    masters = SafeTensorReader(str(master_path)) if master_path.is_dir() else None
+    keys = _keys(reader)
+    active, required_archive = validate_bound_checkpoint_keys(
+        model, keys, spec, allow_missing_archive=allow_missing_archive
+    )
     with reader, ExitStack() as stack:
         master_keys = _keys(stack.enter_context(masters)) if masters else set()
+        scope = getattr(spec, 'checkpoint_keys', None)
+        if masters and scope is not None:
+            master_keys = scope(model, master_keys, dict.fromkeys(active))
         if master_keys - active:
             raise ValueError('Unexpected training master keys')
         for name, binding in model.tensor_bindings.items():

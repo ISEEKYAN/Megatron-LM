@@ -77,6 +77,23 @@ class DeepseekV41WeightSpec:
             owner.refresh_storage()
 
     @staticmethod
+    def checkpoint_keys(model, keys, bindings):
+        """Like DS4's local load targets, require only this stage's bindings.
+
+        Exchange names (never payloads) first so unknown checkpoint keys are
+        still rejected globally instead of silently treating typos as remote.
+        """
+        if model.ps.pp_size == 1:
+            return keys
+        import torch.distributed as dist
+
+        stages = [None] * model.ps.pp_size
+        dist.all_gather_object(stages, set(bindings), group=model.ps.pp_group)
+        if keys - set().union(*stages):
+            raise ValueError('Checkpoint key coverage mismatch: unbound PP keys')
+        return keys & set(bindings)
+
+    @staticmethod
     def expand_bindings(model, available):
         if model.ps.ep_size > 1:
             experts = model.config.to_hf_dict()['text_config']['n_routed_experts']
