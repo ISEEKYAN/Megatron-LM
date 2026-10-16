@@ -17,7 +17,9 @@ elif [[ "$RECIPE_LAYERS" == 9 || "$RECIPE_LAYERS" == 8 ]]; then
  export DS41_VARIANT_LAYERS=0,1,2,14,15,19,20,21,24 DS41_CP=2 DS41_WORLD=8 DS41_RECOMPUTE=full
  if [[ "$RECIPE_LAYERS" == 8 ]]; then export DS41_VARIANT_LAYERS=0,1,2,14,19,20,21,24; fi
 elif [[ "$RECIPE_LAYERS" == 40 ]]; then
- export DS41_EP=64 DS41_CP=4 DS41_WORLD=64 DS41_TRAIN_BATCH=16
+ # Full model at the long-sequence length: EP64 over CP4 on 64 GPUs (DP16)
+ # with full activation recompute, 17408+128 tokens.
+ export DS41_EP=64 DS41_CP=4 DS41_WORLD=64 DS41_TRAIN_BATCH=16 DS41_RECOMPUTE=full
 fi
 export DS41_DATA=/data/${DS41_DATA_FILE:-dapo-math-17k-cleaned.parquet}
 export PYTHONPATH=/opt/src/mlite/experimental/lite/examples/verl:${PYTHONPATH:-}
@@ -27,7 +29,7 @@ else
  "$DS41_PYTHON" /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/prepare_prefix.py
 fi
 unset DS41_RELEASE
-if [[ "$RECIPE_LAYERS" == 6 || "$RECIPE_LAYERS" == 8 || "$RECIPE_LAYERS" == 9 ]]; then
+if [[ "$RECIPE_LAYERS" == 6 || "$RECIPE_LAYERS" == 8 || "$RECIPE_LAYERS" == 9 || "$RECIPE_LAYERS" == 40 ]]; then
  # Past the 2048x8 candidate pool, so the two-level Top-K drops blocks.
  "$DS41_PYTHON" /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/prepare_long_prompts.py \
   --data "$DS41_DATA" --model "$DS41_MODEL" --output /run-artifacts/inputs/c8-candidate-long-prompts.parquet \

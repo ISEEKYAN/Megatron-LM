@@ -53,8 +53,9 @@ LONG_PROMPTS = {
     6: 'c8-candidate-long-prompts.parquet',
     8: 'c8-candidate-long-prompts.parquet',
     9: 'c8-candidate-long-prompts.parquet',
+    40: 'c8-candidate-long-prompts.parquet',
 }
-PROMPT_LENGTHS = {4: '12800', 6: '17408', 8: '17408', 9: '17408'}
+PROMPT_LENGTHS = {4: '12800', 6: '17408', 8: '17408', 9: '17408', 40: '17408'}
 FROZEN_TABLES = {6: '2', 8: '2', 9: '2', 40: '2'}
 # Long-sequence proxy: release subset with every 40L layer role, EP8xCP2 and
 # full activation recompute (8L drops layer 15).
@@ -98,9 +99,15 @@ def production_environment(layers, bi, inputs):
     if layers in LONG_SEQUENCE:
         base.update(DS41_CP='2', DS41_WORLD='8', DS41_RECOMPUTE='full')
     if layers == 40:
-        # Full model: EP64/DP64 over 16 nodes; four sequences per prompt need
-        # 16 prompts so that every data-parallel rank receives one sequence.
-        base.update(DS41_EP='64', DS41_WORLD='64', DS41_TRAIN_BATCH='16')
+        # Full model at the long-sequence length: EP64 over CP4 on 16 nodes
+        # (DP16) with full activation recompute; 16 prompts x 4 sequences.
+        base.update(
+            DS41_EP='64',
+            DS41_CP='4',
+            DS41_WORLD='64',
+            DS41_TRAIN_BATCH='16',
+            DS41_RECOMPUTE='full',
+        )
     base['PYTHONPATH'] = str(RECIPE.parents[1]) + ':' + base.get('PYTHONPATH', '')
     return base
 
@@ -194,7 +201,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             (run / 'indexer-boundary-coverage.json').write_text(
                 json.dumps(coverage, indent=2) + '\n'
             )
-        if layers in LONG_SEQUENCE:
+        if layers in LONG_SEQUENCE or layers == 40:
             assert any(
                 row['kind'] == 'recompute_backward' for row in events
             ), 'Activation recompute did not run in backward'
