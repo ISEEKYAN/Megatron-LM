@@ -2,7 +2,9 @@
 
 import json
 import os
+import subprocess
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import torch
@@ -27,10 +29,11 @@ split = int(
     )
 )
 rows = {}
+actor_impl = None
 for role in ('actor', 'ref'):
     engine_dict = raw['actor_rollout_ref'][role]['engine']
     # Parsing topology does not require expanding the large token map in OmegaConf.
-    engine_dict['impl_cfg'].pop('token_map', None)
+    token_map = engine_dict['impl_cfg'].pop('token_map', None)
     engine = instantiate(OmegaConf.create(engine_dict))
     runtime = MegatronLiteConfig(
         parallel=ParallelConfig(
@@ -47,7 +50,11 @@ for role in ('actor', 'ref'):
             else dict(engine.impl_cfg)
         ),
     )
+    if token_map is not None:
+        runtime.impl_cfg['token_map'] = token_map
     impl = _build_impl_cfg(protocol, runtime)
+    if role == 'actor':
+        actor_impl = impl
     actual = {key: getattr(impl.parallel, key) for key in expected}
     assert actual == expected, (role, actual, expected)
     assert impl.pipeline_split_layer == split, (role, impl.pipeline_split_layer, split)
@@ -55,7 +62,86 @@ for role in ('actor', 'ref'):
 assert rows['actor'] == rows['ref']
 assert not torch.cuda.is_initialized()
 receipt = {'passed': True, 'typed_impl_configs': rows, 'model_constructed': False}
-(source.parent / 'parallel-config.json').write_text(
-    json.dumps(receipt, indent=2) + '\n'
-)
+if os.environ.get('DS41_META_WORKER') != '1':
+    (source.parent / 'parallel-config.json').write_text(
+        json.dumps(receipt, indent=2) + '\n'
+    )
 print('DS41_TYPED_PARALLEL_CONFIG', json.dumps(receipt), flush=True)
+
+if os.environ.get('DS41_META_WORKER') != '1':
+    subprocess.run(
+        [
+            sys.executable,
+            '-m',
+            'torch.distributed.run',
+            '--standalone',
+            '--nproc-per-node=' + os.environ['DS41_WORLD'],
+            __file__,
+            str(source),
+        ],
+        env={**os.environ, 'DS41_META_WORKER': '1'},
+        check=True,
+    )
+else:
+    import torch.distributed as dist
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import parameter_groups
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
+    from megatron.lite.primitive.modules.native_fp32_linear import (
+        configure_residual_projections,
+    )
+    from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
+    from megatron.lite.primitive.parallel.state import init_parallel
+
+    dist.init_process_group('gloo')
+    try:
+        ps = init_parallel(replace(actor_impl.parallel, etp=1))
+        model_cfg = protocol.build_model_config(
+            raw['actor_rollout_ref']['model']['path']
+        )
+        layers = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
+        layout = build_pipeline_chunk_layout(
+            layers, replace(ps, pp_layout=f'Et*{split}|t*{layers - split}L')
+        )
+        span = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
+        model = protocol._construct_model(
+            model_cfg, replace(actor_impl, device='meta'), ps, span
+        )
+        if actor_impl.text_only:
+            for binding in model.parameter_bindings():
+                if binding.role in ('vision', 'aligner', 'image_delimiter'):
+                    binding.tensor.requires_grad_(False)
+        configure_residual_projections(
+            model, actor_impl.dtype, actor_impl.optimizer == 'muon', EngramTable
+        )
+        leaves = sum(parameter.requires_grad for parameter in model.parameters())
+        owners = len(parameter_groups(model, lr=1e-6))
+        assert leaves == owners, (leaves, owners)
+        counts = os.environ.get('DS41_PARAMETER_COUNTS', '')
+        if counts:
+            assert leaves == int(counts.split(',')[ps.pp_rank]), (
+                ps.pp_rank,
+                leaves,
+                counts,
+            )
+        assert not torch.cuda.is_initialized()
+        result = {
+            'passed': True,
+            'global_rank': dist.get_rank(),
+            'pp_rank': ps.pp_rank,
+            'world': dist.get_world_size(),
+            'ep': ps.ep_size,
+            'cp': ps.cp_size,
+            'stage_range': span,
+            'trainable_leaves': leaves,
+            'optimizer_owners': owners,
+            'model_constructed': 'meta',
+            'weights_loaded': False,
+            'optimizer_state_constructed': False,
+        }
+        (source.parent / f'model-counts-rank-{dist.get_rank()}.json').write_text(
+            json.dumps(result, indent=2) + '\n'
+        )
+        print('DS41_META_STAGE_COUNTS', json.dumps(result), flush=True)
+        dist.barrier()
+    finally:
+        dist.destroy_process_group()
