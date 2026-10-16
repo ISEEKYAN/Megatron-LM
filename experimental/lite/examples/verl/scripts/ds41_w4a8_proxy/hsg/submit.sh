@@ -1,6 +1,8 @@
 #!/usr/bin/env bash
 set -euo pipefail
 DS41_BUNDLE=${DS41_BUNDLE:?set the shared release directory}
+DS41_CPU_ONLY=${DS41_CPU_ONLY:-0}
+[[ "$DS41_CPU_ONLY" == 0 || "$DS41_CPU_ONLY" == 1 ]] || { echo "DS41_CPU_ONLY takes 0 or 1" >&2; exit 2; }
 DS41_LAYERS=2
 if [[ "${1:-}" == --layers ]]; then
  DS41_LAYERS=${2:?--layers takes 2, 4, 6, 8, 9 or 40}
@@ -25,7 +27,9 @@ case "$DS41_LAYERS" in
   ;;
  # Full model: EP64 on 16 GB200 nodes; see plan-40l for capacity and GPU-hour budget.
  40)
-  : "${DS41_40L_GPU_AUTHORIZATION:?16-node jobs need an explicit authorization reference}"
+  if [[ "$DS41_CPU_ONLY" != 1 ]]; then
+   : "${DS41_40L_GPU_AUTHORIZATION:?16-node jobs need an explicit authorization reference}"
+  fi
   DS41_GPU_NODES=16 DS41_GPU_TIME_DEFAULT=04:00:00
   echo 'WARNING: 40L fresh+resume run in one 4h job; HF load plus two stages can exceed batch MaxTime (see plan-40l).' >&2
   ;;
@@ -66,6 +70,10 @@ DS41_CPU_JOB=$(sbatch --parsable --account="$DS41_SLURM_ACCOUNT" -p "$DS41_CPU_P
  --nodes=2 --ntasks-per-node=1 --gpus=0 --cpus-per-task="$DS41_CPU_CPUS" --mem="$DS41_CPU_MEM" --time="$DS41_CPU_TIME" \
  --output="$DS41_OUTPUT/logs/cpu-%j.out" \
  "$DS41_BUNDLE/recipe/hsg/cluster.sbatch" "$DS41_OUTPUT" cpu)
+if [[ "$DS41_CPU_ONLY" == 1 ]]; then
+ printf 'CPU gate: %s\nResults: %s/logs\n' "$DS41_CPU_JOB" "$DS41_OUTPUT"
+ exit 0
+fi
 DS41_GPU_JOB=$(sbatch --parsable --account="$DS41_SLURM_ACCOUNT" -p "$DS41_GPU_PARTITION" "${DS41_GPU_QOS[@]}" \
  --dependency="afterok:$DS41_CPU_JOB" --kill-on-invalid-dep=yes \
  --nodes="$DS41_GPU_NODES" --ntasks-per-node=1 --gpus-per-node=4 --cpus-per-task="$DS41_GPU_CPUS" --mem="$DS41_GPU_MEM" --time="$DS41_GPU_TIME" \

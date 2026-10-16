@@ -57,8 +57,12 @@ def test_release_defaults_keep_eager_and_head_only_override():
     assert result['hf_overrides'] == {'head_dtype': 'float32'}
 
 
-@pytest.mark.parametrize('layers', [2, 4, 6, 9])
-def test_hsg_submit_preserves_variant_and_resource_overrides(tmp_path, layers):
+@pytest.mark.parametrize(
+    ('layers', 'cpu_only'), [(2, False), (4, False), (6, False), (9, False), (40, True)]
+)
+def test_hsg_submit_preserves_variant_and_resource_overrides(
+    tmp_path, layers, cpu_only
+):
     """The delivered entry submits both stages with the requested resources."""
     import os
     import subprocess
@@ -94,6 +98,7 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(tmp_path, layers):
         'DS41_CPU_MEM': '0',
         'DS41_GPU_MEM': '0',
         'DS41_GPU_QOS': '',
+        'DS41_CPU_ONLY': '1' if cpu_only else '0',
     }
     subprocess.run(
         [
@@ -109,10 +114,15 @@ def test_hsg_submit_preserves_variant_and_resource_overrides(tmp_path, layers):
         text=True,
     )
     calls = call_log.read_text().splitlines()
-    assert calls.count(str(layers)) == 2
-    assert '--time=00:30:00' in calls and '--time=01:30:00' in calls
-    assert '--cpus-per-task=24' in calls and '--cpus-per-task=64' in calls
-    assert calls.count('--mem=0') == 2
-    assert '--dependency=afterok:12345' in calls
+    expected_jobs = 1 if cpu_only else 2
+    assert calls.count(str(layers)) == expected_jobs
+    assert '--time=00:30:00' in calls and '--cpus-per-task=24' in calls
+    assert calls.count('--mem=0') == expected_jobs
     assert calls.count('--qos') == 1 and 'cpu-short' in calls
-    assert calls.count('--nodes=2') == 2
+    assert calls.count('--nodes=2') == expected_jobs
+    if cpu_only:
+        assert '--gpus-per-node=4' not in calls
+        assert not any(arg.startswith('--dependency=') for arg in calls)
+    else:
+        assert '--time=01:30:00' in calls and '--cpus-per-task=64' in calls
+        assert '--dependency=afterok:12345' in calls

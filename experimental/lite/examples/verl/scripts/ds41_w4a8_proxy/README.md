@@ -49,6 +49,10 @@ that variant's CPU construction receipt. Set `DS41_PRECISION=official`,
 `DS41_CUDAGRAPH=full_and_piecewise`, and `DS41_CUDAGRAPH_MAX_CAPTURE=16`
 before submission; both preparation and GPU workers receive these settings.
 
+`DS41_CPU_ONLY=1` submits only the zero-GPU stage, including for 40L; it
+does not require or grant GPU authorization. The default submits the CPU gate
+and its dependent GPU job.
+
 Resource overrides use `DS41_CPU_TIME`, `DS41_GPU_TIME` (Slurm time format),
 `DS41_CPU_CPUS`, `DS41_GPU_CPUS`, `DS41_CPU_MEM`, `DS41_GPU_MEM`,
 `DS41_CPU_PARTITION`, `DS41_GPU_PARTITION`, and `DS41_CPU_QOS`.
