@@ -12,7 +12,18 @@ import torch
 
 
 def fp32_score_reference(query, keys, weights, lengths):
-    q, k, w = (value.detach().float().cpu() for value in (query, keys, weights))
+    from megatron.lite.primitive.modules.deployment_math.cache import IndexCache
+    from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+    def decoded_cpu(value):
+        if isinstance(value, IndexCache):
+            return dequantize_mxfp4(
+                value.packed.detach().cpu().view(torch.int8),
+                value.scale.detach().cpu().view(torch.float8_e8m0fnu),
+            )
+        return value.detach().float().cpu()
+
+    q, k, w = (decoded_cpu(value) for value in (query, keys, weights))
     bounds = torch.broadcast_to(lengths.detach().cpu(), q.shape[:2] + (1,))
     scores = q.new_empty(q.shape[:2] + (k.shape[1],))
     columns = torch.arange(k.shape[1])

@@ -351,7 +351,12 @@ def test_indexer_batched_requests_one_launch_and_serial_bitwise(monkeypatch):
     assert torch.equal(selected, wanted)
 
 
-def test_fp32_diagnostic_keeps_weight_midpoint_and_masks_causal_tail():
+@pytest.mark.parametrize(
+    'pack_query,pack_keys', [(False, False), (True, False), (False, True), (True, True)]
+)
+def test_fp32_diagnostic_keeps_weight_midpoint_and_masks_causal_tail(
+    v41_core_te, pack_query, pack_keys
+):
     """The diagnostic must retain a coefficient that BF16 would round away."""
     import importlib.util
     from pathlib import Path
@@ -367,7 +372,25 @@ def test_fp32_diagnostic_keeps_weight_midpoint_and_masks_causal_tail():
     keys = torch.full((1, 2, 128), 1 / 16, dtype=torch.bfloat16)
     weights = torch.full((1, 130, 32), 1 + 2**-8, dtype=torch.float32)
     lengths = (torch.arange(130, dtype=torch.int32) % 2).unsqueeze(-1)
+    from megatron.lite.primitive.modules.deployment_math.cache import IndexCache
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+
+    def packet(values):
+        packed, scales = quantize_mxfp4(values)
+        return IndexCache(packed.view(torch.uint8), scales.view(torch.uint8))
+
+    query = packet(query) if pack_query else query
+    keys = packet(keys) if pack_keys else keys
+    saved = [
+        (value.packed.clone(), value.scale.clone())
+        for value in (query, keys)
+        if isinstance(value, IndexCache)
+    ]
     actual = module.fp32_score_reference(query, keys, weights, lengths)
+    for value, (packed, scale) in zip(
+        (value for value in (query, keys) if isinstance(value, IndexCache)), saved
+    ):
+        assert torch.equal(value.packed, packed) and torch.equal(value.scale, scale)
     assert actual.dtype == torch.float32
     assert actual[0, 1, 0].item() == 16.0625
     assert actual[0, 1, 0].bfloat16().item() == 16.0
