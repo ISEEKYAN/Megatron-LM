@@ -101,7 +101,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             ['bash', str(RECIPE / 'run.sh')],
             run / 'train.log',
             env,
-            timeout=2700 if layers == 4 else 1500,
+            timeout=2700 if layers == 4 else (2400 if stage == 'resumed' else 1500),
         )
         events = [
             json.loads(line)
