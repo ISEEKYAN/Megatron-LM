@@ -362,6 +362,7 @@ class ResyncReceiver:
         self.received_tables = set()
         self.frozen_manifest = None
         self.reuse_frozen = False
+        self.resend_frozen = False
         self.finished = self.ended = False
         # load_weights invokes these model hooks per bucket. Defer all of them
         # until weight AND scale tensors for the entire generation have arrived.
@@ -423,6 +424,7 @@ class ResyncReceiver:
                     if previous[1] != self._table_digests():
                         raise ValueError('Receiver frozen Engram storage changed')
                 self.frozen_manifest, self.reuse_frozen = mapped, item.reuse
+                self.resend_frozen = item.resend
                 continue
             if isinstance(item, RowChunk):
                 if self.reuse_frozen:
@@ -506,6 +508,12 @@ class ResyncReceiver:
                 else:
                     table.register_buffer(alias, parameter.detach(), persistent=False)
 
+    def _drop_frozen_aliases(self):
+        for name in self.expected_tables:
+            table = self.model.get_submodule(name.rsplit('.', 1)[0])
+            for field in ('weight', 'weight_scale_inv'):
+                table._buffers.pop('_ds41_frozen_' + field, None)
+
     def _table_digests(self):
         from megatron.lite.primitive.ckpt.frozen_storage import storage_digest
 
@@ -566,8 +574,24 @@ class ResyncReceiver:
                     raise ValueError(
                         'Receiver frozen Engram storage changed during resync'
                     )
-                self._preserve_frozen_tables()
-                self.model._ds41_frozen_tables = (self.frozen_manifest, digests)
+                if self.resend_frozen:
+                    # Rewritten every generation: the bytes must equal the
+                    # first generation's, and nothing survives sleep on host.
+                    if previous is not None and previous != (
+                        self.frozen_manifest,
+                        digests,
+                    ):
+                        raise ValueError(
+                            'Resent frozen Engram bytes differ from the first generation'
+                        )
+                    self._drop_frozen_aliases()
+                    # The first generation's census-verified digests stay the
+                    # baseline; later generations only compare against it.
+                    if previous is None:
+                        self.model._ds41_frozen_tables = (self.frozen_manifest, digests)
+                else:
+                    self._preserve_frozen_tables()
+                    self.model._ds41_frozen_tables = (self.frozen_manifest, digests)
             self.finished = True
         except BaseException:
             self.abort()

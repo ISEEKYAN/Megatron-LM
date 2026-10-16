@@ -335,6 +335,7 @@ def save_hf_weights(
         # Saved HF checkpoints must be standalone, including frozen tables.
         resync_config = dict(resync_config or {})
         resync_config.pop('freeze_engram', None)
+        resync_config.pop('resend_frozen_engram', None)
         weights = export_hf_weights(
             chunks,
             model_cfg,

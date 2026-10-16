@@ -214,7 +214,8 @@ def _export_stage_hf_weights(
         previous = getattr(model, '_resync_frozen_tables', None)
         if previous is not None and previous != manifest:
             raise ValueError('Frozen Engram storage changed since initial resync')
-        reuse = previous is not None
+        resend = (resync_config or {}).get('resend_frozen_engram', False)
+        reuse = previous is not None and not resend
         if reuse:
 
             class FrozenSpec(DeepseekV41WeightSpec):
@@ -223,7 +224,7 @@ def _export_stage_hf_weights(
                     return binding.role == 'engram_table'
 
             spec = FrozenSpec()
-        yield frozen_tables_transport(manifest, reuse)
+        yield frozen_tables_transport(manifest, reuse, resend)
     weights = _export_checkpoint(chunks[0], spec=spec, **kwargs)
     if deployment:
         weights = transport_weights(weights, deployment=True)

@@ -20,6 +20,11 @@ p.add_argument(
     help='Frozen Engram tables in the model (2L/4L prefixes: 1; 6L subset and 40L: 2)',
 )
 p.add_argument(
+    '--frozen-resend',
+    action='store_true',
+    help='Frozen tables are resent every resync (two-table models): no reuse',
+)
+p.add_argument(
     '--parameter-counts',
     default='334',
     help='Expected owned trainable tensors by PP stage, from CPU init receipt',
@@ -136,6 +141,7 @@ for row in events:
     if row['kind'] == 'resync':
         assert row['finished'] and row['staging_current'] == 0
         assert row['frozen_tables'] == args.frozen_tables
+        assert row.get('frozen_resend', False) == args.frozen_resend
         assert row['received_tables'] == (
             0 if row['frozen_reuse'] else args.frozen_tables
         )
@@ -164,7 +170,11 @@ for rows in resync.values():
     assert [r['generation'] for r in rows] == list(range(1, args.steps + 2)), [
         r['generation'] for r in rows
     ]
-    assert not rows[0]['frozen_reuse'] and all(r['frozen_reuse'] for r in rows[1:])
+    if args.frozen_resend:
+        # Every generation carries all tables; none relies on a sleep copy.
+        assert not any(r['frozen_reuse'] for r in rows)
+    else:
+        assert not rows[0]['frozen_reuse'] and all(r['frozen_reuse'] for r in rows[1:])
 print(
     json.dumps(
         {

@@ -173,6 +173,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                     _parameter_counts(layers),
                     '--frozen-tables',
                     FROZEN_TABLES.get(layers, '1'),
+                    *(['--frozen-resend'] if layers in FROZEN_TABLES else []),
                     *(['--ranks', '64'] if layers == 40 else []),
                 ],
                 run / 'verified.json',

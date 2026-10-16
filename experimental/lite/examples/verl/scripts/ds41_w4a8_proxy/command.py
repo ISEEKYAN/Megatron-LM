@@ -147,7 +147,10 @@ args = [
     f'actor_rollout_ref.actor.engine.pp={pp}',
     f'actor_rollout_ref.ref.engine.pp={pp}',
     'actor_rollout_ref.actor.engine.resync_format=mxfp4',
-    '++actor_rollout_ref.actor.engine.resync_config={expert_dtype:fp4,freeze_engram:true}',
+    # Two frozen tables (6L/8L/9L subsets, 40L): resend them every resync so
+    # the rollout's level-2 sleep keeps no per-rank host copy (47.2 GiB/rank).
+    '++actor_rollout_ref.actor.engine.resync_config={expert_dtype:fp4,freeze_engram:true'
+    + ('}' if layers in (2, 4) else ',resend_frozen_engram:true}'),
     *[
         f'++actor_rollout_ref.actor.engine.impl_cfg.{k}={v}'
         for k, v in {

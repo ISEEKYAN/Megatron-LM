@@ -17,12 +17,16 @@ def validate_target(target, options):
         raise ValueError('DS4.1 resync requires target=mxfp4 (or vllm)')
     options = dict(options or {})
     if (
-        options.keys() - {'expert_dtype', 'freeze_engram'}
+        options.keys() - {'expert_dtype', 'freeze_engram', 'resend_frozen_engram'}
         or options.get('expert_dtype', 'fp4') != 'fp4'
     ):
         raise ValueError('DS4.1 resync supports only expert_dtype=fp4')
     if type(options.get('freeze_engram', False)) is not bool:
         raise ValueError('freeze_engram must be bool')
+    if type(options.get('resend_frozen_engram', False)) is not bool:
+        raise ValueError('resend_frozen_engram must be bool')
+    if options.get('resend_frozen_engram') and not options.get('freeze_engram'):
+        raise ValueError('resend_frozen_engram requires freeze_engram')
     return True
 
 
@@ -30,10 +34,15 @@ def validate_target(target, options):
 class FrozenTables:
     reuse: bool
     manifest: dict
+    # Resend: every generation carries the table rows, and the receiver keeps
+    # no sleep-surviving copy (level-2 sleep would save it to host per worker).
+    resend: bool = False
 
 
-def frozen_tables_transport(manifest, reuse):
-    meta = ['frozen_tables', reuse, manifest]
+def frozen_tables_transport(manifest, reuse, resend=False):
+    if resend and reuse:
+        raise ValueError('Resent frozen tables are never reused')
+    meta = ['frozen_tables', reuse, manifest] + ([True] if resend else [])
     return _PREFIX + json.dumps(meta, separators=(',', ':')), torch.empty(
         0, dtype=torch.uint8
     )
@@ -111,10 +120,16 @@ def decode_transport(name, tensor):
     meta = json.loads(name[len(_PREFIX) :])
     if tensor.dtype != torch.uint8 or not tensor.is_contiguous():
         raise ValueError('DS4.1 transport requires contiguous uint8 payloads')
-    if len(meta) == 3 and meta[0] == 'frozen_tables':
-        if tensor.numel() or type(meta[1]) is not bool or not isinstance(meta[2], dict):
+    if len(meta) in (3, 4) and meta[0] == 'frozen_tables':
+        if (
+            tensor.numel()
+            or type(meta[1]) is not bool
+            or not isinstance(meta[2], dict)
+            or meta[3:] not in ([], [True])
+            or (meta[3:] and meta[1])
+        ):
             raise ValueError('Invalid frozen table manifest')
-        return FrozenTables(meta[1], meta[2])
+        return FrozenTables(meta[1], meta[2], bool(meta[3:]))
     if meta == ['end'] and tensor.numel() == 0:
         return None
     if len(meta) == 2 and meta[1] in _DTYPES:

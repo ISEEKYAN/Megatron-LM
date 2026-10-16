@@ -595,3 +595,81 @@ def test_sharded_initial_census_checks_installed_bytes(
     receiver.finish()
     assert torch.equal(model.table.weight.view(torch.uint8), raw[a:b])
     assert torch.equal(model.table.weight_scale_inv.view(torch.uint8), scales[a:b])
+
+
+def test_resent_frozen_tables_keep_no_sleep_copy(v41_core_te, monkeypatch):
+    """Resend: every generation carries rows, equal bytes, no level-2 buffers."""
+    import megatron.lite.model.deepseek_v41.lite.resync as resync
+    from megatron.lite.primitive.ckpt.row_stream import RowChunk
+
+    consumer = adapter(v41_core_te)
+    model = receiver_model(monkeypatch)
+    model.table.weight.data.view(torch.uint8).fill_(56)
+    manifest = receiver_manifest(model)
+    rows = model.table.weight.detach().clone()
+    scales = model.table.weight_scale_inv.detach().clone()
+
+    def generation(weight=rows):
+        receiver = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+        item = resync.decode_transport(
+            *resync.frozen_tables_transport(manifest, False, resend=True)
+        )
+        assert item.resend and not item.reuse
+        receiver.receive([resync.frozen_tables_transport(manifest, False, resend=True)])
+        receiver.receive(
+            list(
+                resync.transport_weights(
+                    [
+                        RowChunk(
+                            'layers.1.engram.embed.weight',
+                            0,
+                            4,
+                            weight.clone(),
+                            scales.clone(),
+                        )
+                    ],
+                    deployment=True,
+                )
+            )
+        )
+        return receiver
+
+    for _ in range(2):
+        receiver = generation()
+        receiver.finish()
+        assert receiver.received_tables == receiver.expected_tables
+        # Nothing for GPUWorker sleep(level=2) to save to host.
+        assert list(model.named_buffers()) == []
+    # Level-2 sleep discards the table; the next generation rewrites it.
+    model.table.weight.data.view(torch.uint8).zero_()
+    generation().finish()
+    # Resent bytes that differ from the first generation are refused.
+    changed = rows.clone()
+    changed.view(torch.uint8)[0, 0] ^= 1
+    broken = generation(changed)
+    with pytest.raises(ValueError):
+        broken.finish()
+    broken.abort()
+    # A resent generation without its table rows is refused.
+    missing = consumer.ResyncReceiver(model, NS(cpu_offload_gb=0))
+    missing.receive(
+        [
+            resync.frozen_tables_transport(manifest, False, resend=True),
+            *resync.transport_weights([], deployment=True),
+        ]
+    )
+    with pytest.raises(ValueError, match='missing Engram tables'):
+        missing.finish()
+    missing.abort()
+    with pytest.raises(ValueError, match='never reused'):
+        resync.frozen_tables_transport(manifest, True, resend=True)
+
+
+def test_resend_option_requires_freeze():
+    import megatron.lite.model.deepseek_v41.lite.resync as resync
+
+    assert resync.validate_target(
+        'mxfp4', {'freeze_engram': True, 'resend_frozen_engram': True}
+    )
+    with pytest.raises(ValueError, match='requires freeze_engram'):
+        resync.validate_target('mxfp4', {'resend_frozen_engram': True})

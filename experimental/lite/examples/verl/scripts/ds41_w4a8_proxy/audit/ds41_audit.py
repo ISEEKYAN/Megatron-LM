@@ -370,6 +370,7 @@ def _resync(module):
                     'staging_current': self.staging.current_bytes,
                     'staging_peak': self.staging.peak_bytes,
                     'frozen_reuse': self.reuse_frozen,
+                    'frozen_resend': self.resend_frozen,
                     'frozen_tables': len(self.expected_tables),
                     'received_tables': len(self.received_tables),
                     'resources': resources(),
