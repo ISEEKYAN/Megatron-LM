@@ -126,7 +126,7 @@ def validate_resync_budget(model, budget):
     return share
 
 
-def export_hf_weights(
+def _export_stage_hf_weights(
     chunks, model_cfg, ps, *, target=None, resync_config=None, **kwargs
 ):
     from .resync import transport_weights, validate_target
@@ -233,3 +233,64 @@ def export_hf_weights(
             break
     if manifest is not None:
         chunks[0]._resync_frozen_tables = manifest
+
+
+def export_hf_weights(
+    chunks, model_cfg, ps, *, target=None, resync_config=None, **kwargs
+):
+    """Use the DS4 bounded PP stream after the DS41 stage-local codec.
+
+    Frozen-table metadata is a generation-wide header. Merge the small census
+    across PP peers before emitting it once, then stream each stage's tensors.
+    Codec and row/EP collectives stay in the owning stage's iterator.
+    """
+    if ps.pp_size <= 1:
+        yield from _export_stage_hf_weights(
+            chunks, model_cfg, ps, target=target, resync_config=resync_config, **kwargs
+        )
+        return
+    import torch.distributed as dist
+    from megatron.lite.primitive.ckpt.pipeline_stream import stream_pipeline_tensors
+
+    from .resync import (
+        FrozenTables,
+        decode_transport,
+        frozen_tables_transport,
+        validate_target,
+    )
+
+    deployment = validate_target(target, resync_config)
+    options = dict(kwargs)
+    if not ps.pp_is_last:
+        # Archival MTP bytes are stage-independent; export exactly one copy.
+        options['include_archival'] = False
+    weights = iter(
+        _export_stage_hf_weights(
+            chunks, model_cfg, ps, target=target, resync_config=resync_config, **options
+        )
+    )
+    if deployment and (resync_config or {}).get('freeze_engram', False):
+        local = decode_transport(*next(weights))
+        if not isinstance(local, FrozenTables):
+            raise ValueError('PP frozen-table stream requires a leading census')
+        censuses = [None] * ps.pp_size
+        dist.all_gather_object(censuses, local, group=ps.pp_group)
+        manifest = {}
+        for census in censuses:
+            if not isinstance(census, FrozenTables) or census.reuse != local.reuse:
+                raise ValueError('PP frozen-table generations disagree')
+            for name, pieces in census.manifest.items():
+                if name in manifest and manifest[name] != pieces:
+                    raise ValueError('PP frozen-table owners disagree')
+                manifest[name] = pieces
+        yield frozen_tables_transport(manifest, local.reuse)
+    yield from stream_pipeline_tensors(
+        weights,
+        ps,
+        buffer_max_size_bytes=(
+            kwargs.get('buffer_max_size_bytes', 5 * 1024**3) // 4
+            if deployment
+            else kwargs.get('buffer_max_size_bytes', 5 * 1024**3)
+        ),
+        cpu=kwargs.get('cpu', False),
+    )
