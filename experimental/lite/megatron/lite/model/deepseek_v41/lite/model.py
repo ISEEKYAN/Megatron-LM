@@ -24,6 +24,7 @@ from megatron.lite.primitive.utils import ensure_divisible
 from torch import nn
 
 from ..codecs import CODECS, attention_codecs
+from ..topology import pipeline_cut
 from . import block as block_primitives
 from . import checkpoint as checkpoint_primitives
 from .moe import DeepseekV41MoE, ModalityRouter
@@ -84,14 +85,7 @@ class DeepseekV41Model(nn.Module):
         self.config = config
         self.deployment_math = deployment_math
         self.topology = config.topology
-        self.pipeline_cut = next(
-            (
-                policy.index
-                for policy in self.topology
-                if policy.candidate_mode == "build"
-            ),
-            len(self.topology),
-        )
+        self.pipeline_cut = pipeline_cut(self.topology)
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
             self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None

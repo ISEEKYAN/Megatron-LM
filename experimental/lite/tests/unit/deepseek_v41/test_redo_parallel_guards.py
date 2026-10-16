@@ -9,10 +9,13 @@ from megatron.lite.model.deepseek_v41.lite.protocol import (
     build_model,
 )
 from megatron.lite.runtime.contracts import ParallelConfig
+from test_redo_parity import release_config
 
 
 def _build(**kwargs):
-    return build_model(object(), impl_cfg=ImplConfig(**kwargs))
+    # Guards fire before construction; the config only supplies the topology
+    # (the PP split must be its candidate publisher).
+    return build_model(release_config(), impl_cfg=ImplConfig(**kwargs))
 
 
 # --- the coarse dimension check, which runs before dependent guards ----------------

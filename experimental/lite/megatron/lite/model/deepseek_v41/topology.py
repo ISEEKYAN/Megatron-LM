@@ -118,4 +118,12 @@ def build_topology(spec: TopologySpec) -> tuple[LayerPolicy, ...]:
     return tuple(policies)
 
 
+def pipeline_cut(policies: tuple[LayerPolicy, ...]) -> int:
+    """The only PP split that keeps every CSA owner with its readers: the
+    candidate publisher (release layer 20), or no split without one."""
+    return next(
+        (p.index for p in policies if p.candidate_mode == "build"), len(policies)
+    )
+
+
 V41_TOPOLOGY = build_topology(TopologySpec())

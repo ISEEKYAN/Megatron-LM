@@ -283,3 +283,36 @@ def test_first_layer_broadcast_only_without_engram():
     proxy = topology.build_topology(_layer_subset()._spec(text))
     # Layer 0 is release layer 1: Engram injects first, so the copies differ.
     assert proxy[0].engram_slot == 0 and not proxy[0].broadcasts_embedding
+
+
+def test_p6_pipeline_cut_keeps_every_owner_with_its_readers():
+    from megatron.lite.model.deepseek_v41 import topology
+
+    assert topology.pipeline_cut(topology.V41_TOPOLOGY) == 20
+    text = _layer_subset().subset_config(release_config().to_hf_dict(), P6)[
+        'text_config'
+    ]
+    proxy = topology.build_topology(_layer_subset()._spec(text))
+    cut = topology.pipeline_cut(proxy)
+    assert cut == 3  # release layer 20, the candidate publisher
+    for policy in proxy:
+        stage = policy.index >= cut
+        for owner in (policy.kv_owner, policy.index_owner):
+            assert owner is None or (owner >= cut) == stage, policy
+
+
+def test_pp_guard_accepts_the_proxy_candidate_publisher(monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite.protocol import (
+        ImplConfig,
+        _validate_parallel,
+    )
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 2)
+    parallel = ParallelConfig(pp=2)
+    assert (
+        _validate_parallel(ImplConfig(pipeline_split_layer=3), parallel, cut=3) is None
+    )
+    with pytest.raises(NotImplementedError, match='only split layer 3'):
+        _validate_parallel(ImplConfig(pipeline_split_layer=20), parallel, cut=3)

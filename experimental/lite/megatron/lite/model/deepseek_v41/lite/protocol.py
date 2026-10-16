@@ -15,6 +15,7 @@ import megatron.lite.primitive.parallel.state as _imports_state
 import torch
 from megatron.lite.model import protocol_utils as _protocol_utils
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+from megatron.lite.model.deepseek_v41.topology import pipeline_cut
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config_fields import project_fields
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
@@ -86,14 +87,15 @@ def build_model_config(source, **overrides):
     )
 
 
-def _validate_parallel(c, p):
+def _validate_parallel(c, p, cut=20):
+    """`cut` is the model's candidate-publisher layer (20 in the release)."""
     if p.pp > 1 and (not c.text_only or c.external_vision_device is not None):
         raise NotImplementedError(
             'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training'
         )
-    if p.pp > 1 and c.pipeline_split_layer != 20:
+    if p.pp > 1 and c.pipeline_split_layer != cut:
         raise NotImplementedError(
-            'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer 20 is supported; other cuts require transporting CSA2 owner state'
+            f'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: only split layer {cut} (the candidate publisher) is supported; other cuts require transporting CSA2 owner state'
         )
     if p.pp > 1 and (p.ep != 1 or p.cp != 1):
         raise NotImplementedError(
@@ -164,7 +166,7 @@ def build_model(model_cfg, *, impl_cfg):
             'supported: DP, EP with CP=1, contiguous CP-only, or text-only PP2; '
             'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
         )
-    _validate_parallel(c, p)
+    _validate_parallel(c, p, cut=pipeline_cut(model_cfg.topology))
     ps = ParallelState()
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         ps = init_parallel(replace(p, etp=1))
