@@ -81,7 +81,8 @@ def _ceil_ue8m0(scale: torch.Tensor) -> torch.Tensor:
 def _unpack_ue8m0_scales(packed: torch.Tensor, groups: int) -> torch.Tensor:
     """Packed int32 UE8M0 bytes (four groups per word) -> float32 powers of two."""
     rows = packed.shape[0]
-    exponent = packed.contiguous().view(torch.uint8).reshape(rows, -1)[:, :groups]
+    # flatten() copies a column-major (or single-group) layout into row order.
+    exponent = packed.flatten().view(torch.uint8).reshape(rows, -1)[:, :groups]
     return (exponent.to(torch.int32) << 23).view(torch.float32)
 
 
