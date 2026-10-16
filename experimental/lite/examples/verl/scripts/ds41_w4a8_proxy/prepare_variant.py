@@ -14,6 +14,11 @@ source = Path(os.environ['DS41_RELEASE'])
 out = Path(os.environ['DS41_OUTPUT'])
 model = Path(os.environ['DS41_MODEL'])
 layers = [int(i) for i in os.environ['DS41_VARIANT_LAYERS'].split(',')]
+# Same precision switch as prepare_prefix.py: official adds the reference
+# inference contract (group-32 expert activations, BF16 wo_a) to the config.
+precision = os.environ.get('DS41_PRECISION', 'release')
+if precision not in ('release', 'official'):
+    raise ValueError('DS41_PRECISION must be release or official')
 model.mkdir(parents=True, exist_ok=True)
 receipts = {
     v['file']: v
@@ -28,6 +33,8 @@ for name in ('config.json', 'tokenizer.json', 'tokenizer_config.json'):
     assert actual == rec['sha256'], name
 cfg = subset_config(json.loads((source / 'config.json').read_text()), layers)
 t = cfg['text_config']
+if precision == 'official':
+    t.update(expert_activation_group_size=32, wo_a_dtype='bf16')
 # Existing VERL generic-HF adapter reads this root metadata alias. Its value
 # is identical to the release's nested context limit; no resizing/scaling.
 cfg['max_position_embeddings'] = t['max_position_embeddings']
