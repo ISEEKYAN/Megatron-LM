@@ -49,6 +49,8 @@ For the long-sequence proxy, pass `--layers 9`: release layers `0,1,2,14,15,19,2
 DS41_PARAMETER_COUNTS=<count> bash "$DS41_BUNDLE/recipe/hsg/submit.sh" --layers 9 /path/to/your/new-c8-output
 ```
 
+To reuse a subset prepared earlier for the same layers (for example under a storage quota), set `DS41_VARIANT_REUSE=<absolute model directory>`: the CPU stage reads every reused tensor back, requires its bytes to equal the release tensor it was renamed from, and links the shards instead of writing new ones; both stages bind that directory at the same absolute path.
+
 The same launcher accepts `--layers 2`, `--layers 4`, `--layers 6`, and
 `--layers 9`. The 6L and 9L variants require `DS41_PARAMETER_COUNTS` from
 that variant's CPU construction receipt. Set `DS41_PRECISION=official`,

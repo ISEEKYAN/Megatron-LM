@@ -194,6 +194,22 @@ def test_renamed_shards_are_byte_exact_and_closed(tmp_path):
         )
     assert {row['key']: row['source_key'] for row in lineage} == expected
 
+    # A second preparation links the verified shards instead of copying them.
+    linked = tmp_path / 'linked'
+    linked.mkdir()
+    reused_map, reused_lineage = module.reuse_subset(
+        source, weight_map, [1, 14], out, linked
+    )
+    assert reused_map == new_map and reused_lineage == lineage
+    assert all((linked / file).is_symlink() for file in set(new_map.values()))
+    # Any byte that differs from the release is refused.
+    shard = out / new_map['embed.weight']
+    raw = bytearray(shard.read_bytes())
+    raw[-1] ^= 0xFF
+    shard.write_bytes(bytes(raw))
+    with pytest.raises(IOError, match='release bytes'):
+        module.reuse_subset(source, weight_map, [1, 14], out, tmp_path / 'linked')
+
 
 def _audit(monkeypatch, tmp_path):
     import importlib.util

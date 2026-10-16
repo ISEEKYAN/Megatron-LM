@@ -42,8 +42,13 @@ test "${RAY_AUTH_MODE:?Ray auth mode required}" = token
 : "${RAY_AUTH_TOKEN:?per-job Ray token required}"
 export RECIPE_ROLE RECIPE_HEAD_IP
 export RECIPE_NODE_IP=$(getent ahostsv4 "$(hostname)" | awk 'NR==1 {print $1}')
+# A reused 6L/8L/9L subset links to shards at its own absolute path.
+RECIPE_REUSE=()
+if [[ -n "${DS41_VARIANT_REUSE:-}" ]]; then
+ RECIPE_REUSE=(--mount "$DS41_VARIANT_REUSE:$DS41_VARIANT_REUSE:none:bind,ro")
+fi
 set +e
-enroot start --root --rw \
+enroot start --root --rw "${RECIPE_REUSE[@]}" \
  --env CUDA_VISIBLE_DEVICES --env NVIDIA_VISIBLE_DEVICES --env PYTHONPATH \
  --env PYTHONDONTWRITEBYTECODE --env DS41_DATA_FILE --env WANDB_API_KEY --env WANDB_MODE --env WANDB_ENTITY \
  --env RAY_AUTH_MODE --env RAY_AUTH_TOKEN \

@@ -162,17 +162,84 @@ def tensor_digests(path):
     return digests
 
 
-def write_subset(source_dir, weight_map, layers, output_dir):
-    """Write renumbered shards for `layers`; return the new weight map and lineage."""
-    source_dir, output_dir = Path(source_dir), Path(output_dir)
+def _plan(weight_map, layers):
     plan = {}
     for old, file in weight_map.items():
         new = renamed(old, layers)
         if new is not None:
             plan.setdefault(file, {})[new] = old
+    return plan
+
+
+def _shard_name(index, count):
+    return f'model-subset-{index + 1:05d}-of-{count:05d}.safetensors'
+
+
+def source_digests(source, names):
+    """sha256 of each release tensor `names` ({new: old}) read from `source`."""
+    header, base = _header(source)
+    digests = {}
+    with open(source, 'rb') as f:
+        for new, old in names.items():
+            begin, end = header[old]['data_offsets']
+            f.seek(base + begin)
+            digest, remaining = hashlib.sha256(), end - begin
+            while remaining:
+                chunk = f.read(min(COPY_CHUNK, remaining))
+                if not chunk:
+                    raise IOError(f'{source} ended inside {old}')
+                digest.update(chunk)
+                remaining -= len(chunk)
+            digests[new] = digest.hexdigest()
+    return digests
+
+
+def reuse_subset(source_dir, weight_map, layers, prepared_dir, output_dir):
+    """Link the shards of an earlier `write_subset` of the same layers.
+
+    Every reused tensor is read back and must equal the release bytes under its
+    release name (same dtype, shape and sha256) before it is linked; nothing is
+    copied. Returns the same weight map and lineage as `write_subset`.
+    """
+    source_dir, output_dir = Path(source_dir), Path(output_dir)
+    prepared_dir = Path(prepared_dir).resolve()
+    plan = _plan(weight_map, layers)
     new_map, lineage = {}, []
     for index, file in enumerate(sorted(plan)):
-        name = f'model-subset-{index + 1:05d}-of-{len(plan):05d}.safetensors'
+        name = _shard_name(index, len(plan))
+        header, _ = _header(source_dir / file)
+        reused, _ = _header(prepared_dir / name)
+        reused.pop('__metadata__', None)
+        if set(reused) != set(plan[file]):
+            raise ValueError(f'{name} does not hold the planned tensors')
+        for new, old in plan[file].items():
+            if [reused[new]['dtype'], reused[new]['shape']] != [
+                header[old]['dtype'],
+                header[old]['shape'],
+            ]:
+                raise ValueError(f'{name}:{new} differs from release {old}')
+        expected = source_digests(source_dir / file, plan[file])
+        if tensor_digests(prepared_dir / name) != expected:
+            raise IOError(f'{name} does not hold the release bytes')
+        target = output_dir / name
+        if target.is_symlink() or target.exists():
+            target.unlink()
+        target.symlink_to(prepared_dir / name)
+        for new, old in plan[file].items():
+            new_map[new] = name
+            lineage.append(
+                dict(key=new, source_key=old, source_file=file, sha256=expected[new])
+            )
+    return new_map, lineage
+
+
+def write_subset(source_dir, weight_map, layers, output_dir):
+    """Write renumbered shards for `layers`; return the new weight map and lineage."""
+    source_dir, output_dir = Path(source_dir), Path(output_dir)
+    plan = _plan(weight_map, layers)
+    new_map, lineage = {}, []
+    for index, file in enumerate(sorted(plan)):
+        name = _shard_name(index, len(plan))
         copied = copy_shard(source_dir / file, plan[file], output_dir / name)
         written = tensor_digests(output_dir / name)
         if written != copied:

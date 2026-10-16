@@ -73,6 +73,12 @@ if [[ "$DS41_PP" != 1 ]]; then
  fi
 fi
 if [[ -n "${DS41_PARAMETER_COUNTS:-}" ]]; then export DS41_PARAMETER_COUNTS; fi
+# Reuse an earlier, verified 6L/8L/9L subset instead of writing new shards.
+if [[ -n "${DS41_VARIANT_REUSE:-}" ]]; then
+ test "${DS41_VARIANT_REUSE:0:1}" = /
+ test -s "$DS41_VARIANT_REUSE/model.safetensors.index.json"
+ export DS41_VARIANT_REUSE
+fi
 mkdir -p "$DS41_OUTPUT/logs"
 DS41_CPU_ARGS=()
 if [[ -n "${DS41_CPU_EXCLUDE:-}" ]]; then

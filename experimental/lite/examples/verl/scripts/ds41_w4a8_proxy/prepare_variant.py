@@ -6,7 +6,7 @@ import os
 import shutil
 from pathlib import Path
 
-from layer_subset import subset_config, write_subset
+from layer_subset import reuse_subset, subset_config, write_subset
 from token_map import build_compressed_token_map
 from transformers import AutoTokenizer, GenerationConfig
 
@@ -59,7 +59,13 @@ for file in sorted(set(index['weight_map'].values())):
         and rec['sha256'] == rec['expected_lfs_sha256']
     ), file
     assert (source / file).stat().st_size == rec['size']
-weights, lineage = write_subset(source, index['weight_map'], layers, model)
+# DS41_VARIANT_REUSE: an earlier subset of the same layers (bound at the same
+# absolute path); its shards are verified against the release and linked.
+reuse = os.environ.get('DS41_VARIANT_REUSE')
+if reuse:
+    weights, lineage = reuse_subset(source, index['weight_map'], layers, reuse, model)
+else:
+    weights, lineage = write_subset(source, index['weight_map'], layers, model)
 (model / 'model.safetensors.index.json').write_text(
     json.dumps(
         {
@@ -106,6 +112,7 @@ print(
         {
             'release_revision': revision,
             'release_layers': layers,
+            'reused_from': reuse or None,
             'changed_text_fields': record['changed_text_fields'],
             'tensors': len(lineage),
             'token_map_sha256': record['token_map_sha256'],

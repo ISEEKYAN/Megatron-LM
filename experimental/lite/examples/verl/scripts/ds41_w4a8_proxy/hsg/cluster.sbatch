@@ -19,7 +19,12 @@ if [[ "$RECIPE_STAGE" == cpu ]]; then
  enroot create --name ds41-runtime "$DS41_BUNDLE/runtime.sqsh"
  # CPU-only preparation creates faithful prefix links and resolves the exact config.
  export PYTHONPATH=/opt/runtime/.venv/lib/python3.12/site-packages
- enroot start --root --rw --env DS41_DATA_FILE --env WANDB_API_KEY --env PYTHONPATH --env RECIPE_LAYERS \
+ # The reused subset's links resolve at its own absolute path.
+ RECIPE_REUSE=()
+ if [[ -n "${DS41_VARIANT_REUSE:-}" ]]; then
+  RECIPE_REUSE=(--env DS41_VARIANT_REUSE --mount "$DS41_VARIANT_REUSE:$DS41_VARIANT_REUSE:none:bind,ro")
+ fi
+ enroot start --root --rw "${RECIPE_REUSE[@]}" --env DS41_DATA_FILE --env WANDB_API_KEY --env PYTHONPATH --env RECIPE_LAYERS \
   --env DS41_PRECISION --env DS41_CUDAGRAPH --env DS41_CUDAGRAPH_MAX_CAPTURE --env VLLM_USE_BREAKABLE_CUDAGRAPH \
   --env DS41_PP --env DS41_PIPELINE_SPLIT_LAYER --env DS41_EP --env DS41_CP --env DS41_WORLD --env DS41_PARAMETER_COUNTS \
   --mount "$RECIPE_ROOT:/run-artifacts:none:bind" \
