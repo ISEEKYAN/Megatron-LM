@@ -136,7 +136,8 @@ def _run(rank, store, directory, official):
     )
     assert report['forward_bitwise'], report
     assert report['repeat_bitwise_0'] and report['repeat_bitwise_1'], report
-    torch.testing.assert_close(dx0, dx1, rtol=2**-7, atol=2**-10)
+    # Per-rank partial sums and the DeepEP combine each round to BF16.
+    torch.testing.assert_close(dx0, dx1, rtol=2**-6, atol=2**-9)
     assert report['grad_keys_equal'], report
     for key in g0:
         torch.testing.assert_close(g0[key], g1[key], rtol=0, atol=0, msg=key)

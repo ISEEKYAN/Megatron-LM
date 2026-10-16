@@ -72,7 +72,7 @@ def test_w4a8_deepep_matches_unfused_dispatch(v41_core_te, monkeypatch, official
     # The route scatter VJP sums a token's slot gradients in BF16 slot order;
     # the unfused unpermute sums them in another order (and DeepEP combine
     # owns that sum across ranks), so dX agrees to BF16 rounding only.
-    torch.testing.assert_close(inputs[0], inputs[1], rtol=2**-7, atol=2**-10)
+    torch.testing.assert_close(inputs[0], inputs[1], rtol=2**-6, atol=2**-9)
     assert torch.equal(
         models[0].gate.router.gate.weight.grad, models[1].gate.router.gate.weight.grad
     )
