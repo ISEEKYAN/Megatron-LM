@@ -2,6 +2,8 @@
 
 This recipe runs a faithful two-layer release prefix through two strict GRPO updates, saves a checkpoint, starts a new training process, restores it and runs two more updates. Training uses MLite deployment math; inference uses vLLM with `VLLM_BATCH_INVARIANT=1`. Expert weights are MXFP4 with dynamic FP8 activations (W4A8), EP8 and TP/CP/PP1. Optimizer state is on the host and Engram tables remain frozen.
 
+Both proxy depths explicitly disable prefix caching. The runtime compatibility adapter preserves `enable_prefix_caching=false` as vLLM's `--no-enable-prefix-caching`; a resolved Hydra value alone does not verify the engine setting. Check that the vLLM engine startup configuration reports `enable_prefix_caching=False`. The v1.1 release lost the false value during CLI conversion and enabled caching; this configuration correction belongs to v1.2 and requires new C8 validation.
+
 ## Environment and shared release
 
 Use HSG GB200 (SM100), Enroot, Slurm, and an online W&B account. The release bundle supplies one runtime image with matched PyTorch, Transformer Engine, vLLM, MLite, VERL and native CUDA kernels; no source build or package install is needed during a GPU allocation. Set `DS41_BUNDLE` to the shared project release directory supplied with the handoff. Check its `SHA256SUMS` and `manifests/` before running. `paths.env` gives the existing weight directory and parquet directory; edit a copy if your input locations differ.

@@ -374,6 +374,46 @@ def _patch_verl_vllm_device_uuid() -> bool:
     return changed
 
 
+def _patch_verl_vllm_prefix_caching_cli() -> bool:
+    """Preserve the DS41 recipe's cache disable through VERL's CLI conversion."""
+    if os.environ.get("VERL_MLITE_HF_CONFIG_MODEL_TYPE") != "deepseek_v41":
+        return False
+
+    utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
+    original = utils.build_cli_args_from_config
+    changed = False
+    if getattr(original, "_verl_mlite_prefix_caching_patch", False):
+        patched = original
+    else:
+
+        @wraps(original)
+        def patched(config: dict[str, Any]) -> list[str]:
+            # Other boolean options may use store_true rather than accepting
+            # negative flags. Only this vLLM BooleanOptionalAction is adapted.
+            disabled = {
+                key
+                for key in ("enable_prefix_caching", "enable-prefix-caching")
+                if config.get(key) is False
+            }
+            args = original({k: v for k, v in config.items() if k not in disabled})
+            if disabled:
+                args.append("--no-enable-prefix-caching")
+            return args
+
+        patched._verl_mlite_prefix_caching_patch = True
+        utils.build_cli_args_from_config = patched
+        changed = True
+
+    consumer = sys.modules.get(_VLLM_ASYNC_SERVER_MODULE)
+    if (
+        consumer is not None
+        and getattr(consumer, "build_cli_args_from_config", None) is not patched
+    ):
+        consumer.build_cli_args_from_config = patched
+        changed = True
+    return changed
+
+
 def _patch_transformers_rope_ignore_keys() -> None:
     try:
         import transformers.modeling_rope_utils as rope_utils
@@ -916,6 +956,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
     result = _patch_verl_vllm_device_uuid()
     _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    result = _patch_verl_vllm_prefix_caching_cli()
+    _trace_runtime_patch("05b.verl_vllm_prefix_caching_cli", result)
     # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
     # module, which drops compatibility attributes installed on the old module.
     result = _patch_transformers_vision2seq_alias()
