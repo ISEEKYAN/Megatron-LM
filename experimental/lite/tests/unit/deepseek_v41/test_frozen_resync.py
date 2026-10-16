@@ -382,7 +382,7 @@ def _ep8_frozen_census_worker(rank, directory):
         model.local_layer_range = (0, 2)
         model.archival_bindings = {}
         model.archival_store = None
-        model.ps = NS(ep_size=8, ep_group=dist.group.WORLD)
+        model.ps = NS(pp_size=1, pp_rank=0, ep_size=8, ep_group=dist.group.WORLD)
         model.config = NS(to_hf_dict=lambda: {'text_config': {'n_routed_experts': 8}})
         model.engram_layer_ids = (1,)
         model.engram_hash = NS(primes=torch.tensor([[[3, 4, 5, 5]]]))
