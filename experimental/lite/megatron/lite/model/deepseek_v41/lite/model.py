@@ -100,6 +100,16 @@ class DeepseekV41Model(nn.Module):
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
         # The reference gate owns bias_vl only with a vision tower.
         self.routes_image_sentinels = getattr(v, 'num_hidden_layers', 0) > 0
+        # Same text_config key as the rollout: 32 is the official expert
+        # contract (group-32 activations, routing weight before FC2 quant).
+        act_group = getattr(t, 'expert_activation_group_size', 128)
+        if act_group not in (32, 128):
+            raise ValueError(f'Unsupported expert_activation_group_size {act_group}')
+        official_expert_contract = act_group == 32
+        if official_expert_contract and not (w4a8_experts and deployment_math):
+            raise ValueError(
+                'The official expert contract requires deployment-math W4A8 experts'
+            )
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
         local_experts = ensure_divisible(t.n_routed_experts, self.ps.ep_size)
         expert_start = self.ps.ep_rank * local_experts
@@ -168,6 +178,7 @@ class DeepseekV41Model(nn.Module):
                 ps=self.ps,
                 use_deepep=use_deepep,
                 w4a8=w4a8_experts,
+                official_expert_contract=official_expert_contract,
             )
             block = DeepseekV41Block(
                 dim,

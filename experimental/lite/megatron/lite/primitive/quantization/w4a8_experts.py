@@ -52,14 +52,21 @@ dequantize_mxfp4 = _imports_mxfp4.dequantize_mxfp4
 quantize_mxfp4 = _imports_mxfp4.quantize_mxfp4
 
 FP8_ACT_GROUP_SIZE = 128
+# DeepSeek-V4.1 official expert contract (reference inference/model.py): group-32
+# activations, routing weight applied to SwiGLU before FC2 quantization, and a
+# 1e-4 floor on each group's absolute maximum.
+OFFICIAL_ACT_GROUP_SIZE = 32
+OFFICIAL_ACT_EPS = 1e-4
 _E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)  # 448.0
 # vLLM initializes the group absmax at eps=1e-10 and floors the scale at 1e-10.
 _SCALE_FLOOR = 1e-10
 
 __all__ = [
     "FP8_ACT_GROUP_SIZE",
+    "OFFICIAL_ACT_GROUP_SIZE",
     "dequantize_fp8_act",
     "quantize_fp8_act",
+    "quantize_official_act",
     "topk_fma_combine",
     "w4a8_expert_mlp",
     "w4a8_grouped_gemm",
@@ -87,7 +94,7 @@ def _unpack_ue8m0_scales(packed: torch.Tensor, groups: int) -> torch.Tensor:
 
 
 def quantize_fp8_act(
-    x: torch.Tensor, *, packed_ue8m0: bool = False
+    x: torch.Tensor, *, packed_ue8m0: bool = False, group_size: int = FP8_ACT_GROUP_SIZE
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-token-group (128) E4M3 quantization with UE8M0 scales.
 
@@ -103,10 +110,10 @@ def quantize_fp8_act(
         scale = ceil_ue8m0(max(amax / 448, 1e-10))
         codes = e4m3_rne(clamp(x / scale, -448, 448))
     """
-    if x.dim() != 2 or x.shape[-1] % FP8_ACT_GROUP_SIZE:
+    if x.dim() != 2 or x.shape[-1] % group_size:
         raise ValueError(
             f"FP8 activation quantization expects [M, K] with K divisible by "
-            f"{FP8_ACT_GROUP_SIZE}, got {tuple(x.shape)}."
+            f"{group_size}, got {tuple(x.shape)}."
         )
     if (
         x.is_cuda
@@ -123,22 +130,49 @@ def quantize_fp8_act(
             round_scale=True,
             masked_m=None,
             fuse_silu_and_mul=False,
+            group_size=group_size,
         )
         if packed_ue8m0:
-            scale = _unpack_ue8m0_scales(scale, x.shape[-1] // FP8_ACT_GROUP_SIZE)
+            scale = _unpack_ue8m0_scales(scale, x.shape[-1] // group_size)
         return codes, scale
+    return _reference_quantize(x, group_size, _SCALE_FLOOR)
+
+
+def _reference_quantize(x, group_size, floor):
     rows, cols = x.shape
-    groups = x.float().reshape(rows, cols // FP8_ACT_GROUP_SIZE, FP8_ACT_GROUP_SIZE)
-    amax = groups.abs().amax(dim=-1).clamp_min(_SCALE_FLOOR)
+    groups = x.float().reshape(rows, cols // group_size, group_size)
+    amax = groups.abs().amax(dim=-1).clamp_min(floor)
     scale = _ceil_ue8m0((amax / _E4M3_MAX).clamp_min(_SCALE_FLOOR))
     codes = (groups / scale.unsqueeze(-1)).clamp(-_E4M3_MAX, _E4M3_MAX)
     return codes.to(torch.float8_e4m3fn).reshape(rows, cols), scale
 
 
+def quantize_official_act(
+    x: torch.Tensor, group_size: int = OFFICIAL_ACT_GROUP_SIZE
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Official-contract expert FC1 input quantization (floor 1e-4, UE8M0).
+
+    On CUDA this is the rollout's own first-stage quantizer
+    (``per_token_group_quant_fp8`` with FP32 power-of-two scales).
+    """
+    if x.dim() != 2 or x.shape[-1] % group_size:
+        raise ValueError(f"Expected [M, K] with K divisible by {group_size}")
+    if x.is_cuda and x.dtype == torch.bfloat16:
+        from vllm.model_executor.layers.quantization.utils.fp8_utils import (
+            per_token_group_quant_fp8,
+        )
+
+        return per_token_group_quant_fp8(
+            x.contiguous(), group_size, eps=OFFICIAL_ACT_EPS, use_ue8m0=True
+        )
+    return _reference_quantize(x, group_size, OFFICIAL_ACT_EPS)
+
+
 def dequantize_fp8_act(codes: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
-    """Inverse of :func:`quantize_fp8_act` in float32."""
+    """Inverse of :func:`quantize_fp8_act` in float32; the group is K / groups."""
     rows, cols = codes.shape
-    groups = codes.float().reshape(rows, cols // FP8_ACT_GROUP_SIZE, FP8_ACT_GROUP_SIZE)
+    group = cols // scale.shape[1]
+    groups = codes.float().reshape(rows, cols // group, group)
     return (groups * scale.unsqueeze(-1)).reshape(rows, cols)
 
 
@@ -240,7 +274,7 @@ def _deep_gemm_grouped(x_codes, x_scale, w_codes, w_scale, m_splits) -> torch.Te
         ),
         out,
         grouped_layout,
-        recipe_a=(1, FP8_ACT_GROUP_SIZE),
+        recipe_a=(1, x_codes.shape[1] // x_scale.shape[1]),
         recipe_b=(1, MXFP4_BLOCK_SIZE),
     )
     return out.index_select(0, rows)
@@ -253,8 +287,10 @@ class _W4A8GroupedGemm(torch.autograd.Function):
     """``out[rows_e] = Q_a8(x[rows_e]) @ Q_mxfp4(W_e).T`` with STE backward."""
 
     @staticmethod
-    def forward(ctx, x, m_splits, backend, packed_ue8m0, *weights):  # type: ignore[override]
-        x_codes, x_scale = quantize_fp8_act(x, packed_ue8m0=packed_ue8m0)
+    def forward(ctx, x, m_splits, backend, quantize, *weights):  # type: ignore[override]
+        # ``quantize`` maps x to (codes, FP32 scales), or is a precomputed pair
+        # from a native kernel; x then only carries the VJP.
+        x_codes, x_scale = quantize if isinstance(quantize, tuple) else quantize(x)
         packed = [quantize_mxfp4(weight.detach()) for weight in weights]
         w_codes = torch.stack([codes for codes, _ in packed])
         w_scale = torch.stack([scale for _, scale in packed])
@@ -293,8 +329,13 @@ def w4a8_grouped_gemm(
     *,
     backend: str | None = None,
     packed_ue8m0: bool = False,
+    official: bool = False,
+    activation: tuple[torch.Tensor, torch.Tensor] | None = None,
 ) -> torch.Tensor:
     """Grouped ``[M, K] x [N, K]^T`` per expert with A8 activations and MXFP4 weights.
+
+    ``official`` quantizes ``x`` with the official-contract group-32 quantizer;
+    ``activation`` supplies codes/scales already produced for ``x``.
 
     ``x`` holds the expert-sorted BF16 tokens (``m_splits[e]`` rows for expert
     ``e``); ``weights`` are per-expert BF16 or FP32 masters. Quantization reads
@@ -316,7 +357,24 @@ def w4a8_grouped_gemm(
         raise ValueError(
             f"Unknown W4A8 backend {backend!r}; use one of {sorted(_BACKENDS)}."
         )
-    return _W4A8GroupedGemm.apply(x, tuple(m_splits), backend, packed_ue8m0, *weights)
+    if activation is not None:
+        quantize = activation
+    elif official:
+        quantize = quantize_official_act
+    else:
+
+        def quantize(value):
+            return quantize_fp8_act(value, packed_ue8m0=packed_ue8m0)
+
+    return _W4A8GroupedGemm.apply(x, tuple(m_splits), backend, quantize, *weights)
+
+
+def _swiglu_fp32(fc1_out: torch.Tensor, swiglu_limit: float | None) -> torch.Tensor:
+    gate, up = fc1_out.float().chunk(2, dim=-1)
+    if swiglu_limit is not None:
+        gate = clamp_with_inclusive_vjp(gate, max=swiglu_limit)
+        up = clamp_with_inclusive_vjp(up, min=-swiglu_limit, max=swiglu_limit)
+    return torch.nn.functional.silu(gate) * up
 
 
 def _swiglu_reference(
@@ -329,11 +387,7 @@ def _swiglu_reference(
     with no lower bound, ``up = clamp(up, -L, L)``, both in float32 before
     ``silu(gate) * up``. The A2 quantization sees the rounded result.
     """
-    gate, up = fc1_out.float().chunk(2, dim=-1)
-    if swiglu_limit is not None:
-        gate = clamp_with_inclusive_vjp(gate, max=swiglu_limit)
-        up = clamp_with_inclusive_vjp(up, min=-swiglu_limit, max=swiglu_limit)
-    return (torch.nn.functional.silu(gate) * up).to(fc1_out.dtype)
+    return _swiglu_fp32(fc1_out, swiglu_limit).to(fc1_out.dtype)
 
 
 class _SwiGLUBf16(torch.autograd.Function):
@@ -369,8 +423,13 @@ def w4a8_expert_mlp(
     swiglu_limit: float | None = None,
     *,
     backend: str | None = None,
+    row_weights: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Routed-expert MLP in the rollout's W4A8 order of operations.
+
+    With ``row_weights`` (one routing weight per dispatched row) this is the
+    official expert contract: group-32 activations, ``bf16(w * silu(gate) * up)``
+    quantized for FC2, and rows returned already weighted (combine with 1).
 
     FC1 (``[gate, up]`` halves) -> SwiGLU computed in float32 and rounded once
     to BF16 -> FC2. The rows are unweighted; the router weights are applied by
@@ -381,11 +440,58 @@ def w4a8_expert_mlp(
         raise ValueError(
             f"swiglu_limit must be None or finite and positive, got {swiglu_limit!r}."
         )
+    if row_weights is not None:
+        return _official_expert_mlp(
+            x, fc1_weights, fc2_weights, m_splits, swiglu_limit, backend, row_weights
+        )
     fc1_out = w4a8_grouped_gemm(x, fc1_weights, m_splits, backend=backend)
     hidden = _swiglu_bf16(fc1_out, swiglu_limit)
     # The rollout's fused SiLU-mul quantizer writes packed UE8M0 scales.
     return w4a8_grouped_gemm(
         hidden, fc2_weights, m_splits, backend=backend, packed_ue8m0=True
+    )
+
+
+def _official_expert_mlp(
+    x, fc1_weights, fc2_weights, m_splits, swiglu_limit, backend, row_weights
+):
+    if row_weights.shape != (x.shape[0],):
+        raise ValueError("row_weights must hold one routing weight per row")
+    fc1_out = w4a8_grouped_gemm(
+        x, fc1_weights, m_splits, backend=backend, official=True
+    )
+    weights = row_weights.float()
+    # The FC2 input value and its VJP: bf16(w * silu(gate) * up), weight first
+    # multiplied in FP32 as in the reference expert.
+    hidden = (weights.unsqueeze(-1) * _swiglu_fp32(fc1_out, swiglu_limit)).to(
+        fc1_out.dtype
+    )
+    activation = None
+    if fc1_out.is_cuda and os.environ.get('VLLM_BATCH_INVARIANT') == '1':
+        from vllm.model_executor.kernels.batch_invariant import (
+            fused_silu_mul_per_token_group_quant_fp8,
+        )
+
+        codes, packed = fused_silu_mul_per_token_group_quant_fp8(
+            fc1_out.detach().contiguous(),
+            use_ue8m0=True,
+            clamp_limit=swiglu_limit,
+            masked_m=None,
+            group_size=OFFICIAL_ACT_GROUP_SIZE,
+            eps=OFFICIAL_ACT_EPS,
+            row_scale=weights.detach().contiguous(),
+        )
+        activation = (
+            codes,
+            _unpack_ue8m0_scales(packed, hidden.shape[-1] // OFFICIAL_ACT_GROUP_SIZE),
+        )
+    return w4a8_grouped_gemm(
+        hidden,
+        fc2_weights,
+        m_splits,
+        backend=backend,
+        official=True,
+        activation=activation,
     )
 
 

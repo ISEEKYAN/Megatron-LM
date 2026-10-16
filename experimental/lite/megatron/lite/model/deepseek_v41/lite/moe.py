@@ -151,12 +151,18 @@ class DeepseekV41MoE(nn.Module):
         ps=None,
         use_deepep=False,
         w4a8=False,
+        official_expert_contract=False,
     ):
         super().__init__()
         self.gate = router
         self.experts = Experts.from_modules(experts)
         self.shared_experts = shared_experts
         self.w4a8 = w4a8
+        if official_expert_contract and not w4a8:
+            raise ValueError('The official expert contract requires W4A8 experts')
+        # Reference inference/model.py: group-32 activations and the routing
+        # weight applied before FC2 quantization (rows combine unweighted).
+        self.official_expert_contract = official_expert_contract
         from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
         from megatron.lite.primitive.parallel.state import ParallelState
 
@@ -212,10 +218,19 @@ class DeepseekV41MoE(nn.Module):
                 [e.w2.weight for e in local],
                 counts.tolist(),
                 swiglu_limit=local[0].swiglu_limit or None,
+                row_weights=scores if self.official_expert_contract else None,
             )
             rows, row_token, row_expert = self.dispatcher.combine_unreduced(expert_rows)
             output = w4a8_experts.topk_fma_combine(
-                rows, row_token, row_expert, indices, weights
+                rows,
+                row_token,
+                row_expert,
+                indices,
+                (
+                    torch.ones_like(weights)
+                    if self.official_expert_contract
+                    else weights
+                ),
             )
         else:
             output = self.dispatcher.combine(self.experts(dispatched, counts, scores))
