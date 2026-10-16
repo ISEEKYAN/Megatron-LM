@@ -3,10 +3,10 @@ set -euo pipefail
 DS41_BUNDLE=${DS41_BUNDLE:?set the shared release directory}
 DS41_LAYERS=2
 if [[ "${1:-}" == --layers ]]; then
- DS41_LAYERS=${2:?--layers takes 2, 4, 6 or 40}
+ DS41_LAYERS=${2:?--layers takes 2, 4, 6, 8, 9 or 40}
  shift 2
 fi
-DS41_OUTPUT=${1:?usage: bash hsg/submit.sh [--layers 2|4|6|40] /absolute/shared/output}
+DS41_OUTPUT=${1:?usage: bash hsg/submit.sh [--layers 2|4|6|8|9|40] /absolute/shared/output}
 DS41_CPU_TIME=01:00:00
 case "$DS41_LAYERS" in
  2) DS41_GPU_NODES=2 DS41_GPU_TIME=01:15:00 ;;
@@ -18,16 +18,23 @@ case "$DS41_LAYERS" in
   : "${DS41_PARAMETER_COUNTS:?6L needs the trainable count from its CPU construction receipt}"
   DS41_GPU_NODES=2 DS41_CPU_TIME=02:00:00 DS41_GPU_TIME=02:30:00
   ;;
+ # Long-sequence proxy (9L; 8L fallback without layer 15): EP8xCP2, recompute.
+ 8|9)
+  : "${DS41_PARAMETER_COUNTS:?${DS41_LAYERS}L needs the trainable count from its CPU construction receipt}"
+  DS41_GPU_NODES=2 DS41_CPU_TIME=02:00:00 DS41_GPU_TIME=03:00:00
+  ;;
  # Full model: EP64 on 16 GB200 nodes; see plan-40l for capacity and GPU-hour budget.
  40)
   : "${DS41_40L_GPU_AUTHORIZATION:?16-node jobs need an explicit authorization reference}"
   DS41_GPU_NODES=16 DS41_GPU_TIME=04:00:00
   echo 'WARNING: 40L fresh+resume run in one 4h job; HF load plus two stages can exceed batch MaxTime (see plan-40l).' >&2
   ;;
- *) echo 'DS41 C8 supports --layers 2, 4, 6 or 40' >&2; exit 2 ;;
+ *) echo 'DS41 C8 supports --layers 2, 4, 6, 8, 9 or 40' >&2; exit 2 ;;
 esac
-DS41_GPU_QOS=(--qos interactive)
-if (( DS41_GPU_NODES > 2 )); then
+# DS41_GPU_QOS='' selects the partition's default QOS for a 2-node job.
+DS41_GPU_QOS_NAME=${DS41_GPU_QOS-interactive}
+DS41_GPU_QOS=(--qos "$DS41_GPU_QOS_NAME")
+if (( DS41_GPU_NODES > 2 )) || [[ -z "$DS41_GPU_QOS_NAME" ]]; then
  DS41_GPU_QOS=()
 fi
 : "${DS41_SLURM_ACCOUNT:?set DS41_SLURM_ACCOUNT to your HSG project account}"

@@ -29,13 +29,16 @@ if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
 layers = int(os.environ.get('DS41_LAYERS', '2'))
 prompt_length = int(
-    os.environ.get('DS41_PROMPT_LENGTH', {4: '1536', 6: '17408'}.get(layers, '256'))
+    os.environ.get(
+        'DS41_PROMPT_LENGTH',
+        {4: '1536', 6: '17408', 8: '17408', 9: '17408'}.get(layers, '256'),
+    )
 )
 response_length = int(os.environ.get('DS41_RESPONSE_LENGTH', '128'))
 context_length = prompt_length + response_length
-if layers not in (2, 4, 6, 40) or min(prompt_length, response_length) <= 0:
+if layers not in (2, 4, 6, 8, 9, 40) or min(prompt_length, response_length) <= 0:
     raise ValueError(
-        'Expected a 2L/4L prefix, the 6L release subset or the full 40L model '
+        'Expected a 2L/4L prefix, a 6L/8L/9L release subset or the full 40L model '
         'and positive prompt/response lengths'
     )
 if min(ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):

@@ -10,7 +10,7 @@ from pathlib import Path
 
 parser = argparse.ArgumentParser()
 mode = parser.add_mutually_exclusive_group()
-for layers in (2, 4, 6, 40):
+for layers in (2, 4, 6, 8, 9, 40):
     mode.add_argument(
         f'--c8-{layers}l', dest='layers', action='store_const', const=layers
     )

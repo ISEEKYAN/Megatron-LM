@@ -501,6 +501,26 @@ def _grad_forward(module):
         install(module, tensors, event, counters)
 
 
+def _recompute(module):
+    original = module.CheckpointFunction.backward
+    seen = set()
+
+    def backward(ctx, *grad_outputs):
+        # One record per process: activation recompute actually ran in backward.
+        if os.getpid() not in seen:
+            seen.add(os.getpid())
+            event(
+                'recompute_backward',
+                {
+                    'autograd_thread': threading.current_thread()
+                    is not threading.main_thread()
+                },
+            )
+        return original(ctx, *grad_outputs)
+
+    module.CheckpointFunction.backward = staticmethod(backward)
+
+
 def _capturing(tensor):
     # Reading counts back would sync inside a CUDA graph capture.
     return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
@@ -609,6 +629,7 @@ _callbacks = {
     'verl_mlite.engine.mlite_engine': _checkpoint,
     'megatron.lite.model.deepseek_v41.lite.protocol': _indexer,
     'verl.workers.utils.losses': _grad_forward,
+    'megatron.lite.primitive.recompute': _recompute,
 }
 
 

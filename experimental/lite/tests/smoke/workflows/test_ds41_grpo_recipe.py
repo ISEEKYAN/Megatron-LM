@@ -51,9 +51,14 @@ def _command(command, destination, env, *, timeout=1500):
 LONG_PROMPTS = {
     4: 'c8-boundary-long-prompts.parquet',
     6: 'c8-candidate-long-prompts.parquet',
+    8: 'c8-candidate-long-prompts.parquet',
+    9: 'c8-candidate-long-prompts.parquet',
 }
-PROMPT_LENGTHS = {4: '12800', 6: '17408'}
-FROZEN_TABLES = {6: '2', 40: '2'}
+PROMPT_LENGTHS = {4: '12800', 6: '17408', 8: '17408', 9: '17408'}
+FROZEN_TABLES = {6: '2', 8: '2', 9: '2', 40: '2'}
+# Long-sequence proxy: release subset with every 40L layer role, EP8xCP2 and
+# full activation recompute (8L drops layer 15).
+LONG_SEQUENCE = {8, 9}
 
 
 def _parameter_counts(layers):
@@ -81,6 +86,8 @@ def production_environment(layers, bi, inputs):
         DS41_INDEXER_DIAGNOSTIC=str(int(layers == 4)),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
+    if layers in LONG_SEQUENCE:
+        base.update(DS41_CP='2', DS41_WORLD='8', DS41_RECOMPUTE='full')
     if layers == 40:
         # Full model: EP64/DP64 over 16 nodes; four sequences per prompt need
         # 16 prompts so that every data-parallel rank receives one sequence.
@@ -98,7 +105,9 @@ def stage_environment(base, run, steps, resume):
     return env
 
 
-@pytest.mark.parametrize('layers,bi', [(2, 1), (4, 1), (6, 1), (2, 0), (40, 1)])
+@pytest.mark.parametrize(
+    'layers,bi', [(2, 1), (4, 1), (6, 1), (8, 1), (9, 1), (2, 0), (40, 1)]
+)
 def test_two_updates_and_checkpoint_resume(layers, bi):
     """Require raw token equality and exact saved owner/state on a fresh process."""
     if os.environ.get('DS41_C8_ENABLED') != '1':
@@ -123,9 +132,14 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             ['bash', str(RECIPE / 'run.sh')],
             run / 'train.log',
             env,
-            timeout={2: 2400 if stage == 'resumed' else 1500, 4: 2700, 6: 2700, 40: 6600}[
-                layers
-            ],
+            timeout={
+                2: 2400 if stage == 'resumed' else 1500,
+                4: 2700,
+                6: 2700,
+                8: 4500,
+                9: 4500,
+                40: 6600,
+            }[layers],
         )
         events = [
             json.loads(line)
@@ -170,7 +184,11 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             (run / 'indexer-boundary-coverage.json').write_text(
                 json.dumps(coverage, indent=2) + '\n'
             )
-        if layers == 6:
+        if layers in LONG_SEQUENCE:
+            assert any(
+                row['kind'] == 'recompute_backward' for row in events
+            ), 'Activation recompute did not run in backward'
+        if layers in (6, *LONG_SEQUENCE):
             candidates = [
                 row
                 for row in events
