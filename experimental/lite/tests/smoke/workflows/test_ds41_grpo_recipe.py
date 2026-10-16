@@ -209,9 +209,12 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                 'Candidate filtering stayed the identity',
                 candidates,
             )
-            assert any(
-                row['kind'] == 'decoder_replay_batch_used' for row in events
-            ), 'vLLM decoder SWA bounded replay did not run'
+            # Bounded replay clamps the windows of the layers past the last KV
+            # source and is off in this recipe: no replay batch may run.
+            assert not any(
+                row['kind'] in ('decoder_replay_enabled', 'decoder_replay_batch_used')
+                for row in events
+            ), 'vLLM decoder SWA bounded replay ran'
             (run / 'candidate-coverage.json').write_text(
                 json.dumps(candidates, indent=2) + '\n'
             )
