@@ -612,6 +612,9 @@ def _decoder_replay(module):
     def __init__(self, *args, **kwargs):
         init(self, *args, **kwargs)
         event('decoder_replay_enabled', {'window': self.window})
+        # The recipe runs vLLM without bounded replay; stop at engine build
+        # rather than after a whole round on different KV.
+        raise RuntimeError('vLLM built decoder SWA bounded replay layers')
 
     def __call__(self, *args):
         replay = self.uses_replay_batch()

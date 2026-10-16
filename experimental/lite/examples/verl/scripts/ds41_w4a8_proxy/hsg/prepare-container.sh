@@ -45,6 +45,9 @@ else
  export DS41_PROMPT_LENGTH=256
 fi
 bash /opt/src/mlite/experimental/lite/examples/verl/scripts/ds41_w4a8_proxy/run.sh --config-only
+# The rollout engine arguments must reach vLLM as resolved: run them through
+# VERL's CLI conversion and vLLM's own parser before any GPU is allocated.
+"$DS41_PYTHON" /recipe/check-vllm-cli.py "$DS41_OUTPUT/resolved.yaml"
 if [[ "${DS41_PP:-1}" != 1 ]]; then
  "$DS41_PYTHON" /recipe/verify-parallel-config.py "$DS41_OUTPUT/resolved.yaml"
 fi
