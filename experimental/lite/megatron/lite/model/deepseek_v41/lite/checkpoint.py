@@ -278,13 +278,17 @@ def export_hf_weights(
         dist.all_gather_object(censuses, local, group=ps.pp_group)
         manifest = {}
         for census in censuses:
-            if not isinstance(census, FrozenTables) or census.reuse != local.reuse:
+            if (
+                not isinstance(census, FrozenTables)
+                or census.reuse != local.reuse
+                or census.resend != local.resend
+            ):
                 raise ValueError('PP frozen-table generations disagree')
             for name, pieces in census.manifest.items():
                 if name in manifest and manifest[name] != pieces:
                     raise ValueError('PP frozen-table owners disagree')
                 manifest[name] = pieces
-        yield frozen_tables_transport(manifest, local.reuse)
+        yield frozen_tables_transport(manifest, local.reuse, local.resend)
     yield from stream_pipeline_tensors(
         weights,
         ps,

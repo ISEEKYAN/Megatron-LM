@@ -33,9 +33,10 @@ def test_pp_stream_copies_borrowed_codec_storage(monkeypatch):
     assert [(n, int(t.item())) for n, t in result] == [('0', 0), ('1', 1), ('2', 2)]
 
 
-@pytest.mark.parametrize('mismatch', [False, True])
+@pytest.mark.parametrize('mismatch', ['none', 'reuse', 'resend'])
+@pytest.mark.parametrize('resend', [False, True])
 def test_pp_export_publishes_one_generation_wide_frozen_header(
-    v41_core_te, monkeypatch, mismatch
+    v41_core_te, monkeypatch, mismatch, resend
 ):
     from types import SimpleNamespace
 
@@ -47,12 +48,19 @@ def test_pp_export_publishes_one_generation_wide_frozen_header(
 
     def export(*args, **kwargs):
         assert kwargs['include_archival'] is False
-        yield resync.frozen_tables_transport({'first': ['hash-a']}, False)
+        yield resync.frozen_tables_transport({'first': ['hash-a']}, False, resend)
         yield 'local', torch.tensor([3])
 
     def gather(result, local, *, group):
         assert group is ps.pp_group
-        result[:] = [local, resync.FrozenTables(mismatch, {'second': ['hash-b']})]
+        result[:] = [
+            local,
+            resync.FrozenTables(
+                mismatch == 'reuse',
+                {'second': ['hash-b']},
+                resend ^ (mismatch == 'resend'),
+            ),
+        ]
 
     def stream(weights, state, **kwargs):
         seen.append(kwargs['buffer_max_size_bytes'])
@@ -68,11 +76,11 @@ def test_pp_export_publishes_one_generation_wide_frozen_header(
             object(),
             ps,
             target='mxfp4',
-            resync_config={'freeze_engram': True},
+            resync_config={'freeze_engram': True, 'resend_frozen_engram': resend},
             buffer_max_size_bytes=256,
         )
     )
-    if mismatch:
+    if mismatch != 'none':
         with pytest.raises(ValueError, match='generations disagree'):
             call()
         assert not seen
@@ -81,6 +89,7 @@ def test_pp_export_publishes_one_generation_wide_frozen_header(
         first = resync.decode_transport(*result[0])
         assert first.manifest == {'first': ['hash-a'], 'second': ['hash-b']}
         assert first.reuse is False
+        assert first.resend is resend
         assert [name for name, _ in result[1:]] == ['local', 'remote']
         assert seen == [64]
 
