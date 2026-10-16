@@ -1901,6 +1901,14 @@ def _local_rows(lookup, tensor):
     return tensor[lookup.boundaries[lookup.rank] : lookup.boundaries[lookup.rank + 1]]
 
 
+def require_complete_bound_model(model):
+    """Full-model consumers must not write an unassembled PP stage."""
+    if model.local_layer_range != (0, len(model.layers)):
+        raise NotImplementedError(
+            'Pipeline stage export requires distributed checkpoint assembly'
+        )
+
+
 def export_bound_tensors(
     model,
     spec,
@@ -1910,11 +1918,11 @@ def export_bound_tensors(
     masters_only=False,
     buffer_max_size_bytes=5 * 1024**3,
 ):
-    """Yield numerical masters and frozen storage for encoding or exact resume."""
-    if model.local_layer_range != (0, len(model.layers)):
-        raise NotImplementedError(
-            'Pipeline stage export requires distributed checkpoint assembly'
-        )
+    """Yield this stage's bound masters/storage, like the DS4 local iterator.
+
+    PP consumers assemble stages with pipeline_stream before exposing a full
+    model; full-model writers must call require_complete_bound_model first.
+    """
     model.validate_parameter_bindings()
     if not row_chunks:
         for name, binding in model.tensor_bindings.items():
@@ -2233,6 +2241,7 @@ def export_checkpoint(
 def save_bound_model(
     model, path, spec, *, export_dtype=None, buffer_max_size_bytes=5 * 1024**3
 ):
+    require_complete_bound_model(model)
     stream_export_to_shards(
         export_checkpoint(
             model,

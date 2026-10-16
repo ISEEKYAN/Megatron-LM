@@ -108,7 +108,14 @@ class DeepseekV41WeightSpec:
 
 
 _SPEC = DeepseekV41WeightSpec()
-export_checkpoint = partial(_export_checkpoint, spec=_SPEC)
+
+
+def export_checkpoint(model, **kwargs):
+    """Single-model export; PP resync uses the stage iterator below."""
+    _imports_hf_weights.require_complete_bound_model(model)
+    yield from _export_checkpoint(model, spec=_SPEC, **kwargs)
+
+
 save_model = partial(save_bound_model, spec=_SPEC)
 
 
@@ -274,6 +281,7 @@ def export_hf_weights(
         FrozenTables,
         decode_transport,
         frozen_tables_transport,
+        transport_weights,
         validate_target,
     )
 
@@ -306,6 +314,10 @@ def export_hf_weights(
                     raise ValueError('PP frozen-table owners disagree')
                 manifest[name] = pieces
         yield frozen_tables_transport(manifest, local.reuse, local.resend)
+    if deployment:
+        # A generation spans all stages. Stage-local ends must not finalize
+        # the receiver before later stages' payloads arrive.
+        weights = (pair for pair in weights if decode_transport(*pair) is not None)
     yield from stream_pipeline_tensors(
         weights,
         ps,
@@ -316,3 +328,5 @@ def export_hf_weights(
         ),
         cpu=kwargs.get('cpu', False),
     )
+    if deployment:
+        yield from transport_weights((), deployment=True)

@@ -90,84 +90,20 @@ def test_pp_export_publishes_one_generation_wide_frozen_header(
         assert first.manifest == {'first': ['hash-a'], 'second': ['hash-b']}
         assert first.reuse is False
         assert first.resend is resend
-        assert [name for name, _ in result[1:]] == ['local', 'remote']
+        assert [name for name, _ in result[1:-1]] == ['local', 'remote']
+        assert resync.decode_transport(*result[-1]) is None
         assert seen == [64]
 
 
-def _pp_export_worker(rank, directory):
-    import runpy
-    from datetime import timedelta
-    from pathlib import Path
-
-    import torch.distributed as dist
-
-    fixtures = runpy.run_path(str(Path(__file__).parents[2] / 'conftest.py'))
-    import megatron.core.fp8_utils  # noqa: F401
-    import megatron.core.transformer.experimental_attention_variant.csa  # noqa: F401
-    import megatron.core.transformer.hyper_connection  # noqa: F401
-
-    fixtures['transformer_engine_import_stub'].__wrapped__(pytest.MonkeyPatch())()
-    from megatron.lite.model.deepseek_v41.lite import checkpoint, resync
-    from megatron.lite.primitive.parallel.state import init_parallel
-    from megatron.lite.runtime.contracts import ParallelConfig
-
-    torch.set_num_threads(1)
-    dist.init_process_group(
-        'gloo',
-        init_method=f'file://{directory}/store',
-        rank=rank,
-        world_size=2,
-        timeout=timedelta(seconds=90),
-    )
-    try:
-        ps = init_parallel(ParallelConfig(pp=2))
-        original = checkpoint._export_stage_hf_weights
-        for reuse in [False, True]:
-
-            def stage_export(*args, **kwargs):
-                if rank == 0:
-                    assert kwargs['include_archival'] is False
-                yield resync.frozen_tables_transport(
-                    {f'table-{rank}': [f'hash-{rank}']}, reuse
-                )
-                payload = torch.empty(1, dtype=torch.int64)
-                for index in range(3):
-                    payload.fill_(rank * 10 + index)
-                    yield f'layer-{rank}/weight-{index}', payload
-
-            checkpoint._export_stage_hf_weights = stage_export
-            result = list(
-                checkpoint.export_hf_weights(
-                    [object()],
-                    object(),
-                    ps,
-                    target='mxfp4',
-                    resync_config={'freeze_engram': True},
-                    buffer_max_size_bytes=32,
-                )
-            )
-            census = resync.decode_transport(*result[0])
-            assert isinstance(census, resync.FrozenTables)
-            assert census.reuse is reuse
-            assert census.manifest == {'table-0': ['hash-0'], 'table-1': ['hash-1']}
-            assert [(name, tensor.item()) for name, tensor in result[1:]] == [
-                (f'layer-{stage}/weight-{index}', stage * 10 + index)
-                for stage in range(2)
-                for index in range(3)
-            ]
-        checkpoint._export_stage_hf_weights = original
-        torch.save(
-            {'rank': rank, 'complete_stream': True, 'initial_and_reuse': True},
-            Path(directory) / f'rank-{rank}.pt',
-        )
-    finally:
-        dist.destroy_process_group()
-
-
 def test_real_pp_stream_merges_initial_and_reused_frozen_generations(tmp_path):
-    import torch.multiprocessing as mp
+    import json
 
-    mp.spawn(_pp_export_worker, args=(str(tmp_path),), nprocs=2, join=True)
-    for rank in range(2):
-        result = torch.load(tmp_path / f'rank-{rank}.pt', weights_only=True)
-        assert result['complete_stream'] and result['initial_and_reuse']
+    import torch.multiprocessing as mp
+    from test_pp_bound_export import _real_pp_export_worker
+
+    mp.spawn(_real_pp_export_worker, args=(2, 1, str(tmp_path)), nprocs=2, join=True)
+    rows = [
+        json.loads((tmp_path / f'rank-{rank}.json').read_text()) for rank in range(2)
+    ]
+    assert all(row['passed'] and row['receiver_loaded'] for row in rows)
+    assert len({row['sha256'] for row in rows}) == 1

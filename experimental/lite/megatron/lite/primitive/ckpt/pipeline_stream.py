@@ -49,7 +49,14 @@ def stream_pipeline_tensors(weights, ps, *, buffer_max_size_bytes, cpu=False):
                     if is_source
                     else torch.empty(shape, dtype=dtype, device=device)
                 )
-                dist.broadcast(tensor, src=source_rank, group=ps.pp_group)
+                # The encoded stream includes FP8 storage; Gloo has no FP8
+                # scalar type. Broadcast its exact bytes, retaining the dtype
+                # in the header, rather than casting numerical values.
+                dist.broadcast(
+                    tensor.reshape(-1).view(torch.uint8),
+                    src=source_rank,
+                    group=ps.pp_group,
+                )
                 yield name, tensor.cpu() if cpu else tensor
                 del tensor
             del bucket
