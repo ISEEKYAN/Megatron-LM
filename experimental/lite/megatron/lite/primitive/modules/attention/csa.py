@@ -507,24 +507,43 @@ class CompressedSparseAttention(nn.Module):
         key_positions = torch.arange(global_length, device=x.device)
         qr = self.q_norm(self.wq_a(x))
         # V4.1 deliberately has no per-query-head RMS after wq_b.
-        q = rotate(
-            self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim)),
-            positions,
-            c,
-            ratio,
-            deployment_math=self.deployment_math,
-        )
-        # SWA KV uses the same ordered RoPE multiply-adds as native Q.
-        # Keep BF16 rounding before the FP8 codec, as the receiver does.
-        window = rotate(
-            self.kv_norm(self.wkv(full_x)),
-            key_positions,
-            c,
-            ratio,
-            deployment_math=self.deployment_math,
-        )
-        if c.swa_fp8:
-            window = swa_codec(window)
+        unrotated_q = self.wq_b(qr).unflatten(-1, (c.heads, c.head_dim))
+        unrotated_kv = self.kv_norm(self.wkv(full_x))
+        native_cache = self.deployment_math and x.is_cuda
+        if native_cache:
+            from megatron.lite.primitive.modules.deployment_math.cache import (
+                rotary_cache,
+                swa_cache,
+            )
+
+            if cp_context is not None or not (c.swa_fp8 and c.main_qat and c.index_qat):
+                raise ValueError("Deployment cache requires CP1 and enabled KV codecs")
+            cos_sin = rotary_cache(c, ratio, x.device)
+
+            def swa_vjp(query, values):
+                return (
+                    rotate(query, positions, c, ratio, deployment_math=True),
+                    rotate(values, key_positions, c, ratio, deployment_math=True),
+                )
+
+            q, window = swa_cache(
+                unrotated_q, unrotated_kv, key_positions, cos_sin, c.eps, swa_vjp
+            )
+        else:
+            q = rotate(
+                unrotated_q, positions, c, ratio, deployment_math=self.deployment_math
+            )
+            # SWA KV uses the same ordered RoPE multiply-adds as native Q.
+            # Keep BF16 rounding before the FP8 codec, as the receiver does.
+            window = rotate(
+                unrotated_kv,
+                key_positions,
+                c,
+                ratio,
+                deployment_math=self.deployment_math,
+            )
+            if c.swa_fp8:
+                window = swa_codec(window)
         kv = window
         visible = (key_positions[None, :] <= positions[:, None]) & (
             key_positions[None, :] > positions[:, None] - c.window
@@ -534,23 +553,44 @@ class CompressedSparseAttention(nn.Module):
             if self.owns_kv:
                 latent = self.compressor(full_x)
                 cp = torch.arange(latent.shape[1], device=x.device) * ratio
-                # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
-                index_k = self.indexer.k_norm(self.indexer.wk(latent))
-                index_k = index_codec(
-                    rotate(index_k, cp, c, ratio), enabled=c.index_qat
-                )
-                # Native NVFP4 rotates FP32 values directly into the codec;
-                # rounding RoPE to BF16 first can cross an E2M1 midpoint.
-                main = main_codec(
-                    rotate(
-                        latent,
-                        cp,
-                        c,
+                if native_cache:
+                    from megatron.lite.primitive.modules.deployment_math.cache import (
+                        compressed_cache,
+                        index_cache,
+                    )
+
+                    index_k = index_cache(
+                        self.indexer.wk(latent),
+                        self.indexer.k_norm.weight,
+                        self.indexer.k_norm.eps,
                         ratio,
-                        output_dtype=torch.float32 if self.deployment_math else None,
-                    ),
-                    enabled=c.main_qat,
-                ).to(x.dtype)
+                        cos_sin,
+                    )
+
+                    def main_vjp(values):
+                        return rotate(values, cp, c, ratio, deployment_math=True)
+
+                    main = compressed_cache(latent, ratio, cos_sin, main_vjp)
+                else:
+                    # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
+                    index_k = self.indexer.k_norm(self.indexer.wk(latent))
+                    index_k = index_codec(
+                        rotate(index_k, cp, c, ratio), enabled=c.index_qat
+                    )
+                    # Native NVFP4 rotates FP32 values directly into the codec;
+                    # rounding RoPE to BF16 first can cross an E2M1 midpoint.
+                    main = main_codec(
+                        rotate(
+                            latent,
+                            cp,
+                            c,
+                            ratio,
+                            output_dtype=(
+                                torch.float32 if self.deployment_math else None
+                            ),
+                        ),
+                        enabled=c.main_qat,
+                    ).to(x.dtype)
                 state = AttentionState(kv_owner=layer, main_kv=main, index_k=index_k)
             if (
                 state.kv_owner != self.kv_owner
@@ -563,22 +603,33 @@ class CompressedSparseAttention(nn.Module):
             lengths = ((positions + 1) // ratio).unsqueeze(-1)
             if self.owns_index:
                 iq = self.indexer.wq_b(qr).unflatten(-1, (c.index_heads, c.index_dim))
-                # Native index-Q rounds ordered FP32 RoPE multiply-adds to
-                # BF16 before FP4. Complex arithmetic can cross a midpoint.
-                iq = index_codec(
-                    rotate(
-                        iq, positions, c, ratio, deployment_math=self.deployment_math
-                    ),
-                    enabled=c.index_qat,
-                )
-                weights = self.indexer.weights_proj(x) * (
-                    c.index_dim**-0.5 * c.index_heads**-0.5
-                )
+                if native_cache:
+                    from megatron.lite.primitive.modules.deployment_math.cache import (
+                        index_query,
+                    )
+
+                    iq, weights = index_query(
+                        iq, self.indexer.weights_proj(x), positions, cos_sin
+                    )
+                else:
+                    iq = index_codec(
+                        rotate(
+                            iq,
+                            positions,
+                            c,
+                            ratio,
+                            deployment_math=self.deployment_math,
+                        ),
+                        enabled=c.index_qat,
+                    )
+                    weights = self.indexer.weights_proj(x) * (
+                        c.index_dim**-0.5 * c.index_heads**-0.5
+                    )
                 native_indexer = (
                     self.deployment_math
                     and c.index_qat
                     and x.is_cuda
-                    and state.index_k.shape[1] > c.topk
+                    and (native_cache or state.index_k.shape[1] > c.topk)
                 )
                 if native_indexer:
                     from megatron.lite.primitive.modules import deployment_math
@@ -592,7 +643,7 @@ class CompressedSparseAttention(nn.Module):
                         * weights.unsqueeze(-1)
                     ).sum(2)
                 pool = state.candidates
-                if self.candidate_mode == 'build':
+                if self.candidate_mode == "build":
                     pool = candidate_blocks(
                         scores,
                         lengths,
@@ -600,7 +651,7 @@ class CompressedSparseAttention(nn.Module):
                         block_size=c.block_size,
                     )
                 injected_pool = pool if candidate_mask is None else candidate_mask
-                if self.candidate_mode == 'reuse' and injected_pool is None:
+                if self.candidate_mode == "reuse" and injected_pool is None:
                     raise ValueError("Reindex requires the layer-20 candidate pool")
                 selector = (
                     deployment_math.indexer_select_positions
@@ -612,7 +663,7 @@ class CompressedSparseAttention(nn.Module):
                     lengths,
                     c.topk,
                     candidates=(
-                        injected_pool if self.candidate_mode == 'reuse' else None
+                        injected_pool if self.candidate_mode == "reuse" else None
                     ),
                 )
                 state = replace(
@@ -1505,6 +1556,7 @@ class CrossLayerAttentionConfig:
     main_qat: bool = True
     index_qat: bool = True
     swa_fp8: bool = True
+    deployment_hf_config: dict | None = None
 
 
 @dataclass(frozen=True)
@@ -1533,7 +1585,6 @@ def rotate(
     pos_freqs = theta ** (dims / rd)
     freqs = 1 / pos_freqs
     if ratio != 0 and config.original_length > 0:
-
         low, high = _yarn_find_correction_range(
             config.beta_fast, config.beta_slow, rd, theta, config.original_length
         )

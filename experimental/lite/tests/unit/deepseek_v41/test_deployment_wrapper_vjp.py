@@ -292,9 +292,9 @@ def test_compressor_production_backward_raw_and_gamma(cuda, monkeypatch, ratio):
     w = _leaf((512, 32), cuda)
     gate = _leaf((512, 32), cuda) if ratio == 2 else None
     gamma = _leaf((512,), cuda)
-    from megatron.lite.primitive.kernels import deployment_compressor
-
-    compress_norm = deployment_compressor.compress_norm
+    from megatron.lite.primitive.modules.deployment_math.cache import (
+        pool_norm as compress_norm,
+    )
 
     raw_shape = (2, 5, 512 * ratio)
     with pytest.raises(ValueError, match='CUDA FP32'):

@@ -17,7 +17,7 @@ import torch
 
 root = Path(os.environ['W4_GRPO_OUT']) / 'audit'
 root.mkdir(parents=True, exist_ok=True)
-counters = {'raw': 0, 'adv': 0, 'resync': 0, 'optimizer': 0}
+counters = {'raw': 0, 'adv': 0, 'resync': 0, 'optimizer': 0, 'grad': 0}
 strict = os.environ.get('VLLM_BATCH_INVARIANT', '1') == '1'
 _installed = set()
 
@@ -494,6 +494,13 @@ def _indexer(module):
         install(event)
 
 
+def _grad_forward(module):
+    if strict:
+        from grad_forward import install
+
+        install(module, tensors, event, counters)
+
+
 _callbacks = {
     'vllm.model_executor.kernels.batch_invariant': _selector,
     'vllm._custom_ops': _legacy_guard,
@@ -504,6 +511,7 @@ _callbacks = {
     'verl.utils.tracking': _tracking,
     'verl_mlite.engine.mlite_engine': _checkpoint,
     'megatron.lite.model.deepseek_v41.lite.protocol': _indexer,
+    'verl.workers.utils.losses': _grad_forward,
 }
 
 

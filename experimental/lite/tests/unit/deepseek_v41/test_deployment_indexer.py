@@ -1,9 +1,42 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Native BF16 index ranking matches original packets and padded batches."""
+
 import os
 
 import pytest
 import torch
+
+
+@pytest.mark.parametrize("rows", [0, 1, 63, 64, 65, 6464])
+def test_private_cache_pages_isolate_requests_and_preserve_partial_pages(
+    v41_core_te, rows
+):
+    from megatron.lite.primitive.modules.deployment_math.cache import cache_geometry
+
+    table, slots, lengths = cache_geometry(2, rows, 64, device="cpu")
+    assert table.dtype == torch.int32 and slots.dtype == torch.int64
+    assert lengths.tolist() == [rows, rows]
+    assert slots.shape == (2, rows)
+    if rows:
+        assert torch.equal(slots[0], torch.arange(rows))
+        assert torch.equal(slots[1], torch.arange(rows) + table.shape[1] * 64)
+        assert slots.unique().numel() == 2 * rows
+        pages = slots.div(64, rounding_mode="floor")
+        assert set(pages[0].tolist()) <= set(table[0].tolist())
+        assert set(pages[1].tolist()) <= set(table[1].tolist())
+        assert not set(table[0].tolist()) & set(table[1].tolist())
+
+
+def test_private_cache_cpu_rejects_native_execution_without_cuda(v41_core_te):
+    from megatron.lite.primitive.modules.deployment_math import cache
+
+    before = torch.cuda.is_initialized()
+    values = torch.ones(1, 2, 512, dtype=torch.bfloat16)
+    with pytest.raises(ValueError, match="CUDA BF16"):
+        cache.compressed_cache(values, 2, None, lambda x: x)
+    with pytest.raises(ValueError, match="CUDA BF16"):
+        cache.index_cache(values[..., :128], torch.ones(128), 1e-20, 2, None)
+    assert torch.cuda.is_initialized() == before
 
 
 def test_indexer_provider_cpu_fails_without_initializing_cuda(v41_core_te):
@@ -214,10 +247,10 @@ def test_indexer_batched_requests_one_launch_and_serial_bitwise(monkeypatch):
     from vllm.utils import deep_gemm
 
     torch.manual_seed(1943)
-    q = torch.randn(3, 7, 32, 128, device='cuda', dtype=torch.bfloat16)
-    k = torch.randn(3, 139, 128, device='cuda', dtype=torch.bfloat16)
-    w = torch.randn(3, 7, 32, device='cuda', dtype=torch.float32)
-    lengths = torch.randint(1, 140, (3, 7, 1), device='cuda', dtype=torch.int32)
+    q = torch.randn(3, 7, 32, 128, device="cuda", dtype=torch.bfloat16)
+    k = torch.randn(3, 139, 128, device="cuda", dtype=torch.bfloat16)
+    w = torch.randn(3, 7, 32, device="cuda", dtype=torch.float32)
+    lengths = torch.randint(1, 140, (3, 7, 1), device="cuda", dtype=torch.int32)
     expected = torch.cat(
         [
             dm.indexer_scores(
@@ -280,7 +313,7 @@ def test_fp32_diagnostic_keeps_weight_midpoint_and_masks_causal_tail():
     assert torch.isneginf(actual[0, 128]).all() and torch.isneginf(actual[0, 129, 1])
 
 
-@pytest.mark.gpus(1, min_architecture='blackwell')
+@pytest.mark.gpus(1, min_architecture="blackwell")
 @pytest.mark.parametrize('use_candidates', [False, True])
 def test_indexer_selection_crosses_batch_dispatch_boundary(
     v41_core_te, monkeypatch, use_candidates
@@ -295,12 +328,12 @@ def test_indexer_selection_crosses_batch_dispatch_boundary(
     rows, columns, top_k = 12290, 640, 512
     lengths = torch.tensor([640, 0, 1, 511, 512, 513], dtype=torch.int32)
     lengths = lengths.repeat((rows + 5) // 6)[:rows]
-    scores = torch.ones((1, rows, columns), device='cuda', dtype=torch.float32)
+    scores = torch.ones((1, rows, columns), device="cuda", dtype=torch.float32)
     ends = lengths.cuda().reshape(1, rows, 1)
-    scores.masked_fill_(torch.arange(columns, device='cuda') >= ends, -torch.inf)
+    scores.masked_fill_(torch.arange(columns, device="cuda") >= ends, -torch.inf)
     candidates = None
     if use_candidates:
-        candidates = torch.arange(columns, device='cuda') % 2 == 0
+        candidates = torch.arange(columns, device="cuda") % 2 == 0
         candidates = candidates.expand_as(scores)
     calls = []
     native = bi.top_k_per_row_prefill
@@ -336,7 +369,7 @@ def test_indexer_selection_crosses_batch_dispatch_boundary(
     inference_positions = torch.empty_like(selected[0])
     bi.top_k_per_row_prefill(
         inference_scores,
-        torch.zeros(rows, device='cuda', dtype=torch.int32),
+        torch.zeros(rows, device="cuda", dtype=torch.int32),
         ends.flatten(),
         inference_positions,
         rows,
@@ -350,11 +383,11 @@ def test_indexer_selection_crosses_batch_dispatch_boundary(
 
     torch.manual_seed(1947)
     heads, dim = 32, 512
-    query = torch.randn(1, 1, heads, dim, device='cuda', dtype=torch.bfloat16)
+    query = torch.randn(1, 1, heads, dim, device="cuda", dtype=torch.bfloat16)
     query = query.expand(1, 2, heads, dim).contiguous()
-    kv = torch.randn(1, columns, dim, device='cuda', dtype=torch.bfloat16)
-    sink = torch.randn(heads, device='cuda', dtype=torch.float32)
-    mask = torch.ones(1, 2, columns, device='cuda', dtype=torch.bool)
+    kv = torch.randn(1, columns, dim, device="cuda", dtype=torch.bfloat16)
+    sink = torch.randn(heads, device="cuda", dtype=torch.float32)
+    mask = torch.ones(1, 2, columns, device="cuda", dtype=torch.bool)
     chosen = selected[:, [0, 12288]]
     kwargs = dict(main_size=columns, window_size=0, width=top_k, scale=dim**-0.5)
     actual = dm.sparse_attention(query, kv, sink, mask, chosen, **kwargs)

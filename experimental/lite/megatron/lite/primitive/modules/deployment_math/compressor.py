@@ -13,9 +13,9 @@ def compressor(x, wkv, wgate, gamma, ratio, eps):
     raw = bf16_fp32_linear(x, weights)
 
     def visible(scores, master):
-        from megatron.lite.primitive.kernels import deployment_compressor
+        from .cache import pool_norm
 
-        return deployment_compressor.compress_norm(scores, master, ratio, eps)
+        return pool_norm(scores, master, ratio, eps)
 
     def reference(scores, master):
         cutoff = scores.shape[1] // ratio * ratio

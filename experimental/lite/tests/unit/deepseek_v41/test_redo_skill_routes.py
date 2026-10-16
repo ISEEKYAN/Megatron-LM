@@ -45,7 +45,7 @@ def test_bound_training_routes_and_skill_contract():
         'parallel/owned_ddp.py': 'test_redo_reduction_contract.py::test_owned_ddp_subgroups_sync_bytes_experts_and_manual_dense',
         'kernels/deployment_rms_norm.py': 'test_deployment_math.py::test_qkv_norm_native_forward_fp32_vjp_and_process_state',
         'kernels/deployment_engram.py': 'test_deployment_engram.py::test_native_forward_partitions_and_owned_vjp',
-        'kernels/deployment_compressor.py': 'test_deployment_compressor.py::test_dense_compressor_matches_native_group_program',
+        'modules/deployment_math/cache.py': 'test_deployment_compressor.py::test_dense_compressor_matches_native_group_program',
         'kernels/mxfp8_block32.py': 'test_deployment_math.py::test_grouped_fp8_one_launch_serial_batch1_and_vllm_bitwise',
         'kernels/sparse_metadata.py': 'test_deployment_math.py::test_sparse_metadata_stable_order_batch1_graph_and_one_launch',
         'modules/attention/cp.py': 'test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce',

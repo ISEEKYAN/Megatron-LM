@@ -9,10 +9,10 @@ import torch
 )
 @pytest.mark.parametrize('ratio', [1, 2])
 def test_dense_compressor_matches_native_group_program(ratio):
-    import megatron.lite.primitive.kernels.deployment_compressor as _imports_deployment_compressor
-
-    compress_norm = _imports_deployment_compressor.compress_norm
     import vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache as _imports_fused_compress_quant_cache
+    from megatron.lite.primitive.modules.deployment_math.cache import (
+        pool_norm as compress_norm,
+    )
 
     fused_save_compress_norm = (
         _imports_fused_compress_quant_cache.fused_save_compress_norm

@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Release policy and one topology table, including inactive archival metadata."""
+
 from copy import deepcopy
 
 from megatron.lite.primitive.config import load_hf_config_dict
@@ -94,5 +95,6 @@ class DeepseekV41Config:
             linear_fp8=linear_fp8,
             main_qat=main_qat,
             index_qat=index_qat,
-            swa_fp8=swa_fp8
+            swa_fp8=swa_fp8,
+            deployment_hf_config=self.to_hf_dict(),
         )

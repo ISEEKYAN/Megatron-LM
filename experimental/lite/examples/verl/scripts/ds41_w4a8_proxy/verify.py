@@ -49,6 +49,22 @@ for path in sorted((root / 'audit').glob('raw-*.pt')):
         }
     )
 assert len(raw) == args.steps, len(raw)
+grad_tokens = 0
+grad_updates = set()
+for path in sorted((root / 'audit').glob('grad-*.pt')):
+    payload = torch.load(path, map_location='cpu', weights_only=False)
+    assert payload['grad_enabled'] and payload['actor_requires_grad'], path
+    actor = payload['actor_log_probs']
+    assert actor.numel() and torch.isfinite(actor).all(), path
+    assert torch.equal(actor, payload['rollout_log_probs']), path
+    assert torch.equal(actor, payload['old_log_probs']), path
+    assert payload['input_ids'], path
+    grad_tokens += actor.numel()
+    grad_updates.add((payload['rank'], payload['update']))
+assert grad_updates == {
+    (rank, update) for rank in range(args.ranks) for update in range(1, args.steps + 1)
+}, grad_updates
+assert grad_tokens == sum(row['tokens'] for row in raw), (grad_tokens, raw)
 advs = []
 for path in sorted((root / 'audit').glob('adv-*.pt')):
     j = torch.load(path, map_location='cpu', weights_only=False)
@@ -148,6 +164,8 @@ print(
             'all_strict_zero': True,
             'actual_verl_steps': args.steps,
             'raw': raw,
+            'grad_forward_tokens': grad_tokens,
+            'grad_forward_rank_updates': sorted(grad_updates),
             'advantages': advs,
             'steps': steps,
             'global_PP_grad_norms': global_grad_norms,

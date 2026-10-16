@@ -10,12 +10,16 @@ from .autograd import visible_forward
 def indexer_scores(query, keys, weights, lengths):
     """Native SM100 BF16 MXFP4 index scores for the deployment selector.
 
-    Inputs are the owned QAT decoded values. Index ranking has no VJP in the
+    Inputs may be rollout Q/K packets or owned QAT decoded values. Index ranking has no VJP in the
     CSA recipe; attention keeps its ordinary VJP with the selected slots fixed.
     """
-    if not all(t.is_cuda for t in (query, keys, weights, lengths)):
+    from .cache import IndexCache
+
+    key_tensor = keys.packed if isinstance(keys, IndexCache) else keys
+    query_tensor = query.packed if isinstance(query, IndexCache) else query
+    if not all(t.is_cuda for t in (query_tensor, key_tensor, weights, lengths)):
         raise RuntimeError('Deployment index scoring requires CUDA')
-    if query.ndim != 4 or keys.ndim != 3:
+    if query.ndim != 4 or key_tensor.ndim != 3:
         raise ValueError('Index Q/K must be BSHD/BTD')
     batch, rows, heads, width = query.shape
     if heads != 32 or width != 128 or keys.shape[0] != batch or keys.shape[-1] != width:
@@ -24,11 +28,12 @@ def indexer_scores(query, keys, weights, lengths):
         raise ValueError('Index head weights must be BSH')
     columns = keys.shape[1]
     if rows == 0 or columns == 0:
-        return query.new_empty((batch, rows, columns), dtype=torch.float32)
+        return query_tensor.new_empty((batch, rows, columns), dtype=torch.float32)
     from megatron.lite.primitive.quantization.mxfp4 import quantize_index
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits
 
-    q, k = quantize_index(query), quantize_index(keys)
+    q = query if isinstance(query, IndexCache) else quantize_index(query)
+    k = keys if isinstance(keys, IndexCache) else quantize_index(keys)
     q_scale = q.scale.contiguous().view(torch.int32).squeeze(-1)
     k_scale = k.scale.contiguous().view(torch.int32).squeeze(-1)
     ends = torch.broadcast_to(lengths, (batch, rows, 1)).to(torch.int32)
