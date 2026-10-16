@@ -230,6 +230,7 @@ class DeepseekV41Model(nn.Module):
             group_size=self.ps.dp_cp_size,
             local_range=(start, end),
             projection=partial(_FP8_LINEAR, fp8=quantized),
+            hash_layer_ids=getattr(t, 'engram_hash_layer_ids', None),
             **memory_options,
         )
         for index, module in memories.items():

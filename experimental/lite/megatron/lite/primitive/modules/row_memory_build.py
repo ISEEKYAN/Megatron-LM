@@ -23,7 +23,8 @@ def build_row_memories(
     group_size,
     local_range,
     constructors,
-    projection
+    projection,
+    hash_layer_ids=None
 ):
     (
         primes_fn,
@@ -49,7 +50,11 @@ def build_row_memories(
             hash_module = hash_type(
                 token_map,
                 pad_id,
-                multipliers_fn(layer_ids, order, compressed_vocabulary),
+                # A model built from renumbered release layers keeps the
+                # release hash: the multipliers are seeded by these ids.
+                multipliers_fn(
+                    hash_layer_ids or layer_ids, order, compressed_vocabulary
+                ),
                 primes,
             )
     memories = {}

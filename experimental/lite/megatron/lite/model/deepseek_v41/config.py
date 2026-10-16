@@ -45,6 +45,12 @@ class DeepseekV41Config:
             raise ValueError('Only YaRN rope_scaling is supported')
         if text['num_nextn_predict_layers'] != 3:
             raise ValueError('The archival DSpark contract requires three layers')
+        hash_ids = text.get('engram_hash_layer_ids')
+        if hash_ids is not None and (
+            len(hash_ids) != len(text['engram_layer_ids'])
+            or any(type(i) is not int or i < 0 for i in hash_ids)
+        ):
+            raise ValueError('engram_hash_layer_ids must name one id per table')
         if text['engram_head_dim'] % 32:
             raise ValueError('Engram head width must be divisible by 32')
         if not 0 < text['num_experts_per_tok'] <= text['n_routed_experts']:
