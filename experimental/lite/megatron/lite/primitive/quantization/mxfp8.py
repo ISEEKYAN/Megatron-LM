@@ -119,10 +119,11 @@ def dynamic_fp8_linear(x, weight, *, deployment_math=False):
 
 class _DynamicGroupedLinear(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, x, weight):
+    def forward(ctx, x, weight, activation=None):
         from megatron.lite.primitive.kernels import mxfp8_block32
 
-        activation = quantize_linear_activation(x)
+        if activation is None:
+            activation = quantize_linear_activation(x)
         codes, scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
         decoded = dequantize_block_fp8(codes, scales, (32, 32)).to(x.dtype)
         ctx.weight_dtype = weight.dtype
@@ -154,11 +155,15 @@ class _DynamicGroupedLinear(torch.autograd.Function):
                 .to(activation.dtype)
             )
             dw = torch.bmm(g.transpose(1, 2), a).to(ctx.weight_dtype)
-        return dx, dw
+        return dx, dw, None
 
 
-def dynamic_fp8_grouped_linear(x, weight):
-    """One grouped K32 launch; each group retains its independent forward codec."""
+def dynamic_fp8_grouped_linear(x, weight, *, activation=None):
+    """One grouped K32 launch; each group retains its independent forward codec.
+
+    ``activation`` supplies FP8 codes/scales produced by a native kernel for
+    ``x``; ``x`` then only carries the VJP.
+    """
     if not x.is_cuda or not weight.is_cuda:
         raise RuntimeError("dynamic grouped FP8 Linear requires CUDA")
     _validate_input(x, 32)
@@ -179,4 +184,9 @@ def dynamic_fp8_grouped_linear(x, weight):
         torch.bfloat16,
     ):
         raise ValueError("Grouped activation/master device or dtype mismatch")
-    return _DynamicGroupedLinear.apply(x, weight)
+    if activation is not None and (
+        activation.values.shape != x.shape
+        or activation.scale.shape != (*x.shape[:-1], x.shape[-1] // 32)
+    ):
+        raise ValueError("Native grouped activation must match the input blocks")
+    return _DynamicGroupedLinear.apply(x, weight, activation)

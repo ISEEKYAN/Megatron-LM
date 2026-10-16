@@ -560,7 +560,7 @@ class CompressedSparseAttention(nn.Module):
                     )
 
                     index_k = index_cache(
-                        self.indexer.wk(latent),
+                        _indexer_linear(self.indexer.wk, latent, self.deployment_math),
                         self.indexer.k_norm.weight,
                         self.indexer.k_norm.eps,
                         ratio,
@@ -573,7 +573,9 @@ class CompressedSparseAttention(nn.Module):
                     main = compressed_cache(latent, ratio, cos_sin, main_vjp)
                 else:
                     # Index keys branch BEFORE main RoPE/QAT. No in-place aliasing.
-                    index_k = self.indexer.k_norm(self.indexer.wk(latent))
+                    index_k = self.indexer.k_norm(
+                        _indexer_linear(self.indexer.wk, latent, self.deployment_math)
+                    )
                     index_k = index_codec(
                         rotate(index_k, cp, c, ratio), enabled=c.index_qat
                     )
@@ -609,7 +611,12 @@ class CompressedSparseAttention(nn.Module):
                     )
 
                     iq, weights = index_query(
-                        iq, self.indexer.weights_proj(x), positions, cos_sin
+                        iq,
+                        _indexer_linear(
+                            self.indexer.weights_proj, x, self.deployment_math
+                        ),
+                        positions,
+                        cos_sin,
                     )
                 else:
                     iq = index_codec(
@@ -622,9 +629,9 @@ class CompressedSparseAttention(nn.Module):
                         ),
                         enabled=c.index_qat,
                     )
-                    weights = self.indexer.weights_proj(x) * (
-                        c.index_dim**-0.5 * c.index_heads**-0.5
-                    )
+                    weights = _indexer_linear(
+                        self.indexer.weights_proj, x, self.deployment_math
+                    ) * (c.index_dim**-0.5 * c.index_heads**-0.5)
                 native_indexer = (
                     self.deployment_math
                     and c.index_qat
@@ -710,6 +717,11 @@ class CompressedSparseAttention(nn.Module):
             output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(
                 x.dtype
             )
+        native_activation = None
+        if self.deployment_math and self.wo_a.fp8 and output.is_cuda:
+            native_activation = _native_inverse_rope_activation(
+                output, positions, c, ratio
+            )
         output = rotate(
             output,
             positions,
@@ -721,6 +733,7 @@ class CompressedSparseAttention(nn.Module):
                 if self.deployment_math and self.wo_a.fp8
                 else output.dtype
             ),
+            deployment_math=native_activation is not None,
         )
         grouped = output.reshape(b, length, c.groups, c.heads * c.head_dim // c.groups)
         weight = self.wo_a.weight.reshape(c.groups, c.o_rank, -1)
@@ -735,7 +748,14 @@ class CompressedSparseAttention(nn.Module):
                 if self.codecs is None
                 else self.codecs.get("linear_grouped", mxfp8.dynamic_fp8_grouped_linear)
             )
-            output = grouped_codec(grouped, weight).flatten(2)
+            if native_activation is None:
+                output = grouped_codec(grouped, weight).flatten(2)
+            else:
+                # The native inverse-RoPE kernel owns the FP8 activation; the
+                # rotated reference above only carries the VJP.
+                output = grouped_codec(
+                    grouped, weight, activation=native_activation
+                ).flatten(2)
         elif getattr(self.wo_a, 'native_fp32', False):
             output = torch.stack(
                 [
@@ -996,7 +1016,9 @@ class CompressedSparseAttention(nn.Module):
         q_indexer = q_indexer.transpose(1, 2).transpose(0, 1).contiguous()
         weights_indexer = (
             (
-                self.indexer.weights_proj(x).to(dtype=x.dtype)
+                _indexer_linear(self.indexer.weights_proj, x, self.deployment_math).to(
+                    dtype=x.dtype
+                )
                 * (self.indexer.index_n_heads**-0.5)
             )
             .transpose(0, 1)
@@ -1567,6 +1589,69 @@ class AttentionState:
     index_k: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+
+
+def _indexer_linear(linear, x, deployment_math):
+    """Replicated BF16 indexer projection (wk, weights_proj).
+
+    vLLM's batch-invariant ReplicatedLinear runs the fixed-order BF16 GEMM with
+    FP32 accumulation and rounds the result to BF16; cuBLAS can differ in the
+    last bit, which moves index keys and weights before Top-K.
+    """
+    if deployment_math and x.is_cuda:
+        from megatron.lite.primitive.modules import deployment_math as native
+
+        return native.bf16_fp32_linear(x, linear.weight).to(x.dtype)
+    return linear(x)
+
+
+def rope_cos_sin_cache(length, config, ratio, device):
+    """FP32 cos||sin rows for positions [0, length), deployment frequencies."""
+    rd = config.rope_dim
+    probe = torch.zeros(1, length, rd, device=device)
+    probe[..., ::2] = 1
+    rotated = rotate(
+        probe,
+        torch.arange(length, device=device),
+        config,
+        ratio,
+        output_dtype=torch.float32,
+        deployment_math=True,
+    )[0]
+    return torch.cat((rotated[:, ::2], rotated[:, 1::2]), -1).contiguous()
+
+
+def _native_inverse_rope_activation(output, positions, config, ratio):
+    """vLLM's fused inverse RoPE + block32 E8M0 FP8 codec for the wo_a input."""
+    from megatron.lite.primitive.quantization.mxfp8 import FP8Values
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
+        fused_inv_rope_fp8_quant,
+    )
+
+    b, length, heads, head_dim = output.shape
+    groups = config.groups
+    width = heads * head_dim // groups
+    cache = rope_cos_sin_cache(int(positions.max()) + 1, config, ratio, output.device)
+    values, scales = fused_inv_rope_fp8_quant(
+        output.reshape(b * length, heads, head_dim),
+        positions.to(torch.int64).repeat(b),
+        cache,
+        n_groups=groups,
+        heads_per_group=heads // groups,
+        nope_dim=head_dim - config.rope_dim,
+        rope_dim=config.rope_dim,
+        quant_group_size=32,
+        tma_aligned_scales=False,
+    )
+    values = values.contiguous().reshape(b, length, groups, width)
+    scales = scales.contiguous().reshape(b, length, groups, width // 32)
+    exponent = torch.log2(scales)
+    decoded = (values.float().unflatten(-1, (-1, 32)) * scales.unsqueeze(-1)).flatten(
+        -2
+    )
+    return FP8Values(
+        values, (exponent + 127).to(torch.uint8).view(torch.float8_e8m0fnu), decoded
+    )
 
 
 def rotate(

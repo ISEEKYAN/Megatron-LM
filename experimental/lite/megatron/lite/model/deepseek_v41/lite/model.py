@@ -85,6 +85,8 @@ class DeepseekV41Model(nn.Module):
         )
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
+        # vLLM's router applies bias_vl to sentinel IDs iff vision_n_layers > 0.
+        self.routes_image_sentinels = getattr(v, 'num_hidden_layers', 0) > 0
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
         local_experts = ensure_divisible(t.n_routed_experts, self.ps.ep_size)
         expert_start = self.ps.ep_rank * local_experts
@@ -361,8 +363,14 @@ class DeepseekV41Model(nn.Module):
         routing_mask = image_mask
         if self.deployment_math:
             # Native routing treats all five sentinel IDs as visual, including
-            # generated placeholders. Engram only blocks the actual image ID.
-            routing_mask = (input_ids >= 129264) & (input_ids < 129269)
+            # generated placeholders, only when the checkpoint has a vision
+            # tower; text-only checkpoints route them with the text bias.
+            # Engram only blocks the actual image ID.
+            routing_mask = (
+                (input_ids >= 129264) & (input_ids < 129269)
+                if self.routes_image_sentinels
+                else None
+            )
             token_mask = input_ids != 129264
         hashes = (
             sequence_hashes(self.engram_hash, input_ids, token_mask, cp_context)

@@ -78,8 +78,21 @@ def _ceil_ue8m0(scale: torch.Tensor) -> torch.Tensor:
     return (exponent << 23).view(torch.float32)
 
 
-def quantize_fp8_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+def _unpack_ue8m0_scales(packed: torch.Tensor, groups: int) -> torch.Tensor:
+    """Packed int32 UE8M0 bytes (four groups per word) -> float32 powers of two."""
+    rows = packed.shape[0]
+    exponent = packed.contiguous().view(torch.uint8).reshape(rows, -1)[:, :groups]
+    return (exponent.to(torch.int32) << 23).view(torch.float32)
+
+
+def quantize_fp8_act(
+    x: torch.Tensor, *, packed_ue8m0: bool = False
+) -> tuple[torch.Tensor, torch.Tensor]:
     """Dynamic per-token-group (128) E4M3 quantization with UE8M0 scales.
+
+    ``packed_ue8m0`` selects the native kernel's packed-UE8M0 variant, which
+    the rollout uses for the second expert GEMM input; its paired FP8
+    conversion can pick a different tie than the scalar variant.
 
     Returns ``(codes, scale)``: ``codes`` is ``float8_e4m3fn`` with the shape of
     ``x``; ``scale`` is float32 ``[M, K // 128]`` holding exact powers of two, so
@@ -103,13 +116,16 @@ def quantize_fp8_act(x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
             fused_silu_mul_per_token_group_quant_fp8,
         )
 
-        return fused_silu_mul_per_token_group_quant_fp8(
+        codes, scale = fused_silu_mul_per_token_group_quant_fp8(
             x.contiguous(),
-            use_ue8m0=False,
+            use_ue8m0=packed_ue8m0,
             round_scale=True,
             masked_m=None,
             fuse_silu_and_mul=False,
         )
+        if packed_ue8m0:
+            scale = _unpack_ue8m0_scales(scale, x.shape[-1] // FP8_ACT_GROUP_SIZE)
+        return codes, scale
     rows, cols = x.shape
     groups = x.float().reshape(rows, cols // FP8_ACT_GROUP_SIZE, FP8_ACT_GROUP_SIZE)
     amax = groups.abs().amax(dim=-1).clamp_min(_SCALE_FLOOR)
@@ -236,8 +252,8 @@ class _W4A8GroupedGemm(torch.autograd.Function):
     """``out[rows_e] = Q_a8(x[rows_e]) @ Q_mxfp4(W_e).T`` with STE backward."""
 
     @staticmethod
-    def forward(ctx, x, m_splits, backend, *weights):  # type: ignore[override]
-        x_codes, x_scale = quantize_fp8_act(x)
+    def forward(ctx, x, m_splits, backend, packed_ue8m0, *weights):  # type: ignore[override]
+        x_codes, x_scale = quantize_fp8_act(x, packed_ue8m0=packed_ue8m0)
         packed = [quantize_mxfp4(weight.detach()) for weight in weights]
         w_codes = torch.stack([codes for codes, _ in packed])
         w_scale = torch.stack([scale for _, scale in packed])
@@ -262,7 +278,7 @@ class _W4A8GroupedGemm(torch.autograd.Function):
             else:
                 grad_w = grad.t() @ x_hat[start:end]
             grad_weights.append(grad_w.to(ctx.weight_dtypes[expert]))
-        return (grad_x, None, None, *grad_weights)
+        return (grad_x, None, None, None, *grad_weights)
 
 
 def _default_backend(x: torch.Tensor) -> str:
@@ -275,6 +291,7 @@ def w4a8_grouped_gemm(
     m_splits: Sequence[int],
     *,
     backend: str | None = None,
+    packed_ue8m0: bool = False,
 ) -> torch.Tensor:
     """Grouped ``[M, K] x [N, K]^T`` per expert with A8 activations and MXFP4 weights.
 
@@ -298,7 +315,7 @@ def w4a8_grouped_gemm(
         raise ValueError(
             f"Unknown W4A8 backend {backend!r}; use one of {sorted(_BACKENDS)}."
         )
-    return _W4A8GroupedGemm.apply(x, tuple(m_splits), backend, *weights)
+    return _W4A8GroupedGemm.apply(x, tuple(m_splits), backend, packed_ue8m0, *weights)
 
 
 def _swiglu_reference(
@@ -365,7 +382,10 @@ def w4a8_expert_mlp(
         )
     fc1_out = w4a8_grouped_gemm(x, fc1_weights, m_splits, backend=backend)
     hidden = _swiglu_bf16(fc1_out, swiglu_limit)
-    return w4a8_grouped_gemm(hidden, fc2_weights, m_splits, backend=backend)
+    # The rollout's fused SiLU-mul quantizer writes packed UE8M0 scales.
+    return w4a8_grouped_gemm(
+        hidden, fc2_weights, m_splits, backend=backend, packed_ue8m0=True
+    )
 
 
 def _fma_f32(a: torch.Tensor, b: torch.Tensor, c: torch.Tensor) -> torch.Tensor:
