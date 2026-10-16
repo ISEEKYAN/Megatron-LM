@@ -7,6 +7,12 @@ RECIPE_STAGE=${2:?cpu or gpu}
 : "${DS41_BUNDLE:?shared release directory}"
 export RECIPE_LAYERS=${DS41_LAYERS:-2}
 export RECIPE_CPU_COLLECTION=0 RECIPE_C8_MODE=--c8-${RECIPE_LAYERS}l
+RECIPE_TOPOLOGY_ENV=()
+for RECIPE_TOPOLOGY_KEY in DS41_PP DS41_PIPELINE_SPLIT_LAYER DS41_EP DS41_CP DS41_WORLD; do
+ if [[ -v "$RECIPE_TOPOLOGY_KEY" ]]; then
+  RECIPE_TOPOLOGY_ENV+=(--env "$RECIPE_TOPOLOGY_KEY")
+ fi
+done
 if [[ "$RECIPE_STAGE" == cpu ]]; then
  export RECIPE_CPU_COLLECTION=1 CUDA_VISIBLE_DEVICES=''
  (cd "$DS41_BUNDLE" && sha256sum -c SHA256SUMS)
@@ -26,7 +32,7 @@ if [[ "$RECIPE_STAGE" == cpu ]]; then
  fi
  enroot start --root --rw "${RECIPE_REUSE[@]}" --env DS41_DATA_FILE --env WANDB_API_KEY --env PYTHONPATH --env RECIPE_LAYERS \
   --env DS41_PRECISION --env DS41_CUDAGRAPH --env DS41_CUDAGRAPH_MAX_CAPTURE --env VLLM_USE_BREAKABLE_CUDAGRAPH \
-  --env DS41_PP --env DS41_PIPELINE_SPLIT_LAYER --env DS41_EP --env DS41_CP --env DS41_WORLD --env DS41_PARAMETER_COUNTS \
+  "${RECIPE_TOPOLOGY_ENV[@]}" --env DS41_PARAMETER_COUNTS \
   --mount "$RECIPE_ROOT:/run-artifacts:none:bind" \
   --mount "$DS41_RELEASE:/release:none:bind,ro" \
   --mount "$DS41_DATA_DIR:/data:none:bind,ro" \

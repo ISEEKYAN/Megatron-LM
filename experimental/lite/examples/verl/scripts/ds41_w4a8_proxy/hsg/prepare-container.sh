@@ -17,7 +17,7 @@ elif [[ "$RECIPE_LAYERS" == 9 || "$RECIPE_LAYERS" == 8 ]]; then
  export DS41_VARIANT_LAYERS=0,1,2,14,15,19,20,21,24 DS41_CP=2 DS41_WORLD=8 DS41_RECOMPUTE=full
  if [[ "$RECIPE_LAYERS" == 8 ]]; then export DS41_VARIANT_LAYERS=0,1,2,14,19,20,21,24; fi
 elif [[ "$RECIPE_LAYERS" == 40 ]]; then
- export DS41_EP=64 DS41_WORLD=64 DS41_TRAIN_BATCH=16
+ export DS41_EP=64 DS41_CP=4 DS41_WORLD=64 DS41_TRAIN_BATCH=16
 fi
 export DS41_DATA=/data/${DS41_DATA_FILE:-dapo-math-17k-cleaned.parquet}
 export PYTHONPATH=/opt/src/mlite/experimental/lite/examples/verl:${PYTHONPATH:-}
