@@ -330,7 +330,10 @@ def test_pp_guard_accepts_the_proxy_candidate_publisher(monkeypatch):
     assert (
         _validate_parallel(ImplConfig(pipeline_split_layer=3), parallel, cut=3) is None
     )
-    with pytest.raises(NotImplementedError, match='only split layer 3'):
+    with pytest.raises(
+        NotImplementedError,
+        match='V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: expected topology-validated split 3',
+    ):
         _validate_parallel(ImplConfig(pipeline_split_layer=20), parallel, cut=3)
 
 
