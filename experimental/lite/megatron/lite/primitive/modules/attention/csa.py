@@ -1712,7 +1712,7 @@ def _bf16_wo_a(output, positions, config, ratio, weight):
             inverse=True,
             output_dtype=torch.bfloat16,
             deployment_math=True,
-        ).reshape(b, length, groups, -1)
+        ).reshape(b, length, groups, o.shape[2] * o.shape[3] // groups)
 
     weights = weight.reshape(groups, config.o_rank, -1)
     # A CP rank with no local rows takes the reference path: the native

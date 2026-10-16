@@ -38,6 +38,23 @@ def test_sparse_attention_without_local_rows_keeps_graph():
     assert torch.equal(sink.grad, torch.zeros_like(sink))
 
 
+def test_bf16_wo_a_reference_without_local_rows(v41_core_te):
+    """The empty-rank reference path keeps explicit widths (no -1 over 0 rows)."""
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+    from megatron.lite.primitive.modules.attention import csa
+    from test_w4a8_fp32 import tiny_config
+
+    cfg = tiny_config().to_hf_dict()
+    cfg['text_config']['wo_a_dtype'] = 'bf16'
+    c = DeepseekV41Config(cfg).attention_config()
+    q = torch.zeros(1, 0, c.heads, c.head_dim, dtype=torch.bfloat16, requires_grad=True)
+    weight = torch.randn(c.groups * c.o_rank, c.heads * c.head_dim // c.groups)
+    projected = csa._bf16_wo_a(q, torch.arange(0), c, 0, weight)
+    assert projected.shape == (1, 0, c.groups * c.o_rank)
+    projected.sum().backward()
+    assert q.grad.shape == q.shape
+
+
 def _residual_cuda_error():
     """The error a later checked launch would report, if any."""
     torch.cuda.synchronize()

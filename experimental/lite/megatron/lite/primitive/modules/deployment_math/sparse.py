@@ -106,7 +106,9 @@ def indexer_select_positions(scores, lengths, topk, *, candidates=None):
     selected = (
         torch.where(valid, selected, columns).sort(-1).values[:, : min(topk, columns)]
     )
-    return torch.where(selected < columns, selected, -1).reshape(batch, rows, -1)
+    return torch.where(selected < columns, selected, -1).reshape(
+        batch, rows, selected.shape[-1]
+    )
 
 
 # Query rows per reference VJP chunk. The fp32 reference gathers
