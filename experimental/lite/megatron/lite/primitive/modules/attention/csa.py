@@ -733,7 +733,8 @@ class CompressedSparseAttention(nn.Module):
             output = _bf16_wo_a(output, positions, c, ratio, self.wo_a.weight)
             return self.wo_b(output.to(x.dtype)), state
         native_activation = None
-        if self.deployment_math and self.wo_a.fp8 and output.is_cuda:
+        # No local rows (CP): the reference codec below handles the empty input.
+        if self.deployment_math and self.wo_a.fp8 and output.is_cuda and length:
             native_activation = _native_inverse_rope_activation(
                 output, positions, c, ratio
             )
@@ -1714,7 +1715,9 @@ def _bf16_wo_a(output, positions, config, ratio, weight):
         ).reshape(b, length, groups, -1)
 
     weights = weight.reshape(groups, config.o_rank, -1)
-    if output.is_cuda:
+    # A CP rank with no local rows takes the reference path: the native
+    # inverse RoPE needs positions, and an empty GEMM has nothing to round.
+    if output.is_cuda and length:
         from megatron.lite.primitive.modules import deployment_math as native
 
         grouped = native.visible_forward(

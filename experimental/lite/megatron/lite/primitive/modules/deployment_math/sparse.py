@@ -176,6 +176,11 @@ class _ChunkedRowVJP(torch.autograd.Function):
 def sparse_attention(
     q, kv, sink, mask, main_indices, *, main_size, window_size, width, scale
 ):
+    if q.shape[1] == 0:
+        # A CP rank can own no query rows of a document; FlashMLA rejects an
+        # empty launch. Keep the graph to kv and sink (zero gradients) so every
+        # CP rank runs the same backward collectives.
+        return q.new_zeros(q.shape) + (kv.sum() + sink.sum()).to(q.dtype) * 0
     # Native prefill gathers compressed KV before SWA and preserves selected
     # index order. Construct the same physical row order from the owned state.
     reordered = torch.cat([kv[:, window_size:], kv[:, :window_size]], 1)
