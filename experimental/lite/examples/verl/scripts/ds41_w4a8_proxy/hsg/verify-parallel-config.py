@@ -1,5 +1,6 @@
 """Parse both resolved engine configs into the actual DS41 implementation config."""
 
+import importlib.util
 import json
 import os
 import subprocess
@@ -113,6 +114,27 @@ else:
         configure_residual_projections(
             model, actor_impl.dtype, actor_impl.optimizer == 'muon', EngramTable
         )
+        from megatron.lite.model.deepseek_v41.lite.checkpoint import _SPEC
+
+        header_spec = importlib.util.spec_from_file_location(
+            'ds41_checkpoint_headers', Path(__file__).with_name('checkpoint-headers.py')
+        )
+        header_gate = importlib.util.module_from_spec(header_spec)
+        header_spec.loader.exec_module(header_gate)
+        model_path = raw['actor_rollout_ref']['model']['path']
+        headers = header_gate.read_headers(model_path)
+        header_receipt = header_gate.check(model, model_path, _SPEC, headers)
+        header_receipt.update(
+            passed=True,
+            global_rank=dist.get_rank(),
+            pp_rank=ps.pp_rank,
+            stage_range=span,
+            payload_read=False,
+        )
+        (source.parent / f'checkpoint-headers-rank-{dist.get_rank()}.json').write_text(
+            json.dumps(header_receipt, indent=2) + '\n'
+        )
+        print('DS41_CHECKPOINT_HEADERS', json.dumps(header_receipt), flush=True)
         leaves = sum(parameter.requires_grad for parameter in model.parameters())
         owners = len(parameter_groups(model, lr=1e-6))
         assert leaves == owners, (leaves, owners)
