@@ -117,9 +117,10 @@ class _DeepEPDispatch(torch.autograd.Function):
         ctx.handle = handle
         ctx.async_finish = async_finish
         ctx.allocate_on_comm_stream = allocate_on_comm_stream
-        recv_per_expert_tensor = torch.tensor(
-            recv_per_expert, dtype=torch.int64, device=recv_hidden.device
-        )
+        # DeepEP already returns these counts as host metadata. Keep that
+        # canonical copy on CPU; consumers that need a device tensor can upload
+        # it once without forcing grouped MoE to synchronize it back.
+        recv_per_expert_tensor = torch.tensor(recv_per_expert, dtype=torch.int64)
         return recv_hidden, recv_indices, recv_probs, recv_per_expert_tensor, handle
 
     @staticmethod
@@ -435,7 +436,8 @@ class TokenDispatcher:
         Returns ``(rows, row_token, row_expert)`` in this rank's dispatch order:
         ``rows[i]`` is the output for token ``row_token[i]`` at (global) expert
         ``row_expert[i]``. For callers that reduce the top-k rows themselves.
-        Only the unfused local and all-to-all paths keep this row layout.
+        Only the unfused local and all-to-all paths keep this row layout; over
+        DeepEP use ``route_preserving_deepep.RoutePreservingDeepEPDispatcher``.
         """
         if self.use_deepep or self.moe_permute_fusion:
             raise RuntimeError(
