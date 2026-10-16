@@ -188,14 +188,14 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
-    if c.w4a8_experts and (c.dtype != torch.bfloat16 or c.use_deepep):
-        raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
+    if c.w4a8_experts and c.dtype != torch.bfloat16:
+        raise ValueError('V4.1 W4A8 requires BF16 residuals')
     if c.deployment_math and (not c.w4a8_experts or not c.quantized):
         raise ValueError('Deployment math requires quantized W4A8 experts')
-    if c.deployment_math and (c.dtype != torch.bfloat16 or p.tp != 1 or c.use_deepep):
+    if c.deployment_math and (c.dtype != torch.bfloat16 or p.tp != 1):
         # Contiguous CP is supported (gathered KV/compressor, split SWA writer);
         # each rank evaluates the deployment head on its own rows.
-        raise ValueError('Deployment math requires BF16 and TP=1 without DeepEP')
+        raise ValueError('Deployment math requires BF16 and TP=1')
     layer_range = None
     if p.pp > 1:
         import megatron.lite.primitive.parallel.pp as _imports_pp

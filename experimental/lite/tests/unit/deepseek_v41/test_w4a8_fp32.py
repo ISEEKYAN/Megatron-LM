@@ -233,7 +233,7 @@ def test_model_export_reference_and_two_muon_steps(v41_core_te, tmp_path, monkey
             assert optimizer.step()[0]
 
 
-@pytest.mark.parametrize('kwargs', [dict(dtype=torch.float32), dict(use_deepep=True)])
+@pytest.mark.parametrize('kwargs', [dict(dtype=torch.float32)])
 def test_reject_incompatible_config(v41_core_te, kwargs):
     from megatron.lite.model.deepseek_v41.lite import protocol
 
