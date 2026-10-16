@@ -45,6 +45,19 @@ sequence_hashes = row_memories.sequence_hashes
 _FP8_LINEAR = partial(Linear, fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")])
 
 
+def sentinel_routing_mask(input_ids, routes_image_sentinels):
+    """Tokens routed with ``bias_vl`` under deployment math.
+
+    Native routing treats all five sentinel IDs as visual, including generated
+    placeholders, but only for checkpoints with a vision tower: the reference
+    gate has no ``bias_vl`` when ``vision_n_layers == 0`` and vLLM then routes
+    the sentinels with the text bias.
+    """
+    if not routes_image_sentinels:
+        return None
+    return (input_ids >= 129264) & (input_ids < 129269)
+
+
 class DeepseekV41Model(nn.Module):
 
     def __init__(
@@ -85,7 +98,7 @@ class DeepseekV41Model(nn.Module):
         )
         cfg = config.to_hf_dict()
         t, v = (SimpleNamespace(**cfg[key]) for key in ('text_config', 'vision_config'))
-        # vLLM's router applies bias_vl to sentinel IDs iff vision_n_layers > 0.
+        # The reference gate owns bias_vl only with a vision tower.
         self.routes_image_sentinels = getattr(v, 'num_hidden_layers', 0) > 0
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
         local_experts = ensure_divisible(t.n_routed_experts, self.ps.ep_size)
@@ -362,15 +375,8 @@ class DeepseekV41Model(nn.Module):
         token_mask = None if image_mask is None else ~image_mask
         routing_mask = image_mask
         if self.deployment_math:
-            # Native routing treats all five sentinel IDs as visual, including
-            # generated placeholders, only when the checkpoint has a vision
-            # tower; text-only checkpoints route them with the text bias.
+            routing_mask = sentinel_routing_mask(input_ids, self.routes_image_sentinels)
             # Engram only blocks the actual image ID.
-            routing_mask = (
-                (input_ids >= 129264) & (input_ids < 129269)
-                if self.routes_image_sentinels
-                else None
-            )
             token_mask = input_ids != 129264
         hashes = (
             sequence_hashes(self.engram_hash, input_ids, token_mask, cp_context)
