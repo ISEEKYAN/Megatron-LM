@@ -78,6 +78,25 @@ def _parameter_counts(layers):
     return known.get(layers) or os.environ['DS41_PARAMETER_COUNTS']
 
 
+def _indexer_probe_enabled(layers, pp):
+    return layers == 4 and pp == 1
+
+
+def _check_indexer_probes(layers, pp, events):
+    probes = [row for row in events if row['kind'] == 'indexer_fp32_definition_probe']
+    if _indexer_probe_enabled(layers, pp):
+        assert probes, 'The long-input BF16/FP32-definition probe did not execute'
+        assert all(
+            row['native_replay_equal']
+            and row['parameter_versions_unchanged']
+            and sum(call['truncated_rows'] for call in row['score_calls']) > 0
+            for row in probes
+        )
+    else:
+        assert probes == [], 'The PP1-only indexer diagnostic unexpectedly ran'
+    return probes
+
+
 def production_environment(layers, bi, inputs):
     base = os.environ.copy()
     base.pop('DS41_RELEASE', None)
@@ -94,7 +113,7 @@ def production_environment(layers, bi, inputs):
         DS41_PROMPT_LENGTH=PROMPT_LENGTHS.get(layers, '256'),
         VLLM_BATCH_INVARIANT=str(bi),
         DS41_INDEXER_DIAGNOSTIC=str(
-            int(layers == 4 and int(base.get('DS41_PP', '1')) == 1)
+            int(_indexer_probe_enabled(layers, int(base.get('DS41_PP', '1'))))
         ),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
@@ -230,15 +249,8 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                 json.dumps(candidates, indent=2) + '\n'
             )
         if layers == 4:
-            probes = [
-                row for row in events if row['kind'] == 'indexer_fp32_definition_probe'
-            ]
-            assert probes, 'The long-input BF16/FP32-definition probe did not execute'
-            assert all(
-                row['native_replay_equal']
-                and row['parameter_versions_unchanged']
-                and sum(call['truncated_rows'] for call in row['score_calls']) > 0
-                for row in probes
+            probes = _check_indexer_probes(
+                layers, int(base.get('DS41_PP', '1')), events
             )
             (run / 'indexer-probes.json').write_text(
                 json.dumps(probes, indent=2) + '\n'

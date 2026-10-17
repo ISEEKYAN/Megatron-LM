@@ -82,8 +82,50 @@ def test_smoke_enables_indexer_diagnostic_only_for_4l_pp1(layers, pp, expected):
     ]
     assert len(expressions) == 1
     expression = ast.Expression(expressions[0])
+    helpers = _smoke_probe_helpers(tree)
     actual = eval(
         compile(expression, '<smoke-diagnostic-env>', 'eval'),
-        {'layers': layers, 'base': {'DS41_PP': str(pp)}},
+        dict(helpers, layers=layers, base={'DS41_PP': str(pp)}),
     )
     assert actual == expected
+
+
+def _smoke_probe_helpers(tree):
+    helpers = ast.Module(
+        body=[
+            node
+            for node in tree.body
+            if isinstance(node, ast.FunctionDef)
+            and node.name in ('_indexer_probe_enabled', '_check_indexer_probes')
+        ],
+        type_ignores=[],
+    )
+    namespace = {}
+    exec(compile(helpers, '<smoke-probe-helpers>', 'exec'), namespace)
+    return namespace
+
+
+@pytest.mark.parametrize(
+    'pp,has_probe,passes',
+    [(1, True, True), (2, False, True), (1, False, False), (2, True, False)],
+)
+def test_probe_receipts_require_pp1_probe_and_pp2_absence(pp, has_probe, passes):
+    source = (ROOT / 'tests/smoke/workflows/test_ds41_grpo_recipe.py').read_text()
+    check = _smoke_probe_helpers(ast.parse(source))['_check_indexer_probes']
+    probes = (
+        [
+            dict(
+                kind='indexer_fp32_definition_probe',
+                native_replay_equal=True,
+                parameter_versions_unchanged=True,
+                score_calls=[dict(truncated_rows=1)],
+            )
+        ]
+        if has_probe
+        else []
+    )
+    if passes:
+        assert check(4, pp, probes) == probes
+    else:
+        with pytest.raises(AssertionError):
+            check(4, pp, probes)
