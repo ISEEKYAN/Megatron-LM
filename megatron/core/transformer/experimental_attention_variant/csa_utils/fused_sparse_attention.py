@@ -31,6 +31,8 @@ from typing import Optional, Tuple
 import torch
 from torch import Tensor
 
+from ..dsa_cudnn_kernels import _get_head_padding
+
 from megatron.core.fusions.fused_mla_yarn_rope_apply import (
     mla_rope_apply_raw_,
     mla_rope_unapply_raw,
@@ -3832,3 +3834,74 @@ __all__ = [
     "prepare_thd_compact_indexer_workspace",
     "pack_thd_compact_k",
 ]
+
+
+# Appended from NVIDIA/Megatron-LM@6605602ea9 (#6404, 22ab025230), byte-identical.
+@lru_cache(maxsize=1)
+def _get_topk_alignment() -> int:
+    """Minimum ``TopK`` alignment required by the current GPU architecture.
+
+    * SM90 : dual-warpgroup loop steps by 2 blocks → ``2 * B_TOPK = 128``
+    * SM100: single-pipeline loop steps by 1 block → ``B_TOPK`` (64 for
+      head64, 128 for head128). DSA uses ``D = 512`` which maps to the
+      head64 kernel path → 64.
+    """
+    sm = torch.cuda.get_device_capability()
+    if sm[0] >= 10:
+        return 64
+    return 128
+
+
+def _csa_sparse_attention_backward(
+    q: Tensor,
+    kv: Tensor,
+    out: Tensor,
+    d_out: Tensor,
+    lse: Tensor,
+    attn_sink: Tensor,
+    topk_idxs: Tensor,
+    softmax_scale: float,
+    topk_length: Optional[Tensor],
+) -> Tuple[Tensor, Tensor, Tensor]:
+    """Run cuDNN sparse-attention backward with FlashMLA-compatible head padding."""
+    _ensure_dsa_namespace()
+
+    actual_num_heads = q.size(1)
+    padded_num_heads = _get_head_padding(actual_num_heads) if q.is_cuda else actual_num_heads
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+
+        out_padded = out.new_zeros((out.size(0), padded_num_heads, out.size(2)))
+        out_padded[:, :actual_num_heads, :] = out
+        out = out_padded
+
+        d_out_padded = d_out.new_zeros((d_out.size(0), padded_num_heads, d_out.size(2)))
+        d_out_padded[:, :actual_num_heads, :] = d_out
+        d_out = d_out_padded
+
+        lse_padded = lse.new_zeros((lse.size(0), padded_num_heads))
+        lse_padded[:, :actual_num_heads] = lse
+        lse = lse_padded
+
+        attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+        attn_sink_padded[:actual_num_heads] = attn_sink
+        attn_sink = attn_sink_padded
+
+    result = _DSA.sparse_attention_backward_wrapper(
+        q,
+        kv,
+        out,
+        d_out,
+        lse,
+        attn_sink,
+        topk_idxs,
+        softmax_scale=softmax_scale,
+        topk_length=topk_length,
+    )
+    dq, dkv, d_sink = result["dq"], result["dkv"], result["d_sink"]
+    if padded_num_heads != actual_num_heads:
+        dq = dq[:, :actual_num_heads, :].contiguous()
+        d_sink = d_sink[:actual_num_heads].contiguous()
+    return dq, dkv, d_sink
