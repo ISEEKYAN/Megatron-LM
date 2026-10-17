@@ -227,6 +227,66 @@ def versus(directory, name, grad):
     return dict(abs=error, rel=error / (scale or 1.0), max_reference=scale)
 
 
+def cp_rows(total, cp_rank, cp_size, cp_group=None):
+    """Global row of each local row under the runtime's CP slicing (-1 for padding).
+
+    Uses CP-A's PackedCPGeometry when the tree has it, else the CP slicing the
+    protocol uses (ContiguousCPSequence); both split the whole pack
+    contiguously, ``ceil(T / cp)`` rows per rank, padding only the tail.
+    """
+    import torch
+
+    try:
+        from megatron.lite.primitive.modules.attention.packed_geometry import (
+            PackedCPGeometry,
+        )
+
+        geometry = PackedCPGeometry.from_cu_seqlens(
+            torch.tensor([0, total]), cp_rank, cp_size, cp_group
+        )
+    except ImportError:
+        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+        geometry = ContiguousCPSequence(total, cp_rank, cp_size, cp_group)
+    ids = torch.arange(1, total + 1)[None]  # 0 marks padding after slicing
+    return geometry.slice(ids, seq_dim=1)[0] - 1
+
+
+def cp_loss(log_probs, rows, total, cp_size):
+    """Mean negative log-probability of the sequence, this rank's share.
+
+    The runtime averages gradients over DP x CP, so each CP rank's partial sum
+    over its own rows is scaled by the CP size (a power of two, exact); for CP1
+    this is the plain mean.
+    """
+    import torch
+
+    mask = (rows >= 0).to(device=log_probs.device, dtype=torch.float32)
+    return -(log_probs.float() * mask).sum() / float(total) * cp_size
+
+
+def fragment(rows, log_probs):
+    keep = rows >= 0
+    return dict(rows=rows[keep].tolist(), logprobs=log_probs[keep].tolist())
+
+
+def merge_fragments(parts):
+    """Per global sequence, the CP fragments back in row order; every row once."""
+    pieces = {}
+    for part in parts:
+        for index, piece in (part or {}).items():
+            pieces.setdefault(index, {})
+            for row, value in zip(piece['rows'], piece['logprobs']):
+                if pieces[index].setdefault(row, value) != value:
+                    raise RuntimeError(f'sequence {index}: replicas disagree at {row}')
+    merged = {}
+    for index, rows in pieces.items():
+        if sorted(rows) != list(range(len(rows))):
+            raise RuntimeError(f'sequence {index}: rows missing after the CP merge')
+        merged[index] = [rows[r] for r in range(len(rows))]
+    return merged
+
+
 def main():
     args = parse()
     os.environ.setdefault('VLLM_BATCH_INVARIANT', '1')
@@ -266,11 +326,6 @@ def main():
     ps = handle._parallel_state
     rank = dist.get_rank()
     device = torch.device('cuda', torch.cuda.current_device())
-    if args.cp > 1:
-        # CP ranks share a sequence and slice it; that assignment is not built yet.
-        raise NotImplementedError(
-            'ds41_gate.py does not assign CP-sliced sequences yet'
-        )
     dp_group = ps.dp_group
     if dp_group is None:
         dp_size, dp_rank = 1, 0
@@ -330,9 +385,10 @@ def main():
 
         def loss_fn(raw_output, runtime_batch, loss_context):
             log_probs = raw_output['log_probs']
-            collected.append(log_probs.detach().float().cpu())
-            mask = runtime_batch.loss_mask
-            return -(log_probs.float() * mask).sum() / mask.sum(), {}
+            total = int(runtime_batch.seq_lens.sum())
+            rows = cp_rows(total, ps.cp_rank, ps.cp_size, ps.cp_group)
+            collected.append((rows, log_probs.detach().float().cpu()))
+            return cp_loss(log_probs, rows, total, ps.cp_size), {}
 
         t1 = time.time()
         with rt.train_mode(handle):
@@ -345,12 +401,12 @@ def main():
             )
         step_s = time.time() - t1
         # Log-probs by global sequence index (last PP stage holds them).
-        local = {index: lp.tolist() for index, lp in zip(mine, collected)}
+        local = {
+            index: fragment(rows, lp) for index, (rows, lp) in zip(mine, collected)
+        }
         gathered = [None] * world
         dist.all_gather_object(gathered, local)
-        logprobs = {}
-        for part in gathered:
-            logprobs.update(part or {})
+        logprobs = merge_fragments(gathered)
         grads, owned = {}, []
         if repeat == 0 and args.save_grads:
             check_space(args.save_grads, handle, saver)
