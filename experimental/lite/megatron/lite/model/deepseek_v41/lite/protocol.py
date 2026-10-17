@@ -600,6 +600,41 @@ def packed_paired_forward(
     return torch.cat(outputs, dim=1), torch.cat(mixes, dim=1)
 
 
+def packed_pipeline_forward(
+    sequence_forward, hidden, pre_mix, cu_seqlens, *, previous_post=None, **kwargs
+):
+    """Preserve each document's deferred mHC operands across a PP boundary."""
+    offset = 0
+    posts = []
+
+    def document_forward(h, pre, **document_kwargs):
+        nonlocal offset
+        end = offset + h.shape[1]
+        pending = (
+            None
+            if previous_post is None
+            else tuple(value[:, offset:end] for value in previous_post)
+        )
+        offset = end
+        h, pre, outgoing = sequence_forward(
+            h, pre, previous_post=pending, return_pending=True, **document_kwargs
+        )
+        posts.append(outgoing)
+        return h, pre
+
+    h, pre = packed_paired_forward(
+        document_forward, hidden, pre_mix, cu_seqlens, **kwargs
+    )
+    if all(post is None for post in posts):
+        return h, pre, None
+    if any(post is None for post in posts):
+        raise ValueError('PP documents disagree on deferred post availability')
+    pending = tuple(
+        torch.cat([post[field] for post in posts], dim=1) for field in range(4)
+    )
+    return h, pre, pending
+
+
 def _validate_replay(model, batch):
     if batch.routed_experts is not None:
         routers = [
