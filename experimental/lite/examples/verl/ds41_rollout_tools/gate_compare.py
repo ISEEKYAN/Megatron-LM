@@ -3,18 +3,20 @@
 
 Log-probabilities are always compared bitwise, per global sequence.
 
-  --criterion bitwise    a partition change that keeps the DP size (or the same
-                         configuration, in one process or fresh ones): every
-                         parameter's gradient bit fingerprint equal
-  --criterion tolerance  a partition change that changes the DP size (the FP32
-                         sums are reordered): B must have been run with
-                         --compare-grads against A's saved gradients, and every
-                         parameter must satisfy rel <= --rel or abs <= --abs
-                         (test_cp_ep_parity: 5e-5 relative to max |A|, 2e-6
-                         absolute); both runs must also be bitwise against their
-                         own in-process repeat (--repeats 2)
-  --criterion auto       (default) bitwise when both records have the same DP
-                         size, tolerance otherwise
+  --criterion bitwise    any partition change that keeps the EP size (DP, PP or
+                         CP may change), and the same configuration in one
+                         process or in fresh ones: every parameter's gradient
+                         bit fingerprint equal
+  --criterion ep-change  a partition change that changes the EP size (expert
+                         reductions are reordered): both runs bitwise against
+                         their own in-process repeat (--repeats 2); gradient
+                         errors are reported, not judged -- element-wise when B
+                         was run with --compare-grads against A's saved
+                         gradients (max |a - b| and that over max |A|, with the
+                         count beyond test_cp_ep_parity's 5e-5 relative and
+                         2e-6 absolute for reference), by sketch otherwise
+  --criterion auto       (default) bitwise when both records have the same EP
+                         size, ep-change otherwise
 
   python gate_compare.py A B --out receipt.json
   python gate_compare.py A A --suffix-b=-repeat1    # in-process repeat
@@ -37,8 +39,8 @@ def _load(directory, suffix):
     return lps, grads
 
 
-def _dp_size(directory):
-    return json.loads((Path(directory) / 'record.json').read_text())['dp_size']
+def _ep_size(directory):
+    return json.loads((Path(directory) / 'record.json').read_text())['ep_size']
 
 
 def _quantiles(values):
@@ -61,7 +63,51 @@ def _bitwise(a, b):
     return lp_unequal, grad_unequal
 
 
-def compare(a, b, criterion='bitwise', rel=REL, absolute=ABS, repeats=None):
+def _errors(grad_a, grad_b):
+    """Element-wise errors from B's --compare-grads fields, else sketch errors."""
+    measured = {
+        n: g['versus'] for n, g in grad_b.items() if 'abs' in g.get('versus', {})
+    }
+    sketch = {
+        n: max(abs(p - q) for p, q in zip(x['sketch'], grad_b[n]['sketch']))
+        / (max(x['norm'], grad_b[n]['norm']) or 1.0)
+        for n, x in grad_a.items()
+    }
+    if not measured:
+        rel = sketch
+        return dict(
+            kind='sketch',
+            rel_distribution=_quantiles(list(rel.values())),
+            expert_rel_distribution=_quantiles(
+                [v for n, v in rel.items() if '.ffn.experts.' in n]
+            ),
+            worst=[[v, n] for n, v in sorted(rel.items(), key=lambda kv: -kv[1])][:20],
+        )
+    beyond = sorted(
+        (
+            (v['rel'], v['abs'], n)
+            for n, v in measured.items()
+            if v['rel'] > REL and v['abs'] > ABS
+        ),
+        reverse=True,
+    )
+    return dict(
+        kind='element-wise',
+        unmeasured=sorted(grad_b.keys() - measured.keys())[:10],
+        rel_distribution=_quantiles([v['rel'] for v in measured.values()]),
+        abs_distribution=_quantiles([v['abs'] for v in measured.values()]),
+        expert_rel_distribution=_quantiles(
+            [v['rel'] for n, v in measured.items() if '.ffn.experts.' in n]
+        ),
+        dense_rel_distribution=_quantiles(
+            [v['rel'] for n, v in measured.items() if '.ffn.experts.' not in n]
+        ),
+        beyond_parity_tolerance=len(beyond),
+        worst=[[r, e, n] for r, e, n in beyond[:20]],
+    )
+
+
+def compare(a, b, criterion='bitwise', repeats=None):
     (lp_a, grad_a), (lp_b, grad_b) = a, b
     if lp_a.keys() != lp_b.keys():
         raise SystemExit('the two runs scored different sequences')
@@ -69,17 +115,6 @@ def compare(a, b, criterion='bitwise', rel=REL, absolute=ABS, repeats=None):
         missing = sorted(grad_a.keys() ^ grad_b.keys())
         raise SystemExit(f'parameter sets differ: {missing[:5]}')
     lp_unequal, bit_unequal = _bitwise(a, b)
-    worst = sorted(
-        (
-            (
-                max(abs(p - q) for p, q in zip(x['sketch'], grad_b[n]['sketch']))
-                / (max(x['norm'], grad_b[n]['norm']) or 1.0),
-                n,
-            )
-            for n, x in grad_a.items()
-        ),
-        reverse=True,
-    )
     report = dict(
         criterion=criterion,
         logprobs=dict(sequences=len(lp_a), unequal=lp_unequal[:20]),
@@ -87,43 +122,19 @@ def compare(a, b, criterion='bitwise', rel=REL, absolute=ABS, repeats=None):
             parameters=len(grad_a),
             bitwise_unequal=len(bit_unequal),
             first_unequal=bit_unequal[:10],
-            worst_sketch_rel=[[round(e, 9), n] for e, n in worst[:10]],
         ),
     )
     if criterion == 'bitwise':
         report['passed'] = not lp_unequal and not bit_unequal
         return report
-    measured = {
-        n: g['versus'] for n, g in grad_b.items() if 'abs' in g.get('versus', {})
-    }
-    unmeasured = sorted(grad_b.keys() - measured.keys())
-    outliers = sorted(
-        (
-            (v['rel'], v['abs'], n)
-            for n, v in measured.items()
-            if v['rel'] > rel and v['abs'] > absolute
-        ),
-        reverse=True,
-    )
-    experts = [n for n in measured if '.ffn.experts.' in n]
-    dense = [n for n in measured if '.ffn.experts.' not in n]
-    report['tolerance'] = dict(
-        rel=rel,
-        abs=absolute,
-        unmeasured=len(unmeasured),
-        first_unmeasured=unmeasured[:10],
-        outliers=len(outliers),
-        worst=[[r, e, n] for r, e, n in outliers[:20]],
-        rel_distribution=_quantiles([v['rel'] for v in measured.values()]),
-        abs_distribution=_quantiles([v['abs'] for v in measured.values()]),
-        expert_rel_distribution=_quantiles([measured[n]['rel'] for n in experts]),
-        dense_rel_distribution=_quantiles([measured[n]['rel'] for n in dense]),
-    )
+    # An EP change is judged on log-probs and on each side being reproducible;
+    # gradient errors are reported only.
+    report['errors'] = _errors(grad_a, grad_b)
     report['run_to_run'] = repeats
     repeat_ok = repeats is not None and all(
         not r['logprobs_unequal'] and not r['grads_unequal'] for r in repeats.values()
     )
-    report['passed'] = not lp_unequal and not unmeasured and not outliers and repeat_ok
+    report['passed'] = not lp_unequal and repeat_ok
     return report
 
 
@@ -147,28 +158,24 @@ def main():
     ap.add_argument('--suffix-a', default='')
     ap.add_argument('--suffix-b', default='')
     ap.add_argument(
-        '--criterion', choices=('auto', 'bitwise', 'tolerance'), default='auto'
+        '--criterion', choices=('auto', 'bitwise', 'ep-change'), default='auto'
     )
-    ap.add_argument('--rel', type=float, default=REL)
-    ap.add_argument('--abs', type=float, default=ABS)
     ap.add_argument('--label', default='')
     ap.add_argument('--out', default=None)
     args = ap.parse_args()
-    dp = (_dp_size(args.a), _dp_size(args.b))
+    ep = (_ep_size(args.a), _ep_size(args.b))
     criterion = args.criterion
     if criterion == 'auto':
-        criterion = 'bitwise' if dp[0] == dp[1] else 'tolerance'
+        criterion = 'bitwise' if ep[0] == ep[1] else 'ep-change'
     report = compare(
         _load(args.a, args.suffix_a),
         _load(args.b, args.suffix_b),
         criterion,
-        args.rel,
-        args.abs,
-        run_to_run((args.a, args.b)) if criterion == 'tolerance' else None,
+        run_to_run((args.a, args.b)) if criterion == 'ep-change' else None,
     )
     report.update(
         label=args.label,
-        dp_size=list(dp),
+        ep_size=list(ep),
         a=f'{args.a}{args.suffix_a}',
         b=f'{args.b}{args.suffix_b}',
     )

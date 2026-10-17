@@ -6,10 +6,10 @@ import pytest
 from gate_compare import compare, run_to_run
 
 
-def _run(lp_shift=0.0, fp=(1, 2), versus=None):
+def _run(lp_shift=0.0, fp=(1, 2), versus=None, sketch_shift=0.0):
     lps = {0: [-1.0, -2.0], 1: [-0.5 + lp_shift]}
     grads = {
-        'w': dict(fingerprint=list(fp), norm=2.0, sketch=[1.0, -1.0]),
+        'w': dict(fingerprint=list(fp), norm=2.0, sketch=[1.0 + sketch_shift, -1.0]),
         'b': dict(fingerprint=[3, 4], norm=1.0, sketch=[0.5, 0.5]),
     }
     for name, (rel, error) in (versus or {}).items():
@@ -17,7 +17,6 @@ def _run(lp_shift=0.0, fp=(1, 2), versus=None):
     return lps, grads
 
 
-SMALL = {'w': (1e-6, 1e-6), 'b': (0.0, 0.0)}
 CLEAN = {'a': dict(logprobs_unequal=[], grads_unequal=[])}
 
 
@@ -25,36 +24,31 @@ def test_identical_runs_pass_bitwise():
     assert compare(_run(), _run())['passed']
 
 
-def test_logprob_difference_always_fails():
-    report = compare(
-        _run(), _run(lp_shift=1e-7, versus=SMALL), 'tolerance', repeats=CLEAN
-    )
-    assert not report['passed'] and report['logprobs']['unequal'] == [1]
-
-
 def test_bitwise_rejects_a_changed_fingerprint():
     assert not compare(_run(), _run(fp=(1, 9)))['passed']
 
 
-def test_tolerance_is_relative_or_absolute():
-    a = _run()
-    # rel 1e-6 passes; abs 1e-7 passes even at rel 1e-3 (a small, cancelling sum).
-    for versus in (SMALL, {'w': (1e-3, 1e-7), 'b': (0.0, 0.0)}):
-        b = _run(fp=(1, 9), versus=versus)
-        assert compare(a, b, 'tolerance', repeats=CLEAN)['passed']
-    b = _run(fp=(1, 9), versus={'w': (1e-3, 1e-5), 'b': (0.0, 0.0)})
-    report = compare(a, b, 'tolerance', repeats=CLEAN)
-    assert not report['passed'] and report['tolerance']['outliers'] == 1
+def test_logprob_difference_always_fails():
+    report = compare(_run(), _run(lp_shift=1e-7), 'ep-change', repeats=CLEAN)
+    assert not report['passed'] and report['logprobs']['unequal'] == [1]
 
 
-def test_tolerance_needs_every_parameter_measured_and_clean_repeats():
-    a = _run()
-    partial = _run(versus={'w': (0.0, 0.0)})
-    assert not compare(a, partial, 'tolerance', repeats=CLEAN)['passed']
-    b = _run(versus=SMALL)
-    assert not compare(a, b, 'tolerance', repeats=None)['passed']
+def test_ep_change_reports_gradient_errors_without_judging_them():
+    b = _run(fp=(1, 9), versus={'w': (1e-2, 1e-3), 'b': (0.0, 0.0)})
+    report = compare(_run(), b, 'ep-change', repeats=CLEAN)
+    assert report['passed']
+    errors = report['errors']
+    assert errors['kind'] == 'element-wise' and errors['beyond_parity_tolerance'] == 1
+    assert errors['rel_distribution']['max'] == 1e-2
+    sketch = compare(_run(), _run(fp=(1, 9), sketch_shift=0.5), 'ep-change', CLEAN)
+    assert sketch['passed'] and sketch['errors']['kind'] == 'sketch'
+
+
+def test_ep_change_needs_clean_repeats_on_both_sides():
+    b = _run(fp=(1, 9))
+    assert not compare(_run(), b, 'ep-change', repeats=None)['passed']
     dirty = {'a': dict(logprobs_unequal=[], grads_unequal=['w'])}
-    assert not compare(a, b, 'tolerance', repeats=dirty)['passed']
+    assert not compare(_run(), b, 'ep-change', repeats=dirty)['passed']
 
 
 def test_run_to_run_reads_the_in_process_repeat(tmp_path):

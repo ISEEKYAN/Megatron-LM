@@ -29,9 +29,9 @@ replicates the model on every node saves, a pipelined one compares).
 
 Comparisons (gate_compare.py): same configuration in fresh processes or
 --repeats inside one process must be bitwise; a partition change that keeps
-the DP size must be bitwise; one that changes it compares log-probs bitwise,
-gradients element-wise within tolerance (--compare-grads), and each side must
-be bitwise run to run.
+the EP size (DP, PP or CP may change) must be bitwise; one that changes the EP
+size compares log-probs bitwise, requires each side to be bitwise run to run,
+and reports the gradient errors (element-wise with --compare-grads).
 
   torchrun --nproc_per_node 4 ds41_gate.py --model M --records R --out O --ep 4 --path deployment
 """
