@@ -35,22 +35,30 @@ default_placement_fn = _protocols.default_placement_fn
 DeviceMesh = _imports_device_mesh.DeviceMesh
 
 
-def _buffer_state(model, prefix, *, host):
-    """Alias persistent buffer byte planes, with global offsets for row shards.
+def _local_state(model, prefix, *, host):
+    """Alias persistent buffers and row-sharded parameters as byte planes.
 
     Both checkpoint paths save and load these: a persistent buffer the model
-    updates in training (the router's load-balancing bias) is training state.
-    The host path keeps them on CPU next to the host parameter owners.
+    updates in training (the router's load-balancing bias) is training state,
+    and a module whose rows are sharded over a group (a trainable Engram table)
+    keeps each rank's rows at their global offset. Placement-based DTensors
+    would treat such rows as replicated and keep one rank's copy. The host
+    path keeps everything on CPU next to the host parameter owners. Returns the
+    state and the ids of the parameters it covers.
     """
-    result = {}
+    result, covered = {}, set()
     for path, module in model.named_modules():
+        lookup = getattr(module, 'lookup', None)
+        sharded = getattr(lookup, 'group', None) is not None
         buffers = [
             (name, value)
             for name, value in module.named_buffers(recurse=False)
             if name not in module._non_persistent_buffers_set
         ]
-        lookup = getattr(module, 'lookup', None)
-        sharded = getattr(lookup, 'group', None) is not None
+        if sharded:
+            parameters = list(module.named_parameters(recurse=False))
+            covered.update(id(value) for _, value in parameters)
+            buffers += parameters
         if buffers and sharded:
             cuts = getattr(lookup, 'boundaries', ())
             if not cuts:
@@ -70,14 +78,14 @@ def _buffer_state(model, prefix, *, host):
                 or not value.is_contiguous()
             ):
                 raise ValueError(
-                    'Checkpoint requires contiguous plain buffers (on CPU for host)'
+                    'Checkpoint requires contiguous plain tensors (on CPU for host)'
                 )
             key = '.'.join(part for part in (prefix, path, name) if part)
             if not sharded:
                 result[key] = value.detach().reshape(-1).view(torch.uint8)
                 continue
             if value.ndim != 2 or value.shape[0] != end - start:
-                raise ValueError('Buffer rows do not match row shard metadata')
+                raise ValueError('Tensor rows do not match row shard metadata')
             # Preserve the global row coordinate, as MCore ShardedTensor does.
             # A plain tensor here would let DCP deduplicate distinct EP owners.
             byte_rows = value.detach().view(torch.uint8)
@@ -92,7 +100,7 @@ def _buffer_state(model, prefix, *, host):
             result[key] = ShardedTensor._init_from_local_shards(
                 shards, cuts[-1], byte_rows.shape[1], process_group=lookup.group
             )
-    return result
+    return result, covered
 
 
 def save_training_checkpoint(
@@ -142,8 +150,6 @@ def save_training_checkpoint(
     if not isinstance(model, nn.Module):
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     host_parameters = getattr(optimizer, "checkpoint_device", None) == "cpu"
-    if host_parameters and getattr(optimizer, "row_parameters", None):
-        raise ValueError("Host checkpoint requires complete owners, not row shards")
     if not host_parameters:
         dense_mesh, expert_mesh = _build_meshes(config)
     state_dict: dict = {"step": step}
@@ -154,8 +160,11 @@ def save_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
-        state_dict.update(_buffer_state(model, model_prefix, host=host_parameters))
+        local, covered = _local_state(model, model_prefix, host=host_parameters)
+        state_dict.update(local)
         for name, param in model.named_parameters():
+            if id(param) in covered:
+                continue
             if host_parameters:
                 if param.device.type != "cpu" or isinstance(param, DTensor):
                     raise ValueError(
@@ -223,8 +232,6 @@ def load_training_checkpoint(
     if not isinstance(model, nn.Module):
         raise TypeError("DCP checkpointing currently expects a single nn.Module.")
     host_parameters = getattr(optimizer, "checkpoint_device", None) == "cpu"
-    if host_parameters and getattr(optimizer, "row_parameters", None):
-        raise ValueError("Host checkpoint requires complete owners, not row shards")
     if not host_parameters:
         dense_mesh, expert_mesh = _build_meshes(config)
 
@@ -234,7 +241,7 @@ def load_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
-        buffers = _buffer_state(model, model_prefix, host=host_parameters)
+        buffers, covered = _local_state(model, model_prefix, host=host_parameters)
         if not host_parameters:
             # Checkpoints saved before buffers joined the non-host path have none.
             saved = dcp.FileSystemReader(ckpt_path).read_metadata().state_dict_metadata
@@ -247,6 +254,8 @@ def load_training_checkpoint(
                 buffers = {k: v for k, v in buffers.items() if k in saved}
         state_dict.update(buffers)
         for name, param in model.named_parameters():
+            if id(param) in covered:
+                continue  # loaded in place through its row-sharded alias
             if host_parameters:
                 if param.device.type != "cpu" or isinstance(param, DTensor):
                     raise ValueError(
@@ -266,7 +275,7 @@ def load_training_checkpoint(
     if load_model:
         for name, param in model.named_parameters():
             key = f"{model_prefix}.{name}"
-            if key in state_dict:
+            if key in state_dict and id(param) not in covered:
                 t = state_dict[key]
                 with torch.no_grad():
                     _copy_tensor_(param, t)
