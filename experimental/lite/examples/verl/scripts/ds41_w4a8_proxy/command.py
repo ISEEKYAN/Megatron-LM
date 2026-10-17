@@ -35,7 +35,7 @@ if dispatcher not in ('alltoall', 'deepep'):
     raise ValueError('ACTOR_MOE_DISPATCHER must be alltoall or deepep')
 use_deepep = 'true' if dispatcher == 'deepep' else 'false'
 # DeepEP dispatch VJP reduced as all-to-all does (bitwise dX across dispatchers).
-routed_backward = os.environ.get('DEEPEP_ROUTED_BACKWARD', '1')
+routed_backward = os.environ.get('DEEPEP_ROUTED_BACKWARD', '0')
 if routed_backward not in ('0', '1'):
     raise ValueError('DEEPEP_ROUTED_BACKWARD must be 0 or 1')
 routed_backward = 'true' if use_deepep == 'true' and routed_backward == '1' else 'false'

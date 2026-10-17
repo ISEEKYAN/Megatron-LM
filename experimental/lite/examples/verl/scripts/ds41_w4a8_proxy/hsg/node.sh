@@ -73,7 +73,7 @@ enroot start --root --rw "${RECIPE_REUSE[@]}" \
  --env USER --env SLURM_JOB_ID --env DS41_PARAMETER_COUNTS --env RECIPE_C8_MODE --env RECIPE_NNODES --env RECIPE_LAYERS --env RECIPE_CPU_COLLECTION --env RECIPE_ALLOCATED_GPU_COUNT --env RECIPE_ROLE --env RECIPE_HEAD_IP --env RECIPE_NODE_IP \
  --mount "$RECIPE_OUTPUT:/test-output:none:bind" \
  --mount "$RECIPE_ROOT:/run-artifacts:none:bind" \
- --mount "$RECIPE_LOCAL_RAY:/var/tmp:none:bind"
+ --mount "$RECIPE_LOCAL_RAY:/var/tmp:none:bind" \
  --mount "$RECIPE_LOCAL_CACHE:/runtime-cache:none:bind" \
  --mount "$RECIPE_LOCAL_CACHE/tmp:/tmp:none:bind" \
  --mount "$DS41_BUNDLE/recipe/hsg:/recipe:none:bind,ro" \

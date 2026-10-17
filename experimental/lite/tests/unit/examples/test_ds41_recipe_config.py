@@ -563,3 +563,36 @@ def test_deepep_optional_switches_reach_both_container_stages():
     for name in ('cluster.sbatch', 'node.sh'):
         forwarded, conditional = _forwarded_env(recipe / name)
         assert required <= forwarded & conditional
+
+
+def test_node_enroot_mounts_stay_in_one_command(tmp_path):
+    """A dropped continuation must fail before any GPU allocation."""
+    import os
+    import re
+    import subprocess
+    from pathlib import Path
+
+    recipe = Path(__file__).parents[3] / 'examples/verl/scripts/ds41_w4a8_proxy'
+    source = (recipe / 'hsg/node.sh').read_text()
+    invocation = source.split('set +e\n', 1)[1].split('RECIPE_RESULT=$?', 1)[0]
+    names = set(re.findall(r'\$\{?([A-Z][A-Z_0-9]*)', invocation))
+    env = {**os.environ, **{name: '/fixture' for name in names}}
+    env['ARGV_FILE'] = str(tmp_path / 'argv')
+    preamble = 'enroot() { printf "%s\\0" "$@" >"$ARGV_FILE"; }; RECIPE_REUSE=(); RECIPE_TOPOLOGY_ENV=(); RECIPE_OPTION_ENV=();\n'
+    result = subprocess.run(
+        ['bash', '-e', '-c', preamble + invocation], env=env, capture_output=True
+    )
+    assert result.returncode == 0, result.stderr.decode()
+    argv = (tmp_path / 'argv').read_bytes().split(b'\0')[:-1]
+    assert b'/fixture:/var/tmp:none:bind' in argv
+    assert b'/fixture:/runtime-cache:none:bind' in argv
+    assert argv[-3:] == [b'ds41-runtime', b'bash', b'/recipe/container-node.sh']
+    broken = invocation.replace(
+        ' --mount "$RECIPE_LOCAL_RAY:/var/tmp:none:bind" \\\n',
+        ' --mount "$RECIPE_LOCAL_RAY:/var/tmp:none:bind"\n',
+    )
+    assert broken != invocation
+    result = subprocess.run(
+        ['bash', '-e', '-c', preamble + broken], env=env, capture_output=True
+    )
+    assert result.returncode == 127 and b'--mount: command not found' in result.stderr
