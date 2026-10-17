@@ -34,6 +34,11 @@ dispatcher = os.environ.get('ACTOR_MOE_DISPATCHER', 'alltoall')
 if dispatcher not in ('alltoall', 'deepep'):
     raise ValueError('ACTOR_MOE_DISPATCHER must be alltoall or deepep')
 use_deepep = 'true' if dispatcher == 'deepep' else 'false'
+# DeepEP dispatch VJP reduced as all-to-all does (bitwise dX across dispatchers).
+routed_backward = os.environ.get('DEEPEP_ROUTED_BACKWARD', '1')
+if routed_backward not in ('0', '1'):
+    raise ValueError('DEEPEP_ROUTED_BACKWARD must be 0 or 1')
+routed_backward = 'true' if use_deepep == 'true' and routed_backward == '1' else 'false'
 all2all = os.environ.get('ROLLOUT_ALL2ALL_BACKEND', 'allgather_reducescatter')
 if all2all not in ('allgather_reducescatter', 'deepep_low_latency'):
     raise ValueError(
@@ -176,6 +181,7 @@ args = [
             **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
             'use_deepep': use_deepep,
+            'deepep_routed_backward': routed_backward,
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
             'optimizer': 'muon',
@@ -197,6 +203,7 @@ args = [
             **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
             'use_deepep': use_deepep,
+            'deepep_routed_backward': routed_backward,
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
         }.items()
