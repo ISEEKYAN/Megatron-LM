@@ -56,6 +56,8 @@ class ImplConfig:
     token_map: list[int] | None = None
     trainable_engram: bool = False
     shard_engram: bool = True
+    # Frozen Engram tables stay in host memory; lookups copy only gathered rows.
+    host_engram: bool = False
     text_only: bool = True
     vision_trainability: VisionTrainability | None = None
     external_vision_device: str | None = None
@@ -144,7 +146,7 @@ def _construct_model(model_cfg, impl_cfg, ps, layer_range):
             ),
             **project_fields(
                 vars(c),
-                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
+                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram host_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )

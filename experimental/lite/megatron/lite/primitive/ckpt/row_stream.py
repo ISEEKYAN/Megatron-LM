@@ -89,8 +89,13 @@ def stream_rows(
     rows = min(rows, max(b - a for a, b in zip(boundaries, boundaries[1:])))
     if rows == 0:
         raise ValueError('Row streaming requires a nonempty global table')
+    device = weight.device
+    if weight.device.type == 'cpu' and weight.is_pinned():
+        # Host-resident (pinned) rows are staged through device memory, so
+        # collectives and consumers see the same device payloads as before.
+        device = torch.device('cuda', torch.cuda.current_device())
     scratch = torch.empty(
-        rows * (weight_bytes + scale_bytes), device=weight.device, dtype=torch.uint8
+        rows * (weight_bytes + scale_bytes), device=device, dtype=torch.uint8
     )
     for owner, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
         for offset in range(begin, end, rows):

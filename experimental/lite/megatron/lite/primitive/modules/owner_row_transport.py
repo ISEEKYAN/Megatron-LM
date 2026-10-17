@@ -178,7 +178,12 @@ def _gather_rows(tensor, ids, route=None):
         return None
     # Index FP8 storage as bytes; floating masters retain their autograd edge.
     rows = tensor.view(torch.uint8) if tensor.element_size() == 1 else tensor
-    rows = rows[ids if route is None else route.local_ids]
+    index = ids if route is None else route.local_ids
+    if rows.device != index.device:
+        # Host-resident table: gather the rows on the host and copy only them.
+        rows = rows[index.to(rows.device)].to(index.device)
+    else:
+        rows = rows[index]
     if route is not None:
         rows = route.return_rows(rows)
     if tensor.element_size() == 1:

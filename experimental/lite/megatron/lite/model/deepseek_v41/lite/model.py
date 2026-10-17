@@ -160,6 +160,7 @@ class DeepseekV41Model(nn.Module):
         use_deepep=False,
         trainable_engram=False,
         shard_engram=True,
+        host_engram=False,
         gate_temperature=1.0,
         bias_rate=0.001,
         enable_dspark_execution=False,
@@ -315,6 +316,7 @@ class DeepseekV41Model(nn.Module):
             local_range=(start, end),
             projection=partial(_FP8_LINEAR, fp8=quantized),
             hash_layer_ids=getattr(t, 'engram_hash_layer_ids', None),
+            host_resident=host_engram,
             **memory_options,
         )
         for index, module in memories.items():

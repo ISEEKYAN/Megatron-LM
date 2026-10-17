@@ -54,6 +54,29 @@ from .config import MegatronLiteEngineConfig
 
 _patch_bucketed_weight_sender()
 
+# Frozen host-resident Engram tables are byte-identical in the colocated actor
+# and ref models: the model built second aliases the first one's host storage.
+_SHARED_HOST_ENGRAM_TABLES = {}
+
+
+def _share_host_engram_tables(model_chunks):
+    from megatron.lite.primitive.modules.engram_lookup import EngramTable
+
+    for chunk in model_chunks:
+        for name, module in chunk.named_modules():
+            if not isinstance(module, EngramTable) or not module.host_resident:
+                continue
+            lookup = getattr(module, "lookup", None)
+            key = (
+                name,
+                None if lookup is None else lookup.boundaries,
+                tuple(module.weight.shape),
+            )
+            owner = _SHARED_HOST_ENGRAM_TABLES.setdefault(key, module)
+            if owner is not module:
+                module.share_storage(owner)
+
+
 (
     BaseEngine,
     BaseEngineCtx,
@@ -314,6 +337,9 @@ class MegatronLiteEngine(BaseEngine):
         )
         self.handle = self.runtime.build_model()
         self.module = self._extract_primary_module()
+        _share_host_engram_tables(
+            self.handle._extras.get("model_chunks", [self.handle._model])
+        )
 
         if self.handle._optimizer is not None and self.handle._lr_scheduler is None:
             self.handle._lr_scheduler = _build_lr_scheduler(

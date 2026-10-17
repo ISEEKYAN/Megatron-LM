@@ -24,6 +24,10 @@ world = int(os.environ.get('DS41_WORLD', str(ep * cp)))
 train_batch = int(os.environ.get('DS41_TRAIN_BATCH', '8'))
 kv_cache_bytes = int(os.environ.get('DS41_KV_CACHE_BYTES', str(256 * 2**20)))
 segmented_host = '1'
+# Frozen Engram tables in host memory, shared by the colocated actor and ref.
+engram_host = os.environ.get('DS41_ENGRAM_HOST', '0')
+if engram_host not in ('0', '1'):
+    raise ValueError('DS41_ENGRAM_HOST must be 0 or 1')
 bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
@@ -158,6 +162,7 @@ args = [
             'w4a8_experts': 'true',
             'deployment_math': 'true',
             'trainable_engram': 'false',
+            **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
@@ -177,6 +182,7 @@ args = [
             'w4a8_experts': 'true',
             'deployment_math': 'true',
             'trainable_engram': 'false',
+            **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
             'dtype': 'bfloat16',
             **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),

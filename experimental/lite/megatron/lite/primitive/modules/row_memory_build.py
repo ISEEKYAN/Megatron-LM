@@ -24,7 +24,8 @@ def build_row_memories(
     local_range,
     constructors,
     projection,
-    hash_layer_ids=None
+    hash_layer_ids=None,
+    host_resident=False
 ):
     (
         primes_fn,
@@ -67,12 +68,23 @@ def build_row_memories(
             lookup = lookup_type(boundaries, group)
             rows = boundaries[lookup.rank + 1] - boundaries[lookup.rank]
             table_type, options = shard_type, {'lookup': lookup}
-        table = table_type(
-            torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
-            torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
-            trainable=trainable,
-            **options
-        )
+        if host_resident:
+            # Expanded scalars: the host table is the only full-size allocation.
+            initial = (
+                torch.zeros((), dtype=torch.float8_e4m3fn, device='cpu').expand(
+                    rows, width
+                ),
+                torch.ones((), dtype=torch.float8_e8m0fnu, device='cpu').expand(
+                    rows, width // 32
+                ),
+            )
+            options['host_resident'] = True
+        else:
+            initial = (
+                torch.zeros(rows, width, dtype=torch.float8_e4m3fn),
+                torch.ones(rows, width // 32, dtype=torch.float8_e8m0fnu),
+            )
+        table = table_type(*initial, trainable=trainable, **options)
         memories[index] = memory_type(
             hidden_size,
             copies,
