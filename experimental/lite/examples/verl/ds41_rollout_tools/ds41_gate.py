@@ -14,10 +14,21 @@ Receipts (rank 0 writes):
                   (experts are reported by their owner rank)
   record.json     configuration, memory and timings
 
+Gradients are read after the runtime's finalize_grads, i.e. exactly what the
+optimizer consumes (dense averaged over DP x CP, experts summed over expert-DP
+and scaled the same way); replicas must agree bitwise.
+
+--save-grads DIR writes every parameter's FP32 gradient once (by its owner
+rank) under DIR, after checking the free space; --compare-grads DIR makes the
+owner of each parameter stream the saved gradient of another run back and
+record its error: max |a - b| and that over max |b| (the test_cp_ep_parity
+measures). Both are meant for node-local storage inside one job.
+
 Comparisons (gate_compare.py): same configuration in fresh processes or
 --repeats inside one process must be bitwise; a partition change that keeps
-the DP size must be bitwise; one that changes it compares log-probs bitwise
-and gradients by sketch to rounding level (configurable).
+the DP size must be bitwise; one that changes it compares log-probs bitwise,
+gradients element-wise within tolerance (--compare-grads), and each side must
+be bitwise run to run.
 
   torchrun --nproc_per_node 4 ds41_gate.py --model M --records R --out O --ep 4 --path deployment
 """
@@ -53,6 +64,14 @@ def parse():
     ap.add_argument('--recompute', choices=('none', 'full'), default='none')
     ap.add_argument('--host-engram', action='store_true')
     ap.add_argument('--repeats', type=int, default=1, help='steps inside this process')
+    ap.add_argument(
+        '--save-grads', default=None, help='write FP32 gradients (first step) here'
+    )
+    ap.add_argument(
+        '--compare-grads',
+        default=None,
+        help='element-wise error of the first step against gradients saved here',
+    )
     return ap.parse_args()
 
 
@@ -139,6 +158,57 @@ def gpu_memory(device):
     )
 
 
+def _grad_path(directory, name):
+    return Path(directory) / f'{name}.pt'
+
+
+def check_space(directory, handle, owner):
+    """Fail before writing when the node-local disk cannot hold every owner's gradients."""
+    import shutil
+
+    import torch
+    import torch.distributed as dist
+
+    Path(directory).mkdir(parents=True, exist_ok=True)
+    mine = sum(
+        p.numel() * 4
+        for chunk in handle._extras.get('model_chunks', [handle._model])
+        for name, p in chunk.named_parameters()
+        if p.requires_grad and owner(name)
+    )
+    total = torch.tensor(mine, dtype=torch.int64, device='cuda')
+    dist.all_reduce(total)  # one node: every rank writes to the same disk
+    free = shutil.disk_usage(directory).free
+    if free < int(total.item() * 1.05):
+        raise SystemExit(
+            f'DS41_GATE_SPACE: {total.item() / GiB:.1f} GiB of gradients, '
+            f'{free / GiB:.1f} GiB free in {directory}'
+        )
+
+
+def save_grads(directory, owned):
+    import torch
+
+    for name, grad in owned:
+        torch.save(grad.cpu(), _grad_path(directory, name))
+
+
+def versus(directory, name, grad):
+    """test_cp_ep_parity's per-parameter error: max |a - b| and over max |b|."""
+    import torch
+
+    path = _grad_path(directory, name)
+    if not path.exists():
+        return dict(missing=True)
+    reference = torch.load(path, map_location=grad.device)
+    if reference.shape != grad.shape:
+        return dict(shape=[list(reference.shape), list(grad.shape)])
+    error = float((grad - reference).abs().max()) if grad.numel() else 0.0
+    scale = float(reference.abs().max()) if grad.numel() else 0.0
+    del reference
+    return dict(abs=error, rel=error / (scale or 1.0), max_reference=scale)
+
+
 def main():
     args = parse()
     os.environ.setdefault('VLLM_BATCH_INVARIANT', '1')
@@ -188,6 +258,13 @@ def main():
         dp_size, dp_rank = 1, 0
     else:
         dp_size, dp_rank = dist.get_world_size(dp_group), dist.get_rank(dp_group)
+    ep_dp_rank = 0 if ps.ep_dp_group is None else dist.get_rank(ps.ep_dp_group)
+
+    def owner(name):
+        # One writer/comparer per parameter: expert-DP rank 0 for experts,
+        # DP rank 0 (of each pipeline stage) for dense parameters.
+        return (ep_dp_rank if '.ffn.experts.' in name else dp_rank) == 0
+
     records = load_records(args.records)[: args.sequences]
     if len(records) % dp_size:
         raise ValueError(f'{len(records)} sequences do not split over DP {dp_size}')
@@ -246,25 +323,30 @@ def main():
         logprobs = {}
         for part in gathered:
             logprobs.update(part or {})
-        grads = {}
+        grads, owned = {}, []
+        if repeat == 0 and args.save_grads:
+            check_space(args.save_grads, handle, owner)
         for chunk in handle._extras.get('model_chunks', [handle._model]):
             for name, parameter in chunk.named_parameters():
                 grad = getattr(parameter, 'main_grad', None)
                 grad = parameter.grad if grad is None else grad
                 if grad is None:
                     continue
-                grad = grad.detach().float().clone()
-                if '.ffn.experts.' in name:
-                    group = ps.ep_dp_group
-                else:
-                    group = dp_group  # dense: replicated, SUM as the optimizer does
-                if group is not None and dist.get_world_size(group) > 1:
-                    dist.all_reduce(grad, group=group)
+                # finalize_grads already synchronized replicas; take it as is.
+                grad = grad.detach().float()
                 grads[name] = dict(
                     fingerprint=fingerprint(grad),
                     norm=float(grad.double().norm()),
                     sketch=sketch(grad),
                 )
+                if repeat == 0 and owner(name):
+                    if args.save_grads:
+                        owned.append((name, grad))
+                    if args.compare_grads:
+                        grads[name]['versus'] = versus(args.compare_grads, name, grad)
+        if owned:
+            save_grads(args.save_grads, owned)
+            owned.clear()
         everyone = [None] * world
         dist.all_gather_object(everyone, grads)
         merged, conflicts = {}, []
