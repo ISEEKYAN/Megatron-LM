@@ -24,6 +24,7 @@ ROUTES = {
     "ckpt/binding_records.py": "deepseek_v41/test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory",
     "modules/engram_lookup.py": "deepseek_v41/test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage",
     "modules/owner_row_transport.py": "deepseek_v41/test_redo_engram_residency.py::test_owner_transport_preserves_compact_rows_and_backward",
+    "modules/packed_row_memory.py": "deepseek_v41/test_packed_hashes.py::test_packed_hashes_equal_document_hashes_then_cp_slice",
     "modules/row_memory_build.py": "deepseek_v41/test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state",
     "modules/paired_stream.py": "deepseek_v41/test_redo_parity.py::test_real_pp2_boundary_restarts_attention_state",
     "modules/image_data.py": "deepseek_v41/test_redo_parity.py::test_image_tokens_backpropagate_into_vision_and_aligner",
