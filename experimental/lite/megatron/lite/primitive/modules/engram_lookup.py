@@ -24,6 +24,8 @@ then the owner gathers requested rows on the host and copies only those rows.
 Group=None explicitly means local.
 """
 
+import weakref
+
 import numpy as np
 import torch
 import torch.distributed as dist
@@ -289,13 +291,24 @@ class ShardedEngramTable(EngramTable):
 
 
 def _host_copy(tensor):
-    out = torch.empty(
-        tensor.shape,
-        dtype=tensor.dtype,
-        device='cpu',
-        pin_memory=torch.cuda.is_available(),
-    )
-    return out.copy_(tensor.detach())
+    """Exact-size host copy, page-locked in place when CUDA is available.
+
+    ``pin_memory=True`` goes through the caching host allocator, which rounds each
+    block up to a power of two (an 11.4 GiB table would take 16 GiB). As in vLLM's
+    ``DPSharedEngramStorage._allocate``, register a plain allocation instead and
+    unregister it when its owner is released.
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    owner = np.empty(max(nbytes, 1), dtype=np.uint8)
+    out = torch.from_numpy(owner)[:nbytes].view(tensor.dtype).view(tensor.shape)
+    out.copy_(tensor.detach())
+    if torch.cuda.is_available() and nbytes:
+        pointer = owner.ctypes.data
+        result = torch.cuda.cudart().cudaHostRegister(pointer, nbytes, 0)
+        if int(result) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {result}")
+        weakref.finalize(owner, torch.cuda.cudart().cudaHostUnregister, pointer)
+    return out
 
 
 def hash_multipliers(layer_ids, max_ngram_size, vocab_size):

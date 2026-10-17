@@ -128,6 +128,11 @@ def test_cuda_lookup_copies_only_gathered_rows_and_matches_resident_bytes():
     resident = EngramTable(weight, scale).cuda()
     host = EngramTable(weight, scale, host_resident=True).cuda()
     assert host.weight.device.type == "cpu" and host.weight.is_pinned()
+    # Registered in place at the exact size (no power-of-two pinned block).
+    for buffer in (host.weight, host.scale):
+        assert (
+            buffer.untyped_storage().nbytes() == buffer.numel() * buffer.element_size()
+        )
     ids = torch.tensor([[5, 0, 3], [3, 3, 1]], device="cuda")
     out = host(ids)
     assert out.is_cuda
