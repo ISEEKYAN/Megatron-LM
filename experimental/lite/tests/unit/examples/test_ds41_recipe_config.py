@@ -23,16 +23,20 @@ SPEC.loader.exec_module(CONTRACT)
         'rank_missing',
         'rank_duplicate',
         'replay',
+        'replay_exact',
+        'replay_rows',
+        'engram_layout',
+        'engram_tp',
         'replay_config',
         'replay_missing',
         'engram_device',
-        'engram_private',
+        'engram_shared',
         'engram_missing',
         'pytest_failed',
     ],
 )
 def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
-    """A successful process exit cannot hide a failed rank or enabled replay."""
+    """A successful process exit cannot hide a failed rank or an invalid runtime profile."""
     import subprocess
     import sys
 
@@ -47,14 +51,18 @@ def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
         (config / 'vllm-cli.json').write_text(
             json.dumps(
                 {
-                    'swa_bounded_replay': failure == 'replay_config',
+                    'swa_bounded_replay': failure != 'replay_config',
+                    'tensor_parallel_size': 2 if failure == 'engram_tp' else 1,
                     **(
                         {}
                         if failure == 'engram_missing'
                         else {
                             'engram_config': {
                                 'cpu_offload': failure != 'engram_device',
-                                'dp_shared_memory': failure != 'engram_private',
+                                'dp_shared_memory': failure == 'engram_shared',
+                                'host_table_layout': (
+                                    'head' if failure == 'engram_layout' else 'per_rank'
+                                ),
                             }
                         }
                     ),
@@ -71,10 +79,19 @@ def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
             if failure == 'rank_duplicate':
                 row['global_rank'] = 0
             (config / f'{prefix}-rank-{rank}.json').write_text(json.dumps(row))
-    if failure == 'replay':
-        (output / 'events-123.jsonl').write_text(
-            json.dumps({'kind': 'decoder_replay_enabled', 'window': 128}) + '\n'
+    if failure in ('replay', 'replay_exact', 'replay_rows'):
+        event = dict(
+            kind='decoder_replay_enabled',
+            enabled=True,
+            window=128,
+            layers_after_cut=2,
+            replay_rows=255,
         )
+        if failure == 'replay':
+            event.pop('enabled')
+        if failure == 'replay_rows':
+            event['replay_rows'] = 128
+        (output / 'events-123.jsonl').write_text(json.dumps(event) + '\n')
     command = [
         sys.executable,
         str(ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/hsg/check-cpu-receipts.py'),
@@ -89,8 +106,9 @@ def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
     ]
     completed = subprocess.run(command, capture_output=True, text=True)
     receipt = json.loads((output / 'receipt-validation.json').read_text())
-    assert completed.returncode == (0 if failure is None else 1)
-    assert receipt['passed'] is (failure is None)
+    expected = failure in (None, 'replay_exact')
+    assert completed.returncode == (0 if expected else 1)
+    assert receipt['passed'] is expected
 
 
 def test_official_graph_uses_native_precision_and_breakable_capture():
@@ -317,13 +335,22 @@ def test_p6_cpu_and_gpu_resolve_full_recompute(tmp_path, monkeypatch):
     engram_kwargs = OmegaConf.to_container(
         resolved.actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config
     )
-    assert engram_kwargs == {'embedding_across_dp': True}
+    assert engram_kwargs == {
+        'embedding_across_dp': True,
+        'cpu_offload': True,
+        'dp_shared_memory': False,
+        'host_table_layout': 'per_rank',
+    }
     engram = EngramConfig(**engram_kwargs)
     defaults = EngramConfig()
     assert engram.cpu_offload == defaults.cpu_offload is True
-    assert engram.dp_shared_memory == defaults.dp_shared_memory is None
+    assert engram.dp_shared_memory is False and defaults.dp_shared_memory is None
     engram.resolve_dp_shared_memory(ParallelConfig(data_parallel_size=8))
-    assert (engram.cpu_offload, engram.dp_shared_memory) == (True, True)
+    assert (engram.cpu_offload, engram.dp_shared_memory, engram.host_table_layout) == (
+        True,
+        False,
+        'per_rank',
+    )
     for role in ('actor', 'ref'):
         assert resolved.actor_rollout_ref[role].engine.impl_cfg.recompute == 'full'
 
@@ -374,6 +401,8 @@ def test_cpu_and_gpu_stages_forward_the_same_optional_config_env():
     assert {k for k in host if (k in cpu) != (k in gpu)} == set()
     forwarded = host & cpu
     assert forwarded and forwarded <= cpu_conditional & gpu_conditional, forwarded
+
+
 @pytest.mark.parametrize('stale', ['stop-workers-11', 'result.json', 'job-owner-11'])
 def test_cpu_output_reuse_is_rejected_before_receipts_are_overwritten(tmp_path, stale):
     """An earlier job's output must never become a new gate's receipt."""
@@ -462,3 +491,62 @@ def test_cpu_launcher_rejects_reused_receipts_before_preparation(tmp_path):
     assert 'RECIPE_OUTPUT_REUSED' in result.stderr
     assert receipt.read_text() == '{"passed": true}'
     assert not (output / 'inputs').exists()
+
+
+@pytest.mark.parametrize('rows', [382, 128])
+def test_replay_observer_checks_the_engine_receptive_field(tmp_path, monkeypatch, rows):
+    """An engine observer must reject the old one-window replay geometry."""
+    import runpy
+    from types import SimpleNamespace
+
+    monkeypatch.setenv('W4_GRPO_OUT', str(tmp_path))
+    audit = runpy.run_path(
+        str(ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/audit/ds41_audit.py')
+    )
+
+    class Model:
+        end_layer = 6
+        decoder_replay_start = 2
+        config = SimpleNamespace(sliding_window=128)
+
+        def run_layers(self, hidden):
+            return hidden
+
+    class Replay:
+        def __init__(
+            self,
+            replay_rows,
+            run_layers,
+            write_batch_kv,
+            metadata_prefixes,
+            first_swa_prefix,
+        ):
+            self.replay_rows = replay_rows
+
+        def uses_replay_batch(self):
+            return True
+
+        def __call__(self, hidden):
+            return hidden
+
+    audit['_decoder_replay'](SimpleNamespace(DecoderReplayLayers=Replay))
+    if rows != 382:
+        with pytest.raises(RuntimeError, match='receptive field'):
+            Replay(rows, Model().run_layers, None, set(), 'model.layers.2')
+        return
+    replay = Replay(rows, Model().run_layers, None, set(), 'model.layers.2')
+    marker = object()
+    assert replay(marker) is marker
+    events = [
+        json.loads(line)
+        for file in (tmp_path / 'audit').glob('events-*')
+        for line in file.read_text().splitlines()
+    ]
+    assert [e['kind'] for e in events] == [
+        'decoder_replay_enabled',
+        'decoder_replay_batch_used',
+    ]
+    assert all(
+        e['enabled'] and e['layers_after_cut'] == 3 and e['replay_rows'] == 382
+        for e in events
+    )

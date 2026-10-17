@@ -610,18 +610,30 @@ def _decoder_replay(module):
     used = []
 
     def __init__(self, *args, **kwargs):
+        bound = inspect.signature(init).bind(self, *args, **kwargs).arguments
         init(self, *args, **kwargs)
-        event('decoder_replay_enabled', {'window': self.window})
-        # The recipe runs vLLM without bounded replay; stop at engine build
-        # rather than after a whole round on different KV.
-        raise RuntimeError('vLLM built decoder SWA bounded replay layers')
+        owner = bound['run_layers'].__self__
+        n = owner.end_layer - 1 - owner.decoder_replay_start
+        window = owner.config.sliding_window
+        expected = n * (window - 1) + 1
+        if n < 1 or window < 1 or self.replay_rows != expected:
+            raise RuntimeError('vLLM decoder replay does not cover its receptive field')
+        self._ds41_replay_receipt = dict(
+            enabled=True,
+            cut=owner.decoder_replay_start,
+            end_layer=owner.end_layer,
+            layers_after_cut=n,
+            window=window,
+            replay_rows=self.replay_rows,
+        )
+        event('decoder_replay_enabled', self._ds41_replay_receipt)
 
     def __call__(self, *args):
         replay = self.uses_replay_batch()
         result = call(self, *args)
         if replay and not used:
             used.append(True)
-            event('decoder_replay_batch_used', {'window': self.window})
+            event('decoder_replay_batch_used', self._ds41_replay_receipt)
         return result
 
     cls.__init__, cls.__call__ = __init__, __call__

@@ -225,15 +225,9 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
     + hydra_mapping(rollout['compilation_config']),
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={embedding_across_dp:true}',
-    # Decoder SWA bounded replay reruns the layers after the last KV source on
-    # each prompt's last sliding_window rows and clamps their windows at the
-    # replay start, so long prompts decode from different KV than training.
-    # VERL turns engine kwargs into vLLM CLI flags and drops False values
-    # (build_cli_args_from_config), so the negated flag of vLLM's
-    # BooleanOptionalAction carries the setting; hsg/check-vllm-cli.py and the
-    # audit assert that vLLM really runs without replay.
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.no_swa_bounded_replay=true',
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:true,embedding_across_dp:true,dp_shared_memory:false,host_table_layout:per_rank}',
+    # Use the exact multi-layer replay receptive field from the vLLM overlay.
+    # Leave swa_bounded_replay unset; the production resolver checks eligibility.
     f'+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes={kv_cache_bytes}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:0}',
