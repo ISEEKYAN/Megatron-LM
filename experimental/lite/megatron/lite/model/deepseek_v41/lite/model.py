@@ -511,6 +511,8 @@ class DeepseekV41Model(nn.Module):
         modality_loads=None,
         cp_context=None,
         geometry=None,
+        previous_post=None,
+        return_pending=False,
     ):
         start, end = self.local_layer_range
         token_mask = None if image_mask is None else ~image_mask
@@ -525,7 +527,6 @@ class DeepseekV41Model(nn.Module):
             else None
         )
         state = AttentionState()
-        previous_post = None
         for index in range(start, end):
             layer = self.layers[index]
             if layer.engram is not None:
@@ -572,6 +573,11 @@ class DeepseekV41Model(nn.Module):
             hidden, pre, state = result[:3]
             if extra:
                 previous_post = result[3]
+            elif return_pending:
+                # The CPU/reference block has no native deferred-post branch.
+                previous_post = None
+        if return_pending:
+            return hidden, pre, previous_post
         return hidden, pre
 
     def set_input_tensor(self, input_tensor):
@@ -615,15 +621,16 @@ class DeepseekV41Model(nn.Module):
         # _sequence indexes by global layer id; publish only the local interval.
         loads = [[] for _ in self.layers]
         image_mask = None
+        incoming_post = None
         if local_start == cut:
             carrier, self._input_tensor = self._input_tensor, None
-            hidden, pre = stream.unpack_pair(
+            hidden, pre, incoming_post = stream.unpack_state(
                 carrier,
                 input_ids.shape,
                 self.hc_mult,
                 self.config.hidden_size,
                 self.pipeline_residual_dtype,
-                'V4.1_PP_PAIRED_INPUT: expected FP32 packed hidden/pre_mix',
+                require_pending=self.deployment_math and input_ids.is_cuda,
             )
         else:
             embeddings = self.embed(input_ids)
@@ -636,14 +643,42 @@ class DeepseekV41Model(nn.Module):
                 embeddings = self.merge_image_embeddings(images, embeddings)
             hidden, pre = expand_hc(embeddings, self.hc_mult)
         sequence = partial(self._sequence, modality_loads=loads)
-        if cu_seqlens is not None:
-            sequence = partial(
-                packed_forward, sequence, cu_seqlens=cu_seqlens, cp_context=cp_context
+        if self.ps.pp_size > 1:
+            if cu_seqlens is not None:
+                from .protocol import packed_pipeline_forward
+
+                sequence = partial(
+                    packed_pipeline_forward,
+                    sequence,
+                    cu_seqlens=cu_seqlens,
+                    cp_context=cp_context,
+                )
+            else:
+                sequence = partial(sequence, return_pending=True)
+            hidden, pre, outgoing_post = sequence(
+                hidden,
+                pre,
+                previous_post=incoming_post,
+                input_ids=input_ids,
+                image_mask=image_mask,
             )
-        hidden, pre = sequence(hidden, pre, input_ids=input_ids, image_mask=image_mask)
+        else:
+            # Keep the PP1 ABI and its exact native arithmetic unchanged.
+            if cu_seqlens is not None:
+                sequence = partial(
+                    packed_forward,
+                    sequence,
+                    cu_seqlens=cu_seqlens,
+                    cp_context=cp_context,
+                )
+            hidden, pre = sequence(
+                hidden, pre, input_ids=input_ids, image_mask=image_mask
+            )
         if local_end == cut and cut < count:
             return {
-                'hidden_states': stream.pack_pair(hidden, pre),
+                # Materialized hidden is still needed if the next stage starts
+                # with Engram; otherwise its unused carrier gradient is zero.
+                'hidden_states': stream.pack_state(hidden, pre, outgoing_post),
                 'modality_loads': tuple(
                     tuple(entries) for entries in loads[local_start:local_end]
                 ),
