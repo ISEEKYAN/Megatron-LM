@@ -107,12 +107,12 @@ def _digest(tensors):
     return hasher.hexdigest()[:16]
 
 
+def _grad(p):
+    return p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
+
+
 def _grads(model):
-    out = []
-    for p in model.parameters():
-        g = p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
-        out.append(g)
-    return out
+    return [_grad(p) for p in model.parameters()]
 
 
 def _masters(optimizer):
@@ -167,7 +167,8 @@ def _step(bundle, schedulers):
     embed = model.tensor_bindings['embed.weight'].tensor
     stages = dict(
         embed_grad=_digest(_grads(torch.nn.ModuleList([model.embed]))),
-        grads=_digest(_grads(model)),
+        # Per parameter, so a difference names the parameter whose backward differs.
+        grads={name: _digest([_grad(p)]) for name, p in model.named_parameters()},
     )
     head = model.tensor_bindings['head.weight'].tensor
     grad = head.main_grad if getattr(head, 'main_grad', None) is not None else head.grad
