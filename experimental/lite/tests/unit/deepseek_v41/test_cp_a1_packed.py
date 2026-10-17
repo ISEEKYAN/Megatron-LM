@@ -329,3 +329,39 @@ def test_full_recompute_runs_the_packed_slice(model, lengths):
         assert (got is None) == (want is None)
         if got is not None:
             assert torch.equal(got, want)
+
+
+def test_packed_state_round_trips_deployment_index_cache(v41_core_te):
+    """On the deployment path index_k is an IndexCache (packed rows + scales)."""
+    from megatron.lite.primitive.modules.attention.csa import (
+        AttentionState,
+        _document_state,
+        _packed_state,
+    )
+    from megatron.lite.primitive.modules.deployment_math.cache import IndexCache
+
+    torch.manual_seed(3)
+    rows = [3, 0, 5]  # compressed rows per document, one empty
+    queries = [4, 1, 6]
+    states = [
+        AttentionState(
+            kv_owner=2,
+            index_owner=2,
+            main_kv=torch.randn(1, r, 8),
+            index_k=IndexCache(
+                torch.randint(0, 255, (1, r, 64), dtype=torch.uint8),
+                torch.randint(0, 255, (1, r, 4), dtype=torch.uint8),
+            ),
+            indices=torch.randint(-1, max(r, 1), (1, q, min(2, r)), dtype=torch.int32),
+        )
+        for r, q in zip(rows, queries)
+    ]
+    packed = _packed_state(states, queries)
+    assert isinstance(packed.index_k, IndexCache)
+    assert packed.kv_bounds == _bounds(rows) and packed.query_bounds == _bounds(queries)
+    for doc, state in enumerate(states):
+        back = _document_state(packed, doc)
+        assert torch.equal(back.main_kv, state.main_kv)
+        assert torch.equal(back.index_k.packed, state.index_k.packed)
+        assert torch.equal(back.index_k.scale, state.index_k.scale)
+        assert torch.equal(back.indices, state.indices)
