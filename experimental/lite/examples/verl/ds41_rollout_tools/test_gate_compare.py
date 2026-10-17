@@ -29,26 +29,29 @@ def test_bitwise_rejects_a_changed_fingerprint():
 
 
 def test_logprob_difference_always_fails():
-    report = compare(_run(), _run(lp_shift=1e-7), 'ep-change', repeats=CLEAN)
+    report = compare(_run(), _run(lp_shift=1e-7), 'cross-partition', repeats=CLEAN)
     assert not report['passed'] and report['logprobs']['unequal'] == [1]
 
 
-def test_ep_change_reports_gradient_errors_without_judging_them():
+def test_cross_partition_reports_gradient_errors_without_judging_them():
     b = _run(fp=(1, 9), versus={'w': (1e-2, 1e-3), 'b': (0.0, 0.0)})
-    report = compare(_run(), b, 'ep-change', repeats=CLEAN)
+    report = compare(_run(), b, 'cross-partition', repeats=CLEAN)
     assert report['passed']
     errors = report['errors']
     assert errors['kind'] == 'element-wise' and errors['beyond_parity_tolerance'] == 1
     assert errors['rel_distribution']['max'] == 1e-2
-    sketch = compare(_run(), _run(fp=(1, 9), sketch_shift=0.5), 'ep-change', CLEAN)
+    assert set(errors['per_layer']) == {'w', 'b'}
+    sketch = compare(
+        _run(), _run(fp=(1, 9), sketch_shift=0.5), 'cross-partition', CLEAN
+    )
     assert sketch['passed'] and sketch['errors']['kind'] == 'sketch'
 
 
-def test_ep_change_needs_clean_repeats_on_both_sides():
+def test_cross_partition_needs_clean_repeats_on_both_sides():
     b = _run(fp=(1, 9))
-    assert not compare(_run(), b, 'ep-change', repeats=None)['passed']
+    assert not compare(_run(), b, 'cross-partition', repeats=None)['passed']
     dirty = {'a': dict(logprobs_unequal=[], grads_unequal=['w'])}
-    assert not compare(_run(), b, 'ep-change', repeats=dirty)['passed']
+    assert not compare(_run(), b, 'cross-partition', repeats=dirty)['passed']
 
 
 def test_run_to_run_reads_the_in_process_repeat(tmp_path):

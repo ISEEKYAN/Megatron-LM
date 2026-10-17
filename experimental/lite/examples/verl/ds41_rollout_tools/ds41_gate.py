@@ -28,10 +28,10 @@ owners must sit on nodes where the saving run had replicas (e.g. a run that
 replicates the model on every node saves, a pipelined one compares).
 
 Comparisons (gate_compare.py): same configuration in fresh processes or
---repeats inside one process must be bitwise; a partition change that keeps
-the EP size (DP, PP or CP may change) must be bitwise; one that changes the EP
-size compares log-probs bitwise, requires each side to be bitwise run to run,
-and reports the gradient errors (element-wise with --compare-grads).
+--repeats inside one process must be bitwise (so must recompute none vs full
+and a resumed run); a different parallel partition (DP, PP, CP or EP) compares
+log-probs bitwise, requires each side to be bitwise run to run, and reports the
+gradient errors across the two (element-wise with --compare-grads).
 
   torchrun --nproc_per_node 4 ds41_gate.py --model M --records R --out O --ep 4 --path deployment
 """

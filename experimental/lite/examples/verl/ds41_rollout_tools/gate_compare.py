@@ -3,20 +3,21 @@
 
 Log-probabilities are always compared bitwise, per global sequence.
 
-  --criterion bitwise    any partition change that keeps the EP size (DP, PP or
-                         CP may change), and the same configuration in one
-                         process or in fresh ones: every parameter's gradient
-                         bit fingerprint equal
-  --criterion ep-change  a partition change that changes the EP size (expert
-                         reductions are reordered): both runs bitwise against
-                         their own in-process repeat (--repeats 2); gradient
-                         errors are reported, not judged -- element-wise when B
-                         was run with --compare-grads against A's saved
-                         gradients (max |a - b| and that over max |A|, with the
-                         count beyond test_cp_ep_parity's 5e-5 relative and
-                         2e-6 absolute for reference), by sketch otherwise
-  --criterion auto       (default) bitwise when both records have the same EP
-                         size, ep-change otherwise
+  --criterion bitwise          the same configuration (one process or fresh
+                               ones; recompute, resume): every parameter's
+                               gradient bit fingerprint equal
+  --criterion cross-partition  a different parallel partition (DP, PP, CP or EP):
+                               both runs bitwise against their own in-process
+                               repeat (--repeats 2), log-probs and every
+                               gradient; gradient errors across the two are
+                               reported (median, max, per layer), not judged --
+                               element-wise when B was run with --compare-grads
+                               against A's saved gradients (max |a - b| and
+                               that over max |A|, with the count beyond
+                               test_cp_ep_parity's 5e-5 relative and 2e-6
+                               absolute for reference), by sketch otherwise
+  --criterion auto             (default) bitwise when both records have the
+                               same partition, cross-partition otherwise
 
   python gate_compare.py A B --out receipt.json
   python gate_compare.py A A --suffix-b=-repeat1    # in-process repeat
@@ -39,8 +40,13 @@ def _load(directory, suffix):
     return lps, grads
 
 
-def _ep_size(directory):
-    return json.loads((Path(directory) / 'record.json').read_text())['ep_size']
+PARTITION = ('world', 'dp_size', 'ep_size', 'pp_size', 'cp_size')
+
+
+def _partition(directory):
+    record = json.loads((Path(directory) / 'record.json').read_text())
+    split = record.get('args', {}).get('pipeline_split_layer')
+    return [record[k] for k in PARTITION] + [split]
 
 
 def _quantiles(values):
@@ -61,6 +67,15 @@ def _bitwise(a, b):
         n for n in grad_a if grad_a[n]['fingerprint'] != grad_b[n]['fingerprint']
     )
     return lp_unequal, grad_unequal
+
+
+def _by_layer(measured):
+    groups = {}
+    for name, v in measured.items():
+        parts = name.split('.')
+        layer = '.'.join(parts[:2]) if parts[0] == 'layers' else parts[0]
+        groups.setdefault(layer, []).append(v['rel'])
+    return groups
 
 
 def _errors(grad_a, grad_b):
@@ -102,6 +117,10 @@ def _errors(grad_a, grad_b):
         dense_rel_distribution=_quantiles(
             [v['rel'] for n, v in measured.items() if '.ffn.experts.' not in n]
         ),
+        per_layer={
+            layer: _quantiles(values)
+            for layer, values in sorted(_by_layer(measured).items())
+        },
         beyond_parity_tolerance=len(beyond),
         worst=[[r, e, n] for r, e, n in beyond[:20]],
     )
@@ -127,8 +146,8 @@ def compare(a, b, criterion='bitwise', repeats=None):
     if criterion == 'bitwise':
         report['passed'] = not lp_unequal and not bit_unequal
         return report
-    # An EP change is judged on log-probs and on each side being reproducible;
-    # gradient errors are reported only.
+    # A partition change is judged on log-probs and on each side being
+    # reproducible; gradient errors across the two are reported only.
     report['errors'] = _errors(grad_a, grad_b)
     report['run_to_run'] = repeats
     repeat_ok = repeats is not None and all(
@@ -158,24 +177,25 @@ def main():
     ap.add_argument('--suffix-a', default='')
     ap.add_argument('--suffix-b', default='')
     ap.add_argument(
-        '--criterion', choices=('auto', 'bitwise', 'ep-change'), default='auto'
+        '--criterion', choices=('auto', 'bitwise', 'cross-partition'), default='auto'
     )
     ap.add_argument('--label', default='')
     ap.add_argument('--out', default=None)
     args = ap.parse_args()
-    ep = (_ep_size(args.a), _ep_size(args.b))
+    partitions = (_partition(args.a), _partition(args.b))
     criterion = args.criterion
     if criterion == 'auto':
-        criterion = 'bitwise' if ep[0] == ep[1] else 'ep-change'
+        same = partitions[0] == partitions[1]
+        criterion = 'bitwise' if same else 'cross-partition'
     report = compare(
         _load(args.a, args.suffix_a),
         _load(args.b, args.suffix_b),
         criterion,
-        run_to_run((args.a, args.b)) if criterion == 'ep-change' else None,
+        run_to_run((args.a, args.b)) if criterion == 'cross-partition' else None,
     )
     report.update(
         label=args.label,
-        ep_size=list(ep),
+        partition=dict(fields=[*PARTITION, 'split'], a=partitions[0], b=partitions[1]),
         a=f'{args.a}{args.suffix_a}',
         b=f'{args.b}{args.suffix_b}',
     )
