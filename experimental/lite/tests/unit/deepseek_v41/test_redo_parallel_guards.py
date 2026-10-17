@@ -26,9 +26,7 @@ def _build(**kwargs):
     [
         (ParallelConfig(tp=2), "tp"),
         (ParallelConfig(vpp=2), "vpp"),
-        (ParallelConfig(pp=4), "pp"),
         (ParallelConfig(etp=2), "etp"),
-        (ParallelConfig(pp_layout=[[0], [1]]), "pp_layout"),
     ],
 )
 def test_unsupported_dimensions_are_named_individually(parallel, named):
@@ -192,3 +190,10 @@ def test_ep_replicas_use_independent_expert_dp_groups(monkeypatch, v41_core_te, 
                 lr=0.001, ns_steps=5, coefficient_type='quintic'
             ),
         )
+
+
+def test_more_than_two_stages_need_explicit_owner_safe_cuts():
+    with pytest.raises(ValueError, match="V4.1_PP_SPLIT: more than two stages"):
+        _build(parallel=ParallelConfig(pp=4))
+    with pytest.raises(NotImplementedError, match="V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED"):
+        _build(parallel=ParallelConfig(pp=3), pipeline_split_layer=(8, 10))

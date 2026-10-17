@@ -147,4 +147,27 @@ def pipeline_cut(
     return requested
 
 
+def pipeline_cuts(
+    policies: tuple[LayerPolicy, ...], requested, stages: int | None = None
+) -> tuple[int, ...]:
+    """Stage boundaries for ``stages`` pipeline stages, none transporting state.
+
+    ``requested`` is one cut, increasing cuts, or None (two stages at the
+    default cut). Every cut must pass ``pipeline_cut``: no layer after it reads
+    an owner before it, so each stage owns the sources its layers read.
+    """
+    if requested is None:
+        if stages not in (None, 2):
+            raise ValueError('V4.1_PP_SPLIT: more than two stages need explicit cuts')
+        requested = (pipeline_cut(policies),)
+    elif type(requested) is int:
+        requested = (requested,)
+    cuts = tuple(requested)
+    if stages is not None and len(cuts) != stages - 1:
+        raise ValueError(f'V4.1_PP_SPLIT: {stages} stages need {stages - 1} cuts')
+    if any(type(cut) is not int for cut in cuts) or list(cuts) != sorted(set(cuts)):
+        raise ValueError('V4.1_PP_SPLIT: cuts must be strictly increasing integers')
+    return tuple(pipeline_cut(policies, cut) for cut in cuts)
+
+
 V41_TOPOLOGY = build_topology(TopologySpec())

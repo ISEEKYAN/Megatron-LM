@@ -25,7 +25,7 @@ from megatron.lite.primitive.utils import ensure_divisible
 from torch import nn
 
 from ..codecs import CODECS, attention_codecs
-from ..topology import pipeline_cut
+from ..topology import pipeline_cut, pipeline_cuts
 from . import block as block_primitives
 from . import checkpoint as checkpoint_primitives
 from .moe import DeepseekV41MoE, ModalityRouter
@@ -245,7 +245,15 @@ class DeepseekV41Model(nn.Module):
         self.config = config
         self.deployment_math = deployment_math
         self.topology = config.topology
-        self.pipeline_cut = pipeline_cut(self.topology, pipeline_split_layer)
+        # Stage boundaries (none without PP); each owns its readers' sources.
+        self.pipeline_cuts = (
+            ()
+            if pipeline_split_layer is None
+            else pipeline_cuts(self.topology, pipeline_split_layer)
+        )
+        self.pipeline_cut = (
+            self.pipeline_cuts[0] if self.pipeline_cuts else pipeline_cut(self.topology)
+        )
         self.ps = parallel_state or ParallelState()
         self.engram_group = (
             self.ps.dp_cp_group if shard_engram and self.ps.dp_cp_size > 1 else None
@@ -620,9 +628,9 @@ class DeepseekV41Model(nn.Module):
 
     def set_input_tensor(self, input_tensor):
         """Receive the FP32 paired HC carrier through the shared PP interface."""
-        if self.local_layer_range[0] != self.pipeline_cut:
+        if self.local_layer_range[0] == 0:
             raise RuntimeError(
-                'V4.1_PP_INPUT_STAGE: only the receiving stage accepts input'
+                'V4.1_PP_INPUT_STAGE: only a receiving stage accepts input'
             )
         if self._input_tensor is not None:
             raise RuntimeError('V4.1_PP_INPUT_PENDING: previous input was not consumed')
@@ -643,8 +651,9 @@ class DeepseekV41Model(nn.Module):
         from .protocol import packed_paired_forward as packed_forward
 
         local_start, local_end = self.local_layer_range
-        cut, count = self.pipeline_cut, len(self.topology)
-        if (local_start, local_end) not in ((0, count), (0, cut), (cut, count)):
+        count = len(self.topology)
+        bounds = (0, *self.pipeline_cuts, count)
+        if (local_start, local_end) not in ((0, count), *zip(bounds, bounds[1:])):
             raise RuntimeError(
                 'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: use the range protocol'
             )
@@ -660,7 +669,7 @@ class DeepseekV41Model(nn.Module):
         loads = [[] for _ in self.layers]
         image_mask = None
         incoming_post = None
-        if local_start == cut:
+        if local_start > 0:
             carrier, self._input_tensor = self._input_tensor, None
             hidden, pre, incoming_post = stream.unpack_state(
                 carrier,
@@ -712,7 +721,7 @@ class DeepseekV41Model(nn.Module):
             hidden, pre = sequence(
                 hidden, pre, input_ids=input_ids, image_mask=image_mask
             )
-        if local_end == cut and cut < count:
+        if local_end < count:
             return {
                 # Materialized hidden is still needed if the next stage starts
                 # with Engram; otherwise its unused carrier gradient is zero.

@@ -15,7 +15,7 @@ import megatron.lite.primitive.parallel.state as _imports_state
 import torch
 from megatron.lite.model import protocol_utils as _protocol_utils
 from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
-from megatron.lite.model.deepseek_v41.topology import pipeline_cut
+from megatron.lite.model.deepseek_v41.topology import pipeline_cuts
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.config_fields import project_fields
 from megatron.lite.primitive.parallel.owned_ddp import wrap_owned_ddp
@@ -62,7 +62,9 @@ class ImplConfig:
     gate_temperature: float = 1.0
     bias_rate: float = 0.001
     enable_dspark_execution: bool = False
-    pipeline_split_layer: int = 20
+    # Pipeline stage boundaries: one cut, increasing cuts (PP>2), or None for
+    # the topology's default two-stage cut. Each must keep owners with readers.
+    pipeline_split_layer: int | tuple[int, ...] | None = None
     # 'full': recompute every CSA-state-consuming layer and the FFN of each
     # KV/index source layer in backward (MCore full/uniform/1 granularity).
     # Selective (MCore module names): 'moe' recomputes every layer's FFN;
@@ -75,6 +77,12 @@ class ImplConfig:
         if isinstance(self.optimizer_config, Mapping):
             object.__setattr__(
                 self, "optimizer_config", OptimizerConfig(**self.optimizer_config)
+            )
+        if self.pipeline_split_layer is not None and not isinstance(
+            self.pipeline_split_layer, int
+        ):
+            object.__setattr__(
+                self, "pipeline_split_layer", tuple(self.pipeline_split_layer)
             )
         if isinstance(self.dtype, str):
             dtypes = {"float32": torch.float32, "bfloat16": torch.bfloat16}
@@ -93,19 +101,27 @@ def build_model_config(source, **overrides):
     )
 
 
+def _cut_tuple(cuts):
+    return () if cuts is None else (cuts,) if isinstance(cuts, int) else tuple(cuts)
+
+
 def _validate_parallel(c, p, cut=20):
-    """`cut` is the topology-validated stage boundary."""
+    """`cut` is the topology-validated stage boundary (or boundaries)."""
     if p.pp > 1 and (not c.text_only or c.external_vision_device is not None):
         raise NotImplementedError(
             'V4.1_PP_TEXT_ONLY: PP currently supports text-only training; use PP=1 for multimodal training'
         )
-    if p.pp > 1 and c.pipeline_split_layer != cut:
+    if (
+        p.pp > 1
+        and c.pipeline_split_layer is not None
+        and _cut_tuple(c.pipeline_split_layer) != _cut_tuple(cut)
+    ):
         raise NotImplementedError(
             f'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: expected topology-validated split {cut}'
         )
     if p.pp > 1 and p.cp != 1:
         raise NotImplementedError(
-            'V4.1_PP_COMBINATION_UNSUPPORTED: PP2 currently requires CP=1'
+            'V4.1_PP_COMBINATION_UNSUPPORTED: PP currently requires CP=1'
         )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError('EP size must be a positive integer')
@@ -133,7 +149,46 @@ def _validate_parallel(c, p, cut=20):
         raise ValueError('EP requires an initialized distributed world divisible by ep')
 
 
-def _construct_model(model_cfg, impl_cfg, ps, layer_range):
+def _pipeline_stages(model_cfg, c, p):
+    """Every stage's ``[start, end)`` layer range, with owner-safe boundaries.
+
+    Cuts come from ``pipeline_split_layer`` or, for a custom MCore
+    ``pp_layout``, from the layer ranges that layout assigns to each rank.
+    """
+    count = len(model_cfg.topology)
+    if p.pp == 1:
+        return ((0, count),)
+    requested = c.pipeline_split_layer
+    if p.pp_layout is not None:
+        import megatron.lite.primitive.parallel.pp as _imports_pp
+
+        if requested is not None:
+            raise ValueError('V4.1_PP_SPLIT: set pp_layout or pipeline_split_layer')
+        layers = [
+            _imports_pp.build_pipeline_chunk_layout(
+                count,
+                ParallelState(
+                    pp_size=p.pp,
+                    pp_rank=rank,
+                    pp_is_first=rank == 0,
+                    pp_is_last=rank == p.pp - 1,
+                    pp_layout=p.pp_layout,
+                ),
+            ).layer_indices
+            for rank in range(p.pp)
+        ]
+        if any(not ids for ids in layers) or [i for ids in layers for i in ids] != list(
+            range(count)
+        ):
+            raise ValueError(
+                'V4.1_PP_SPLIT: pp_layout must give every stage contiguous layers'
+            )
+        requested = tuple(ids[0] for ids in layers[1:])
+    bounds = (0, *pipeline_cuts(model_cfg.topology, requested, p.pp), count)
+    return tuple(zip(bounds, bounds[1:]))
+
+
+def _construct_model(model_cfg, impl_cfg, ps, layer_range, stages=None):
     from .model import DeepseekV41Model
 
     c = impl_cfg
@@ -143,7 +198,9 @@ def _construct_model(model_cfg, impl_cfg, ps, layer_range):
             parallel_state=ps,
             layer_range=layer_range,
             pipeline_split_layer=(
-                c.pipeline_split_layer if c.parallel.pp > 1 else None
+                tuple(start for start, _ in stages[1:])
+                if stages is not None and len(stages) > 1
+                else None
             ),
             **project_fields(
                 vars(c),
@@ -160,20 +217,18 @@ def build_model(model_cfg, *, impl_cfg):
         for key, invalid in (
             ('tp', p.tp != 1),
             ('vpp', p.vpp != 1),
-            ('pp', p.pp not in (1, 2)),
             ('etp', p.etp not in (None, 1)),
-            ('pp_layout', p.pp_layout is not None),
         )
         if invalid
     ]
     if unsupported:
         raise NotImplementedError(
             f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
-            'supported: DP, EP, contiguous CP (alone or with EP), or text-only PP2; '
-            'TP/VPP/ETP, PP other than 1 or 2, and custom pipeline layouts are unsupported'
+            'supported: DP, EP, contiguous CP (alone or with EP), or text-only PP '
+            '(owner-safe cuts or pp_layout); TP/VPP/ETP are unsupported'
         )
-    cut = pipeline_cut(model_cfg.topology, c.pipeline_split_layer if p.pp > 1 else None)
-    _validate_parallel(c, p, cut=cut)
+    stages = _pipeline_stages(model_cfg, c, p)
+    _validate_parallel(c, p, cut=tuple(start for start, _ in stages[1:]))
     ps = ParallelState()
     if torch.distributed.is_initialized() and torch.distributed.get_world_size() != 1:
         ps = init_parallel(replace(p, etp=1))
@@ -197,19 +252,8 @@ def build_model(model_cfg, *, impl_cfg):
         # Contiguous CP is supported (gathered KV/compressor, split SWA writer);
         # each rank evaluates the deployment head on its own rows.
         raise ValueError('Deployment math requires BF16 and TP=1 without DeepEP')
-    layer_range = None
-    if p.pp > 1:
-        import megatron.lite.primitive.parallel.pp as _imports_pp
-
-        build_pipeline_chunk_layout = _imports_pp.build_pipeline_chunk_layout
-
-        cut = impl_cfg.pipeline_split_layer
-        count = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
-        layout = build_pipeline_chunk_layout(
-            count, replace(ps, pp_layout=f'Et*{cut}|t*{count - cut}L')
-        )
-        layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
-    model = _construct_model(model_cfg, impl_cfg, ps, layer_range)
+    layer_range = stages[ps.pp_rank] if p.pp > 1 else None
+    model = _construct_model(model_cfg, impl_cfg, ps, layer_range, stages)
     model.pipeline_residual_dtype = impl_cfg.dtype
     from megatron.lite.primitive.recompute import parse_recompute_spec
 
