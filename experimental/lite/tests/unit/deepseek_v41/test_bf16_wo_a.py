@@ -73,7 +73,7 @@ def test_bf16_wo_a_exports_plain_weight_and_loads_release_fp8(v41_core_te, tmp_p
     assert torch.equal(decoded.bfloat16().float(), decoded)
 
 
-def test_bf16_wo_a_reference_rounds_once_per_group():
+def test_bf16_wo_a_reference_rounds_once_per_group(v41_core_te):
     from megatron.lite.primitive.modules.attention import csa
 
     torch.manual_seed(3)
