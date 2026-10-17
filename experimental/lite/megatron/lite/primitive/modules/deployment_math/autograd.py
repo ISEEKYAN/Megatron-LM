@@ -5,6 +5,25 @@ import torch
 from torch.autograd.function import once_differentiable
 
 
+def _canonical(x):
+    """Same values in standard contiguous strides.
+
+    The reference VJP runs eager reductions/GEMMs whose kernel choice follows
+    operand strides. Upstream gradients of equal value arrive in different
+    layouts (e.g. a PP carrier slice vs. an einsum-transposed PP1 gradient),
+    so the owned gradient must not see producer strides.
+    """
+    if x is None:
+        return None
+    strides, step = [], 1
+    for size in reversed(x.shape):
+        strides.append(step)
+        step *= max(size, 1)
+    if x.stride() == tuple(reversed(strides)):
+        return x
+    return x.clone(memory_format=torch.contiguous_format)
+
+
 class _Visible(torch.autograd.Function):
     @staticmethod
     def forward(ctx, visible, reference, *inputs):
@@ -29,9 +48,10 @@ class _Visible(torch.autograd.Function):
             device_type=tensors[0].device.type, enabled=False
         ):
             leaves = [
-                x.detach().requires_grad_(needed)
+                _canonical(x.detach()).requires_grad_(needed)
                 for x, needed in zip(tensors, ctx.needs_input_grad[2:])
             ]
+            grad_outputs = [_canonical(g) for g in grad_outputs]
             outputs = ctx.reference(*leaves)
             if isinstance(outputs, torch.Tensor):
                 outputs = (outputs,)
