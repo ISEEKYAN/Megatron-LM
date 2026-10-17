@@ -63,11 +63,15 @@ def test_pp2_rejections_name_their_own_cause(kwargs, key):
     assert str(caught.value).startswith(key), str(caught.value)
 
 
-@pytest.mark.parametrize("extra", [dict(cp=2)])
-def test_pp2_rejects_being_combined_with_cp(extra):
-    with pytest.raises(NotImplementedError) as caught:
-        _build(parallel=ParallelConfig(pp=2, **extra))
-    assert str(caught.value).startswith("V4.1_PP_COMBINATION_UNSUPPORTED")
+def test_pp_and_cp_combine(monkeypatch):
+    # PP over CP passes the guards; numerical parity is in test_pp_cp.py.
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "get_world_size", lambda: 8)
+    protocol._validate_parallel(
+        protocol.ImplConfig(device="cpu"), ParallelConfig(pp=2, cp=2, ep=2), cut=20
+    )
 
 
 def test_cp_and_ep_combine_like_mcore(monkeypatch):

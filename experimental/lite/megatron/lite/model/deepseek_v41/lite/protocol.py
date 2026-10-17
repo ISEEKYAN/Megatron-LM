@@ -119,10 +119,6 @@ def _validate_parallel(c, p, cut=20):
         raise NotImplementedError(
             f'V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED: expected topology-validated split {cut}'
         )
-    if p.pp > 1 and p.cp != 1:
-        raise NotImplementedError(
-            'V4.1_PP_COMBINATION_UNSUPPORTED: PP currently requires CP=1'
-        )
     if type(p.ep) is not int or p.ep < 1:
         raise ValueError('EP size must be a positive integer')
     if p.pp > 1 and (
@@ -224,8 +220,8 @@ def build_model(model_cfg, *, impl_cfg):
     if unsupported:
         raise NotImplementedError(
             f'V4.1_UNSUPPORTED_PARALLELISM: {", ".join(unsupported)}; '
-            'supported: DP, EP, contiguous CP (alone or with EP), or text-only PP '
-            '(owner-safe cuts or pp_layout); TP/VPP/ETP are unsupported'
+            'supported: DP, EP, contiguous CP (alone or with EP) and text-only PP '
+            '(owner-safe cuts or pp_layout), in any combination; TP/VPP/ETP are unsupported'
         )
     stages = _pipeline_stages(model_cfg, c, p)
     _validate_parallel(c, p, cut=tuple(start for start, _ in stages[1:]))
