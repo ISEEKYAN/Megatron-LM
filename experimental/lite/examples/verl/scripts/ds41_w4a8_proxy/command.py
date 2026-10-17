@@ -70,7 +70,7 @@ if min(pp, ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
     raise ValueError(
         'DS41_PP must be positive and DS41_WORLD divisible by EP*PP and CP*PP'
     )
-if pp_cuts and len(pp_cuts) != pp - 1:
+if pp > 1 and pp_cuts and len(pp_cuts) != pp - 1:
     raise ValueError('DS41_PIPELINE_SPLIT_LAYER needs DS41_PP - 1 cuts')
 split_layer = (
     {
