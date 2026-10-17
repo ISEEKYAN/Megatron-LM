@@ -19,6 +19,7 @@ ROUTES = {
     "ckpt/frozen_storage.py": "deepseek_v41/test_frozen_resync.py::test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption",
     "ckpt/dcp.py": "deepseek_v41/test_segmented_host_update.py::test_real_dcp_fresh_process_resume_restores_frozen_buffers_and_updates",
     "ckpt/row_stream.py": "deepseek_v41/test_bound_row_export.py::test_bound_save_streams_rows_and_exact_masters_under_budget",
+    "ckpt/pipeline_stream.py": "deepseek_v41/test_pp_bound_export.py::test_real_pp_bound_generation_and_stage_load",
     "ckpt/hf_weights.py": "deepseek_v41/test_redo_export_contract.py::test_hf_export_obeys_external_quantized_storage",
     "ckpt/binding_records.py": "deepseek_v41/test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory",
     "modules/engram_lookup.py": "deepseek_v41/test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage",
@@ -89,3 +90,8 @@ An actual run needs independent test results and non-skipped GPU smoke evidence.
 V4.1 release notes: archival HF save/export deliberately reject resync options;
 CP loss deliberately fails without the prepared global normalization denominator.
 Neither unsupported request is treated as a successful no-op.
+
+The pipeline stream route exercises real stage-bound export, byte broadcasts,
+Engram row shards, generation termination and stage-local reload. The additional
+`test_pp_stage_export.py::test_real_pp_stream_merges_initial_and_reused_frozen_generations`
+entry exercises the same real worker through the PP stage export suite.

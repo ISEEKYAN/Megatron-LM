@@ -25,6 +25,7 @@ def test_bound_training_routes_and_skill_contract():
         'ckpt/frozen_storage.py': 'test_frozen_resync.py::test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption',
         'ckpt/dcp.py': 'test_segmented_host_update.py::test_real_dcp_fresh_process_resume_restores_frozen_buffers_and_updates',
         'ckpt/row_stream.py': 'test_bound_row_export.py::test_bound_save_streams_rows_and_exact_masters_under_budget',
+        'ckpt/pipeline_stream.py': 'test_pp_bound_export.py::test_real_pp_bound_generation_and_stage_load',
         'ckpt/hf_weights.py': 'test_redo_export_contract.py::test_hf_export_obeys_external_quantized_storage',
         'ckpt/binding_records.py': 'test_redo_bindings.py::test_parameter_bindings_require_exact_owner_inventory',
         'modules/engram_lookup.py': 'test_redo_engram_residency.py::test_forward_does_not_mutate_or_release_storage',
