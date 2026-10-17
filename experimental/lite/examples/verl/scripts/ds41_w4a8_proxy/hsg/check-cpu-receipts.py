@@ -27,6 +27,12 @@ def verify(config, output, *, world, pp):
     replay = json.loads((config / 'vllm-cli.json').read_text())
     if replay.get('swa_bounded_replay') is not False:
         raise ValueError('Resolved vLLM SWA bounded replay is not False')
+    engram = replay.get('engram_config', {})
+    if (
+        engram.get('cpu_offload') is not True
+        or engram.get('dp_shared_memory') is not True
+    ):
+        raise ValueError('Resolved vLLM Engram host/shared defaults are not True/True')
     for path in sorted(config.glob('*.json')):
         require_success(json.loads(path.read_text()), path)
     census = {}

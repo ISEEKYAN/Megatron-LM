@@ -25,6 +25,9 @@ SPEC.loader.exec_module(CONTRACT)
         'replay',
         'replay_config',
         'replay_missing',
+        'engram_device',
+        'engram_private',
+        'engram_missing',
         'pytest_failed',
     ],
 )
@@ -42,7 +45,21 @@ def test_cpu_receipt_cli_rejects_failed_or_incomplete_ranks(tmp_path, failure):
     (output / 'result.json').write_text(json.dumps(result))
     if failure != 'replay_missing':
         (config / 'vllm-cli.json').write_text(
-            json.dumps({'swa_bounded_replay': failure == 'replay_config'})
+            json.dumps(
+                {
+                    'swa_bounded_replay': failure == 'replay_config',
+                    **(
+                        {}
+                        if failure == 'engram_missing'
+                        else {
+                            'engram_config': {
+                                'cpu_offload': failure != 'engram_device',
+                                'dp_shared_memory': failure != 'engram_private',
+                            }
+                        }
+                    ),
+                }
+            )
         )
     for prefix in ('model-counts', 'checkpoint-headers'):
         for rank in range(2):
@@ -295,6 +312,18 @@ def test_p6_cpu_and_gpu_resolve_full_recompute(tmp_path, monkeypatch):
         text=True,
     )
     resolved = OmegaConf.load(Path(env['DS41_OUTPUT']) / 'resolved.yaml')
+    from vllm.config import EngramConfig, ParallelConfig
+
+    engram_kwargs = OmegaConf.to_container(
+        resolved.actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config
+    )
+    assert engram_kwargs == {'embedding_across_dp': True}
+    engram = EngramConfig(**engram_kwargs)
+    defaults = EngramConfig()
+    assert engram.cpu_offload == defaults.cpu_offload is True
+    assert engram.dp_shared_memory == defaults.dp_shared_memory is None
+    engram.resolve_dp_shared_memory(ParallelConfig(data_parallel_size=8))
+    assert (engram.cpu_offload, engram.dp_shared_memory) == (True, True)
     for role in ('actor', 'ref'):
         assert resolved.actor_rollout_ref[role].engine.impl_cfg.recompute == 'full'
 

@@ -225,7 +225,7 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
     + hydra_mapping(rollout['compilation_config']),
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:false,embedding_across_dp:true,dp_shared_memory:false}',
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={embedding_across_dp:true}',
     # Decoder SWA bounded replay reruns the layers after the last KV source on
     # each prompt's last sliding_window rows and clamps their windows at the
     # replay start, so long prompts decode from different KV than training.
