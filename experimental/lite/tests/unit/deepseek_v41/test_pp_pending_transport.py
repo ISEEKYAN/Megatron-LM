@@ -106,6 +106,20 @@ def test_pending_contract_fails_closed(fault):
 
 
 def test_packed_slice_carries_its_pending_and_gradients(v41_core_te):
+    import ast
+    import inspect
+
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    definitions = [
+        node
+        for node in ast.parse(inspect.getsource(protocol)).body
+        if isinstance(node, ast.FunctionDef) and node.name == 'packed_pipeline_forward'
+    ]
+    assert (
+        len(definitions) == 1
+    ), 'The whole-slice pipeline entry must not be overridden'
+
     from megatron.lite.model.deepseek_v41.lite.protocol import packed_pipeline_forward
 
     hidden, pre, *pending = state()

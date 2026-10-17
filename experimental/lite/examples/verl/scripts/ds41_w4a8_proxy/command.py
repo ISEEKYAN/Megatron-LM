@@ -24,6 +24,26 @@ world = int(os.environ.get('DS41_WORLD', str(ep * cp)))
 train_batch = int(os.environ.get('DS41_TRAIN_BATCH', '8'))
 kv_cache_bytes = int(os.environ.get('DS41_KV_CACHE_BYTES', str(256 * 2**20)))
 segmented_host = '1'
+# Frozen Engram tables in host memory, shared by the colocated actor and ref.
+engram_host = os.environ.get('DS41_ENGRAM_HOST', '0')
+if engram_host not in ('0', '1'):
+    raise ValueError('DS41_ENGRAM_HOST must be 0 or 1')
+# Training MoE transport (DS4 recipe: ACTOR_MOE_DISPATCHER=deepep) and the
+# rollout all2all backend (DS4 aligned mode: deepep_low_latency).
+dispatcher = os.environ.get('ACTOR_MOE_DISPATCHER', 'alltoall')
+if dispatcher not in ('alltoall', 'deepep'):
+    raise ValueError('ACTOR_MOE_DISPATCHER must be alltoall or deepep')
+use_deepep = 'true' if dispatcher == 'deepep' else 'false'
+# DeepEP dispatch VJP reduced as all-to-all does (bitwise dX across dispatchers).
+routed_backward = os.environ.get('DEEPEP_ROUTED_BACKWARD', '0')
+if routed_backward not in ('0', '1'):
+    raise ValueError('DEEPEP_ROUTED_BACKWARD must be 0 or 1')
+routed_backward = 'true' if use_deepep == 'true' and routed_backward == '1' else 'false'
+all2all = os.environ.get('ROLLOUT_ALL2ALL_BACKEND', 'allgather_reducescatter')
+if all2all not in ('allgather_reducescatter', 'deepep_low_latency'):
+    raise ValueError(
+        'ROLLOUT_ALL2ALL_BACKEND must be allgather_reducescatter or deepep_low_latency'
+    )
 bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
@@ -177,7 +197,10 @@ args = [
             'w4a8_experts': 'true',
             'deployment_math': 'true',
             'trainable_engram': 'false',
+            **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
+            'use_deepep': use_deepep,
+            'deepep_routed_backward': routed_backward,
             'dtype': 'bfloat16',
             **split_layer,
             'optimizer': 'muon',
@@ -196,7 +219,10 @@ args = [
             'w4a8_experts': 'true',
             'deployment_math': 'true',
             'trainable_engram': 'false',
+            **({'host_engram': 'true'} if engram_host == '1' else {}),
             'use_deepep': 'false',
+            'use_deepep': use_deepep,
+            'deepep_routed_backward': routed_backward,
             'dtype': 'bfloat16',
             **split_layer,
         }.items()
@@ -234,19 +260,13 @@ args = [
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_config={indexer_kv_dtype:mxfp4,indexer_sparse_logits:false}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides='
     + hydra_mapping(rollout['hf_overrides']),
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend=allgather_reducescatter',
+    f'+actor_rollout_ref.rollout.engine_kwargs.vllm.all2all_backend={all2all}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.moe_backend=deep_gemm',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.compilation_config='
     + hydra_mapping(rollout['compilation_config']),
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:false,embedding_across_dp:true,dp_shared_memory:false}',
-    # Decoder SWA bounded replay reruns the layers after the last KV source on
-    # each prompt's last sliding_window rows and clamps their windows at the
-    # replay start, so long prompts decode from different KV than training.
-    # VERL turns engine kwargs into vLLM CLI flags and drops False values
-    # (build_cli_args_from_config), so the negated flag of vLLM's
-    # BooleanOptionalAction carries the setting; hsg/check-vllm-cli.py and the
-    # audit assert that vLLM really runs without replay.
-    '+actor_rollout_ref.rollout.engine_kwargs.vllm.no_swa_bounded_replay=true',
+    '+actor_rollout_ref.rollout.engine_kwargs.vllm.engram_config={cpu_offload:true,embedding_across_dp:true,dp_shared_memory:false,host_table_layout:per_rank}',
+    # Use the exact multi-layer replay receptive field from the vLLM overlay.
+    # Leave swa_bounded_replay unset; the production resolver checks eligibility.
     f'+actor_rollout_ref.rollout.engine_kwargs.vllm.kv_cache_memory_bytes={kv_cache_bytes}',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.disable_custom_all_reduce=true',
     '+actor_rollout_ref.rollout.engine_kwargs.vllm.limit_mm_per_prompt={image:0}',

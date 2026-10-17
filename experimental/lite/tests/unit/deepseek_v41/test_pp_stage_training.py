@@ -133,8 +133,9 @@ def test_pp_paired_forward_backward_and_per_stage_router_stats(pp_models):
         optimizer.accumulate_modality_loads.assert_called_once()
 
 
+@pytest.mark.parametrize('use_deepep', [False, True])
 def test_official_pp2_passes_deployment_guard_before_allocation(
-    v41_core_te, monkeypatch
+    v41_core_te, monkeypatch, use_deepep
 ):
     from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.primitive.parallel.state import ParallelState
@@ -157,6 +158,7 @@ def test_official_pp2_passes_deployment_guard_before_allocation(
                 pipeline_split_layer=2,
                 deployment_math=True,
                 w4a8_experts=True,
+                use_deepep=use_deepep,
             ),
         )
 

@@ -25,8 +25,19 @@ def verify(config, output, *, world, pp):
     if result.get('pytest_exit') != 0:
         raise ValueError('CPU pytest did not exit successfully')
     replay = json.loads((config / 'vllm-cli.json').read_text())
-    if replay.get('swa_bounded_replay') is not False:
-        raise ValueError('Resolved vLLM SWA bounded replay is not False')
+    if replay.get('swa_bounded_replay') is not True:
+        raise ValueError('Resolved vLLM SWA bounded replay is not True')
+    engram = replay.get('engram_config', {})
+    if (
+        engram.get('cpu_offload') is not True
+        or engram.get('dp_shared_memory') is not False
+    ):
+        raise ValueError('Resolved vLLM Engram host/per-rank profile is invalid')
+    if (
+        engram.get('host_table_layout') != 'per_rank'
+        or replay.get('tensor_parallel_size') != 1
+    ):
+        raise ValueError('Per-rank Engram requires explicit layout and TP1')
     for path in sorted(config.glob('*.json')):
         require_success(json.loads(path.read_text()), path)
     census = {}
@@ -48,13 +59,19 @@ def verify(config, output, *, world, pp):
             row = json.loads(line)
             events += 1
             kind = row.get('kind')
-            if kind == 'decoder_replay_batch_used' or (
-                kind == 'decoder_replay_enabled' and row.get('enabled') is not False
-            ):
-                raise ValueError(f'{path}: unexpected {kind}')
-    return dict(
-        passed=True, ranks=census, audit_events=events, swa_bounded_replay=False
-    )
+            if kind in ('decoder_replay_enabled', 'decoder_replay_batch_used'):
+                n, window, kept = (
+                    row.get(k) for k in ('layers_after_cut', 'window', 'replay_rows')
+                )
+                if (
+                    row.get('enabled') is not True
+                    or any(type(v) is not int for v in (n, window, kept))
+                    or n < 1
+                    or window < 1
+                    or kept != n * (window - 1) + 1
+                ):
+                    raise ValueError(f'{path}: invalid exact decoder replay receipt')
+    return dict(passed=True, ranks=census, audit_events=events, swa_bounded_replay=True)
 
 
 if __name__ == '__main__':

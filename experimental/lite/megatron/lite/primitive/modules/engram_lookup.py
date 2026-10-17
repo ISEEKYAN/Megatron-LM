@@ -18,9 +18,13 @@
 
 Owner transport follows NVIDIA-NeMo/Automodel@8a646a739 with uneven row boundaries.
 Every group member must participate in forward and, for trainable tables,
-backward, including members with no requests. Request counts are host metadata;
-no table or fetched value is offloaded. Group=None explicitly means local.
+backward, including members with no requests. Request counts are host metadata.
+Tables are device-resident unless built host_resident (frozen tables only):
+then the owner gathers requested rows on the host and copies only those rows.
+Group=None explicitly means local.
 """
+
+import weakref
 
 import numpy as np
 import torch
@@ -100,10 +104,9 @@ class RowLookup(object):
     def _validate_rows(self, tensors, ids, valid_dtype, message):
         rows = self.boundaries[self.rank + 1] - self.boundaries[self.rank]
         invalid = any(
-            t.ndim != 2
-            or t.shape[0] != rows
-            or t.device != ids.device
-            or not valid_dtype(t)
+            t.ndim != 2 or t.shape[0] != rows
+            # Host-resident frozen tables are gathered on the host.
+            or t.device not in (ids.device, torch.device('cpu')) or not valid_dtype(t)
             for t in tensors
         )
         self._check(
@@ -146,15 +149,29 @@ class RowLookup(object):
 
 
 class EngramTable(nn.Module):
-    """Resident FP8 rows with one construction-time trainability switch.
+    """Resident FP8 rows with construction-time trainability and residency switches.
 
     Trainable mode uses a persistent FP32 master and identity STE on gathered
     rows. Call refresh_storage after an accepted optimizer step. Forward and
-    recompute do not publish or mutate storage. No host offload is performed.
+    recompute do not publish or mutate storage.
+
+    host_resident (frozen tables only) keeps weight/scale in host memory
+    (pinned when CUDA is available): module device moves leave them in place,
+    and lookups copy only the gathered rows to the request device.
     """
 
-    def __init__(self, weight, scale, *, trainable=False, output_dtype=torch.bfloat16):
+    def __init__(
+        self,
+        weight,
+        scale,
+        *,
+        trainable=False,
+        host_resident=False,
+        output_dtype=torch.bfloat16,
+    ):
         super().__init__()
+        if host_resident and trainable:
+            raise ValueError("Host-resident Engram tables must be frozen")
         if (
             weight.ndim != 2
             or weight.shape[1] % 32
@@ -165,8 +182,13 @@ class EngramTable(nn.Module):
         ):
             raise ValueError("Expected FP8 table [rows,D] and E8M0 row/block32 scales")
         self.output_dtype = output_dtype
-        self.register_buffer("weight", weight.detach().clone())
-        self.register_buffer("scale", scale.detach().clone())
+        self.host_resident = host_resident
+        if host_resident:
+            self.register_buffer("weight", _host_copy(weight))
+            self.register_buffer("scale", _host_copy(scale))
+        else:
+            self.register_buffer("weight", weight.detach().clone())
+            self.register_buffer("scale", scale.detach().clone())
         if trainable:
             master = weight.float() * scale.float().repeat_interleave(32, -1)
             self.master = nn.Parameter(master)
@@ -181,6 +203,8 @@ class EngramTable(nn.Module):
         # A parent .bfloat16() must not widen FP8 storage or round the master.
         # Probe only the destination device/dtype, without a lossy round-trip.
         def preserve_dtype(tensor):
+            if self.host_resident and (tensor is self.weight or tensor is self.scale):
+                return tensor
             probe = fn(torch.empty(0, dtype=tensor.dtype, device=tensor.device))
             if probe.dtype == tensor.dtype:
                 return fn(tensor)
@@ -199,6 +223,26 @@ class EngramTable(nn.Module):
         return tuple(
             _gather_rows(t, ids) for t in (self.weight, self.scale, self.master)
         )
+
+    @torch.no_grad()
+    def share_storage(self, other):
+        """Alias another frozen host-resident table holding identical bytes."""
+        if not (
+            self.host_resident
+            and other.host_resident
+            and self.master is None
+            and other.master is None
+        ):
+            raise ValueError("Only frozen host-resident tables can share storage")
+        for name in ("weight", "scale"):
+            mine, theirs = getattr(self, name), getattr(other, name)
+            if (
+                mine.shape != theirs.shape
+                or mine.dtype != theirs.dtype
+                or not torch.equal(mine.view(torch.uint8), theirs.view(torch.uint8))
+            ):
+                raise ValueError("Shared Engram storage differs")
+        self.weight, self.scale = other.weight, other.scale
 
     @torch.no_grad()
     def refresh_storage(self):
@@ -221,9 +265,22 @@ class ShardedEngramTable(EngramTable):
     """
 
     def __init__(
-        self, weight, scale, lookup, *, trainable=False, output_dtype=torch.bfloat16
+        self,
+        weight,
+        scale,
+        lookup,
+        *,
+        trainable=False,
+        host_resident=False,
+        output_dtype=torch.bfloat16,
     ):
-        super().__init__(weight, scale, trainable=trainable, output_dtype=output_dtype)
+        super().__init__(
+            weight,
+            scale,
+            trainable=trainable,
+            host_resident=host_resident,
+            output_dtype=output_dtype,
+        )
         expected = lookup.boundaries[lookup.rank + 1] - lookup.boundaries[lookup.rank]
         if weight.shape[0] != expected:
             raise ValueError("Table rows do not match lookup ownership interval")
@@ -231,6 +288,27 @@ class ShardedEngramTable(EngramTable):
 
     def lookup_fp8(self, ids):
         return self.lookup.fetch(self.weight, self.scale, ids, self.master)
+
+
+def _host_copy(tensor):
+    """Exact-size host copy, page-locked in place when CUDA is available.
+
+    ``pin_memory=True`` goes through the caching host allocator, which rounds each
+    block up to a power of two (an 11.4 GiB table would take 16 GiB). As in vLLM's
+    ``DPSharedEngramStorage._allocate``, register a plain allocation instead and
+    unregister it when its owner is released.
+    """
+    nbytes = tensor.numel() * tensor.element_size()
+    owner = np.empty(max(nbytes, 1), dtype=np.uint8)
+    out = torch.from_numpy(owner)[:nbytes].view(tensor.dtype).view(tensor.shape)
+    out.copy_(tensor.detach())
+    if torch.cuda.is_available() and nbytes:
+        pointer = owner.ctypes.data
+        result = torch.cuda.cudart().cudaHostRegister(pointer, nbytes, 0)
+        if int(result) != 0:
+            raise RuntimeError(f"cudaHostRegister failed: {result}")
+        weakref.finalize(owner, torch.cuda.cudart().cudaHostUnregister, pointer)
+    return out
 
 
 def hash_multipliers(layer_ids, max_ngram_size, vocab_size):

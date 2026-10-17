@@ -442,3 +442,172 @@ def test_reference_runtime_plugins_resolve_as_mapping(plugins):
         )
         == plugins
     )
+
+
+def test_nonfinite_update_does_not_advance_lr_scheduler():
+    engine = _engine(engine_config=_engine_config())
+    scheduler = SimpleNamespace(num_steps=0)
+
+    def step(_):
+        scheduler.num_steps += 1
+
+    scheduler.step = step
+    engine.handle = SimpleNamespace(
+        _optimizer=SimpleNamespace(param_groups=[{"lr": 0.01}]), _lr_scheduler=scheduler
+    )
+    engine.runtime = SimpleNamespace(optimizer_step=lambda _: (False, float("nan"), 0))
+    engine.optimizer_step()
+    assert engine.lr_scheduler_step() == 0.01
+    assert scheduler.num_steps == 0
+    engine.runtime.optimizer_step = lambda _: (True, 1.0, 0)
+    engine.optimizer_step()
+    engine.lr_scheduler_step()
+    assert scheduler.num_steps == 1
+
+
+def test_model_owned_scheduler_preserves_group_rates_and_decay():
+    from megatron.lite.runtime.contracts.config import OptimizerConfig
+    from verl_mlite.engine.mlite_engine import _build_lr_scheduler
+
+    optimizer = SimpleNamespace(
+        param_groups=[
+            {"lr": 0.01, "weight_decay": 0.0},
+            {"lr": 0.05, "weight_decay": 0.1},
+        ]
+    )
+    config = OptimizerConfig(lr=0.01, total_training_steps=8, lr_decay_style="constant")
+    scheduler = _build_lr_scheduler(optimizer, config, preserve_group_policy=True)
+    scheduler.step()
+    assert [g["lr"] for g in optimizer.param_groups] == [0.01, 0.05]
+    assert [g["weight_decay"] for g in optimizer.param_groups] == [0.0, 0.1]
+
+
+@pytest.mark.parametrize("optimizer_name", ["muon", "another_optimizer"])
+@pytest.mark.parametrize("owns_policy", [False, True])
+def test_initialize_consumes_group_ownership_not_optimizer_name(
+    monkeypatch, optimizer_name, owns_policy
+):
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+    from verl_mlite.engine import mlite_engine
+
+    params = [torch.nn.Parameter(torch.ones(())) for _ in range(2)]
+    optimizer = torch.optim.SGD(
+        [
+            {"params": [params[0]], "lr": 0.01, "weight_decay": 0.0},
+            {"params": [params[1]], "lr": 0.05, "weight_decay": 0.1},
+        ]
+    )
+    optimizer.owns_param_group_policy = owns_policy
+    config = _optimizer_config()
+    config.lr, config.total_training_steps, config.lr_warmup_steps = 0.01, 8, 2
+    engine = _engine(
+        engine_config=_engine_config(impl_cfg={"optimizer": optimizer_name}),
+        optimizer_config=config,
+    )
+    handle = ModelHandle(model=torch.nn.Linear(1, 1), optimizer=optimizer)
+    monkeypatch.setattr(
+        mlite_engine,
+        "create_runtime",
+        lambda _: SimpleNamespace(build_model=lambda: handle),
+    )
+    monkeypatch.setattr(engine, "to", lambda **_: None)
+    engine.initialize()
+    scheduler = handle._lr_scheduler
+    assert [g["lr"] for g in optimizer.param_groups] == [0.0, 0.0]
+    scheduler.step()
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(
+        [0.005, 0.025] if owns_policy else [0.005, 0.005]
+    )
+    assert [g["weight_decay"] for g in optimizer.param_groups] == (
+        [0.0, 0.1] if owns_policy else [0.1, 0.1]
+    )
+    state = scheduler.state_dict()
+    scheduler.step()
+    scheduler.load_state_dict(state)
+    assert [g["lr"] for g in optimizer.param_groups] == pytest.approx(
+        [0.005, 0.025] if owns_policy else [0.005, 0.005]
+    )
+
+
+def test_v41_optimizer_policy_survives_engine_scheduler(
+    monkeypatch, transformer_engine_import_stub
+):
+    # Real DS4.1 owners: Engram tables/projections at 5x LR; embedding, head,
+    # attention sinks, hyper-connection vectors and Engram tables at zero decay.
+    import megatron.core.fp8_utils  # noqa: F401
+    import megatron.core.transformer.experimental_attention_variant.csa  # noqa: F401
+    import megatron.core.transformer.hyper_connection  # noqa: F401
+
+    transformer_engine_import_stub()
+    sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deepseek_v41"))
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+    from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
+    from megatron.lite.model.deepseek_v41.lite.optimizer_groups import (
+        _RULES,
+        V41Optimizer,
+    )
+    from megatron.lite.model.deepseek_v41.vision_config import (
+        OptimizerConfig as V41OptimizerConfig,
+    )
+    from megatron.lite.runtime.contracts.handle import ModelHandle
+    from test_pp_stage_training import prefix_config
+    from verl_mlite.engine import mlite_engine
+
+    raw = prefix_config().to_hf_dict()
+    raw["text_config"].update(engram_layer_ids=[1], engram_num_embeddings=[18])
+    torch.manual_seed(5)
+    model = DeepseekV41Model(
+        DeepseekV41Config(raw),
+        quantized=False,
+        token_map=list(range(64)),
+        trainable_engram=True,
+    ).float()
+    for binding in model.parameter_bindings():
+        if binding.role in ("vision", "aligner", "image_delimiter"):
+            binding.tensor.requires_grad_(False)
+    base_lr = 1e-3
+    optimizer = V41Optimizer(
+        model, V41OptimizerConfig(lr=base_lr, ns_steps=2, coefficient_type="quintic")
+    )
+    roles = {id(b.tensor): b.role for b in model.parameter_bindings()}
+
+    def policy(group):
+        algorithm, matrix_decay, vector_decay, multiplier = _RULES[
+            roles[id(group["params"][0])]
+        ]
+        return multiplier, (
+            vector_decay if group["algorithm"] == "adamw" else matrix_decay
+        )
+
+    covered = {roles[id(g["params"][0])] for g in optimizer.param_groups}
+    assert {"engram_table", "engram_projection", "attention_sink"} <= covered
+    assert {"embedding", "head", "hyper_connection"} <= covered
+    for group in optimizer.param_groups:
+        multiplier, decay = policy(group)
+        assert group["lr"] == pytest.approx(base_lr * multiplier, rel=1e-12)
+        assert group["weight_decay"] == decay
+
+    config = _optimizer_config()
+    config.lr, config.weight_decay = base_lr, 0.1
+    config.total_training_steps, config.lr_warmup_steps = 8, 2
+    config.lr_decay_style = "cosine"
+    engine = _engine(
+        engine_config=_engine_config(impl_cfg={"optimizer": "muon"}),
+        optimizer_config=config,
+    )
+    handle = ModelHandle(model=model, optimizer=optimizer)
+    monkeypatch.setattr(
+        mlite_engine,
+        "create_runtime",
+        lambda _: SimpleNamespace(build_model=lambda: handle),
+    )
+    monkeypatch.setattr(engine, "to", lambda **_: None)
+    engine.initialize()
+    scheduler = handle._lr_scheduler
+    for _ in range(5):
+        lr = scheduler._get_lr()
+        for group in optimizer.param_groups:
+            multiplier, decay = policy(group)
+            assert group["lr"] == pytest.approx(lr * multiplier, rel=1e-12)
+            assert group["weight_decay"] == decay
+        scheduler.step()

@@ -53,9 +53,14 @@ class ImplConfig:
     w4a8_experts: bool = False
     deployment_math: bool = False
     use_deepep: bool = False
+    # DeepEP dispatch VJP reduces route gradients as all-to-all does (bitwise
+    # dX across dispatchers); costs one gradient row per route on the wire.
+    deepep_routed_backward: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
     shard_engram: bool = True
+    # Frozen Engram tables stay in host memory; lookups copy only gathered rows.
+    host_engram: bool = False
     text_only: bool = True
     vision_trainability: VisionTrainability | None = None
     external_vision_device: str | None = None
@@ -200,7 +205,8 @@ def _construct_model(model_cfg, impl_cfg, ps, layer_range, stages=None):
             ),
             **project_fields(
                 vars(c),
-                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram '
+                'token_map quantized w4a8_experts deployment_math use_deepep deepep_routed_backward '
+                'trainable_engram shard_engram host_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )
@@ -240,14 +246,14 @@ def build_model(model_cfg, *, impl_cfg):
         )
     if impl_cfg.dtype not in (torch.bfloat16, torch.float32):
         raise ValueError('V4.1 residual dtype must be BF16 or FP32')
-    if c.w4a8_experts and (c.dtype != torch.bfloat16 or c.use_deepep):
-        raise ValueError('V4.1 W4A8 requires BF16 residuals and no DeepEP')
+    if c.w4a8_experts and c.dtype != torch.bfloat16:
+        raise ValueError('V4.1 W4A8 requires BF16 residuals')
     if c.deployment_math and (not c.w4a8_experts or not c.quantized):
         raise ValueError('Deployment math requires quantized W4A8 experts')
-    if c.deployment_math and (c.dtype != torch.bfloat16 or p.tp != 1 or c.use_deepep):
+    if c.deployment_math and (c.dtype != torch.bfloat16 or p.tp != 1):
         # Contiguous CP is supported (gathered KV/compressor, split SWA writer);
         # each rank evaluates the deployment head on its own rows.
-        raise ValueError('Deployment math requires BF16 and TP=1 without DeepEP')
+        raise ValueError('Deployment math requires BF16 and TP=1')
     layer_range = stages[ps.pp_rank] if p.pp > 1 else None
     model = _construct_model(model_cfg, impl_cfg, ps, layer_range, stages)
     model.pipeline_residual_dtype = impl_cfg.dtype

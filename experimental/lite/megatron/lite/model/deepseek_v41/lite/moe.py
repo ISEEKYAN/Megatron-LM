@@ -162,6 +162,7 @@ class DeepseekV41MoE(nn.Module):
         use_deepep=False,
         w4a8=False,
         official_expert_contract=False,
+        deepep_routed_backward=False,
     ):
         super().__init__()
         self.gate = router
@@ -173,28 +174,39 @@ class DeepseekV41MoE(nn.Module):
         # Reference inference/model.py: group-32 activations and the routing
         # weight applied before FC2 quantization (rows combine unweighted).
         self.official_expert_contract = official_expert_contract
-        from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
+        from megatron.lite.primitive.modules import dispatcher
         from megatron.lite.primitive.parallel.state import ParallelState
 
-        self.dispatcher = TokenDispatcher(
-            router.router.num_experts,
-            router.router.gate.in_features,
-            ps or ParallelState(),
-            use_deepep=use_deepep,
-        )
-        if (
-            use_deepep
-            and self.dispatcher.ep_size > 1
-            and not self.dispatcher.use_deepep
-        ):
+        ps = ps or ParallelState()
+        if use_deepep and ps.ep_size > 1 and dispatcher.deep_ep is None:
             raise RuntimeError(
                 'V4.1_DEEPEP_UNAVAILABLE: requested DeepEP is not installed'
             )
+        if deepep_routed_backward and not (w4a8 and use_deepep):
+            raise ValueError('Routed DeepEP backward requires W4A8 experts over DeepEP')
+        options = {}
+        if w4a8 and use_deepep:
+            # W4A8 reduces each token's top-k rows itself (ordered FMA), so
+            # DeepEP must return the routed rows unreduced.
+            from megatron.lite.primitive.modules.route_preserving_deepep import (
+                RoutePreservingDeepEPDispatcher as Dispatcher,
+            )
+
+            options['routed_backward'] = deepep_routed_backward
+        else:
+            Dispatcher = dispatcher.TokenDispatcher
+        self.dispatcher = Dispatcher(
+            router.router.num_experts,
+            router.router.gate.in_features,
+            ps,
+            use_deepep=use_deepep,
+            **options,
+        )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")
         if w4a8:
-            if use_deepep or self.dispatcher.moe_permute_fusion:
-                raise ValueError('V4.1 W4A8 requires unfused dispatch and no DeepEP')
+            if not use_deepep and self.dispatcher.moe_permute_fusion:
+                raise ValueError('V4.1 W4A8 requires unfused dispatch')
             start = self.dispatcher.ps.ep_rank * self.dispatcher.num_local_experts
             for index, expert in enumerate(self.experts):
                 owned = start <= index < start + self.dispatcher.num_local_experts

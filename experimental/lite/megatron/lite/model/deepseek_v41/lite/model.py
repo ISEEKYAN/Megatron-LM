@@ -229,8 +229,10 @@ class DeepseekV41Model(nn.Module):
         w4a8_experts=False,
         deployment_math=False,
         use_deepep=False,
+        deepep_routed_backward=False,
         trainable_engram=False,
         shard_engram=True,
+        host_engram=False,
         gate_temperature=1.0,
         bias_rate=0.001,
         enable_dspark_execution=False,
@@ -346,6 +348,7 @@ class DeepseekV41Model(nn.Module):
                 shared,
                 ps=self.ps,
                 use_deepep=use_deepep,
+                deepep_routed_backward=deepep_routed_backward,
                 w4a8=w4a8_experts,
                 official_expert_contract=official_expert_contract,
             )
@@ -393,6 +396,7 @@ class DeepseekV41Model(nn.Module):
             local_range=(start, end),
             projection=partial(_FP8_LINEAR, fp8=quantized),
             hash_layer_ids=getattr(t, 'engram_hash_layer_ids', None),
+            host_resident=host_engram,
             **memory_options,
         )
         for index, module in memories.items():

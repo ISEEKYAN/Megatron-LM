@@ -1,6 +1,14 @@
 #!/usr/bin/env bash
 set -euo pipefail
 source /recipe/runtime-cache-env.sh
+source /recipe/job-state.sh
+: "${SLURM_JOB_ID:?job ID required}"
+export RECIPE_STOP_FILE="/test-output/stop-workers-$SLURM_JOB_ID"
+export RECIPE_RAY_TEMP_DIR="/var/tmp/${USER}-ray-${SLURM_JOB_ID}"
+if [[ "$RECIPE_ROLE" == head ]]; then
+ recipe_check_output /test-output "$SLURM_JOB_ID"
+fi
+mkdir -p "$RECIPE_RAY_TEMP_DIR"
 export RAY_worker_register_timeout_seconds=180
 RECIPE_C8_MODE=${RECIPE_C8_MODE:---c8-2l}
 case "$RECIPE_C8_MODE" in --c8-2l|--c8-4l|--c8-6l|--c8-8l|--c8-9l|--c8-40l) ;; *) exit 2 ;; esac
@@ -19,19 +27,18 @@ eval "$("$RECIPE_PYTHON" -S /recipe/ray_ports.py)"
 export DS41_RAY_ADDRESS="$RAY_ADDRESS"
 RECIPE_RAY_PID=''
 cleanup() {
- if [[ "$RECIPE_ROLE" == head ]]; then touch /test-output/stop-workers; fi
+ if [[ "$RECIPE_ROLE" == head ]]; then touch "$RECIPE_STOP_FILE"; fi
  if [[ -n "$RECIPE_RAY_PID" ]]; then
   # Only this invocation's blocking service is terminated; never global ray stop.
   kill -TERM "$RECIPE_RAY_PID" 2>/dev/null || true
   wait "$RECIPE_RAY_PID" 2>/dev/null || true
   mkdir -p "/test-output/ray-internal-$RECIPE_ROLE"
-  for RECIPE_LOG_ROOT in /runtime-cache/ray-c8/session_latest/logs /runtime-cache/tmp/ray/session_latest/logs; do
-   if test -d "$RECIPE_LOG_ROOT"; then
-    find "$RECIPE_LOG_ROOT" -maxdepth 1 -type f \
-     \( -name 'raylet*' -o -name 'gcs_server*' -o -name 'runtime_env_agent*' -o -name 'dashboard_agent*' \) \
-     -exec cp -p {} "/test-output/ray-internal-$RECIPE_ROLE/" \; || true
-   fi
-  done
+  if test -d "$RECIPE_RAY_TEMP_DIR/session_latest/logs"; then
+   cp -aL "$RECIPE_RAY_TEMP_DIR/session_latest/logs/." "/test-output/ray-internal-$RECIPE_ROLE/" || {
+    echo RECIPE_RAY_LOG_ARCHIVE_FAILED >&2
+    return 1
+   }
+  fi
  fi
 }
 trap cleanup EXIT
@@ -47,14 +54,18 @@ RECIPE_RAY_ARGS=(start --node-ip-address="$RECIPE_NODE_IP" --num-gpus="$RECIPE_G
  --ray-client-server-port="$RECIPE_RAY_CLIENT_PORT" --object-store-memory="$RECIPE_OBJECT_BYTES" --disable-usage-stats --block)
 if [[ "$RECIPE_ROLE" == head ]]; then
  "$RECIPE_PYTHON" -S /recipe/ray_ports.py --check
- RECIPE_RAY_ARGS+=(--head --port="$RECIPE_RAY_GCS_PORT" --temp-dir=/runtime-cache/ray-c8 --include-dashboard=false)
+ RECIPE_RAY_ARGS+=(--head --port="$RECIPE_RAY_GCS_PORT" --temp-dir="$RECIPE_RAY_TEMP_DIR" --include-dashboard=false)
 else
  # The head may still be warming its node-local cache.
  "$RECIPE_PYTHON" -S - <<'PY'
 import os,socket,time,pathlib
 deadline=time.monotonic()+180
+heartbeat=time.monotonic()
 while True:
- if pathlib.Path('/test-output/stop-workers').exists():
+ if time.monotonic()>=heartbeat:
+  print('RECIPE_WORKER_WAIT_HEAD',os.environ['SLURM_JOB_ID'],time.strftime('%Y-%m-%dT%H:%M:%SZ',time.gmtime()),flush=True)
+  heartbeat=time.monotonic()+30
+ if pathlib.Path(os.environ['RECIPE_STOP_FILE']).exists():
   raise SystemExit('Head stopped before worker connection')
  try:
   with socket.create_connection((os.environ['RECIPE_HEAD_IP'],int(os.environ['RECIPE_RAY_GCS_PORT'])),timeout=2): break
@@ -70,7 +81,13 @@ env -u RAY_ADDRESS VERL_MLITE_SKIP_RUNTIME_PATCHES=1 \
  "$RECIPE_RAY" "${RECIPE_RAY_ARGS[@]}" >"/test-output/ray-$RECIPE_ROLE.log" 2>&1 &
 RECIPE_RAY_PID=$!
 if [[ "$RECIPE_ROLE" != head ]]; then
- while ! test -f /test-output/stop-workers; do
+ RECIPE_HEARTBEAT=$SECONDS
+ while ! test -f "$RECIPE_STOP_FILE"; do
+  if (( SECONDS >= RECIPE_HEARTBEAT )); then
+   printf 'RECIPE_WORKER_WAIT_HEAD_EXIT job=%s time=' "$SLURM_JOB_ID"
+   date -u +%FT%TZ
+   RECIPE_HEARTBEAT=$((SECONDS + 30))
+  fi
   kill -0 "$RECIPE_RAY_PID"
   sleep 2
  done

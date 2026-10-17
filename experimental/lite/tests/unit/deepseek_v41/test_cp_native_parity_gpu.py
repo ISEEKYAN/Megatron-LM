@@ -7,14 +7,23 @@ rank 0), deployment math with native kernels. Per partition:
 
 * ``full``: forward + backward; ``full_again``: identical repeat (must be
   bitwise, log-probs and every gradient);
-* ``recompute``: recompute='full' must keep log-probs and gradients bitwise
-  (backward-time recomputation launches vLLM kernels on autograd's stream);
-* EP2 x CP2 and EP4 x CP2: every CP rank's log-probs equal its CP1 rows.
+* ``recompute``: recompute='full' must keep log-probs and every gradient
+  bitwise against ``full`` (backward-time recomputation launches vLLM kernels on
+  autograd's stream, and its cotangents may arrive in another layout), and be
+  bitwise run to run;
+* EP2 x CP2 and EP4 x CP2: every CP rank's log-probs equal its CP1 rows;
+* other MoE dispatchers (``DS41_GPU_PARITY_DISPATCHERS``): the same partition
+  and data-parallel size, so log-probs and every gradient must be bitwise the
+  all-to-all run's. The summed DeepEP backward is recorded only.
+
 
 Built like the reference engine (BF16 visible weights, the deployment-math
-values the actor also sees); routed experts are frozen to fit EP2 on 4 GPUs.
+values the actor also sees); routed experts are frozen to fit EP2 on 4 GPUs, so
+their gradients are not compared here: the training gate (ds41_gate.py, every
+parameter including routed experts, recompute none vs full) owns that check.
 """
 
+import hashlib
 import json
 import os
 import traceback
@@ -34,6 +43,24 @@ PARTITIONS = tuple(
     tuple(int(v) for v in item.split('x'))
     for item in os.environ.get('DS41_GPU_PARITY_PARTITIONS', '4x1,2x2,4x2').split(',')
 )
+DISPATCHERS = {
+    'alltoall': {},
+    'deepep': dict(use_deepep=True),
+    'deepep_routed': dict(use_deepep=True, deepep_routed_backward=True),
+}
+SELECTED = tuple(os.environ.get('DS41_GPU_PARITY_DISPATCHERS', 'alltoall').split(','))
+RECORDED_ONLY = {'deepep'}
+
+
+def _tag(ep, cp, dispatcher):
+    return f'{ep}x{cp}' + ('' if dispatcher == 'alltoall' else f'-{dispatcher}')
+
+
+def _digests(grads):
+    return {
+        n: hashlib.sha256(g.contiguous().view(torch.uint8).cpu().numpy()).hexdigest()
+        for n, g in grads.items()
+    }
 
 
 def _batch():
@@ -78,7 +105,7 @@ def _unequal(left, right):
     return [n for n in left if not torch.equal(left[n], right[n])]
 
 
-def _worker(rank, directory, ep, cp):
+def _worker(rank, directory, ep, cp, dispatcher='alltoall'):
     if cp > 1:
         # Report the failing kernel itself rather than a later synchronizing op.
         os.environ['CUDA_LAUNCH_BLOCKING'] = '1'
@@ -93,7 +120,7 @@ def _worker(rank, directory, ep, cp):
     torch.cuda.set_device(rank)
     dist.init_process_group(
         'nccl',
-        init_method=f'file://{directory}/store-{ep}x{cp}',
+        init_method=f'file://{directory}/store-{_tag(ep, cp, dispatcher)}',
         rank=rank,
         world_size=4,
         # Fail fast instead of hanging if a peer rank errors in a collective.
@@ -114,7 +141,7 @@ def _worker(rank, directory, ep, cp):
     )
     from megatron.lite.runtime.contracts import ParallelConfig
 
-    path = Path(directory) / f'{ep}x{cp}-{rank}.pt'
+    path = Path(directory) / f'{_tag(ep, cp, dispatcher)}-{rank}.pt'
     saved = dict(errors={}, log_probs={})
     try:
         token_map = json.loads((Path(PREFIX) / 'token-map.json').read_text())
@@ -127,6 +154,7 @@ def _worker(rank, directory, ep, cp):
             token_map=token_map,
             trainable_engram=False,
             parallel=ParallelConfig(ep=ep, cp=cp),
+            **DISPATCHERS[dispatcher],
         )
         model = protocol.build_model(
             protocol.build_model_config(PREFIX), impl_cfg=impl
@@ -148,6 +176,8 @@ def _worker(rank, directory, ep, cp):
                         recompute_ffn(layer.ffn)
             runs[name] = _step(model, batch, denominator)
             saved['log_probs'][name] = runs[name][0]
+            if name == 'full':
+                saved['grad_digests'] = _digests(runs[name][1])
             saved['max_memory_gib'] = torch.cuda.max_memory_allocated() / 2**30
             torch.save(saved, path)
         saved['repeat_unequal'] = _unequal(runs['full_again'][1], runs['full'][1])
@@ -155,11 +185,6 @@ def _worker(rank, directory, ep, cp):
         # Resume and repeat checks rely on recompute being run-to-run bitwise.
         saved['recompute_repeat_unequal'] = _unequal(
             runs['recompute_again'][1], runs['recompute'][1]
-        )
-        saved['recompute_max_rel_grad'] = max(
-            float((runs['recompute'][1][n] - runs['full'][1][n]).abs().max())
-            / (float(runs['full'][1][n].abs().max()) or 1.0)
-            for n in runs['full'][1]
         )
         torch.save(saved, path)
     except Exception:
@@ -171,11 +196,11 @@ def _worker(rank, directory, ep, cp):
     dist.destroy_process_group()
 
 
-def _run(directory, ep, cp):
+def _run(directory, ep, cp, dispatcher='alltoall'):
     try:
         mp.start_processes(
             _worker,
-            args=(str(directory), ep, cp),
+            args=(str(directory), ep, cp, dispatcher),
             nprocs=4,
             join=True,
             start_method='spawn',
@@ -185,7 +210,7 @@ def _run(directory, ep, cp):
         crashed = f'{type(error).__name__}: {error}'[-2000:]
     records = []
     for rank in range(4):
-        path = directory / f'{ep}x{cp}-{rank}.pt'
+        path = directory / f'{_tag(ep, cp, dispatcher)}-{rank}.pt'
         record = (
             torch.load(path, weights_only=False)
             if path.exists()
@@ -203,13 +228,15 @@ def test_cp_native_parity(tmp_path):
     from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
 
     output = Path(os.environ.get('DS41_GPU_PARITY_OUTPUT', tmp_path))
-    runs = {(ep, cp): _run(output, ep, cp) for ep, cp in PARTITIONS}
-    reference = runs.get((4, 1)) or [
+    runs = {
+        (ep, cp, d): _run(output, ep, cp, d) for ep, cp in PARTITIONS for d in SELECTED
+    }
+    reference = runs.get((4, 1, 'alltoall')) or [
         torch.load(output / f'4x1-{rank}.pt', weights_only=False) for rank in range(1)
     ]
     expected = reference[0]['log_probs'].get('full')
     summary, failed = {}, False
-    for (ep, cp), records in runs.items():
+    for (ep, cp, dispatcher), records in runs.items():
         entry = dict(
             errors=[r['errors'] for r in records],
             max_memory_gib=[r.get('max_memory_gib') for r in records],
@@ -229,7 +256,6 @@ def test_cp_native_parity(tmp_path):
             recompute_unequal_grads=[
                 r.get('recompute_unequal', ['<missing>'])[:10] for r in records
             ],
-            recompute_max_rel_grad=[r.get('recompute_max_rel_grad') for r in records],
             recompute_repeat_lp_equal=[
                 'recompute_again' in r['log_probs']
                 and torch.equal(
@@ -247,8 +273,34 @@ def test_cp_native_parity(tmp_path):
         failed |= not all(entry['recompute_lp_equal'])
         failed |= not all(entry['recompute_repeat_lp_equal'])
         failed |= any(entry['recompute_repeat_unequal_grads'])
-        failed |= any((m is None or m > 1e-2) for m in entry['recompute_max_rel_grad'])
-        if cp > 1:
+        failed |= any(entry['recompute_unequal_grads'])
+        baseline = runs.get((ep, cp, 'alltoall'))
+        if dispatcher != 'alltoall' and baseline is not None:
+            entry['vs_alltoall_lp_equal'] = [
+                'full' in r['log_probs']
+                and 'full' in b['log_probs']
+                and torch.equal(r['log_probs']['full'], b['log_probs']['full'])
+                for r, b in zip(records, baseline)
+            ]
+            entry['vs_alltoall_unequal_grads'] = [
+                (
+                    ['<grad keys differ>']
+                    if r.get('grad_digests', {}).keys()
+                    != b.get('grad_digests', {}).keys()
+                    or not r.get('grad_digests')
+                    else [
+                        n
+                        for n in r['grad_digests']
+                        if r['grad_digests'][n] != b['grad_digests'][n]
+                    ]
+                )
+                for r, b in zip(records, baseline)
+            ]
+            if dispatcher not in RECORDED_ONLY:
+                failed |= not all(entry['vs_alltoall_lp_equal'])
+                failed |= any(entry['vs_alltoall_unequal_grads'])
+        if cp > 1 and dispatcher == 'alltoall':
+
             equal = []
             for rank, record in enumerate(records):
                 local = record['log_probs'].get('full')
@@ -264,7 +316,9 @@ def test_cp_native_parity(tmp_path):
                 )
             entry['log_probs_equal_cp1_rows'] = equal
             failed |= not all(equal)
-        summary[f'ep{ep}xcp{cp}'] = entry
+        summary[
+            f'ep{ep}xcp{cp}' + ('' if dispatcher == 'alltoall' else f'_{dispatcher}')
+        ] = entry
     (output / 'summary.json').write_text(json.dumps(summary, indent=2, default=str))
     print('B2_GPU_PARITY_SUMMARY', json.dumps(summary, default=str), flush=True)
     assert not failed, summary
