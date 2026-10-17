@@ -44,6 +44,39 @@ Linear = attention_primitives.Linear
 build_row_memories = row_memories.build_row_memories
 sequence_hashes = row_memories.sequence_hashes
 
+
+def _hashes(hash_module, input_ids, token_mask, cp_context, geometry):
+    """Engram n-gram hashes; a packed slice hashes each document separately."""
+    if geometry is None:
+        return sequence_hashes(hash_module, input_ids, token_mask, cp_context)
+    from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+
+    sequence = None
+    if geometry.cp_size > 1:
+        sequence = ContiguousCPSequence(
+            geometry.total, geometry.cp_rank, geometry.cp_size, geometry.cp_group
+        )
+    parts, offset = [], 0
+    for doc in range(geometry.num_documents):
+        start, stop = geometry.owned(doc)
+        rows = slice(offset, offset + stop - start)
+        context = None
+        if sequence is not None:
+            context = sequence.document(
+                geometry.boundaries[doc], geometry.boundaries[doc + 1]
+            )
+        parts.append(
+            sequence_hashes(
+                hash_module,
+                input_ids[:, rows],
+                None if token_mask is None else token_mask[:, rows],
+                context,
+            )
+        )
+        offset = rows.stop
+    return torch.cat(parts, 1)
+
+
 _FP8_LINEAR = partial(Linear, fp8_operator=CODECS[("linear", 32, "e8m0", "e4m3")])
 
 
@@ -477,6 +510,7 @@ class DeepseekV41Model(nn.Module):
         image_mask=None,
         modality_loads=None,
         cp_context=None,
+        geometry=None,
     ):
         start, end = self.local_layer_range
         token_mask = None if image_mask is None else ~image_mask
@@ -486,7 +520,7 @@ class DeepseekV41Model(nn.Module):
             # Engram only blocks the actual image ID.
             token_mask = input_ids != 129264
         hashes = (
-            sequence_hashes(self.engram_hash, input_ids, token_mask, cp_context)
+            _hashes(self.engram_hash, input_ids, token_mask, cp_context, geometry)
             if any(start <= i < end for i in self.engram_layer_ids)
             else None
         )
@@ -507,7 +541,11 @@ class DeepseekV41Model(nn.Module):
                 if self.deployment_math and hidden.is_cuda
                 else {}
             )
-            attention_kwargs = {'cp_context': cp_context}
+            attention_kwargs = (
+                {'cp_context': cp_context}
+                if geometry is None
+                else {'geometry': geometry}
+            )
             ffn_kwargs = {
                 'image_mask': routing_mask,
                 'load_sink': (

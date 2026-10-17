@@ -494,6 +494,44 @@ class CompressedSparseAttention(nn.Module):
             CrossLayerIndexer(config, self.owns_kv) if self.owns_index else None
         )
 
+    def _forward_packed(self, x, state, geometry, *, candidate_mask=None):
+        """One call over this rank's packed slice (CP-A transition).
+
+        ``x`` holds the rank's real rows of every document in packing order.
+        Each document still runs the per-document kernels, including documents
+        this rank owns no rows of, so CP collectives stay aligned; the state is
+        the packed (THD) concatenation of the documents' states.
+        """
+        from .cp import ContiguousCPSequence
+
+        sequence = None
+        if geometry.cp_size > 1:
+            sequence = ContiguousCPSequence(
+                geometry.total, geometry.cp_rank, geometry.cp_size, geometry.cp_group
+            )
+        outputs, states, rows, offset = [], [], [], 0
+        for doc in range(geometry.num_documents):
+            start, stop = geometry.owned(doc)
+            count = stop - start
+            begin, end = geometry.boundaries[doc], geometry.boundaries[doc + 1]
+            output, doc_state = self._forward_cross_layer(
+                x[:, offset : offset + count],
+                _document_state(state, doc),
+                candidate_mask=(
+                    None
+                    if candidate_mask is None
+                    else candidate_mask[:, offset : offset + count]
+                ),
+                cp_context=None if sequence is None else sequence.document(begin, end),
+            )
+            outputs.append(output)
+            states.append(doc_state)
+            rows.append(count)
+            offset += count
+        if offset != x.shape[1]:
+            raise ValueError("Packed CSA input does not match the rank's real rows")
+        return torch.cat(outputs, 1), _packed_state(states, rows)
+
     def _forward_cross_layer(self, x, state, *, candidate_mask=None, cp_context=None):
         c, layer, ratio = self.config, self.layer_id, self.ratio
         main_codec = fake_quant_main_kv if self.codecs is None else self.codecs["main"]
@@ -793,6 +831,7 @@ class CompressedSparseAttention(nn.Module):
         position_ids: torch.Tensor | None = None,
         candidate_mask=None,
         cp_context=None,
+        geometry=None,
         attention_mask: torch.Tensor | None = None,
         packed_seq_params: Any = None,
     ) -> torch.Tensor:
@@ -800,6 +839,12 @@ class CompressedSparseAttention(nn.Module):
             if state is None:
                 raise ValueError(
                     "Cross-layer attention requires explicit AttentionState"
+                )
+            if geometry is not None:
+                if cp_context is not None:
+                    raise ValueError("Pass either a packed geometry or a CP context")
+                return self._forward_packed(
+                    x, state, geometry, candidate_mask=candidate_mask
                 )
             return self._forward_cross_layer(
                 x, state, candidate_mask=candidate_mask, cp_context=cp_context
@@ -1600,12 +1645,100 @@ class CrossLayerAttentionConfig:
 
 @dataclass(frozen=True)
 class AttentionState:
+    """Cross-layer CSA state, threaded explicitly through the layers.
+
+    For one document, tensors cover that document. For a packed slice
+    (``geometry``), tensors are the documents' parts concatenated in packing
+    order: ``main_kv``/``index_k`` over compressed rows split at ``kv_bounds``,
+    ``indices``/``candidates`` over this rank's query rows split at
+    ``query_bounds``; ``indices`` stay document-relative.
+    """
+
     kv_owner: int | None = None
     index_owner: int | None = None
     main_kv: torch.Tensor | None = None
     index_k: torch.Tensor | None = None
     indices: torch.Tensor | None = None
     candidates: torch.Tensor | None = None
+    kv_bounds: tuple[int, ...] | None = None
+    query_bounds: tuple[int, ...] | None = None
+
+
+def _document_state(state, doc):
+    """One document's part of a packed state (an empty state if none yet)."""
+    if state.kv_bounds is None and state.query_bounds is None:
+        return AttentionState(kv_owner=state.kv_owner, index_owner=state.index_owner)
+
+    def part(tensor, bounds):
+        if tensor is None:
+            return None
+        return tensor[:, bounds[doc] : bounds[doc + 1]]
+
+    kv, query = state.kv_bounds, state.query_bounds
+    indices, candidates = None, None
+    if query is not None:
+        # Packed widths are padded to the widest document; this document's
+        # selection is min(topk, its compressed rows) wide, its pool covers
+        # exactly its compressed rows.
+        rows = kv[doc + 1] - kv[doc]
+        indices = part(state.indices, query)
+        if indices is not None:
+            indices = indices[..., : min(indices.shape[-1], rows)]
+        candidates = part(state.candidates, query)
+        if candidates is not None:
+            candidates = candidates[..., :rows]
+    return AttentionState(
+        kv_owner=state.kv_owner,
+        index_owner=state.index_owner,
+        main_kv=None if kv is None else part(state.main_kv, kv),
+        index_k=None if kv is None else part(state.index_k, kv),
+        indices=indices,
+        candidates=candidates,
+    )
+
+
+def _packed_state(states, rows):
+    """Concatenate per-document states in packing order (inverse of the above)."""
+    first = states[0]
+    if any(
+        (s.kv_owner, s.index_owner) != (first.kv_owner, first.index_owner)
+        for s in states
+    ):
+        raise RuntimeError('Packed documents disagree on CSA state owners')
+
+    def joined(name, pad=None):
+        parts = [getattr(s, name) for s in states]
+        if all(p is None for p in parts):
+            return None
+        if any(p is None for p in parts):
+            raise RuntimeError(f'Packed CSA state {name} missing for some documents')
+        if pad is not None:
+            # Per-document selections differ in width; pad to the widest with
+            # the empty-slot value (-1 index, False candidate).
+            width = max(p.shape[-1] for p in parts)
+            parts = [F.pad(p, (0, width - p.shape[-1]), value=pad) for p in parts]
+        return torch.cat(parts, 1)
+
+    def bounds(sizes):
+        out = [0]
+        for size in sizes:
+            out.append(out[-1] + size)
+        return tuple(out)
+
+    main_kv = joined('main_kv')
+    indices = joined('indices', -1)
+    return AttentionState(
+        kv_owner=first.kv_owner,
+        index_owner=first.index_owner,
+        main_kv=main_kv,
+        index_k=joined('index_k'),
+        indices=indices,
+        candidates=joined('candidates', False),
+        kv_bounds=(
+            None if main_kv is None else bounds(s.main_kv.shape[1] for s in states)
+        ),
+        query_bounds=None if indices is None else bounds(rows),
+    )
 
 
 def _indexer_linear(linear, x, deployment_math):
