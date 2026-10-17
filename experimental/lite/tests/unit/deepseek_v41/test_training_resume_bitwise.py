@@ -44,6 +44,32 @@ def _prefix_config(experts, hidden_size=None):
     return DeepseekV41Config(hf)
 
 
+def _reduced_config():
+    """The -clean chain's reduced 40L fixture (#218 _assembly_config)."""
+    import importlib.util
+
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+    root = Path(__file__).parents[2] / 'fixtures/deepseek_v41'
+    release = json.loads((root / 'reference/config.json').read_text())
+    modules = {}
+    for name in ('config_mapping', 'fixtures'):
+        path = Path(__file__).parents[3] / 'tools/deepseek_v41' / (name + '.py')
+        spec = importlib.util.spec_from_file_location('c4_' + name, path)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        modules[name] = module
+    overrides = modules['fixtures'].reduced_overrides()
+    for path, target in modules['config_mapping'].MAPPING.items():
+        if target in overrides:
+            parts = path.split('.')
+            section = release
+            for part in parts[:-1]:
+                section = section[part]
+            section[parts[-1]] = overrides[target]
+    return DeepseekV41Config(release)
+
+
 def _impl(case, parallel):
     from dataclasses import replace
 
@@ -53,7 +79,7 @@ def _impl(case, parallel):
     impl = protocol.ImplConfig(
         device=case['device'],
         dtype=torch.float32 if case['device'] == 'cpu' else torch.bfloat16,
-        token_map=list(range(64)),
+        token_map=list(range(256 if case.get('reduced') else 64)),
         trainable_engram=case['trainable'],
         # Sharded Engram lookups are CUDA-only (test_cp_ep_parity).
         shard_engram=case['device'] != 'cpu',
@@ -84,10 +110,12 @@ def _build(case):
     from megatron.lite.runtime.contracts import ParallelConfig
 
     parallel = ParallelConfig(ep=case['ep'], cp=case['cp'])
-    bundle = protocol.build_model(
-        _prefix_config(case['experts'], case.get('hidden_size')),
-        impl_cfg=_impl(case, parallel),
+    config = (
+        _reduced_config()
+        if case.get('reduced')
+        else _prefix_config(case['experts'], case.get('hidden_size'))
     )
+    bundle = protocol.build_model(config, impl_cfg=_impl(case, parallel))
     schedulers = [
         torch.optim.lr_scheduler.StepLR(o, step_size=1, gamma=0.8)
         for o in bundle.optimizer.optimizers
@@ -475,5 +503,23 @@ def test_dcp_resume_is_bitwise_on_gpu(tmp_path, ep, trainable, segmented):
         segmented=segmented,
         quantized=False,
         hidden_size=128,
+    )
+    _run(tmp_path, case)
+
+
+@pytest.mark.gpus(1, min_architecture='blackwell')
+@pytest.mark.parametrize('segmented', [False, True])
+@pytest.mark.parametrize('trainable', [False, True])
+def test_dcp_resume_is_bitwise_quantized_on_gpu(tmp_path, trainable, segmented):
+    """The quantized path on the reduced 40L fixture (#218's GPU configuration)."""
+    case = dict(
+        device='cuda',
+        ep=1,
+        cp=1,
+        experts=8,
+        trainable=trainable,
+        segmented=segmented,
+        quantized=True,
+        reduced=True,
     )
     _run(tmp_path, case)
