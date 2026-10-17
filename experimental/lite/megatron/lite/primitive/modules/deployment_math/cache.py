@@ -162,8 +162,12 @@ def index_query(query, raw_weights, positions, cos_sin):
 
 
 @torch.no_grad()
-def index_cache(k_pre, gamma, eps, ratio, cos_sin, *, block_size=64):
-    """Keep the packet read by rollout's gather and DeepGEMM, without QAT."""
+def index_cache(k_pre, gamma, eps, ratio, cos_sin, *, block_size=64, positions=None):
+    """Keep the packet read by rollout's gather and DeepGEMM, without QAT.
+
+    ``positions`` are the native writer positions (the group's last token);
+    by default row ``r`` of one document is group ``r``.
+    """
     if not k_pre.is_cuda or k_pre.dtype != torch.bfloat16:
         raise ValueError("Deployment index cache requires CUDA BF16 projections")
     from vllm import _custom_ops as ops
@@ -178,8 +182,9 @@ def index_cache(k_pre, gamma, eps, ratio, cos_sin, *, block_size=64):
     cache = torch.zeros(
         (table.numel(), block_size, 68), dtype=torch.uint8, device=k_pre.device
     )
-    positions = torch.arange(rows, device=k_pre.device, dtype=torch.int64)
-    positions = (positions * ratio + ratio - 1).repeat(batch)
+    if positions is None:
+        positions = torch.arange(rows, device=k_pre.device, dtype=torch.int64)
+        positions = (positions * ratio + ratio - 1).repeat(batch)
     if rows:
         indexer_k_norm_rope_store(
             k_pre.flatten(0, 1).contiguous(),
@@ -201,8 +206,15 @@ def index_cache(k_pre, gamma, eps, ratio, cos_sin, *, block_size=64):
     return IndexCache(packed.reshape(batch, rows, 64), scales.reshape(batch, rows, 4))
 
 
-def compressed_cache(latent, ratio, cos_sin, reference, *, block_size=64):
-    """Use NVFP4 writer and BI native gather; only the VJP uses the reference."""
+def compressed_cache(
+    latent, ratio, cos_sin, reference, *, block_size=64, positions=None
+):
+    """Use NVFP4 writer and BI native gather; only the VJP uses the reference.
+
+    ``positions`` are the native writer positions (the group's last token);
+    by default row ``r`` of one document is group ``r``.
+    """
+    writer_positions = positions
     from .autograd import visible_forward
 
     if not latent.is_cuda or latent.dtype != torch.bfloat16:
@@ -220,8 +232,10 @@ def compressed_cache(latent, ratio, cos_sin, reference, *, block_size=64):
         cache = torch.zeros(
             (table.numel(), block_size, 288), dtype=torch.uint8, device=values.device
         )
-        positions = torch.arange(rows, device=values.device, dtype=torch.int64)
-        positions = (positions * ratio + ratio - 1).repeat(batch)
+        positions = writer_positions
+        if positions is None:
+            positions = torch.arange(rows, device=values.device, dtype=torch.int64)
+            positions = (positions * ratio + ratio - 1).repeat(batch)
         if rows:
             rope_quant_insert(
                 values.flatten(0, 1).contiguous(),

@@ -495,12 +495,32 @@ class CompressedSparseAttention(nn.Module):
         )
 
     def _forward_packed(self, x, state, geometry, *, candidate_mask=None):
-        """One call over this rank's packed slice (CP-A transition).
+        """One call over this rank's packed slice.
+
+        On the deployment path the slice runs as a whole (packed_deployment):
+        local window rows plus a fixed left halo, compressed groups made by the
+        rank of their last token and gathered by Core's row map. When a rank's
+        width is below the halo (single-hop exchange cannot supply it) and on
+        the reference path, each document runs the per-document kernels.
+        """
+        if self.deployment_math and x.is_cuda:
+            from . import packed_deployment
+
+            if packed_deployment.fits(self, geometry):
+                return packed_deployment.forward(
+                    self, x, state, geometry, candidate_mask=candidate_mask
+                )
+            packed_deployment.note_fallback(self, geometry)
+        return self._forward_documents(
+            x, state, geometry, candidate_mask=candidate_mask
+        )
+
+    def _forward_documents(self, x, state, geometry, *, candidate_mask=None):
+        """Per-document kernels over a packed slice, with a packed (THD) state.
 
         ``x`` holds the rank's real rows of every document in packing order.
-        Each document still runs the per-document kernels, including documents
-        this rank owns no rows of, so CP collectives stay aligned; the state is
-        the packed (THD) concatenation of the documents' states.
+        Every document runs, including documents this rank owns no rows of, so
+        CP collectives stay aligned.
         """
         from .cp import ContiguousCPSequence
 
@@ -774,9 +794,15 @@ class CompressedSparseAttention(nn.Module):
             output = torch.einsum('bsht,btd->bshd', probabilities, kv.float()).to(
                 x.dtype
             )
+        return self._project_output(output, positions, x), state
+
+    def _project_output(self, output, positions, x):
+        """Inverse RoPE and the grouped wo_a/wo_b projection of attention rows."""
+        c, ratio = self.config, self.ratio
+        b, length = output.shape[:2]
         if self.deployment_math and c.wo_a_bf16:
             output = _bf16_wo_a(output, positions, c, ratio, self.wo_a.weight)
-            return self.wo_b(output.to(x.dtype)), state
+            return self.wo_b(output.to(x.dtype))
         native_activation = None
         # No local rows (CP): the reference codec below handles the empty input.
         if self.deployment_math and self.wo_a.fp8 and output.is_cuda and length:
@@ -828,7 +854,7 @@ class CompressedSparseAttention(nn.Module):
             output = torch.einsum('bsgd,grd->bsgr', grouped, weight).flatten(2)
         # Deployment grouped GEMM retains FP32 inverse-RoPE values through
         # activation quantization, then writes a BF16 projection result.
-        return self.wo_b(output.to(x.dtype)), state
+        return self.wo_b(output.to(x.dtype))
 
     def forward(
         self,
