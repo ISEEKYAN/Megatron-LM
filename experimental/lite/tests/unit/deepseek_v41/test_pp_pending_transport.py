@@ -105,15 +105,16 @@ def test_pending_contract_fails_closed(fault):
             stream.pack_state(hidden, pre, tuple(pending))
 
 
-def test_packed_documents_keep_their_own_pending_and_gradients(v41_core_te):
+def test_packed_slice_carries_its_pending_and_gradients(v41_core_te):
     from megatron.lite.model.deepseek_v41.lite.protocol import packed_pipeline_forward
 
     hidden, pre, *pending = state()
     seen = []
 
-    def sequence(h, p, *, previous_post, return_pending, input_ids):
+    def sequence(h, p, *, previous_post, return_pending, geometry, **kwargs):
+        # One call over the whole slice; documents are marked by the geometry.
         assert return_pending
-        seen.append(tuple(value.detach().clone() for value in previous_post))
+        seen.append((tuple(geometry.boundaries), previous_post))
         return h, p, tuple(value * 2 for value in previous_post)
 
     h, p, result = packed_pipeline_forward(
@@ -125,11 +126,9 @@ def test_packed_documents_keep_their_own_pending_and_gradients(v41_core_te):
         input_ids=torch.arange(5).reshape(1, 5),
     )
     assert torch.equal(h, hidden) and torch.equal(p, pre)
-    for offset, end, document in [(0, 2, seen[0]), (2, 5, seen[1])]:
-        assert all(
-            torch.equal(got, wanted[:, offset:end])
-            for got, wanted in zip(document, pending)
-        )
+    ((boundaries, received),) = seen
+    assert boundaries == (0, 2, 5)
+    assert all(got is wanted for got, wanted in zip(received, pending))
     assert all(torch.equal(got, wanted * 2) for got, wanted in zip(result, pending))
     sum(value.sum() for value in result).backward()
     assert all(torch.equal(value.grad, torch.full_like(value, 2)) for value in pending)

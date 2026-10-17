@@ -661,36 +661,24 @@ def packed_paired_forward(
 def packed_pipeline_forward(
     sequence_forward, hidden, pre_mix, cu_seqlens, *, previous_post=None, **kwargs
 ):
-    """Preserve each document's deferred mHC operands across a PP boundary."""
-    offset = 0
-    posts = []
+    """Carry the slice's deferred mHC operands across a PP boundary.
 
-    def document_forward(h, pre, **document_kwargs):
-        nonlocal offset
-        end = offset + h.shape[1]
-        pending = (
-            None
-            if previous_post is None
-            else tuple(value[:, offset:end] for value in previous_post)
+    packed_paired_forward runs the sequence once over the whole packed slice,
+    so the incoming operands hold exactly this rank's rows and the outgoing
+    ones are returned for the next stage unchanged in layout.
+    """
+    outgoing = []
+
+    def slice_forward(h, pre, **slice_kwargs):
+        h, pre, post = sequence_forward(
+            h, pre, previous_post=previous_post, return_pending=True, **slice_kwargs
         )
-        offset = end
-        h, pre, outgoing = sequence_forward(
-            h, pre, previous_post=pending, return_pending=True, **document_kwargs
-        )
-        posts.append(outgoing)
+        outgoing.append(post)
         return h, pre
 
-    h, pre = packed_paired_forward(
-        document_forward, hidden, pre_mix, cu_seqlens, **kwargs
-    )
-    if all(post is None for post in posts):
-        return h, pre, None
-    if any(post is None for post in posts):
-        raise ValueError('PP documents disagree on deferred post availability')
-    pending = tuple(
-        torch.cat([post[field] for post in posts], dim=1) for field in range(4)
-    )
-    return h, pre, pending
+    h, pre = packed_paired_forward(slice_forward, hidden, pre_mix, cu_seqlens, **kwargs)
+    (post,) = outgoing
+    return h, pre, post
 
 
 def _validate_replay(model, batch):
