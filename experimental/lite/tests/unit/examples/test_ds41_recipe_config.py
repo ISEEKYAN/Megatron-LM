@@ -550,3 +550,16 @@ def test_replay_observer_checks_the_engine_receptive_field(tmp_path, monkeypatch
         e['enabled'] and e['layers_after_cut'] == 3 and e['replay_rows'] == 382
         for e in events
     )
+
+
+def test_deepep_optional_switches_reach_both_container_stages():
+    """DeepEP choices must not silently revert to defaults during CPU prep."""
+    recipe = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/hsg'
+    required = {
+        'ACTOR_MOE_DISPATCHER',
+        'ROLLOUT_ALL2ALL_BACKEND',
+        'DEEPEP_ROUTED_BACKWARD',
+    }
+    for name in ('cluster.sbatch', 'node.sh'):
+        forwarded, conditional = _forwarded_env(recipe / name)
+        assert required <= forwarded & conditional
