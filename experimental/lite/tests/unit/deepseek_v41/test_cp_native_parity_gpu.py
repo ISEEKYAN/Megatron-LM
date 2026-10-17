@@ -7,12 +7,16 @@ rank 0), deployment math with native kernels. Per partition:
 
 * ``full``: forward + backward; ``full_again``: identical repeat (must be
   bitwise, log-probs and every gradient);
-* ``recompute``: recompute='full' must keep log-probs and gradients bitwise
-  (backward-time recomputation launches vLLM kernels on autograd's stream);
+* ``recompute``: recompute='full' must keep log-probs and every gradient
+  bitwise against ``full`` (backward-time recomputation launches vLLM kernels on
+  autograd's stream, and its cotangents may arrive in another layout), and be
+  bitwise run to run;
 * EP2 x CP2 and EP4 x CP2: every CP rank's log-probs equal its CP1 rows.
 
 Built like the reference engine (BF16 visible weights, the deployment-math
-values the actor also sees); routed experts are frozen to fit EP2 on 4 GPUs.
+values the actor also sees); routed experts are frozen to fit EP2 on 4 GPUs, so
+their gradients are not compared here: the training gate (ds41_gate.py, every
+parameter including routed experts, recompute none vs full) owns that check.
 """
 
 import json
@@ -156,11 +160,6 @@ def _worker(rank, directory, ep, cp):
         saved['recompute_repeat_unequal'] = _unequal(
             runs['recompute_again'][1], runs['recompute'][1]
         )
-        saved['recompute_max_rel_grad'] = max(
-            float((runs['recompute'][1][n] - runs['full'][1][n]).abs().max())
-            / (float(runs['full'][1][n].abs().max()) or 1.0)
-            for n in runs['full'][1]
-        )
         torch.save(saved, path)
     except Exception:
         # Persist the traceback, then fail so every rank stops together.
@@ -229,7 +228,6 @@ def test_cp_native_parity(tmp_path):
             recompute_unequal_grads=[
                 r.get('recompute_unequal', ['<missing>'])[:10] for r in records
             ],
-            recompute_max_rel_grad=[r.get('recompute_max_rel_grad') for r in records],
             recompute_repeat_lp_equal=[
                 'recompute_again' in r['log_probs']
                 and torch.equal(
@@ -247,7 +245,7 @@ def test_cp_native_parity(tmp_path):
         failed |= not all(entry['recompute_lp_equal'])
         failed |= not all(entry['recompute_repeat_lp_equal'])
         failed |= any(entry['recompute_repeat_unequal_grads'])
-        failed |= any((m is None or m > 1e-2) for m in entry['recompute_max_rel_grad'])
+        failed |= any(entry['recompute_unequal_grads'])
         if cp > 1:
             equal = []
             for rank, record in enumerate(records):
