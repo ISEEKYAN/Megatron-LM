@@ -28,7 +28,11 @@ bi = os.environ.get('VLLM_BATCH_INVARIANT', '1')
 if bi not in ('0', '1'):
     raise ValueError('VLLM_BATCH_INVARIANT must be 0 or 1')
 layers = int(os.environ.get('DS41_LAYERS', '2'))
-pp_cut = int(os.environ.get('DS41_PIPELINE_SPLIT_LAYER', '2' if layers == 4 else '20'))
+# Stage cuts (comma-separated for PP>2); unset uses the topology's default cut
+# (the candidate publisher: 20 for 40L, 6 for the 9L subset). The 4L prefix has
+# no publisher, so it defaults to the cut before its owner layer 2.
+pp_cuts = os.environ.get('DS41_PIPELINE_SPLIT_LAYER', '2' if layers == 4 else '')
+pp_cuts = [int(cut) for cut in pp_cuts.split(',') if cut]
 prompt_length = int(
     os.environ.get(
         'DS41_PROMPT_LENGTH',
@@ -42,8 +46,23 @@ if layers not in (2, 4, 6, 8, 9, 40) or min(prompt_length, response_length) <= 0
         'Expected a 2L/4L prefix, a 6L/8L/9L release subset or the full 40L model '
         'and positive prompt/response lengths'
     )
-if pp not in (1, 2) or min(ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
-    raise ValueError('DS41_PP must be 1/2 and DS41_WORLD divisible by EP*PP and CP*PP')
+if min(pp, ep, cp, world) < 1 or world % (ep * pp) or world % (cp * pp):
+    raise ValueError(
+        'DS41_PP must be positive and DS41_WORLD divisible by EP*PP and CP*PP'
+    )
+if pp_cuts and len(pp_cuts) != pp - 1:
+    raise ValueError('DS41_PIPELINE_SPLIT_LAYER needs DS41_PP - 1 cuts')
+split_layer = (
+    {
+        'pipeline_split_layer': (
+            ','.join(map(str, pp_cuts)).join('[]')
+            if len(pp_cuts) > 1
+            else str(pp_cuts[0])
+        )
+    }
+    if pp > 1 and pp_cuts
+    else {}
+)
 if train_batch < 1 or (train_batch * 4) % (world // cp):
     raise ValueError(
         'DS41_TRAIN_BATCH x n=4 must divide evenly over data-parallel ranks'
@@ -160,7 +179,7 @@ args = [
             'trainable_engram': 'false',
             'use_deepep': 'false',
             'dtype': 'bfloat16',
-            **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
+            **split_layer,
             'optimizer': 'muon',
             'optimizer_config': '{lr:1e-6,ns_steps:2,coefficient_type:quintic,segmented_host:'
             + ('true' if segmented_host == '1' else 'false')
@@ -179,7 +198,7 @@ args = [
             'trainable_engram': 'false',
             'use_deepep': 'false',
             'dtype': 'bfloat16',
-            **({'pipeline_split_layer': str(pp_cut)} if pp > 1 else {}),
+            **split_layer,
         }.items()
     ],
     'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1',

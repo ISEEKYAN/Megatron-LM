@@ -24,11 +24,14 @@ expected = {
     'ep': int(os.environ.get('DS41_EP', '8')),
     'cp': int(os.environ.get('DS41_CP', '1')),
 }
-split = int(
-    os.environ.get(
-        'DS41_PIPELINE_SPLIT_LAYER', '2' if os.environ['DS41_LAYERS'] == '4' else '20'
-    )
-)
+split = [
+    int(cut)
+    for cut in os.environ.get(
+        'DS41_PIPELINE_SPLIT_LAYER', '2' if os.environ['DS41_LAYERS'] == '4' else ''
+    ).split(',')
+    if cut
+]
+split = None if not split else split[0] if len(split) == 1 else tuple(split)
 rows = {}
 actor_impl = None
 for role in ('actor', 'ref'):
@@ -90,7 +93,6 @@ else:
     from megatron.lite.primitive.modules.native_fp32_linear import (
         configure_residual_projections,
     )
-    from megatron.lite.primitive.parallel.pp import build_pipeline_chunk_layout
     from megatron.lite.primitive.parallel.state import init_parallel
 
     dist.init_process_group('gloo')
@@ -99,13 +101,13 @@ else:
         model_cfg = protocol.build_model_config(
             raw['actor_rollout_ref']['model']['path']
         )
-        layers = model_cfg.to_hf_dict()['text_config']['num_hidden_layers']
-        layout = build_pipeline_chunk_layout(
-            layers, replace(ps, pp_layout=f'Et*{split}|t*{layers - split}L')
-        )
-        span = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
+        stages = protocol._pipeline_stages(model_cfg, actor_impl, actor_impl.parallel)
         model = protocol._construct_model(
-            model_cfg, replace(actor_impl, device='meta'), ps, span
+            model_cfg,
+            replace(actor_impl, device='meta'),
+            ps,
+            stages[ps.pp_rank],
+            stages,
         )
         if actor_impl.text_only:
             for binding in model.parameter_bindings():
