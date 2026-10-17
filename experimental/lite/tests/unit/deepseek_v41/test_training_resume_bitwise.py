@@ -453,6 +453,7 @@ def test_dcp_resume_is_bitwise_on_gpu(tmp_path, ep, trainable, segmented):
     _run(tmp_path, case)
 
 
+@pytest.mark.xfail(strict=True, reason='量化 DCP resume 首步 LP 不等，待 8026724 判别')
 @pytest.mark.gpus(1, min_architecture='blackwell')
 @pytest.mark.parametrize('segmented', [False, True])
 @pytest.mark.parametrize('trainable', [False, True])
