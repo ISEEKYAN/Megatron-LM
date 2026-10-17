@@ -96,6 +96,8 @@ def production_environment(layers, bi, inputs):
         DS41_INDEXER_DIAGNOSTIC=str(int(layers == 4)),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
+    if layers == 6:
+        base['DS41_RECOMPUTE'] = 'full'
     if layers in LONG_SEQUENCE:
         base.update(DS41_CP='2', DS41_WORLD='8', DS41_RECOMPUTE='full')
     if layers == 40:

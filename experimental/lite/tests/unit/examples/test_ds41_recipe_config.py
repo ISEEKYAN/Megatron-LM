@@ -225,3 +225,75 @@ def test_pp_verifier_uses_stage_counts_instead_of_full_model(monkeypatch):
     assert module._parameter_counts(4) == '301,364'
     monkeypatch.setenv('DS41_PP', '1')
     assert module._parameter_counts(4) == '665'
+
+
+def test_p6_cpu_and_gpu_resolve_full_recompute(tmp_path, monkeypatch):
+    """Both production entry paths feed full recompute into real Hydra config."""
+    import os
+    import subprocess
+    import sys
+
+    recipe = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy'
+    monkeypatch.delenv('DS41_RECOMPUTE', raising=False)
+    for key in (
+        'DS41_EP',
+        'DS41_CP',
+        'DS41_WORLD',
+        'DS41_PP',
+        'DS41_PIPELINE_SPLIT_LAYER',
+    ):
+        monkeypatch.delenv(key, raising=False)
+    # Run the actual CPU environment branch without creating container paths.
+    prefix = (
+        (recipe / 'hsg/prepare-container.sh')
+        .read_text()
+        .split('export DS41_DATA=', 1)[0]
+    )
+    cpu_recompute = subprocess.check_output(
+        ['bash', '-c', 'mkdir() { :; }\n' + prefix + '\nprintf %s "$DS41_RECOMPUTE"'],
+        env={**os.environ, 'RECIPE_LAYERS': '6'},
+        text=True,
+    )
+    spec = importlib.util.spec_from_file_location(
+        'ds41_p6_production', ROOT / 'tests/smoke/workflows/test_ds41_grpo_recipe.py'
+    )
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    inputs = tmp_path / 'inputs'
+    env = smoke.production_environment(6, 1, inputs)
+    assert cpu_recompute == env['DS41_RECOMPUTE'] == 'full'
+    pytest.importorskip(
+        'verl', reason='real Hydra resolution requires the recipe VERL runtime'
+    )
+    from omegaconf import OmegaConf
+
+    model = inputs / '6l/model'
+    model.mkdir(parents=True)
+    (model / 'config.json').write_text(
+        json.dumps(
+            {
+                'text_config': {
+                    'expert_activation_group_size': 32,
+                    'wo_a_dtype': 'bf16',
+                    'num_hidden_layers': 6,
+                }
+            }
+        )
+    )
+    (model / 'token-map.json').write_text(json.dumps(list(range(64))))
+    Path(env['DS41_DATA']).write_bytes(b'config-only input; no dataset read')
+    env.update(
+        DS41_OUTPUT=str(tmp_path / 'resolved'),
+        DS41_PRECISION='official',
+        DS41_CUDAGRAPH='full_and_piecewise',
+    )
+    subprocess.run(
+        [sys.executable, str(recipe / 'command.py'), '--config-only'],
+        env=env,
+        check=True,
+        capture_output=True,
+        text=True,
+    )
+    resolved = OmegaConf.load(Path(env['DS41_OUTPUT']) / 'resolved.yaml')
+    for role in ('actor', 'ref'):
+        assert resolved.actor_rollout_ref[role].engine.impl_cfg.recompute == 'full'

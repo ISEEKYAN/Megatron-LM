@@ -9,7 +9,7 @@ export DS41_OUTPUT=/run-artifacts/cpu-config DS41_LAYERS=$RECIPE_LAYERS
 mkdir -p "$DS41_OUTPUT"
 if [[ "$RECIPE_LAYERS" == 6 ]]; then
  # Renumbered release subset instead of a closed prefix (see README).
- export DS41_VARIANT_LAYERS=1,14,15,20,21,24
+ export DS41_VARIANT_LAYERS=1,14,15,20,21,24 DS41_RECOMPUTE=full
 elif [[ "$RECIPE_LAYERS" == 9 || "$RECIPE_LAYERS" == 8 ]]; then
  # Long-sequence proxy: every 40L layer role incl. the ratio-2 CED layer 19,
  # trained at 17408+128 under EP8xCP2 with full activation recompute.
