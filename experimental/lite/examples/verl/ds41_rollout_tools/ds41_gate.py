@@ -18,11 +18,14 @@ Gradients are read after the runtime's finalize_grads, i.e. exactly what the
 optimizer consumes (dense averaged over DP x CP, experts summed over expert-DP
 and scaled the same way); replicas must agree bitwise.
 
---save-grads DIR writes every parameter's FP32 gradient once (by its owner
-rank) under DIR, after checking the free space; --compare-grads DIR makes the
-owner of each parameter stream the saved gradient of another run back and
-record its error: max |a - b| and that over max |b| (the test_cp_ep_parity
-measures). Both are meant for node-local storage inside one job.
+--save-grads DIR writes every parameter's FP32 gradient under DIR on each node
+that holds a replica of it (by the lowest replica rank there), after checking
+that node's free space; --compare-grads DIR makes the owner of each parameter
+stream the saved gradient of another run back from its node and record its
+error: max |a - b| and that over max |b| (the test_cp_ep_parity measures).
+Both are meant for node-local storage inside one job; the comparing run's
+owners must sit on nodes where the saving run had replicas (e.g. a run that
+replicates the model on every node saves, a pipelined one compares).
 
 Comparisons (gate_compare.py): same configuration in fresh processes or
 --repeats inside one process must be bitwise; a partition change that keeps
@@ -162,11 +165,25 @@ def _grad_path(directory, name):
     return Path(directory) / f'{name}.pt'
 
 
-def check_space(directory, handle, owner):
-    """Fail before writing when the node-local disk cannot hold every owner's gradients."""
-    import shutil
+def first_on_node(group):
+    """Whether this rank is the lowest rank of ``group`` on its own node."""
+    import socket
 
-    import torch
+    import torch.distributed as dist
+
+    host = socket.gethostname()
+    if group is None:
+        return True
+    hosts = [None] * dist.get_world_size(group)
+    dist.all_gather_object(hosts, host, group=group)
+    return hosts.index(host) == dist.get_rank(group)
+
+
+def check_space(directory, handle, saver):
+    """Fail before writing when a node-local disk cannot hold that node's gradients."""
+    import shutil
+    import socket
+
     import torch.distributed as dist
 
     Path(directory).mkdir(parents=True, exist_ok=True)
@@ -174,14 +191,15 @@ def check_space(directory, handle, owner):
         p.numel() * 4
         for chunk in handle._extras.get('model_chunks', [handle._model])
         for name, p in chunk.named_parameters()
-        if p.requires_grad and owner(name)
+        if p.requires_grad and saver(name)
     )
-    total = torch.tensor(mine, dtype=torch.int64, device='cuda')
-    dist.all_reduce(total)  # one node: every rank writes to the same disk
+    everyone = [None] * dist.get_world_size()
+    dist.all_gather_object(everyone, (socket.gethostname(), mine))
+    total = sum(size for host, size in everyone if host == socket.gethostname())
     free = shutil.disk_usage(directory).free
-    if free < int(total.item() * 1.05):
+    if free < int(total * 1.05):
         raise SystemExit(
-            f'DS41_GATE_SPACE: {total.item() / GiB:.1f} GiB of gradients, '
+            f'DS41_GATE_SPACE: {total / GiB:.1f} GiB of gradients, '
             f'{free / GiB:.1f} GiB free in {directory}'
         )
 
@@ -261,9 +279,19 @@ def main():
     ep_dp_rank = 0 if ps.ep_dp_group is None else dist.get_rank(ps.ep_dp_group)
 
     def owner(name):
-        # One writer/comparer per parameter: expert-DP rank 0 for experts,
-        # DP rank 0 (of each pipeline stage) for dense parameters.
+        # One comparer per parameter: expert-DP rank 0 for experts, DP rank 0
+        # (of each pipeline stage) for dense parameters.
         return (ep_dp_rank if '.ffn.experts.' in name else dp_rank) == 0
+
+    first = (
+        dict(dense=first_on_node(dp_group), expert=first_on_node(ps.ep_dp_group))
+        if args.save_grads
+        else {}
+    )
+
+    def saver(name):
+        # One writer per parameter and node holding a replica of it.
+        return first['expert' if '.ffn.experts.' in name else 'dense']
 
     records = load_records(args.records)[: args.sequences]
     if len(records) % dp_size:
@@ -325,7 +353,7 @@ def main():
             logprobs.update(part or {})
         grads, owned = {}, []
         if repeat == 0 and args.save_grads:
-            check_space(args.save_grads, handle, owner)
+            check_space(args.save_grads, handle, saver)
         for chunk in handle._extras.get('model_chunks', [handle._model]):
             for name, parameter in chunk.named_parameters():
                 grad = getattr(parameter, 'main_grad', None)
@@ -339,11 +367,10 @@ def main():
                     norm=float(grad.double().norm()),
                     sketch=sketch(grad),
                 )
-                if repeat == 0 and owner(name):
-                    if args.save_grads:
-                        owned.append((name, grad))
-                    if args.compare_grads:
-                        grads[name]['versus'] = versus(args.compare_grads, name, grad)
+                if repeat == 0 and args.save_grads and saver(name):
+                    owned.append((name, grad))
+                if repeat == 0 and args.compare_grads and owner(name):
+                    grads[name]['versus'] = versus(args.compare_grads, name, grad)
         if owned:
             save_grads(args.save_grads, owned)
             owned.clear()
