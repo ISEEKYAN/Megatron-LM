@@ -805,9 +805,9 @@ def _csa_fwd_flash_mla(
     ), "indexer_topk > 0 requires non-compact mode (topk_length must be None)"
     _ensure_flash_mla()
 
-    _total_S_q, _H, _D = q.shape
+    _total_S_q, actual_num_heads, _D = q.shape
     TopK = topk_idxs.shape[-1]
-    topk_align = get_flash_mla_topk_alignment()
+    topk_align = _get_topk_alignment()
     TopK_padded = (TopK + topk_align - 1) // topk_align * topk_align
     if TopK_padded != TopK:
         pad_width = TopK_padded - TopK
@@ -815,6 +815,17 @@ def _csa_fwd_flash_mla(
 
     kv_3d = kv.unsqueeze(1)  # (total_S_kv, 1, D)  h_kv=1
     indices = topk_idxs.unsqueeze(1)  # (total_S_q, 1, TopK_padded) h_kv=1
+
+    padded_num_heads = _get_head_padding(actual_num_heads)
+    if padded_num_heads != actual_num_heads:
+        q_padded = q.new_zeros((q.size(0), padded_num_heads, q.size(2)))
+        q_padded[:, :actual_num_heads, :] = q
+        q = q_padded
+
+        if attn_sink is not None:
+            attn_sink_padded = attn_sink.new_full((padded_num_heads,), float("-inf"))
+            attn_sink_padded[:actual_num_heads] = attn_sink
+            attn_sink = attn_sink_padded
 
     with torch.cuda.nvtx.range("flash_mla_sparse_fwd"):
         res = _flash_mla_sparse_fwd(
@@ -833,6 +844,12 @@ def _csa_fwd_flash_mla(
             out, _max_logits, lse = res
             lse_indexer = None
 
+    if padded_num_heads != actual_num_heads:
+        out = out[:, :actual_num_heads, :]
+        lse = lse[:, :actual_num_heads]
+        if lse_indexer is not None:
+            lse_indexer = lse_indexer[:, :actual_num_heads]
+
     if indexer_topk > 0:
         # When indexer_topk == total TopK, lse_indexer should equal lse but
         # the kernel may not snapshot correctly; fall back to lse.
@@ -840,6 +857,7 @@ def _csa_fwd_flash_mla(
             return out, lse, lse.clone()
         return out, lse, lse_indexer
     return out, lse, None
+
 
 
 def _undo_output_rope_for_backward(
