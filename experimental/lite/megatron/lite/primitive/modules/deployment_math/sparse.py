@@ -195,6 +195,19 @@ def sparse_attention(
     offsets = torch.arange(batch, device=q.device, dtype=torch.int32)[:, None, None]
     flat_indices = torch.where(indices >= 0, indices + offsets * kv.shape[1], -1)
 
+    return sparse_attention_from_indices(
+        q, reordered, sink, flat_indices, lengths, scale=scale
+    )
+
+
+def sparse_attention_from_indices(q, kv, sink, flat_indices, lengths, *, scale):
+    """Use caller-owned physical row addresses without rebuilding sparse slots."""
+    batch, rows, heads, dim = q.shape
+    if flat_indices.shape[:2] != (batch, rows) or lengths.shape != (batch, rows):
+        raise ValueError('Sparse addresses must cover every query row')
+    if flat_indices.dtype != torch.int32 or lengths.dtype != torch.int32:
+        raise ValueError('Sparse addresses and lengths must be int32')
+
     def reference_rows(query, values, bias, start, stop):
         selected = flat_indices[:, start:stop]
         gathered = values.flatten(0, 1)[selected.clamp_min(0).long()]
@@ -210,6 +223,8 @@ def sparse_attention(
         )
 
     def visible(query, values, bias):
+        if not query.is_cuda:
+            return reference_rows(query, values, bias, 0, query.shape[1])
         from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
         padded_heads = 64 if heads <= 64 else 128
@@ -231,6 +246,16 @@ def sparse_attention(
         )
         return output[:, :heads].reshape(batch, rows, heads, dim)
 
+    if rows == 0:
+        from .autograd import visible_forward
+
+        return visible_forward(
+            visible,
+            lambda query, values, bias: reference_rows(query, values, bias, 0, 0),
+            q,
+            kv,
+            sink,
+        )
     return _ChunkedRowVJP.apply(
-        visible, reference_rows, SPARSE_VJP_ROW_CHUNK, q, reordered, sink
+        visible, reference_rows, SPARSE_VJP_ROW_CHUNK, q, kv, sink
     )

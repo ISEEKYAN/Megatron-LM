@@ -43,6 +43,8 @@ ROUTES = {
     "modules/deployment_math/cache.py": "deepseek_v41/test_deployment_compressor.py::test_dense_compressor_matches_native_group_program",
     "kernels/mxfp8_block32.py": "deepseek_v41/test_deployment_math.py::test_grouped_fp8_one_launch_serial_batch1_and_vllm_bitwise",
     "kernels/sparse_metadata.py": "deepseek_v41/test_deployment_math.py::test_sparse_metadata_stable_order_batch1_graph_and_one_launch",
+    "modules/attention/packed_indices.py": "deepseek_v41/test_packed_sparse_indices.py::test_core_indices_match_document_slots_and_attention",
+    "modules/deployment_math/sparse.py": "deepseek_v41/test_packed_sparse_indices.py::test_core_indices_match_document_slots_and_attention",
     "modules/attention/cp.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
     "parallel/cp.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
     "train_step.py": "deepseek_v41/test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce",
