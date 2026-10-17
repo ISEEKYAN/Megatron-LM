@@ -53,10 +53,13 @@ for RECIPE_TOPOLOGY_KEY in DS41_PP DS41_PIPELINE_SPLIT_LAYER DS41_EP DS41_CP DS4
   RECIPE_TOPOLOGY_ENV+=(--env "$RECIPE_TOPOLOGY_KEY")
  fi
 done
+# Optional switches reach the container only when the host sets them (as cluster.sbatch).
 RECIPE_OPTION_ENV=()
-if [[ -v DS41_ENGRAM_HOST ]]; then
- RECIPE_OPTION_ENV+=(--env DS41_ENGRAM_HOST)
-fi
+for RECIPE_OPTION_KEY in DS41_ENGRAM_HOST; do
+ if [[ -v "$RECIPE_OPTION_KEY" ]]; then
+  RECIPE_OPTION_ENV+=(--env "$RECIPE_OPTION_KEY")
+ fi
+done
 set +e
 enroot start --root --rw "${RECIPE_REUSE[@]}" \
  --env CUDA_VISIBLE_DEVICES --env NVIDIA_VISIBLE_DEVICES --env PYTHONPATH \

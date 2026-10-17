@@ -297,3 +297,51 @@ def test_p6_cpu_and_gpu_resolve_full_recompute(tmp_path, monkeypatch):
     resolved = OmegaConf.load(Path(env['DS41_OUTPUT']) / 'resolved.yaml')
     for role in ('actor', 'ref'):
         assert resolved.actor_rollout_ref[role].engine.impl_cfg.recompute == 'full'
+
+
+def _forwarded_env(script):
+    """Keys a launcher forwards into enroot: bare --env and host-set-only loops."""
+    import re
+
+    text = script.read_text()
+    loops = {
+        key
+        for keys, body in re.findall(
+            r'for \w+ in ([\w ]+); do\n(.*?)\ndone', text, re.S
+        )
+        if '[[ -v' in body and '--env' in body
+        for key in keys.split()
+    }
+    bare = set(re.findall(r'--env ([A-Z][A-Z0-9_]+)', text))
+    return bare | loops, loops
+
+
+def test_cpu_and_gpu_stages_forward_the_same_optional_config_env():
+    """The CPU stage resolves the config the GPU stage runs, from the same inputs.
+
+    Every optional DS41_* key command.py reads must reach both containers or
+    neither, and only when the host sets it (a bare --env of an unset name hands
+    the container an empty string).
+    """
+    import re
+
+    recipe = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy'
+    optional = set(
+        re.findall(
+            r"os\.environ\.get\('(DS41_[A-Z0-9_]+)'",
+            (recipe / 'command.py').read_text(),
+        )
+    )
+    # Keys the container scripts set themselves are not host inputs.
+    inside = set()
+    for name in ('prepare-container.sh', 'container-node.sh'):
+        for line in (recipe / 'hsg' / name).read_text().splitlines():
+            if line.lstrip().startswith('export '):
+                inside |= set(re.findall(r'\b(DS41_[A-Z0-9_]+)=', line))
+    host = optional - inside
+    cpu, cpu_conditional = _forwarded_env(recipe / 'hsg/cluster.sbatch')
+    gpu, gpu_conditional = _forwarded_env(recipe / 'hsg/node.sh')
+    assert 'DS41_ENGRAM_HOST' in host
+    assert {k for k in host if (k in cpu) != (k in gpu)} == set()
+    forwarded = host & cpu
+    assert forwarded and forwarded <= cpu_conditional & gpu_conditional, forwarded

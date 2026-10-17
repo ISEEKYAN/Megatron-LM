@@ -13,6 +13,13 @@ for RECIPE_TOPOLOGY_KEY in DS41_PP DS41_PIPELINE_SPLIT_LAYER DS41_EP DS41_CP DS4
   RECIPE_TOPOLOGY_ENV+=(--env "$RECIPE_TOPOLOGY_KEY")
  fi
 done
+# Optional switches reach the container only when the host sets them (as node.sh).
+RECIPE_OPTION_ENV=()
+for RECIPE_OPTION_KEY in DS41_ENGRAM_HOST; do
+ if [[ -v "$RECIPE_OPTION_KEY" ]]; then
+  RECIPE_OPTION_ENV+=(--env "$RECIPE_OPTION_KEY")
+ fi
+done
 if [[ "$RECIPE_STAGE" == cpu ]]; then
  export RECIPE_CPU_COLLECTION=1 CUDA_VISIBLE_DEVICES=''
  (cd "$DS41_BUNDLE" && sha256sum -c SHA256SUMS)
@@ -32,7 +39,7 @@ if [[ "$RECIPE_STAGE" == cpu ]]; then
  fi
  enroot start --root --rw "${RECIPE_REUSE[@]}" --env DS41_DATA_FILE --env WANDB_API_KEY --env PYTHONPATH --env RECIPE_LAYERS \
   --env DS41_PRECISION --env DS41_CUDAGRAPH --env DS41_CUDAGRAPH_MAX_CAPTURE --env VLLM_USE_BREAKABLE_CUDAGRAPH \
-  "${RECIPE_TOPOLOGY_ENV[@]}" --env DS41_PARAMETER_COUNTS \
+  "${RECIPE_TOPOLOGY_ENV[@]}" "${RECIPE_OPTION_ENV[@]}" --env DS41_PARAMETER_COUNTS \
   --mount "$RECIPE_ROOT:/run-artifacts:none:bind" \
   --mount "$DS41_RELEASE:/release:none:bind,ro" \
   --mount "$DS41_DATA_DIR:/data:none:bind,ro" \
