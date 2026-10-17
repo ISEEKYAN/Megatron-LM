@@ -7,6 +7,18 @@ import torch
 from test_receiver_staging import adapter
 
 
+def native_sink(tp, rank):
+    from native_reload import functions
+
+    native = functions(
+        'vllm/model_executor/model_loader/weight_utils.py',
+        ['default_weight_loader', 'load_attention_sink', 'make_attention_sink'],
+        get_tensor_model_parallel_world_size=lambda: tp,
+        get_tensor_model_parallel_rank=lambda: rank,
+    )
+    return native.make_attention_sink(64, torch.float32)
+
+
 @pytest.mark.parametrize('tp', [4, 8])
 @pytest.mark.parametrize('rank', range(8))
 def test_direct_sink_reload_matches_cold_and_preserves_address(
@@ -18,7 +30,7 @@ def test_direct_sink_reload_matches_cold_and_preserves_address(
     model = torch.nn.Module()
     attention = torch.nn.Module()
     model.attention = attention
-    kernel = torch.nn.Parameter(torch.full((64,), -float('inf')), requires_grad=False)
+    kernel = native_sink(tp, rank)
     attention._ds41_attn_sink_initializer = kernel.detach().clone()
     ptr = kernel.data_ptr()
     for generation in (1, 2):
@@ -160,16 +172,21 @@ def test_native_sink_return_names_drive_receiver_finish(
         get_tensor_model_parallel_world_size=lambda: tp,
         get_tensor_model_parallel_rank=lambda: rank,
         is_pp_missing_parameter=lambda name, model: False,
+        default_weight_loader=functions(
+            'vllm/model_executor/model_loader/weight_utils.py',
+            ['default_weight_loader'],
+        ).default_weight_loader,
     )
     consumer = adapter(v41_core_te)
     model = torch.nn.Module()
     model.attn = torch.nn.Module()
-    kernel = torch.nn.Parameter(torch.full((64,), -float('inf')), requires_grad=False)
+    kernel = native_sink(tp, rank)
     model.attn._ds41_attn_sink_initializer = kernel.detach().clone()
     model.attn.attn_sink = torch.nn.Parameter(
         torch.empty(64, device='meta'), requires_grad=False
     )
     model.config = NS(num_attention_heads=64)
+    model.wo_a_bf16 = False
     model.quant_config = None
     model.get_expert_mapping = lambda: []
     infos, _ = install_reload(monkeypatch, model)
@@ -228,9 +245,10 @@ def test_metadata_hook_direct_sink_survives_real_native_reload(
     attention = type(backend, (torch.nn.Module,), {})()
     model.layers = torch.nn.ModuleList([torch.nn.Module()])
     model.layers[0].attn = attention
-    kernel = torch.nn.Parameter(torch.full((64,), -float('inf')), requires_grad=False)
+    kernel = native_sink(tp, rank)
     attention.attn_sink = kernel
     model.config = NS(num_attention_heads=64)
+    model.wo_a_bf16 = False
     model.quant_config = None
     model.get_expert_mapping = lambda: []
     native = functions(
@@ -240,6 +258,10 @@ def test_metadata_hook_direct_sink_survives_real_native_reload(
         get_tensor_model_parallel_world_size=lambda: tp,
         get_tensor_model_parallel_rank=lambda: rank,
         is_pp_missing_parameter=lambda name, model: False,
+        default_weight_loader=functions(
+            'vllm/model_executor/model_loader/weight_utils.py',
+            ['default_weight_loader'],
+        ).default_weight_loader,
     )
     model.load_weights = MethodType(native.load_weights, model)
 

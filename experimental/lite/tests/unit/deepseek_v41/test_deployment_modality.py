@@ -42,6 +42,7 @@ def test_sequence_routes_generated_sentinels_without_masking_engram_placeholders
     model = SimpleNamespace(
         local_layer_range=(0, 1),
         deployment_math=deployment,
+        routes_image_sentinels=True,
         engram_hash=object(),
         engram_layer_ids=[0],
         layers=[Layer()],

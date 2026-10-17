@@ -142,8 +142,10 @@ def test_protocol_preparation_uses_the_ddp_reduction_domain(
     monkeypatch.setattr(
         native_fp32_linear, 'configure_residual_projections', lambda *args: None
     )
+    from test_w4a8_fp32 import tiny_config
+
     bundle = protocol.build_model(
-        object(),
+        tiny_config(),
         impl_cfg=protocol.ImplConfig(
             device='cpu', dtype=torch.float32, parallel=ParallelConfig(cp=cp_size)
         ),

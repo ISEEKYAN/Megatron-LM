@@ -42,34 +42,35 @@ def test_deployment_math_rejects_fp32_residuals(v41_core_te):
         )
 
 
-def test_documented_w4a8_recipe_constructs(v41_core_te, tmp_path, monkeypatch):
+def test_documented_w4a8_recipe_constructs(v41_core_te):
     from pathlib import Path
 
+    from megatron.lite.model.deepseek_v41.lite import protocol
     from test_w4a8_fp32 import tiny_config
 
     path = Path(__file__).resolve().parents[3] / 'examples/verl/DS41_W4A8_VALIDATION.md'
-    # Substitute CPU/EP1 only; keep quantized, dtype and optimizer settings.
-    import ast
-    import json
-
-    source = path.read_text().split('```python\n')[1].split('```')[0]
-    tree = ast.parse(source)
-    for node in ast.walk(tree):
-        if isinstance(node, ast.Call) and isinstance(node.func, ast.Name):
-            for keyword in node.keywords:
-                if node.func.id == 'ImplConfig' and keyword.arg == 'device':
-                    keyword.value = ast.Constant('cpu')
-                if node.func.id == 'ParallelConfig' and keyword.arg == 'ep':
-                    keyword.value = ast.Constant(1)
-    (tmp_path / 'config.json').write_text(json.dumps(tiny_config().to_hf_dict()))
-    monkeypatch.chdir(tmp_path)
-    scope = {}
-    exec(compile(ast.fix_missing_locations(tree), str(path), 'exec'), scope)
-    assert scope['impl'].optimizer_config.lr == 1e-6
-    model = scope['bundle'].chunks[0]
+    documentation = path.read_text()
+    assert 'quantized=True, w4a8_experts=True, deployment_math=True' in documentation
+    assert 'scripts/ds41_w4a8_proxy/README.md' in documentation
+    # The documentation now links to the runnable recipe rather than embedding
+    # a Python program. Exercise the same public implementation contract on CPU.
+    impl = protocol.ImplConfig(
+        device='cpu',
+        dtype=torch.bfloat16,
+        quantized=True,
+        w4a8_experts=True,
+        deployment_math=True,
+        optimizer='muon',
+        optimizer_config=protocol.OptimizerConfig(
+            lr=1e-6, ns_steps=2, coefficient_type='quintic'
+        ),
+    )
+    bundle = protocol.build_model(tiny_config(), impl_cfg=impl)
+    assert impl.optimizer_config.lr == 1e-6
+    model = bundle.chunks[0]
     assert model.deployment_math
     for layer_id, layer in enumerate(model.layers):
         if layer is not None:
             assert layer.attn_mixes.broadcast_projection == (layer_id == 0)
-    assert scope['bundle'].optimizer is not None
+    assert bundle.optimizer is not None
     assert all(p.dtype == torch.float32 for p in model.parameters() if p.requires_grad)
