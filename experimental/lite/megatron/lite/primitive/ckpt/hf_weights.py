@@ -1917,11 +1917,14 @@ def export_bound_tensors(
     encode_rows=False,
     masters_only=False,
     buffer_max_size_bytes=5 * 1024**3,
+    export_device=None,
 ):
     """Yield this stage's bound masters/storage, like the DS4 local iterator.
 
     PP consumers assemble stages with pipeline_stream before exposing a full
     model; full-model writers must call require_complete_bound_model first.
+    With export_device, sources may stay offloaded: each yielded tensor is
+    copied there just before use, and row tables stream from where they are.
     """
     model.validate_parameter_bindings()
     if not row_chunks:
@@ -1978,11 +1981,14 @@ def export_bound_tensors(
                 group=None if lookup is None else lookup.group,
                 buffer_max_size_bytes=buffer_max_size_bytes,
                 quantize=quantize,
+                device=export_device,
             )
             continue
-        yield name, tensor
+        yield name, _on_export_device(tensor, export_device)
         if storage is not None:
-            yield name[:-6] + 'scale', storage[1].detach()
+            yield name[:-6] + 'scale', _on_export_device(
+                storage[1].detach(), export_device
+            )
     if model.ps.ep_size > 1:
         import torch.distributed as dist
 
@@ -1997,12 +2003,12 @@ def export_bound_tensors(
         ]
         gathered = [None] * model.ps.ep_size
         dist.all_gather_object(gathered, metadata, group=model.ps.ep_group)
-        device = next(model.parameters()).device
+        device = export_device or next(model.parameters()).device
         for name, shape, dtype, source in sorted(
             record for records in gathered for record in records
         ):
             value = (
-                local[name].contiguous()
+                _on_export_device(local[name], export_device).contiguous()
                 if name in local
                 else torch.empty(shape, dtype=dtype, device=device)
             )
@@ -2011,6 +2017,10 @@ def export_bound_tensors(
 
 
 _PLAIN = (torch.float32, torch.bfloat16, torch.float16)
+
+
+def _on_export_device(tensor, device):
+    return tensor if device is None else tensor.to(device)
 
 
 def plan_matrix_codec(
@@ -2191,6 +2201,7 @@ def export_checkpoint(
     buffer_max_size_bytes=5 * 1024**3,
     row_chunks=False,
     include_archival=True,
+    export_device=None,
 ):
     dtype = _resolve_export_dtype(export_dtype)
     if (
@@ -2210,6 +2221,7 @@ def export_checkpoint(
         row_chunks=row_chunks,
         encode_rows=True,
         buffer_max_size_bytes=buffer_max_size_bytes // (2 if cpu else 1),
+        export_device=export_device,
     ):
         if isinstance(item, RowChunk):
             yield RowChunk(

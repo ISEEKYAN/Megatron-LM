@@ -24,7 +24,8 @@ def stream_rows(
     boundaries=None,
     group=None,
     buffer_max_size_bytes=5 * 1024**3,
-    quantize=False
+    quantize=False,
+    device=None
 ):
     """Broadcast each owner's rows in global order through one byte buffer.
 
@@ -32,6 +33,8 @@ def stream_rows(
     scratch allocation, including byte-valued FP8/E8M0 storage. Payload views
     expire on the next iteration. Resident inputs and consumer-owned output
     storage are excluded from the scratch limit; no full table is allocated.
+    The scratch lives on device (default: the weight's), so offloaded rows
+    are copied there one chunk at a time.
     """
     if type(quantize) is not bool:
         raise TypeError('quantize must be bool')
@@ -90,7 +93,9 @@ def stream_rows(
     if rows == 0:
         raise ValueError('Row streaming requires a nonempty global table')
     scratch = torch.empty(
-        rows * (weight_bytes + scale_bytes), device=weight.device, dtype=torch.uint8
+        rows * (weight_bytes + scale_bytes),
+        device=device or weight.device,
+        dtype=torch.uint8,
     )
     for owner, (begin, end) in enumerate(zip(boundaries, boundaries[1:])):
         for offset in range(begin, end, rows):
@@ -116,7 +121,9 @@ def stream_rows(
                     )
 
                     encoded, scales = quantize_block_fp8(
-                        weight[local : local + count], (1, 32), scale_format='e8m0'
+                        weight[local : local + count].to(scratch.device),
+                        (1, 32),
+                        scale_format='e8m0',
                     )
                     w.view(torch.uint8).copy_(encoded.view(torch.uint8))
                     s.view(torch.uint8).copy_(scales.view(torch.uint8))

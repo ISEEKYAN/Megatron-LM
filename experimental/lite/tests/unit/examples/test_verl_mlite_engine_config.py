@@ -364,6 +364,58 @@ def test_resync_archival_policy_is_ds41_online_only(model_name, expected):
 
 
 @pytest.mark.parametrize(
+    "model_name,pp_size,chunks,stream",
+    [
+        ("deepseek_v41", 1, 1, True),
+        ("deepseek_v41", 2, 1, False),
+        ("deepseek_v41", 1, 2, False),
+        ("deepseek_v4", 1, 1, False),
+    ],
+)
+def test_offloaded_resync_streams_only_for_ds41_single_stage(
+    monkeypatch, model_name, pp_size, chunks, stream
+):
+    engine = _engine(
+        engine_config=_engine_config(
+            resync_format="mxfp4", model_name=model_name, param_offload=True
+        )
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    monkeypatch.setattr(torch.cuda, "current_device", lambda: 3)
+    moved, received = [], {}
+    engine.to = lambda device, **kw: moved.append((device, kw))
+    engine.handle = SimpleNamespace(
+        _extras={"model_chunks": [object()] * chunks},
+        _model=object(),
+        _parallel_state=SimpleNamespace(pp_size=pp_size),
+    )
+    engine.runtime = SimpleNamespace(
+        export_weights=lambda handle, **kw: received.update(kw) or iter(())
+    )
+    engine._initial_sync_cache_cleared = True
+
+    assert engine.streams_offloaded_export() is stream
+    engine.get_per_tensor_param()
+
+    if stream:
+        # No whole-model reload: the exporter copies each binding itself.
+        assert moved == []
+        assert received["export_device"] == torch.device("cuda", 3)
+    else:
+        assert moved == [("cuda", dict(model=True, optimizer=False, grad=False))]
+        assert "export_device" not in received
+
+
+def test_resident_model_export_never_streams(monkeypatch):
+    engine = _engine(
+        engine_config=_engine_config(resync_format="mxfp4", model_name="deepseek_v41")
+    )
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    engine.handle = object()
+    assert engine.streams_offloaded_export() is False
+
+
+@pytest.mark.parametrize(
     "plugins", [{}, {"dynamic_context_parallel": {"enabled": False}}]
 )
 def test_reference_runtime_plugins_resolve_as_mapping(plugins):

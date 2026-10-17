@@ -393,9 +393,28 @@ class MegatronLiteEngine(BaseEngine):
             forward_only=forward_only,
         )
 
+    def streams_offloaded_export(self) -> bool:
+        """Whether resync reads offloaded tensors binding by binding.
+
+        The DS4.1 PP1 deployment exporter moves one tensor at a time to the
+        device (frozen tables stay on host), so the offloaded model need not be
+        reloaded as a whole. Every other export keeps the whole-model reload.
+        """
+        if not (
+            self.is_param_offload_enabled
+            and self.engine_config.resync_format is not None
+            and self._resolve_model_name() == "deepseek_v41"
+            and torch.cuda.is_available()
+        ):
+            return False
+        extras = getattr(self.handle, "_extras", {})
+        chunks = extras.get("model_chunks", [getattr(self.handle, "_model", None)])
+        return len(chunks) == 1 and self.handle._parallel_state.pp_size == 1
+
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
-        if self.is_param_offload_enabled:
+        stream = self.streams_offloaded_export()
+        if self.is_param_offload_enabled and not stream:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
@@ -417,6 +436,10 @@ class MegatronLiteEngine(BaseEngine):
                 export_kwargs["include_archival"] = False
             if self.engine_config.resync_config:
                 export_kwargs["resync_config"] = dict(self.engine_config.resync_config)
+            if stream:
+                export_kwargs["export_device"] = torch.device(
+                    "cuda", torch.cuda.current_device()
+                )
         elif self._resolve_model_name() == "qwen3_5":
             # Qwen3.5 selects its vLLM checkpoint layout through target=.
             # Qwen3-MoE's HF exporter has no target parameter, so forwarding
