@@ -5,6 +5,9 @@ if [[ -n "${DS41_OVERLAY_SETUP:-}" ]]; then source "$DS41_OVERLAY_SETUP"; fi
 RECIPE_ROOT=${1:?run directory}
 RECIPE_STAGE=${2:?cpu or gpu}
 : "${DS41_BUNDLE:?shared release directory}"
+source "$DS41_BUNDLE/recipe/hsg/job-state.sh"
+RECIPE_OUTPUT="$RECIPE_ROOT/logs/$RECIPE_STAGE"
+recipe_claim_output "$RECIPE_OUTPUT" "${SLURM_JOB_ID:?job ID required}"
 export RECIPE_LAYERS=${DS41_LAYERS:-2}
 export RECIPE_CPU_COLLECTION=0 RECIPE_C8_MODE=--c8-${RECIPE_LAYERS}l
 RECIPE_TOPOLOGY_ENV=()
@@ -58,8 +61,7 @@ mapfile -t RECIPE_NODES < <(scontrol show hostnames "$SLURM_JOB_NODELIST")
 export RECIPE_NNODES=${#RECIPE_NODES[@]}
 test "$RECIPE_NNODES" -ge 2
 RECIPE_HEAD_IP=$(getent ahostsv4 "${RECIPE_NODES[0]}" | awk 'NR==1 {print $1}')
-RECIPE_OUTPUT="$RECIPE_ROOT/logs/$RECIPE_STAGE"
-mkdir -p "$RECIPE_OUTPUT"
+recipe_check_output "$RECIPE_OUTPUT" "$SLURM_JOB_ID"
 srun --exact -N1 -n1 -w "${RECIPE_NODES[0]}" \
  bash "$DS41_BUNDLE/recipe/hsg/node.sh" "$RECIPE_ROOT" "$RECIPE_OUTPUT" head "$RECIPE_HEAD_IP" \
  >"$RECIPE_OUTPUT/head.log" 2>&1 &
@@ -72,13 +74,13 @@ for RECIPE_WORKER in "${RECIPE_NODES[@]:1}"; do
  RECIPE_WORKER_PIDS+=($!)
 done
 cleanup() {
- touch "$RECIPE_OUTPUT/stop-workers"
+ touch "$RECIPE_OUTPUT/stop-workers-$SLURM_JOB_ID"
  kill -TERM "$RECIPE_HEAD_PID" "${RECIPE_WORKER_PIDS[@]}" 2>/dev/null || true
 }
 trap cleanup TERM INT
 RECIPE_RESULT=0
 wait "$RECIPE_HEAD_PID" || RECIPE_RESULT=$?
-touch "$RECIPE_OUTPUT/stop-workers"
+touch "$RECIPE_OUTPUT/stop-workers-$SLURM_JOB_ID"
 for RECIPE_WORKER_PID in "${RECIPE_WORKER_PIDS[@]}"; do
  wait "$RECIPE_WORKER_PID" || RECIPE_RESULT=$?
 done

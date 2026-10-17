@@ -104,3 +104,19 @@ The prior 2L sequence passed via independent CPU verification of frozen producti
 The published HSG launcher selects only the 2L C8 test; the 4L parametrization is not reachable through this launcher. C8 audit receipts and `verify.py` count frozen tables and reuse generations and fingerprint whole tables; they do not independently certify each `{start, end, sha256}` census segment. Segment-level rejection is covered by exporter/receiver CPU tests. Reuse generations check resident whole-table byte digests rather than rerunning the per-segment census, so they detect corruption without locating its segment. These are separate evidence limits, not relaxed strict logprob acceptance.
 
 BI backend declarations are scoped to the tested **SM100 DS41** classes; shared guards remain closed for other hardware/models. FP4 experts use the verified DeepGEMM route. FlashInfer MoE and paired BI0/BI1 performance, the TP4 throughput floor, full 40-layer training and model-quality evaluation are separate pending gates. The numeric-character reward is only a proxy.
+
+### Job isolation and live prechecks
+
+Use a new output directory for every submission. The CPU head rejects existing
+markers or receipts before preparing inputs; CPU and GPU stage directories have
+separate job ownership. Stop markers include the Slurm job ID, and workers only
+observe their own job's marker. Ray uses a job-specific node-local temporary
+directory, and waiting workers emit a heartbeat every 30 seconds. On exit, the
+complete Ray `session_latest/logs` tree is copied into the shared stage output's
+`ray-internal-head/` or `ray-internal-worker/` directory. Node-local `/var/tmp`
+job directories remain for storage-janitor to clean.
+
+Run prechecks and mount checks inside the gate allocation with
+`srun --overlap --jobid=<GATE_JOB_ID> ...`. Do not submit a separate precheck job
+on the same CPU node. Cluster administrator contact is handled by the project
+owner.

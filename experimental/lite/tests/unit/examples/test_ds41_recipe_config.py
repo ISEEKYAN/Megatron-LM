@@ -374,3 +374,91 @@ def test_cpu_and_gpu_stages_forward_the_same_optional_config_env():
     assert {k for k in host if (k in cpu) != (k in gpu)} == set()
     forwarded = host & cpu
     assert forwarded and forwarded <= cpu_conditional & gpu_conditional, forwarded
+@pytest.mark.parametrize('stale', ['stop-workers-11', 'result.json', 'job-owner-11'])
+def test_cpu_output_reuse_is_rejected_before_receipts_are_overwritten(tmp_path, stale):
+    """An earlier job's output must never become a new gate's receipt."""
+    import subprocess
+
+    output = tmp_path / 'logs' / 'cpu'
+    output.mkdir(parents=True)
+    marker = output / stale
+    marker.write_text('old receipt')
+    helper = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/hsg/job-state.sh'
+    result = subprocess.run(
+        [
+            'bash',
+            '-c',
+            'source "$1"; recipe_claim_output "$2" "$3"',
+            'bash',
+            str(helper),
+            str(output),
+            '22',
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert 'RECIPE_OUTPUT_REUSED' in result.stderr
+    assert marker.read_text() == 'old receipt'
+    assert not (output / 'job-owner-22').exists()
+
+
+def test_current_job_output_accepts_own_stop_marker_only(tmp_path):
+    """A worker must not treat another job's stop marker as its own."""
+    import subprocess
+
+    helper = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/hsg/job-state.sh'
+    command = [
+        'bash',
+        '-c',
+        'source "$1"; recipe_claim_output "$2" 22 && '
+        'touch "$2/stop-workers-22" && recipe_check_output "$2" 22',
+        'bash',
+        str(helper),
+        str(tmp_path / 'cpu'),
+    ]
+    subprocess.run(command, check=True)
+    (tmp_path / 'cpu' / 'stop-workers-11').touch()
+    result = subprocess.run(
+        [
+            'bash',
+            '-c',
+            'source "$1"; recipe_check_output "$2" 22',
+            'bash',
+            str(helper),
+            str(tmp_path / 'cpu'),
+        ],
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert 'foreign job marker' in result.stderr
+
+
+def test_cpu_launcher_rejects_reused_receipts_before_preparation(tmp_path):
+    """The public stage launcher rejects stale output before calling Enroot."""
+    import os
+    import subprocess
+
+    recipe = ROOT / 'examples/verl/scripts/ds41_w4a8_proxy'
+    bundle = tmp_path / 'bundle'
+    bundle.mkdir()
+    (bundle / 'recipe').symlink_to(recipe, target_is_directory=True)
+    output = tmp_path / 'run'
+    receipts = output / 'logs' / 'cpu'
+    receipts.mkdir(parents=True)
+    receipt = receipts / 'result.json'
+    receipt.write_text('{"passed": true}')
+    env = dict(
+        os.environ, DS41_BUNDLE=str(bundle), DS41_OVERLAY_SETUP='', SLURM_JOB_ID='22'
+    )
+    result = subprocess.run(
+        ['bash', str(recipe / 'hsg/cluster.sbatch'), str(output), 'cpu'],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    assert result.returncode != 0
+    assert 'RECIPE_OUTPUT_REUSED' in result.stderr
+    assert receipt.read_text() == '{"passed": true}'
+    assert not (output / 'inputs').exists()

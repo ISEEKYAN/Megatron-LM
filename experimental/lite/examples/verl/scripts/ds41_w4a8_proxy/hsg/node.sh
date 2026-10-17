@@ -17,6 +17,8 @@ export ENROOT_DATA_PATH="${DS41_ENROOT_DATA_PATH:-$RECIPE_ROOT/enroot}"
 export ENROOT_TEMP_PATH="/var/tmp/${USER}-ds41-enroot/$SLURM_JOB_ID/$(hostname)"
 RECIPE_LOCAL_CACHE=/var/tmp/${USER}-ds41-fp4-v1
 RECIPE_WARM_CACHE="$RECIPE_ROOT/warm-cache"
+RECIPE_LOCAL_RAY=/var/tmp/${USER}-ray-${SLURM_JOB_ID}
+mkdir -p "$RECIPE_LOCAL_RAY"
 mkdir -p "$ENROOT_TEMP_PATH" "$RECIPE_LOCAL_CACHE/tmp" "$RECIPE_WARM_CACHE"
 case "$(findmnt -T "$RECIPE_LOCAL_CACHE" -n -o FSTYPE)" in
  lustre|nfs|nfs4|cifs|gpfs) echo RECIPE_RUNTIME_CACHE_NOT_LOCAL; exit 1 ;;
@@ -68,9 +70,10 @@ enroot start --root --rw "${RECIPE_REUSE[@]}" \
  --env DS41_PRECISION --env DS41_CUDAGRAPH --env DS41_CUDAGRAPH_MAX_CAPTURE \
  "${RECIPE_TOPOLOGY_ENV[@]}" "${RECIPE_OPTION_ENV[@]}" \
  --env VLLM_USE_BREAKABLE_CUDAGRAPH --env VLLM_BATCH_INVARIANT --env CUDA_HOME --env TORCH_CUDA_ARCH_LIST --env MAX_JOBS \
- --env SLURM_JOB_ID --env DS41_PARAMETER_COUNTS --env RECIPE_C8_MODE --env RECIPE_NNODES --env RECIPE_LAYERS --env RECIPE_CPU_COLLECTION --env RECIPE_ALLOCATED_GPU_COUNT --env RECIPE_ROLE --env RECIPE_HEAD_IP --env RECIPE_NODE_IP \
+ --env USER --env SLURM_JOB_ID --env DS41_PARAMETER_COUNTS --env RECIPE_C8_MODE --env RECIPE_NNODES --env RECIPE_LAYERS --env RECIPE_CPU_COLLECTION --env RECIPE_ALLOCATED_GPU_COUNT --env RECIPE_ROLE --env RECIPE_HEAD_IP --env RECIPE_NODE_IP \
  --mount "$RECIPE_OUTPUT:/test-output:none:bind" \
  --mount "$RECIPE_ROOT:/run-artifacts:none:bind" \
+ --mount "$RECIPE_LOCAL_RAY:/var/tmp:none:bind"
  --mount "$RECIPE_LOCAL_CACHE:/runtime-cache:none:bind" \
  --mount "$RECIPE_LOCAL_CACHE/tmp:/tmp:none:bind" \
  --mount "$DS41_BUNDLE/recipe/hsg:/recipe:none:bind,ro" \
