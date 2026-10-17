@@ -218,6 +218,7 @@ def _distributed_rejection(rank, directory):
                 params=[p],
                 algorithm='adamw',
                 owner_key=str(i),
+                global_order=(stage, i),
                 lr=1e10 if stage == 1 and i == 2 else 0.001,
                 weight_decay=1e10 if stage == 1 and i == 2 else 0.1,
             )

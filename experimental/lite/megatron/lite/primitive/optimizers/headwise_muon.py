@@ -305,41 +305,109 @@ class MixedOptimizer:
             p.grad = p.main_grad = grad
 
     def _grad_norm(self, parameters, gradients):
-        if self.ps is None or (
-            self.ps.ep_size == 1
-            and not self.row_parameters
-            and (self.ps.pp_size == 1 or self.host_update is None)
-        ):
+        if self.ps is not None and self.ps.pp_size > 1:
+            return self._pipeline_grad_norm(parameters, gradients)
+        if self.ps is None or (self.ps.ep_size == 1 and not self.row_parameters):
             return self._base__grad_norm(parameters, gradients)
+        squares = [
+            (self._norm_category(p), grad.double().square().sum())
+            for p, grad in zip(parameters, gradients, strict=True)
+            if grad is not None
+        ]
+        return self._category_norm(squares, parameters[0].device, rows=True)
+
+    def _norm_category(self, p):
+        if id(p) in self.row_ids:
+            return 'row'
+        return 'expert' if id(p) in self.expert_ids else 'dense'
+
+    def _category_norm(self, squares, device, *, rows):
         # Dense gradients are replicated. Count each dense owner once and
         # sum the disjoint expert shards across EP, not expert-DP replicas.
-        dense = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
-        expert = torch.zeros_like(dense)
-        row = torch.zeros_like(dense)
-        for p, grad in zip(parameters, gradients, strict=True):
-            if grad is not None:
-                target = (
-                    row
-                    if id(p) in self.row_ids
-                    else expert if id(p) in self.expert_ids else dense
-                )
-                target.add_(grad.double().square().sum())
+        dense = torch.zeros((), dtype=torch.float64, device=device)
+        totals = {'dense': dense, 'expert': torch.zeros_like(dense)}
+        totals['row'] = torch.zeros_like(dense)
+        for category, square in squares:
+            totals[category].add_(square)
         if self.ps.ep_size > 1:
-            torch.distributed.all_reduce(expert, group=self.ps.ep_group)
-        if self.row_parameters:
-            torch.distributed.all_reduce(row, group=self.row_group)
-        total = dense + expert + row
-        if self.host_update is not None and self.ps.pp_size > 1:
-            torch.distributed.all_reduce(total, group=self.ps.pp_group)
-        return total.sqrt()
+            torch.distributed.all_reduce(totals['expert'], group=self.ps.ep_group)
+        if rows and self.row_parameters:
+            torch.distributed.all_reduce(totals['row'], group=self.row_group)
+        return (dense + totals['expert'] + totals['row']).sqrt()
+
+    def _pipeline_grad_norm(self, parameters, gradients):
+        """The unpartitioned model's norm: same per-owner squares, same order.
+
+        Each stage gathers every stage's per-owner squared norms, orders them
+        as the whole model's optimizer lists its owners, and reduces them as
+        the PP1 paths above do, so the norm and clip factor are bitwise PP1's.
+        """
+        keys = self._global_owner_keys()
+        local = [
+            (keys[id(p)], self._norm_category(p), grad)
+            for p, grad in zip(parameters, gradients, strict=True)
+            if grad is not None
+        ]
+        values = (
+            torch.stack([g.double().square().sum() for *_, g in local]).tolist()
+            if local
+            else []
+        )
+        mine = (
+            [(key, category, v) for (key, category, _), v in zip(local, values)],
+            bool(self.row_parameters),
+        )
+        stages = [None] * self.ps.pp_size
+        torch.distributed.all_gather_object(stages, mine, group=self.ps.pp_group)
+        entries = sorted(entry for owners, _ in stages for entry in owners)
+        rows = any(has_rows for _, has_rows in stages)
+        if rows and not self.row_parameters:
+            raise NotImplementedError(
+                'Sharded row owners on only some pipeline stages cannot be reduced '
+                'like the unpartitioned model'
+            )
+        device = parameters[0].device
+        if self.ps.ep_size == 1 and not rows:
+            if not entries:
+                return torch.tensor(0.0)
+            squares = torch.tensor(
+                [v for *_, v in entries], dtype=torch.float64, device=device
+            )
+            return squares.sum().sqrt()
+        squares = [
+            (category, torch.tensor(v, dtype=torch.float64, device=device))
+            for _, category, v in entries
+        ]
+        return self._category_norm(squares, device, rows=rows)
+
+    def _global_owner_keys(self):
+        # The whole model lists owners by backend (Muon, Sinkhorn, AdamW, then
+        # sharded-row Sinkhorn) and, within one, in model-traversal order.
+        from .sinkhorn import Sinkhorn
+
+        keys = {}
+        for backend in self.optimizers:
+            for group in backend.param_groups:
+                order = group.get('global_order')
+                if order is None:
+                    raise ValueError(
+                        'Pipeline gradient norm requires global_order on every owner'
+                    )
+                for index, p in enumerate(group['params']):
+                    if isinstance(backend, HeadwiseMuon):
+                        rank = 0
+                    elif isinstance(backend, Sinkhorn):
+                        rank = 3 if id(p) in self.row_ids else 1
+                    else:
+                        rank = 2
+                    keys[id(p)] = (rank, *order, index)
+        return keys
 
     def _all_finite(self, valid):
         if self.dp_group is None and (
             self.ps is None
             or (
-                self.ps.ep_size == 1
-                and self.row_group is None
-                and (self.ps.pp_size == 1 or self.host_update is None)
+                self.ps.ep_size == 1 and self.row_group is None and self.ps.pp_size == 1
             )
         ):
             return valid
@@ -347,7 +415,7 @@ class MixedOptimizer:
         torch.distributed.all_reduce(
             flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
         )
-        if self.host_update is not None and self.ps is not None and self.ps.pp_size > 1:
+        if self.ps is not None and self.ps.pp_size > 1:
             torch.distributed.all_reduce(
                 flag, op=torch.distributed.ReduceOp.MIN, group=self.ps.pp_group
             )

@@ -36,12 +36,17 @@ def parameter_groups(model, *, lr, vision_policy=None):
     builder = OwnedParameterGroups(model, _RULES, lr)
     route = builder.route
     bindings, seen = builder.bindings, builder.seen
-    for name, role in (('embed', 'embedding'), ('head', 'head'), ('norm', 'norm')):
+    # Traversal blocks use global layer indices: stages keep None placeholders.
+    for index, (name, role) in enumerate(
+        (('embed', 'embedding'), ('head', 'head'), ('norm', 'norm'))
+    ):
+        builder.block = index
         if getattr(model, name) is not None:
             route(model, name + '.weight', role)
-    for block in model.layers:
+    for index, block in enumerate(model.layers):
         if block is None:
             continue
+        builder.block = 3 + index
         a, c = block.attn, block.attn.config
         for role in ('wq_a', 'wkv', 'wo_a', 'wo_b'):
             route(a, role + '.weight', role)
@@ -84,6 +89,7 @@ def parameter_groups(model, *, lr, vision_policy=None):
                 route(e, 'embed.master', 'engram_table')
             route(e, 'wkv.weight', 'engram_projection')
             route(e, 'q_weight k_weight', 'engram_norm')
+    builder.block = 3 + len(model.layers)
     add_visual_groups(builder, model, vision_policy, VisionOptimizerConfig)
     return builder.finish()
 

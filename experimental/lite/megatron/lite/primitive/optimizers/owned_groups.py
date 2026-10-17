@@ -15,6 +15,10 @@ class OwnedParameterGroups:
         if len(registered) != len({id(p) for _, p in registered}):
             raise ValueError('Unexpected parameter alias in module tree')
         self.groups, self.seen = [], set()
+        # Model-traversal block of the next owners. Pipeline stages emit the
+        # same blocks as the whole model, so (block, index within block) orders
+        # every owner exactly as the unpartitioned model does.
+        self.block, self._block_counts = 0, {}
 
     def add(
         self,
@@ -63,8 +67,10 @@ class OwnedParameterGroups:
                 matrix_partitions=partitions,
                 lr=self.lr * policy.get('multiplier', multiplier),
                 weight_decay=policy.get('decay', decay),
+                global_order=(self.block, self._block_counts.get(self.block, 0)),
             )
         )
+        self._block_counts[self.block] = self._block_counts.get(self.block, 0) + 1
 
     def route(self, owner, paths, role, **policy):
         for path in paths.split():
