@@ -1605,7 +1605,7 @@ class CompressedSparseAttention(nn.Module):
         return output.unsqueeze(1)
 
 
-from dataclasses import dataclass, replace
+from dataclasses import dataclass, fields, is_dataclass, replace
 
 import megatron.lite.primitive.modules.native_fp32_linear as _native_linear
 from megatron.lite.primitive.modules.attention.mhc import RMSNorm
@@ -1671,15 +1671,39 @@ class AttentionState:
     query_bounds: tuple[int, ...] | None = None
 
 
+def _rows(value, start, stop):
+    """Rows [start, stop) of a state field: a tensor or a dataclass of tensors
+    sharing their row dimension (the deployment IndexCache)."""
+    if is_dataclass(value):
+        return replace(
+            value,
+            **{f.name: getattr(value, f.name)[:, start:stop] for f in fields(value)},
+        )
+    return value[:, start:stop]
+
+
+def _cat_rows(parts):
+    """Concatenate state fields along rows; the inverse of ``_rows``."""
+    if is_dataclass(parts[0]):
+        return replace(
+            parts[0],
+            **{
+                f.name: torch.cat([getattr(p, f.name) for p in parts], 1)
+                for f in fields(parts[0])
+            },
+        )
+    return torch.cat(parts, 1)
+
+
 def _document_state(state, doc):
     """One document's part of a packed state (an empty state if none yet)."""
     if state.kv_bounds is None and state.query_bounds is None:
         return AttentionState(kv_owner=state.kv_owner, index_owner=state.index_owner)
 
-    def part(tensor, bounds):
-        if tensor is None:
+    def part(value, bounds):
+        if value is None:
             return None
-        return tensor[:, bounds[doc] : bounds[doc + 1]]
+        return _rows(value, bounds[doc], bounds[doc + 1])
 
     kv, query = state.kv_bounds, state.query_bounds
     indices, candidates = None, None
@@ -1724,7 +1748,7 @@ def _packed_state(states, rows):
             # the empty-slot value (-1 index, False candidate).
             width = max(p.shape[-1] for p in parts)
             parts = [F.pad(p, (0, width - p.shape[-1]), value=pad) for p in parts]
-        return torch.cat(parts, 1)
+        return _cat_rows(parts)
 
     def bounds(sizes):
         out = [0]
