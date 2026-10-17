@@ -324,9 +324,7 @@ class MixedOptimizer:
             else:
                 shard = ('dense', 0)
             local.append(((keys[id(p)], *shard), grad.double().square().sum()))
-        squares = (
-            torch.stack([value for _, value in local]).tolist() if local else []
-        )
+        squares = torch.stack([value for _, value in local]).tolist() if local else []
         entries = [list(zip([key for key, _ in local], squares))]
         distributed = torch.distributed.is_available() and (
             torch.distributed.is_initialized()

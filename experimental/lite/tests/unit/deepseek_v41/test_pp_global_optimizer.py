@@ -58,7 +58,7 @@ def _grads(model, step, poison=None):
     for name, p in model.items():
         i = int(name)
         g = torch.sin(torch.arange(p.numel(), dtype=torch.float32) * (i + 1) + step)
-        g = g.reshape(p.shape) * (3.0 ** i)
+        g = g.reshape(p.shape) * (3.0**i)
         if poison == i:
             g[0] = float('inf')
         p.grad = p.main_grad = g
@@ -72,8 +72,13 @@ def _pp2(rank, directory, reference):
     )
     try:
         ps = SimpleNamespace(
-            pp_size=2, pp_rank=rank, pp_group=dist.group.WORLD, ep_size=1,
-            dp_size=1, dp_cp_size=1, ep_group=None,
+            pp_size=2,
+            pp_rank=rank,
+            pp_group=dist.group.WORLD,
+            ep_size=1,
+            dp_size=1,
+            dp_cp_size=1,
+            ep_group=None,
         )
         model, opt = _build(STAGES[rank], ps)
         for step in range(3):
