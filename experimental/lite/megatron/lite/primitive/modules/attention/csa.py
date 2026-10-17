@@ -602,10 +602,18 @@ class CompressedSparseAttention(nn.Module):
             if c.swa_fp8:
                 window = swa_codec(window)
         kv = window
-        visible = (key_positions[None, :] <= positions[:, None]) & (
-            key_positions[None, :] > positions[:, None] - c.window
+        standard_sparse = (
+            not self.deployment_math
+            and x.is_cuda
+            and cp_context is None
+            and c.head_dim == 512
         )
-        mask = visible.expand(b, -1, -1)
+        mask = None
+        if not standard_sparse:
+            visible = (key_positions[None, :] <= positions[:, None]) & (
+                key_positions[None, :] > positions[:, None] - c.window
+            )
+            mask = visible.expand(b, -1, -1)
         if ratio:
             if self.owns_kv:
                 latent = self.compressor(full_x)
@@ -701,6 +709,12 @@ class CompressedSparseAttention(nn.Module):
                     scores = deployment_math.indexer_scores(
                         iq, state.index_k, weights, lengths
                     )
+                elif standard_sparse:
+                    from .standard_sparse import standard_indexer_scores
+
+                    scores = standard_indexer_scores(
+                        iq, state.index_k, weights, ratio=ratio
+                    )
                 else:
                     scores = (
                         torch.einsum('bshd,btd->bsht', iq, state.index_k).relu()
@@ -735,17 +749,36 @@ class CompressedSparseAttention(nn.Module):
                 )
             elif state.index_owner != self.index_owner or state.indices is None:
                 raise ValueError("Missing or incorrect CSA2 index source state")
-            kv = torch.cat([window, state.main_kv], 1)
-            counts = torch.zeros(
-                b, length, state.main_kv.shape[1], dtype=torch.int32, device=x.device
-            )
-            # Additive scatter keeps padded -1 slots from erasing a valid position zero.
-            if counts.shape[-1]:
-                counts.scatter_add_(
-                    -1, state.indices.clamp_min(0).long(), (state.indices >= 0).int()
+            if not standard_sparse:
+                kv = torch.cat([window, state.main_kv], 1)
+                counts = torch.zeros(
+                    b,
+                    length,
+                    state.main_kv.shape[1],
+                    dtype=torch.int32,
+                    device=x.device,
                 )
-            mask = torch.cat([mask, counts > 0], -1)
-        if self.deployment_math and x.is_cuda:
+                # Additive scatter keeps padded -1 slots from erasing position zero.
+                if counts.shape[-1]:
+                    counts.scatter_add_(
+                        -1,
+                        state.indices.clamp_min(0).long(),
+                        (state.indices >= 0).int(),
+                    )
+                mask = torch.cat([mask, counts > 0], -1)
+        if standard_sparse:
+            from .standard_sparse import standard_sparse_attention
+
+            output = standard_sparse_attention(
+                q,
+                window,
+                state.main_kv if ratio else None,
+                self.attn_sink,
+                state.indices if ratio else None,
+                ratio=ratio,
+                window_size=c.window,
+            )
+        elif self.deployment_math and x.is_cuda:
             from megatron.lite.primitive.modules import deployment_math
 
             width = (
