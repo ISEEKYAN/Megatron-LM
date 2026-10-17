@@ -257,7 +257,7 @@ def test_pp_router_bias_reduces_only_same_stage_owners(v41_core_te, monkeypatch)
     assert router.bias_vl[0] > router.bias_vl[1]
 
 
-def _pp_host_worker(rank, directory):
+def _pp_host_worker(rank, directory, segmented):
     import runpy
     from datetime import timedelta
     from functools import partial
@@ -284,8 +284,8 @@ def _pp_host_worker(rank, directory):
         lr=1e-4,
         ns_steps=2,
         coefficient_type='quintic',
-        clip_grad=0.5,
-        segmented_host=True,
+        clip_grad=1e-4,
+        segmented_host=segmented,
     )
     impl = protocol.ImplConfig(
         device='cpu',
@@ -351,13 +351,18 @@ def _pp_host_worker(rank, directory):
                 wanted = expected_params[name].grad
                 assert (p.grad is None) == (wanted is None), name
                 if wanted is not None:
-                    torch.testing.assert_close(p.grad, wanted, rtol=1e-6, atol=1e-7)
+                    assert torch.equal(p.grad, wanted), name
             optimizer.finalize_grads()
-            assert optimizer.step()[0] and ref_opt.step()[0]
+            # The clip norm is global across stages, so the clipped update
+            # must reproduce the unpartitioned model's bits.
+            stage_result, ref_result = optimizer.step(), ref_opt.step()
+            assert stage_result[0] and ref_result[0]
+            assert stage_result[1] == ref_result[1] > optimizer_cfg.clip_grad, (
+                stage_result[1],
+                ref_result[1],
+            )
             for name, p in stage.named_parameters():
-                torch.testing.assert_close(
-                    p, expected_params[name], rtol=1e-6, atol=1e-7
-                )
+                assert torch.equal(p, expected_params[name]), (iteration, name)
         # One bad stage must reject publication on both PP peers, despite
         # different stage owner inventories and local host transaction lengths.
         before = {n: p.detach().clone() for n, p in stage.named_parameters()}
@@ -379,10 +384,11 @@ def _pp_host_worker(rank, directory):
         dist.destroy_process_group()
 
 
-def test_real_pp2_1f1b_host_update_and_shared_failure_vote(tmp_path):
+@pytest.mark.parametrize('segmented', [True, False], ids=['host', 'resident'])
+def test_real_pp2_1f1b_update_and_shared_failure_vote(tmp_path, segmented):
     import torch.multiprocessing as mp
 
-    mp.spawn(_pp_host_worker, args=(str(tmp_path),), nprocs=2, join=True)
+    mp.spawn(_pp_host_worker, args=(str(tmp_path), segmented), nprocs=2, join=True)
     for rank in range(2):
         result = torch.load(tmp_path / f'rank-{rank}.pt', weights_only=True)
         assert result['two_updates'] and result['pp_rejection']

@@ -305,52 +305,64 @@ class MixedOptimizer:
             p.grad = p.main_grad = grad
 
     def _grad_norm(self, parameters, gradients):
-        if self.ps is None or (
-            self.ps.ep_size == 1
-            and not self.row_parameters
-            and (self.ps.pp_size == 1 or self.host_update is None)
-        ):
-            return self._base__grad_norm(parameters, gradients)
-        # Dense gradients are replicated. Count each dense owner once and
-        # sum the disjoint expert shards across EP, not expert-DP replicas.
-        dense = torch.zeros((), dtype=torch.float64, device=parameters[0].device)
-        expert = torch.zeros_like(dense)
-        row = torch.zeros_like(dense)
+        """Global L2 norm that does not depend on the parallel layout.
+
+        Each owner contributes its own FP64 square sum once: dense owners by
+        release key (DP/EP/CP replicas agree), expert and row shards by key and
+        shard rank. math.fsum is correctly rounded, so PP stages, EP shards
+        and PP1 sum the same multiset to the same bits in any order.
+        """
+        keys = {id(p): g['owner_key'] for g in self.param_groups for p in g['params']}
+        local = []
         for p, grad in zip(parameters, gradients, strict=True):
-            if grad is not None:
-                target = (
-                    row
-                    if id(p) in self.row_ids
-                    else expert if id(p) in self.expert_ids else dense
-                )
-                target.add_(grad.double().square().sum())
-        if self.ps.ep_size > 1:
-            torch.distributed.all_reduce(expert, group=self.ps.ep_group)
-        if self.row_parameters:
-            torch.distributed.all_reduce(row, group=self.row_group)
-        total = dense + expert + row
-        if self.host_update is not None and self.ps.pp_size > 1:
-            torch.distributed.all_reduce(total, group=self.ps.pp_group)
-        return total.sqrt()
+            if grad is None:
+                continue
+            if id(p) in self.expert_ids:
+                shard = ('expert', _group_rank(getattr(self.ps, 'ep_group', None)))
+            elif id(p) in self.row_ids:
+                shard = ('row', _group_rank(self.row_group))
+            else:
+                shard = ('dense', 0)
+            local.append(((keys[id(p)], *shard), grad.double().square().sum()))
+        squares = (
+            torch.stack([value for _, value in local]).tolist() if local else []
+        )
+        entries = [list(zip([key for key, _ in local], squares))]
+        distributed = torch.distributed.is_available() and (
+            torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
+        )
+        if distributed:
+            entries = [None] * torch.distributed.get_world_size()
+            torch.distributed.all_gather_object(
+                entries, list(zip([key for key, _ in local], squares))
+            )
+        owners = {}
+        for rank_entries in entries:
+            for key, value in rank_entries:
+                if owners.setdefault(key, value) != value and not (
+                    math.isnan(value) and math.isnan(owners[key])
+                ):
+                    raise RuntimeError(
+                        f'Replicated gradient owner {key[0]} disagrees across ranks'
+                    )
+        device = parameters[0].device if parameters else 'cpu'
+        try:
+            total = math.fsum(owners.values())
+        except (OverflowError, ValueError):
+            total = math.inf if not any(map(math.isnan, owners.values())) else math.nan
+        return torch.tensor(total, dtype=torch.float64, device=device).sqrt()
 
     def _all_finite(self, valid):
-        if self.dp_group is None and (
-            self.ps is None
-            or (
-                self.ps.ep_size == 1
-                and self.row_group is None
-                and (self.ps.pp_size == 1 or self.host_update is None)
-            )
+        """One vote across every training rank (DP, EP, CP and PP stages)."""
+        if not (
+            torch.distributed.is_available()
+            and torch.distributed.is_initialized()
+            and torch.distributed.get_world_size() > 1
         ):
             return valid
         flag = torch.tensor(int(valid), device=next(self.model.parameters()).device)
-        torch.distributed.all_reduce(
-            flag, op=torch.distributed.ReduceOp.MIN, group=self.dp_group
-        )
-        if self.host_update is not None and self.ps is not None and self.ps.pp_size > 1:
-            torch.distributed.all_reduce(
-                flag, op=torch.distributed.ReduceOp.MIN, group=self.ps.pp_group
-            )
+        torch.distributed.all_reduce(flag, op=torch.distributed.ReduceOp.MIN)
         return bool(flag.item())
 
     def accumulate_modality_loads(self, loads):
@@ -498,18 +510,9 @@ class MixedOptimizer:
         for p in _parameters(self):
             p.main_grad = p.grad
 
-    def _base__grad_norm(self, parameters, gradients):
-        active = [g for g in gradients if g is not None]
-        return (
-            torch.stack([g.double().square().sum() for g in active]).sum().sqrt()
-            if active
-            else torch.tensor(0.0)
-        )
-
-    def _finite(self, tensors):
-        return self._all_finite(
-            not any(not torch.isfinite(tensor).all() for tensor in tensors)
-        )
+    @staticmethod
+    def _local_finite(tensors):
+        return all(bool(torch.isfinite(tensor).all()) for tensor in tensors)
 
     @torch.no_grad()
     def _base_step(self):
@@ -534,11 +537,14 @@ class MixedOptimizer:
         )
         # Reversible gradient views permit retry on failed publication.
         original = [(p, p.grad, getattr(p, 'main_grad', None)) for p in parameters]
-        staged_adam, candidates = [], {}
+        staged_adam, candidates, storage = [], {}, []
         try:
             for p, g in zip(parameters, gradients):
                 p.grad = None if g is None else g * coefficient
                 p.main_grad = p.grad
+            # Stages own different backends and tables. Prepare every local
+            # owner (including row collectives), then vote exactly once.
+            valid = True
             for backend in self.optimizers:
                 if isinstance(backend, torch.optim.AdamW):
                     candidate = deepcopy(backend)
@@ -546,30 +552,30 @@ class MixedOptimizer:
                         q.grad = p.grad
                     candidate.step()
                     candidates.update((id(p), q) for p, q in _pairs(backend, candidate))
-                    if not self._finite(
+                    valid = valid and self._local_finite(
                         v
                         for s in candidate.state.values()
                         for v in s.values()
                         if isinstance(v, torch.Tensor)
-                    ):
-                        return False, float(norm), None
+                    )
                     staged_adam.append((backend, candidate))
-                else:
-                    if not self._all_finite(backend.prepare_step()):
-                        return False, float(norm), None
+                elif backend.prepare_step():
                     candidates.update(
                         (id(p), value) for p, value in backend.candidates()
                     )
-            if not self._finite(candidates.values()):
-                return False, float(norm), None
-            storage = []
-            for table in self.tables:
+                else:
+                    valid = False
+            valid = valid and self._local_finite(candidates.values())
+            for table in self.tables if valid else ():
                 weight, scale = quantize_block_fp8(
                     candidates[id(table.master)], (1, 32), scale_format='e8m0'
                 )
-                if not self._finite(value.float() for value in (weight, scale)):
-                    return False, float(norm), None
+                valid = valid and self._local_finite(
+                    value.float() for value in (weight, scale)
+                )
                 storage.append((table, weight, scale))
+            if not self._all_finite(valid):
+                return False, float(norm), None
             for backend in self.optimizers:
                 if not isinstance(backend, torch.optim.AdamW):
                     backend.commit_step()
@@ -646,6 +652,14 @@ class MixedOptimizer:
         else:
             for backend, saved in zip(self.optimizers, state['optimizers']):
                 backend.load_state_dict(saved)
+
+
+def _group_rank(group):
+    import torch.distributed as dist
+
+    if group is None or not dist.is_initialized():
+        return 0
+    return dist.get_rank(group)
 
 
 def _publish_main_grad(parameter):
