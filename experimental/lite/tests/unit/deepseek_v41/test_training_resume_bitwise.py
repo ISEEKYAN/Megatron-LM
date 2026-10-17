@@ -87,6 +87,22 @@ def _build(case):
     return bundle, schedulers, parallel
 
 
+def _rng_digests():
+    import hashlib
+    import pickle
+
+    import numpy as np
+
+    streams = dict(
+        python=pickle.dumps(random.getstate()),
+        numpy=pickle.dumps(np.random.get_state()),
+        torch=torch.get_rng_state().numpy().tobytes(),
+    )
+    if torch.cuda.is_available() and torch.cuda.is_initialized():
+        streams['cuda'] = torch.cuda.get_rng_state().numpy().tobytes()
+    return {k: hashlib.sha256(v).hexdigest()[:16] for k, v in streams.items()}
+
+
 def _step(bundle, schedulers):
     import numpy as np
     from megatron.lite.runtime.contracts import PackedBatch
@@ -94,6 +110,8 @@ def _step(bundle, schedulers):
 
     model, optimizer = bundle.chunks[0], bundle.optimizer
     model.train()
+    # Every RNG stream entering the step: a divergence names the stream.
+    rng = dict(start=_rng_digests())
     # Consume all three host RNG streams and torch's: a reset or a missing restore
     # changes the batch.
     offset = (
@@ -107,9 +125,11 @@ def _step(bundle, schedulers):
     context = LossContext(normalization_denominator=float(TOKENS))
     with use_loss_context(context):
         output = bundle.forward_step(model, batch)
+    rng['forward'] = _rng_digests()
     loss = output['loss']
     assert loss.requires_grad and torch.isfinite(loss), 'RESUME_LOSS'
     loss.backward()
+    rng['backward'] = _rng_digests()
     head = model.tensor_bindings['head.weight'].tensor
     grad = head.main_grad if getattr(head, 'main_grad', None) is not None else head.grad
     assert (
@@ -118,10 +138,12 @@ def _step(bundle, schedulers):
     if bundle.finalize_grads is not None:
         bundle.finalize_grads()
     accepted = optimizer.step()[0]
+    rng['optimizer'] = _rng_digests()
     assert accepted, 'RESUME_UPDATE: the training step must publish an update'
     for scheduler in schedulers:
         scheduler.step()
     return dict(
+        rng=rng,
         ids=ids.cpu().tolist(),
         loss=loss.detach().float().cpu().view(torch.int32).item(),
         lr=[g['lr'] for g in optimizer.param_groups],
