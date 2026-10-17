@@ -35,8 +35,13 @@ default_placement_fn = _protocols.default_placement_fn
 DeviceMesh = _imports_device_mesh.DeviceMesh
 
 
-def _host_buffer_state(model, prefix):
-    """Alias persistent CPU byte planes with global offsets for row shards."""
+def _buffer_state(model, prefix, *, host):
+    """Alias persistent buffer byte planes, with global offsets for row shards.
+
+    Both checkpoint paths save and load these: a persistent buffer the model
+    updates in training (the router's load-balancing bias) is training state.
+    The host path keeps them on CPU next to the host parameter owners.
+    """
     result = {}
     for path, module in model.named_modules():
         buffers = [
@@ -49,30 +54,30 @@ def _host_buffer_state(model, prefix):
         if buffers and sharded:
             cuts = getattr(lookup, 'boundaries', ())
             if not cuts:
-                raise ValueError('Host checkpoint requires explicit row shard metadata')
+                raise ValueError('Checkpoint requires explicit row shard metadata')
             size, rank = dist.get_world_size(lookup.group), dist.get_rank(lookup.group)
             if (
                 len(cuts) != size + 1
                 or cuts[0] != 0
                 or any(a > b for a, b in zip(cuts, cuts[1:]))
             ):
-                raise ValueError('Invalid host checkpoint row shard boundaries')
+                raise ValueError('Invalid checkpoint row shard boundaries')
             start, end = cuts[rank : rank + 2]
         for name, value in buffers:
             if (
-                value.device.type != 'cpu'
+                (host and value.device.type != 'cpu')
                 or isinstance(value, DTensor)
                 or not value.is_contiguous()
             ):
                 raise ValueError(
-                    'Host checkpoint requires contiguous plain CPU buffers'
+                    'Checkpoint requires contiguous plain buffers (on CPU for host)'
                 )
             key = '.'.join(part for part in (prefix, path, name) if part)
             if not sharded:
                 result[key] = value.detach().reshape(-1).view(torch.uint8)
                 continue
             if value.ndim != 2 or value.shape[0] != end - start:
-                raise ValueError('Host buffer rows do not match row shard metadata')
+                raise ValueError('Buffer rows do not match row shard metadata')
             # Preserve the global row coordinate, as MCore ShardedTensor does.
             # A plain tensor here would let DCP deduplicate distinct EP owners.
             byte_rows = value.detach().view(torch.uint8)
@@ -81,7 +86,7 @@ def _host_buffer_state(model, prefix):
                 metadata = ShardMetadata(
                     shard_offsets=[start, 0],
                     shard_sizes=list(byte_rows.shape),
-                    placement=f'rank:{dist.get_rank()}/cpu',
+                    placement=f'rank:{dist.get_rank()}/{byte_rows.device}',
                 )
                 shards.append(Shard(byte_rows, metadata))
             result[key] = ShardedTensor._init_from_local_shards(
@@ -149,8 +154,7 @@ def save_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if save_model:
-        if host_parameters:
-            state_dict.update(_host_buffer_state(model, model_prefix))
+        state_dict.update(_buffer_state(model, model_prefix, host=host_parameters))
         for name, param in model.named_parameters():
             if host_parameters:
                 if param.device.type != "cpu" or isinstance(param, DTensor):
@@ -230,8 +234,18 @@ def load_training_checkpoint(
     model_prefix = f"model_pp{ps.pp_rank}" if ps.pp_size > 1 else "model"
 
     if load_model:
-        if host_parameters:
-            state_dict.update(_host_buffer_state(model, model_prefix))
+        buffers = _buffer_state(model, model_prefix, host=host_parameters)
+        if not host_parameters:
+            # Checkpoints saved before buffers joined the non-host path have none.
+            saved = dcp.FileSystemReader(ckpt_path).read_metadata().state_dict_metadata
+            missing = sorted(key for key in buffers if key not in saved)
+            if missing:
+                log_rank0(
+                    f"Checkpoint {ckpt_path} has no buffer state for {len(missing)} "
+                    f"buffers (saved before buffers were checkpointed), e.g. {missing[0]}"
+                )
+                buffers = {k: v for k, v in buffers.items() if k in saved}
+        state_dict.update(buffers)
         for name, param in model.named_parameters():
             if host_parameters:
                 if param.device.type != "cpu" or isinstance(param, DTensor):
