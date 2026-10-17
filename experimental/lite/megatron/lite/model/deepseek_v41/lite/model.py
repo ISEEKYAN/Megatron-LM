@@ -180,6 +180,44 @@ def recompute_ffn(module):
     module.forward = forward
 
 
+def recompute_attention(module):
+    """Attention-only recompute for a layer that consumes but never owns CSA state.
+
+    Like recomputed_layer, the consumed state tensors are explicit checkpoint
+    inputs so their gradients reach the owner layer; the state object itself
+    passes through unchanged.
+    """
+    from megatron.lite.primitive.recompute import CheckpointFunction
+    from torch.utils._pytree import tree_flatten, tree_unflatten
+
+    original = module.forward
+
+    def forward(x, state, **kwargs):
+        leaves, spec = tree_flatten([getattr(state, name) for name in _STATE_TENSORS])
+        slots = [i for i, leaf in enumerate(leaves) if isinstance(leaf, torch.Tensor)]
+
+        def run(value, *tensors):
+            values = list(leaves)
+            for slot, tensor in zip(slots, tensors):
+                values[slot] = tensor
+            inner = replace(
+                state, **dict(zip(_STATE_TENSORS, tree_unflatten(values, spec)))
+            )
+            output, published = original(value, inner, **kwargs)
+            if published is not inner:
+                raise RuntimeError(
+                    'V4.1_RECOMPUTE_OWNER: a state-consuming attention changed CSA state'
+                )
+            return output
+
+        output = CheckpointFunction.apply(
+            run, False, x, *(leaves[slot] for slot in slots)
+        )
+        return output, state
+
+    module.forward = forward
+
+
 class DeepseekV41Model(nn.Module):
 
     def __init__(

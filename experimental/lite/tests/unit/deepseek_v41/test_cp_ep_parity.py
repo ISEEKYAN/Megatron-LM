@@ -267,7 +267,7 @@ def _recompute_worker(rank, directory, ep, cp, world, experts, recompute):
         impl_cfg=_impl(ParallelConfig(ep=ep, cp=cp), recompute=recompute),
     )
     model, ps = bundle.chunks[0], bundle.parallel_state
-    assert model.recompute == recompute
+    assert model.recompute == ('full' if recompute == 'full' else None)
     layers = [layer for layer in model.layers if layer is not None]
     # The 4-layer prefix has both kinds: layer 2 owns KV/index, 0/1/3 consume.
     assert any(owns_attention_state(layer) for layer in layers)
@@ -330,6 +330,40 @@ def test_recompute_is_bitwise_at_the_same_partition(
             if not torch.equal(recomputed['grads'][name], value)
         ]
         assert not unequal, (rank, unequal[:8])
+
+
+@pytest.mark.parametrize('ep,cp,world,experts', [(1, 1, 1, 2), (2, 2, 4, 2)])
+@pytest.mark.parametrize('selection', ['moe', 'attn', 'moe,attn'])
+def test_selective_recompute_keeps_the_forward(
+    v41_core_te, tmp_path, ep, cp, world, experts, selection
+):
+    """Selective recompute replays the same forward; backward only needs to run."""
+    torch.set_num_threads(1)
+    for recompute in (None, selection):
+        if world == 1:
+            _recompute_worker(0, str(tmp_path), ep, cp, world, experts, recompute)
+        else:
+            mp.start_processes(
+                _recompute_worker,
+                args=(str(tmp_path), ep, cp, world, experts, recompute),
+                nprocs=world,
+                join=True,
+                start_method='spawn',
+            )
+    for rank in range(world):
+        plain = torch.load(tmp_path / f'None-{rank}.pt')
+        recomputed = torch.load(tmp_path / f'{selection}-{rank}.pt')
+        assert torch.equal(recomputed['hidden'], plain['hidden']), rank
+        assert recomputed['grads'].keys() == plain['grads'].keys(), rank
+        assert all(torch.isfinite(g).all() for g in recomputed['grads'].values())
+
+
+def test_selective_recompute_spec_is_validated(v41_core_te):
+    from megatron.lite.model.deepseek_v41.lite import protocol
+
+    for bad in ('mlp', 'moe,moe', ['attn', 'core_attn']):
+        with pytest.raises(ValueError, match='V4.1 recompute'):
+            protocol.build_model(_prefix_config(2), impl_cfg=_impl(recompute=bad))
 
 
 def test_recompute_carries_container_state_and_hc_carrier(v41_core_te):

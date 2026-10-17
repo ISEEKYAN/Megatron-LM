@@ -65,7 +65,10 @@ class ImplConfig:
     pipeline_split_layer: int = 20
     # 'full': recompute every CSA-state-consuming layer and the FFN of each
     # KV/index source layer in backward (MCore full/uniform/1 granularity).
-    recompute: str | None = None
+    # Selective (MCore module names): 'moe' recomputes every layer's FFN;
+    # 'attn' recomputes the attention of layers that consume CSA state without
+    # owning it. Give a list or a comma-separated string.
+    recompute: str | list[str] | None = None
 
     def __post_init__(self):
         # Runtime/VERL configurations arrive as serialized mappings.
@@ -208,15 +211,27 @@ def build_model(model_cfg, *, impl_cfg):
         layer_range = (layout.layer_indices[0], layout.layer_indices[-1] + 1)
     model = _construct_model(model_cfg, impl_cfg, ps, layer_range)
     model.pipeline_residual_dtype = impl_cfg.dtype
-    if impl_cfg.recompute not in (None, 'full'):
-        raise ValueError('V4.1 recompute must be None or "full"')
-    model.recompute = impl_cfg.recompute
-    if impl_cfg.recompute == 'full':
-        from .model import owns_attention_state, recompute_ffn
+    from megatron.lite.primitive.recompute import parse_recompute_spec
 
-        for layer in model.layers:
-            if layer is not None and owns_attention_state(layer):
-                recompute_ffn(layer.ffn)
+    selective = parse_recompute_spec(impl_cfg.recompute)
+    if selective == ['full']:
+        selective = []
+    elif not set(selective) <= {'moe', 'attn'} or len(set(selective)) != len(selective):
+        raise ValueError(
+            'V4.1 recompute must be None, "full" or a selection of "moe", "attn"'
+        )
+    model.recompute = 'full' if impl_cfg.recompute == 'full' else None
+    from .model import owns_attention_state, recompute_attention, recompute_ffn
+
+    for layer in model.layers if impl_cfg.recompute is not None else ():
+        if layer is None:
+            continue
+        if impl_cfg.recompute == 'full' and owns_attention_state(layer):
+            recompute_ffn(layer.ffn)
+        if 'moe' in selective:
+            recompute_ffn(layer.ffn)
+        if 'attn' in selective and not owns_attention_state(layer):
+            recompute_attention(layer.attn)
     import megatron.lite.primitive.modules.native_fp32_linear as _imports_native_fp32_linear
     from megatron.lite.primitive.modules.engram_lookup import EngramTable
 
