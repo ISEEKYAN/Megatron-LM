@@ -234,6 +234,10 @@ def _worker(rank, directory, case, phase):
     world = case['ep'] * case['cp'] if case['ep'] * case['cp'] > 1 else 1
     gpu = case['device'] != 'cpu'
     if gpu:
+        # As MegatronLiteEngine with full_determinism (the recipe): before CUDA init.
+        from verl.workers.engine.utils import enable_full_determinism
+
+        enable_full_determinism(seed=915)
         torch.cuda.set_device(rank)
         case = dict(case, device=f'cuda:{rank}')
     torch.set_num_threads(1)
@@ -250,11 +254,13 @@ def _worker(rank, directory, case, phase):
         timeout=timedelta(seconds=600),
     )
     record = dict(rank=rank, phase=phase)
-    path = str(root / 'checkpoint')
+    # The determinism control repeats the continuous run with its own checkpoint.
+    tag = '' if phase != 'repeat' else '-repeat'
+    path = str(root / f'checkpoint{tag}')
     try:
         _seed()
         bundle, schedulers, parallel = _build(case)
-        if phase == 'continuous':
+        if phase in ('continuous', 'repeat'):
             history = [_step(bundle, schedulers)]
             _offload(bundle)
             checkpoint.save_training_checkpoint(
@@ -265,14 +271,15 @@ def _worker(rank, directory, case, phase):
                 **_checkpoint(bundle, parallel),
             )
             torch.save(
-                [s.state_dict() for s in schedulers], root / f'schedulers-{rank}.pt'
+                [s.state_dict() for s in schedulers],
+                root / f'schedulers{tag}-{rank}.pt',
             )
             saved = _state(bundle, schedulers)
             _reload(bundle, case)
             history += [_step(bundle, schedulers) for _ in range(STEPS - SAVED_AT)]
             torch.save(
                 dict(saved=saved, expected=_state(bundle, schedulers), history=history),
-                root / f'continuous-{rank}.pt',
+                root / f'continuous{tag}-{rank}.pt',
             )
         else:
             reference = torch.load(root / f'continuous-{rank}.pt', weights_only=False)
@@ -344,7 +351,14 @@ def _worker(rank, directory, case, phase):
 
 def _run(directory, case):
     world = case['ep'] * case['cp']
-    for phase in ('continuous', 'resume'):
+    # GPU cases first check that continuous training repeats bit for bit: a
+    # nondeterministic run makes the resume comparison meaningless.
+    phases = (
+        ('continuous', 'repeat', 'resume')
+        if case['device'] != 'cpu'
+        else ('continuous', 'resume')
+    )
+    for phase in phases:
         # A fresh process group per phase: only the checkpoint on disk is shared.
         mp.start_processes(
             _worker,
@@ -359,7 +373,24 @@ def _run(directory, case):
         ]
         errors = [r['error'] for r in records if 'error' in r]
         assert not errors, errors[0]
-    print('RESUME_BITWISE', json.dumps(dict(case=case, records=records)), flush=True)
+    repeat = {}
+    if 'repeat' in phases:
+        for rank in range(world):
+            first, second = (
+                torch.load(Path(directory) / f'{name}-{rank}.pt', weights_only=False)
+                for name in ('continuous', 'continuous-repeat')
+            )
+            repeat[rank] = _first_difference(
+                [second['history'], second['expected']],
+                [first['history'], first['expected']],
+                'GPU_NONDETERMINISTIC',
+            )
+    print(
+        'RESUME_BITWISE',
+        json.dumps(dict(case=case, repeat=repeat, records=records)),
+        flush=True,
+    )
+    assert not any(repeat.values()), repeat
     for record in records:
         assert record['step'] == SAVED_AT, record
         assert record['restore'] is None, record
