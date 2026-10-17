@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """HF save/export reject unsupported resync requests before reading tensors."""
+from types import SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
@@ -19,11 +20,15 @@ def test_save_and_export_reject_resync(monkeypatch, tmp_path, options):
     writer = Mock()
     monkeypatch.setattr(protocol, 'save_model', writer)
     exporter = Mock(side_effect=AssertionError('Resync reached tensor exporter'))
-    monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
+    monkeypatch.setattr(checkpoint, '_export_checkpoint', exporter)
     with pytest.raises(ValueError, match='DS4.1 resync'):
         protocol.save_hf_weights([object()], tmp_path / 'save', None, None, **options)
     with pytest.raises(ValueError, match='DS4.1 resync'):
-        list(protocol.export_hf_weights([object()], None, None, **options))
+        list(
+            protocol.export_hf_weights(
+                [object()], None, SimpleNamespace(pp_size=1, pp_rank=0), **options
+            )
+        )
     writer.assert_not_called()
     exporter.assert_not_called()
 
@@ -59,25 +64,33 @@ def test_export_rejects_unsupported_selection_before_reading(
     monkeypatch, options, code
 ):
     exporter = Mock(return_value=iter([('weight', torch.ones(1))]))
-    monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
+    monkeypatch.setattr(checkpoint, '_export_checkpoint', exporter)
     with pytest.raises(NotImplementedError, match=f'V4.1_HF_EXPORT_{code}_UNSUPPORTED'):
-        list(protocol.export_hf_weights([object()], None, None, **options))
+        list(
+            protocol.export_hf_weights(
+                [object()], None, SimpleNamespace(pp_size=1, pp_rank=0), **options
+            )
+        )
     exporter.assert_not_called()
 
 
 def test_export_default_selection_preserves_tensors(monkeypatch):
     weight = torch.tensor([2.0, 3.0])
     exporter = Mock(return_value=iter([('weight', weight)]))
-    monkeypatch.setattr(checkpoint, 'export_checkpoint', exporter)
+    monkeypatch.setattr(checkpoint, '_export_checkpoint', exporter)
     model = object()
     result = list(
         protocol.export_hf_weights(
-            [model], None, None, include_mtp_only=False, include_local_prefixes=None
+            [model],
+            None,
+            SimpleNamespace(pp_size=1, pp_rank=0),
+            include_mtp_only=False,
+            include_local_prefixes=None,
         )
     )
     assert len(result) == 1 and result[0][0] == 'weight'
     assert torch.equal(result[0][1], weight)
-    exporter.assert_called_once_with(model)
+    exporter.assert_called_once_with(model, spec=checkpoint._SPEC)
 
 
 @pytest.mark.parametrize('path', [None, '', False])

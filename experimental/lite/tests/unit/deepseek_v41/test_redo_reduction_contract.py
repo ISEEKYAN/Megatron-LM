@@ -66,18 +66,37 @@ def test_cp_experts_use_ddp_and_cannot_reach_expert_finalize(
     assert torch.equal(model.expert.grad, torch.tensor([6.0, 10.0]))
     assert torch.equal(model.row.grad, torch.tensor([8.0, 16.0]) / (2 * cp_size))
 
-    # If CP+EP becomes supported, this test must demand new normalization proof.
+    # EP-over-CP is accepted; numerical update equivalence is covered by
+    # test_cp_ep_parity and test_redo_ep_finalize with real distributed ranks.
+    from megatron.lite.model.deepseek_v41.lite import model as model_module
+    from megatron.lite.primitive.modules import native_fp32_linear
+    from test_w4a8_fp32 import tiny_config
+
+    combined = ParallelState(ep_size=2, cp_size=2, dp_size=2, dp_cp_size=4)
+    chunk = torch.nn.Module()
+    chunk.engram_hash = chunk.engram_group = chunk.vision_schedule = None
+    chunk.layers = []
+    chunk.parameter_bindings = lambda: []
+    constructor = Mock(return_value=chunk)
+    parallel = Mock(return_value=combined)
+    monkeypatch.setattr(torch.distributed, 'is_initialized', lambda: True)
+    monkeypatch.setattr(torch.distributed, 'get_world_size', lambda: 4)
+    monkeypatch.setattr(protocol, 'init_parallel', parallel)
+    monkeypatch.setattr(model_module, 'DeepseekV41Model', constructor)
     monkeypatch.setattr(
-        protocol,
-        'init_parallel',
-        Mock(side_effect=AssertionError('CP+EP escaped guard')),
+        protocol, 'wrap_owned_ddp', lambda value, *args, **kwargs: value
     )
-    with pytest.raises(
-        NotImplementedError, match='CP_AND_EP_NOT_SIMULTANEOUSLY_SUPPORTED'
-    ):
-        protocol.build_model(
-            object(), impl_cfg=protocol.ImplConfig(parallel=ParallelConfig(cp=2, ep=2))
-        )
+    monkeypatch.setattr(
+        native_fp32_linear, 'configure_residual_projections', lambda *args: None
+    )
+    bundle = protocol.build_model(
+        tiny_config(),
+        impl_cfg=protocol.ImplConfig(device='cpu', parallel=ParallelConfig(cp=2, ep=2)),
+    )
+    parallel.assert_called_once_with(ParallelConfig(cp=2, ep=2, etp=1))
+    assert constructor.call_args.kwargs['parallel_state'] is combined
+    assert bundle.parallel_state is combined and bundle.chunks == [chunk]
+    assert bundle.extras['prepare_microbatches'].keywords['cp_size'] == 2
 
 
 def _owned_ddp_subgroup_worker(rank, directory, manual_dense_sync):

@@ -48,6 +48,7 @@ def v4_arms(transformer_engine_import_stub, monkeypatch):
     return original, csa
 
 
+@pytest.mark.gpus(1)
 @pytest.mark.parametrize('ratio', [0, 2, 4])
 def test_v4_default_forward_and_all_parameter_gradients_are_bitwise(v4_arms, ratio):
     from megatron.lite.model.deepseek_v4.config import DeepseekV4Config
