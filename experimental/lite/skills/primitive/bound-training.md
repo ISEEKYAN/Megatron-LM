@@ -41,6 +41,7 @@ ROUTES = {
     "parallel/owned_ddp.py": "deepseek_v41/test_redo_reduction_contract.py::test_owned_ddp_subgroups_sync_bytes_experts_and_manual_dense",
     "kernels/deployment_rms_norm.py": "deepseek_v41/test_deployment_math.py::test_qkv_norm_native_forward_fp32_vjp_and_process_state",
     "kernels/deployment_engram.py": "deepseek_v41/test_deployment_engram.py::test_native_forward_partitions_and_owned_vjp",
+    "modules/deployment_math/packed_cache.py": "deepseek_v41/test_packed_cache_geometry.py::test_document_pages_and_local_queries_match_independent_requests",
     "modules/deployment_math/cache.py": "deepseek_v41/test_deployment_compressor.py::test_dense_compressor_matches_native_group_program",
     "kernels/mxfp8_block32.py": "deepseek_v41/test_deployment_math.py::test_grouped_fp8_one_launch_serial_batch1_and_vllm_bitwise",
     "kernels/sparse_metadata.py": "deepseek_v41/test_deployment_math.py::test_sparse_metadata_stable_order_batch1_graph_and_one_launch",
