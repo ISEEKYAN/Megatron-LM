@@ -52,6 +52,10 @@ def install(event):
     @wraps(original)
     def forward(model, batch, **kwargs):
         result = original(model, batch, **kwargs)
+        # Re-entering forward is unsafe under PP: the receiving stage has
+        # consumed its carrier. This diagnostic is valid only for PP1.
+        if model.ps.pp_size > 1:
+            return result
         if (
             model.training
             or torch.is_grad_enabled()

@@ -93,7 +93,9 @@ def production_environment(layers, bi, inputs):
         DS41_LAYERS=str(layers),
         DS41_PROMPT_LENGTH=PROMPT_LENGTHS.get(layers, '256'),
         VLLM_BATCH_INVARIANT=str(bi),
-        DS41_INDEXER_DIAGNOSTIC=str(int(layers == 4)),
+        DS41_INDEXER_DIAGNOSTIC=str(
+            int(layers == 4 and int(base.get('DS41_PP', '1')) == 1)
+        ),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
     if layers == 6:
