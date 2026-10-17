@@ -12,7 +12,8 @@ import sys
 import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
+from concurrent.futures import TimeoutError as FutureTimeoutError
+from contextvars import ContextVar, copy_context
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -25,6 +26,7 @@ _VLLM_IMPORTABLE: bool | None = None
 
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+_VLLM_ROLLOUT_MODULE = "verl.workers.rollout.vllm_rollout.vllm_rollout"
 
 
 def _vllm_importable() -> bool:
@@ -541,6 +543,189 @@ def _trace_runtime_patch(stage: str, result: Any = None) -> None:
     sys.stderr.flush()
 
 
+# These deadlines detect failure, NEVER success. Each sent bucket/handshake
+# gets its own deadline; a complete resync may legitimately take much longer.
+_WEIGHT_SYNC_SINGLE_ACK_TIMEOUT_S = 600.0
+_WEIGHT_SYNC_POLL_MS = 50
+_WEIGHT_SYNC_SHUTDOWN_TIMEOUT_S = 0.5
+_WEIGHT_SYNC_RPC = ContextVar('mlite_weight_sync_rpc', default=None)
+_DEFERRED_WEIGHT_SENDERS = {}
+
+
+class _WeightSyncAbort:
+    def __init__(self, owner=None):
+        self.event = threading.Event()
+        self.error = None
+        self.owner = owner
+        self.lock = threading.Lock()
+
+    def fail(self, error):
+        with self.lock:
+            if self.error is None:
+                self.error = error
+                if self.owner is not None:
+                    self.owner._mlite_weight_sync_failed = error
+            self.event.set()
+
+    def check(self):
+        if self.error is not None:
+            raise self.error
+
+    def watch(self, future):
+        # Ray ObjectRef.future() is a concurrent Future; its callback can run
+        # while this asyncio thread is inside a synchronous ZMQ/queue wait.
+        as_future = getattr(future, 'future', None)
+        observed = as_future() if callable(as_future) else future
+        if not hasattr(observed, 'add_done_callback'):
+            raise TypeError('Weight sync RPC must expose a completion future')
+
+        def completed(result):
+            try:
+                error = result.exception()
+            except BaseException as exc:
+                error = exc
+            if error is not None:
+                self.fail(error)
+
+        observed.add_done_callback(completed)
+
+
+class _AbortableWeightSocket:
+    def __init__(self, socket, abort):
+        import math
+
+        self._socket, self._abort = socket, abort
+        self._timeout = float(
+            os.environ.get(
+                'MLITE_WEIGHT_SYNC_SINGLE_ACK_TIMEOUT_SECONDS',
+                _WEIGHT_SYNC_SINGLE_ACK_TIMEOUT_S,
+            )
+        )
+        if not math.isfinite(self._timeout) or self._timeout <= 0:
+            raise ValueError('Single-ACK failure timeout must be finite and positive')
+        self._sent_at = None
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+    def send_pyobj(self, *args, **kwargs):
+        import time
+
+        self._abort.check()
+        self._sent_at = time.monotonic()
+        return self._socket.send_pyobj(*args, **kwargs)
+
+    def recv(self, *args, **kwargs):
+        import time
+
+        import zmq
+
+        deadline = (self._sent_at or time.monotonic()) + self._timeout
+        while True:
+            self._abort.check()
+            if self._socket.poll(_WEIGHT_SYNC_POLL_MS, zmq.POLLIN):
+                self._abort.check()
+                return self._socket.recv(*args, **kwargs)
+            if time.monotonic() >= deadline:
+                error = TimeoutError(
+                    'Weight receiver exceeded the single-ACK failure timeout'
+                )
+                self._abort.fail(error)
+                raise error
+
+
+def _install_rollout_weight_failure_watch(rollout_cls):
+    if getattr(rollout_cls, '_mlite_weight_failure_watch_originals', None) is not None:
+        return False
+    original_execute, original_update = (
+        rollout_cls._execute_method,
+        rollout_cls.update_weights,
+    )
+
+    @wraps(original_execute)
+    async def execute(self, method, *args, **kwargs):
+        future = await original_execute(self, method, *args, **kwargs)
+        if method == 'update_weights_from_ipc' and kwargs.get('non_block', False):
+            abort = _WeightSyncAbort(self)
+            if future is not None:
+                abort.watch(future)
+            _WEIGHT_SYNC_RPC.set(abort)
+        return future
+
+    @wraps(original_update)
+    async def update(self, *args, **kwargs):
+        error = getattr(self, '_mlite_weight_sync_failed', None)
+        if error is not None:
+            raise RuntimeError(
+                'Weight sync previously failed; this actor cannot be reused'
+            ) from error
+        token = _WEIGHT_SYNC_RPC.set(None)
+        try:
+            return await original_update(self, *args, **kwargs)
+        except BaseException as exc:
+            self._mlite_weight_sync_failed = exc
+            raise
+        finally:
+            _WEIGHT_SYNC_RPC.reset(token)
+
+    rollout_cls._execute_method, rollout_cls.update_weights = execute, update
+    rollout_cls._mlite_weight_failure_watch_originals = (
+        original_execute,
+        original_update,
+    )
+    return True
+
+
+def _uninstall_rollout_weight_failure_watch(rollout_cls):
+    originals = rollout_cls.__dict__.get('_mlite_weight_failure_watch_originals')
+    if originals is None:
+        return False
+    rollout_cls._execute_method, rollout_cls.update_weights = originals
+    del rollout_cls._mlite_weight_failure_watch_originals
+    return True
+
+
+def _finish_weight_sender(sender, executor, worker, staging, abort):
+    """Bounded cleanup without freeing memory still borrowed by a worker."""
+    abort.event.set()
+    complete = worker is None
+    if worker is not None:
+        try:
+            worker.result(timeout=_WEIGHT_SYNC_SHUTDOWN_TIMEOUT_S)
+            complete = True
+        except FutureTimeoutError:
+            complete = worker.done()
+        except BaseException:
+            complete = True
+    if executor is not None:
+        executor.shutdown(wait=False, cancel_futures=True)
+    if complete:
+        sender._cleanup()
+        return
+    import logging
+
+    logging.getLogger(__name__).error(
+        'Weight producer did not stop; retaining buffers for failed actor cleanup'
+    )
+    if sender.socket is not None:
+        sender.socket.close(linger=0)
+        sender.socket = None
+    key = id(worker)
+    # In-flight collectives cannot be cancelled safely here. Keep storage alive
+    # until they return; the explicitly failed actor is never reused.
+    _DEFERRED_WEIGHT_SENDERS[key] = (sender, executor, staging, worker)
+
+    def cleanup(_):
+        retained = _DEFERRED_WEIGHT_SENDERS.pop(key, None)
+        if retained is not None:
+            try:
+                retained[0]._cleanup()
+            except BaseException:
+                logging.getLogger(__name__).exception('Deferred weight cleanup failed')
+
+    worker.add_done_callback(cleanup)
+
+
 class _SyncBucketProducer:
     """Pack one sender bucket at a time into a caller-owned staging slot."""
 
@@ -637,10 +822,23 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
         return False
 
     original_async_send_weights = sender_cls.async_send_weights
+    original_init_socket = sender_cls._init_socket
+
+    def init_socket(self, *args, **kwargs):
+        result = original_init_socket(self, *args, **kwargs)
+        abort = getattr(self, '_mlite_weight_abort', None)
+        if abort is not None:
+            self.socket = _AbortableWeightSocket(self.socket, abort)
+        return result
 
     async def prefetched_async_send_weights(self, weights):
         import torch
 
+        error = getattr(self, '_mlite_weight_sync_failed', None)
+        if error is not None:
+            raise RuntimeError(
+                'Weight sender previously failed; it cannot be reused'
+            ) from error
         if (
             not isinstance(weights, Iterable)
             or hasattr(weights, "__aiter__")
@@ -649,13 +847,19 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
             return await original_async_send_weights(self, weights)
 
         executor = None
-        stop = threading.Event()
+        abort = _WEIGHT_SYNC_RPC.get() or _WeightSyncAbort()
+        self._mlite_weight_abort = abort
+        stop = abort.event
+        staging_slots = None
+        worker_future = None
         free_slots = None
         ready_results = None
         held_slot = None
         try:
+            abort.check()
             self._init_socket()
             self._init_buffer()
+            abort.check()
             if self.buffer.device.type != "cuda" and not getattr(
                 self, "_mlite_prefetch_allow_cpu", False
             ):
@@ -696,13 +900,14 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                         if kind == "eof" or is_last:
                             return
                 except BaseException as exc:
-                    put_ready(("error", exc, None, 0, None, True, slot_index))
+                    abort.fail(exc)
 
             context = copy_context()
             worker_future = executor.submit(context.run, produce)
             while True:
+                abort.check()
                 try:
-                    result = ready_results.get(timeout=0.1)
+                    result = ready_results.get(timeout=_WEIGHT_SYNC_POLL_MS / 1000)
                 except queue.Empty:
                     if worker_future.done():
                         worker_future.result()
@@ -720,8 +925,6 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                     is_last,
                     held_slot,
                 ) = result
-                if kind == "error":
-                    raise metadata_or_name
                 if kind == "eof":
                     free_slots.put_nowait(held_slot)
                     held_slot = None
@@ -749,17 +952,28 @@ def _install_bucketed_sender_prefetch(sender_cls: type) -> bool:
                 self.socket.recv()
                 if is_last:
                     break
+        except BaseException as exc:
+            abort.fail(exc)
+            self._mlite_weight_sync_failed = abort.error
+            abort.check()
         finally:
-            stop.set()
+            _WEIGHT_SYNC_RPC.set(None)
             if held_slot is not None and free_slots is not None:
                 try:
                     free_slots.put_nowait(held_slot)
                 except queue.Full:
                     pass
-            if executor is not None:
-                executor.shutdown(wait=True, cancel_futures=True)
-            self._cleanup()
+            self._mlite_weight_abort = None
+            try:
+                _finish_weight_sender(
+                    self, executor, worker_future, staging_slots, abort
+                )
+            except BaseException:
+                if abort.error is None:
+                    raise
+                # Do not mask the original receiver/producer exception.
 
+    sender_cls._init_socket = init_socket
     sender_cls.async_send_weights = prefetched_async_send_weights
     sender_cls._mlite_weight_prefetch_patch = True
     return True
@@ -888,9 +1102,12 @@ class _SenderPatchLoader(importlib.abc.Loader):
 
     def exec_module(self, module) -> None:
         self._loader.exec_module(module)
-        _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-        if _weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled():
-            _instrument_bucketed_weight_sender(module.BucketedWeightSender)
+        if module.__name__ == _VLLM_ROLLOUT_MODULE:
+            _install_rollout_weight_failure_watch(module.ServerAdapter)
+        else:
+            _install_bucketed_sender_prefetch(module.BucketedWeightSender)
+            if _weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled():
+                _instrument_bucketed_weight_sender(module.BucketedWeightSender)
 
 
 class _SenderPatchFinder(importlib.abc.MetaPathFinder):
@@ -900,7 +1117,7 @@ class _SenderPatchFinder(importlib.abc.MetaPathFinder):
         self._mlite_weight_sync_probe_requested = False
 
     def find_spec(self, fullname, path, target=None):
-        if fullname != _BUCKETED_SENDER_MODULE:
+        if fullname not in (_BUCKETED_SENDER_MODULE, _VLLM_ROLLOUT_MODULE):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
         if spec is not None and spec.loader is not None:
@@ -909,16 +1126,22 @@ class _SenderPatchFinder(importlib.abc.MetaPathFinder):
 
 
 def _patch_bucketed_weight_transfer() -> bool:
+    changed = False
     module = sys.modules.get(_BUCKETED_SENDER_MODULE)
     if module is not None:
-        return _install_bucketed_sender_prefetch(module.BucketedWeightSender)
-    if any(
+        changed = _install_bucketed_sender_prefetch(module.BucketedWeightSender)
+    rollout = sys.modules.get(_VLLM_ROLLOUT_MODULE)
+    if rollout is not None:
+        changed = (
+            _install_rollout_weight_failure_watch(rollout.ServerAdapter) or changed
+        )
+    if not any(
         getattr(finder, "_mlite_weight_sync_probe_finder", False)
         for finder in sys.meta_path
     ):
-        return False
-    sys.meta_path.insert(0, _SenderPatchFinder())
-    return True
+        sys.meta_path.insert(0, _SenderPatchFinder())
+        changed = True
+    return changed
 
 
 def _patch_bucketed_weight_sender() -> bool:
