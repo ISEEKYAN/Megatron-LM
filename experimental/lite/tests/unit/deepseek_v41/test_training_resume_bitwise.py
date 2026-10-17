@@ -145,7 +145,7 @@ def _step(bundle, schedulers):
     ), 'RESUME_GRADIENT: missing native gradient at head.weight'
     if bundle.finalize_grads is not None:
         bundle.finalize_grads()
-    accepted = optimizer.step()[0]
+    accepted, norm = optimizer.step()[:2]
     rng['optimizer'] = _rng_digests()
     assert accepted, 'RESUME_UPDATE: the training step must publish an update'
     for scheduler in schedulers:
@@ -153,6 +153,8 @@ def _step(bundle, schedulers):
     return dict(
         rng=rng,
         ids=ids.cpu().tolist(),
+        # The global gradient norm the update was clipped with.
+        norm=torch.as_tensor(norm, dtype=torch.float32).cpu().view(torch.int32).item(),
         loss=loss.detach().float().cpu().view(torch.int32).item(),
         lr=[g['lr'] for g in optimizer.param_groups],
     )
