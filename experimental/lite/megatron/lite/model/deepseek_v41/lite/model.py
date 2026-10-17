@@ -158,6 +158,7 @@ class DeepseekV41Model(nn.Module):
         w4a8_experts=False,
         deployment_math=False,
         use_deepep=False,
+        deepep_routed_backward=False,
         trainable_engram=False,
         shard_engram=True,
         host_engram=False,
@@ -269,6 +270,7 @@ class DeepseekV41Model(nn.Module):
                 shared,
                 ps=self.ps,
                 use_deepep=use_deepep,
+                deepep_routed_backward=deepep_routed_backward,
                 w4a8=w4a8_experts,
                 official_expert_contract=official_expert_contract,
             )

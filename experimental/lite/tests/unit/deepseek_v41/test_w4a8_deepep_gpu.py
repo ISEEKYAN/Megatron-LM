@@ -8,6 +8,8 @@
 * ``transport``: identity experts and known per-route gradients isolate the dX
   reduction. Each transport repeats bitwise and stays within two BF16 ulps of
   the FP64 sum.
+* ``*_routed``: the DeepEP dispatch VJP reduces route gradients as all-to-all
+  does, so dX is also bitwise across transports.
 
 Everything runs in the recipe's deterministic mode; the all-to-all repeat
 outside it is only recorded.
@@ -86,7 +88,7 @@ def _ps():
     return init_parallel(ParallelConfig(ep=EP, etp=1))
 
 
-def _moe(rank, official):
+def _moe(rank, official, routed=False):
     from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE, ModalityRouter
     from megatron.lite.primitive.modules.route_preserving_deepep import (
         RoutePreservingDeepEPDispatcher,
@@ -122,6 +124,7 @@ def _moe(rank, official):
             use_deepep=use_deepep,
             w4a8=True,
             official_expert_contract=official,
+            deepep_routed_backward=use_deepep and routed,
         ).cuda()
         for use_deepep in (False, True)
     ]
@@ -159,12 +162,14 @@ def _moe(rank, official):
     report['dx_max_abs_across_transports'] = (
         (dx0.float() - dx1.float()).abs().max().item()
     )
+    if routed:
+        report['dx_bitwise_across_transports'] = torch.equal(dx0, dx1)
     report['grad_keys_equal'] = sorted(g0) == sorted(g1)
     report['grads_bitwise'] = all(torch.equal(g0[k], g1[k]) for k in g0 if k in g1)
     return report
 
 
-def _transport(rank):
+def _transport(rank, routed=False):
     from megatron.lite.primitive.modules.dispatcher import TokenDispatcher
     from megatron.lite.primitive.modules.route_preserving_deepep import (
         RoutePreservingDeepEPDispatcher,
@@ -197,13 +202,15 @@ def _transport(rank):
         torch.cuda.synchronize()
         return x.grad
 
-    def dispatcher(cls, use_deepep):
-        return cls(EXPERTS, HIDDEN, ps, use_deepep=use_deepep)
+    def dispatcher(cls, use_deepep, **options):
+        return cls(EXPERTS, HIDDEN, ps, use_deepep=use_deepep, **options)
 
     report = {}
     paths = {
         'alltoall': lambda: dispatcher(TokenDispatcher, False),
-        'deepep': lambda: dispatcher(RoutePreservingDeepEPDispatcher, True),
+        'deepep': lambda: dispatcher(
+            RoutePreservingDeepEPDispatcher, True, routed_backward=routed
+        ),
     }
     assert not paths['alltoall']().use_deepep
     assert paths['deepep']().use_deepep
@@ -229,6 +236,10 @@ def _transport(rank):
     report['dx_max_abs_across_transports'] = (
         (first['alltoall'].float() - first['deepep'].float()).abs().max().item()
     )
+    if routed:
+        report['dx_bitwise_across_transports'] = torch.equal(
+            first['alltoall'], first['deepep']
+        )
     return report
 
 
@@ -236,6 +247,10 @@ _MODES = {
     'moe0': lambda rank: _moe(rank, False),
     'moe1': lambda rank: _moe(rank, True),
     'transport': _transport,
+    # Routed DeepEP backward: dX is bitwise the all-to-all dispatcher's too.
+    'moe0_routed': lambda rank: _moe(rank, False, routed=True),
+    'moe1_routed': lambda rank: _moe(rank, True, routed=True),
+    'transport_routed': lambda rank: _transport(rank, routed=True),
 }
 
 

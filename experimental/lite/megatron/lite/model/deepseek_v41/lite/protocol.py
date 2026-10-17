@@ -53,6 +53,9 @@ class ImplConfig:
     w4a8_experts: bool = False
     deployment_math: bool = False
     use_deepep: bool = False
+    # DeepEP dispatch VJP reduces route gradients as all-to-all does (bitwise
+    # dX across dispatchers); costs one gradient row per route on the wire.
+    deepep_routed_backward: bool = False
     token_map: list[int] | None = None
     trainable_engram: bool = False
     shard_engram: bool = True
@@ -146,7 +149,8 @@ def _construct_model(model_cfg, impl_cfg, ps, layer_range):
             ),
             **project_fields(
                 vars(c),
-                'token_map quantized w4a8_experts deployment_math use_deepep trainable_engram shard_engram host_engram '
+                'token_map quantized w4a8_experts deployment_math use_deepep deepep_routed_backward '
+                'trainable_engram shard_engram host_engram '
                 'gate_temperature bias_rate enable_dspark_execution',
             ),
         )

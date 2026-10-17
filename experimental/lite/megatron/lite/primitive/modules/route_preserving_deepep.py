@@ -10,6 +10,7 @@ the caller owns the top-k reduction (e.g. an ordered FMA).
 
 from __future__ import annotations
 
+import math
 import os
 from contextlib import contextmanager
 
@@ -626,6 +627,82 @@ def _dispatch_route_metadata(
     )
 
 
+class _RoutedBackwardDispatch(torch.autograd.Function):
+    """Dispatch whose VJP reduces each token's route gradients as all-to-all does.
+
+    Forward is the dispatcher's own route-preserving dispatch. Backward returns
+    every route's input and probability gradient unreduced to its source over
+    the route-metadata handle (one row per route, so DeepEP sums nothing), then
+    orders the routes as the unfused all-to-all permute does (global expert,
+    then token) and applies the same ``index_select`` VJP, so dX is bitwise the
+    all-to-all dispatcher's under the same determinism mode.
+    """
+
+    @staticmethod
+    def forward(ctx, hidden_states, topk_scores, topk_indices, dispatcher):
+        expert_hidden, counts, expert_probs = dispatcher._dispatch_routes(
+            hidden_states, topk_scores, topk_indices
+        )
+        tokens, topk = topk_indices.shape
+        flat = topk_indices.reshape(-1).long()
+        route_slots = torch.nonzero(flat >= 0, as_tuple=False).reshape(-1)
+        route_tokens = torch.div(route_slots, topk, rounding_mode="floor")
+        experts = flat.index_select(0, route_slots)
+        ordered = torch.sort(topk_indices.long(), dim=1).values
+        torch._assert_async(
+            torch.all(ordered[:, 1:] != ordered[:, :-1]),
+            "Routed DeepEP backward needs distinct experts per token",
+        )
+        order = torch.argsort(experts * tokens + route_tokens, stable=True)
+        ctx.route_rows = dispatcher._metadata_route_rows
+        ctx.route_handle = dispatcher._route_handle
+        ctx.buffer = dispatcher.buffer if dispatcher.ep_size > 1 else None
+        ctx.route_slots = route_slots
+        ctx.order = order
+        ctx.order_tokens = route_tokens.index_select(0, order)
+        ctx.hidden_shape = tuple(hidden_states.shape)
+        ctx.scores_shape = tuple(topk_scores.shape)
+        ctx.scores_dtype = topk_scores.dtype
+        ctx.mark_non_differentiable(counts)
+        return expert_hidden, counts, expert_probs
+
+    @staticmethod
+    def backward(ctx, grad_hidden, _grad_counts, grad_probs):
+        rows = ctx.route_rows
+        if grad_hidden is None:
+            grad_hidden = torch.zeros(
+                (rows.numel(), ctx.hidden_shape[1]),
+                dtype=torch.bfloat16,
+                device=rows.device,
+            )
+        else:
+            grad_hidden = grad_hidden.index_select(0, rows)
+        grad_probs = (
+            torch.zeros(rows.numel(), dtype=torch.float32, device=rows.device)
+            if grad_probs is None
+            else grad_probs.float().index_select(0, rows)
+        )
+        if ctx.buffer is not None:
+            with _moe_nvtx_range("moe_bwd/deepep/routed_combine"):
+                grad_hidden, grad_probs, _ = ctx.buffer.combine(
+                    grad_hidden.contiguous(),
+                    ctx.route_handle,
+                    topk_weights=grad_probs.unsqueeze(1).contiguous(),
+                )
+            grad_probs = grad_probs.reshape(-1)
+        # One row per source route, token-major slot order (as combine_unreduced).
+        grad_input = torch.ops.aten.index_select_backward(
+            grad_hidden.index_select(0, ctx.order),
+            ctx.hidden_shape,
+            0,
+            ctx.order_tokens,
+        )
+        grad_scores = grad_probs.new_zeros(math.prod(ctx.scores_shape))
+        grad_scores.index_copy_(0, ctx.route_slots, grad_probs)
+        grad_scores = grad_scores.reshape(ctx.scores_shape).to(ctx.scores_dtype)
+        return grad_input, grad_scores, None, None
+
+
 class RoutePreservingDeepEPDispatcher(TokenDispatcher):
     """Normal DeepEP transport that returns each route's expert row unreduced.
 
@@ -633,9 +710,15 @@ class RoutePreservingDeepEPDispatcher(TokenDispatcher):
     FP32 routing weight per row. ``combine_unreduced`` returns
     ``(rows, row_token, row_expert)`` with one row per valid (token, slot)
     route, in source token-major slot order. Duplicate slots stay separate.
+
+    ``routed_backward`` makes the dispatch VJP reduce route gradients exactly
+    as the unfused all-to-all dispatcher does (see ``_RoutedBackwardDispatch``)
+    at the cost of returning one gradient row per route instead of one per
+    (token, destination rank).
     """
 
-    def __init__(self, *args, **kwargs):
+    def __init__(self, *args, routed_backward=False, **kwargs):
+        self.routed_backward = bool(routed_backward)
         kwargs["use_deepep"] = False
         super().__init__(*args, **kwargs)
         self.use_deepep = self.ep_size > 1
@@ -663,6 +746,13 @@ class RoutePreservingDeepEPDispatcher(TokenDispatcher):
         topk_scores: torch.Tensor,
         topk_indices: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        if self.routed_backward and torch.is_grad_enabled():
+            return _RoutedBackwardDispatch.apply(
+                hidden_states, topk_scores, topk_indices, self
+            )
+        return self._dispatch_routes(hidden_states, topk_scores, topk_indices)
+
+    def _dispatch_routes(self, hidden_states, topk_scores, topk_indices):
         if hidden_states.ndim != 2 or hidden_states.dtype != torch.bfloat16:
             raise TypeError("Route-preserving DeepEP requires BF16 [tokens, hidden]")
         if hidden_states.shape[1] < 16:

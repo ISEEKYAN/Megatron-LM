@@ -162,6 +162,7 @@ class DeepseekV41MoE(nn.Module):
         use_deepep=False,
         w4a8=False,
         official_expert_contract=False,
+        deepep_routed_backward=False,
     ):
         super().__init__()
         self.gate = router
@@ -181,12 +182,17 @@ class DeepseekV41MoE(nn.Module):
             raise RuntimeError(
                 'V4.1_DEEPEP_UNAVAILABLE: requested DeepEP is not installed'
             )
+        if deepep_routed_backward and not (w4a8 and use_deepep):
+            raise ValueError('Routed DeepEP backward requires W4A8 experts over DeepEP')
+        options = {}
         if w4a8 and use_deepep:
             # W4A8 reduces each token's top-k rows itself (ordered FMA), so
             # DeepEP must return the routed rows unreduced.
             from megatron.lite.primitive.modules.route_preserving_deepep import (
                 RoutePreservingDeepEPDispatcher as Dispatcher,
             )
+
+            options['routed_backward'] = deepep_routed_backward
         else:
             Dispatcher = dispatcher.TokenDispatcher
         self.dispatcher = Dispatcher(
@@ -194,6 +200,7 @@ class DeepseekV41MoE(nn.Module):
             router.router.gate.in_features,
             ps,
             use_deepep=use_deepep,
+            **options,
         )
         if len(self.experts) != router.router.num_experts:
             raise ValueError("Provide one expert module per routed expert")

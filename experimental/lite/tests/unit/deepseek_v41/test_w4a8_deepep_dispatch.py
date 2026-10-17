@@ -37,8 +37,11 @@ def _router():
     return router
 
 
+@pytest.mark.parametrize('routed', [False, True], ids=['summed_bwd', 'routed_bwd'])
 @pytest.mark.parametrize('official', [False, True])
-def test_w4a8_deepep_matches_unfused_dispatch(v41_core_te, monkeypatch, official):
+def test_w4a8_deepep_matches_unfused_dispatch(
+    v41_core_te, monkeypatch, official, routed
+):
     from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE
     from megatron.lite.primitive.modules.route_preserving_deepep import (
         RoutePreservingDeepEPDispatcher,
@@ -55,10 +58,12 @@ def test_w4a8_deepep_matches_unfused_dispatch(v41_core_te, monkeypatch, official
             use_deepep=use_deepep,
             w4a8=True,
             official_expert_contract=official,
+            deepep_routed_backward=use_deepep and routed,
         )
         for use_deepep in (False, True)
     ]
     assert isinstance(models[1].dispatcher, RoutePreservingDeepEPDispatcher)
+    assert models[1].dispatcher.routed_backward == routed
     data = torch.randn(2, 9, 128).bfloat16()
     incoming = torch.randn_like(data)
     outputs, inputs = [], []
@@ -69,10 +74,14 @@ def test_w4a8_deepep_matches_unfused_dispatch(v41_core_te, monkeypatch, official
         outputs.append(out)
         inputs.append(x.grad)
     assert torch.equal(outputs[0], outputs[1])
-    # The route scatter VJP sums a token's slot gradients in BF16 slot order;
-    # the unfused unpermute sums them in another order (and DeepEP combine
-    # owns that sum across ranks), so dX agrees to BF16 rounding only.
-    torch.testing.assert_close(inputs[0], inputs[1], rtol=2**-6, atol=2**-9)
+    if routed:
+        # Route gradients reduced by the unfused dispatcher's own VJP.
+        assert torch.equal(inputs[0], inputs[1])
+    else:
+        # The route scatter VJP sums a token's slot gradients in BF16 slot
+        # order; the unfused unpermute sums them in another order (and DeepEP
+        # combine owns that sum across ranks): dX agrees to BF16 rounding.
+        torch.testing.assert_close(inputs[0], inputs[1], rtol=2**-6, atol=2**-9)
     assert torch.equal(
         models[0].gate.router.gate.weight.grad, models[1].gate.router.gate.weight.grad
     )
@@ -111,3 +120,34 @@ def test_unreduced_rows_keep_every_route(v41_core_te):
     assert row_token.tolist() == [0, 0, 1, 1, 2, 2]
     assert row_expert.tolist() == [0, 0, 1, 0, 1, 0]
     assert out[:, 0].tolist() == [10, 10, 20, 20, 30, 30]
+
+
+def test_routed_backward_requires_w4a8_deepep(v41_core_te):
+    from megatron.lite.model.deepseek_v41.lite.moe import DeepseekV41MoE
+
+    with pytest.raises(ValueError, match='Routed DeepEP backward requires'):
+        DeepseekV41MoE(
+            _router(),
+            [_Expert() for _ in range(8)],
+            w4a8=True,
+            deepep_routed_backward=True,
+        )
+
+
+def test_routed_backward_rejects_repeated_experts(v41_core_te):
+    from megatron.lite.primitive.modules.route_preserving_deepep import (
+        RoutePreservingDeepEPDispatcher,
+    )
+    from megatron.lite.primitive.parallel.state import ParallelState
+
+    dispatcher = RoutePreservingDeepEPDispatcher(
+        num_experts=3,
+        hidden_size=16,
+        ps=ParallelState(),
+        use_deepep=True,
+        routed_backward=True,
+    )
+    hidden = torch.ones(2, 16, dtype=torch.bfloat16, requires_grad=True)
+    weights = torch.full((2, 2), 0.5, requires_grad=True)
+    with pytest.raises(RuntimeError, match='distinct experts per token'):
+        dispatcher.dispatch(hidden, weights, torch.tensor([[0, 0], [1, 2]]))
