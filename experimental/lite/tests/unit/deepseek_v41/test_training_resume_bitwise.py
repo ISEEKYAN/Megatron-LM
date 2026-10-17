@@ -32,9 +32,16 @@ STEPS, SAVED_AT = 3, 1
 TOKENS = 8
 
 
-def _prefix_config(experts):
+def _prefix_config(experts, hidden_size=None):
     parity = runpy.run_path(str(Path(__file__).with_name('test_cp_ep_parity.py')))
-    return parity['_prefix_config'](experts)
+    config = parity['_prefix_config'](experts)
+    if hidden_size is None:
+        return config
+    from megatron.lite.model.deepseek_v41.config import DeepseekV41Config
+
+    hf = config.to_hf_dict()
+    hf['text_config']['hidden_size'] = hidden_size
+    return DeepseekV41Config(hf)
 
 
 def _impl(case, parallel):
@@ -78,7 +85,8 @@ def _build(case):
 
     parallel = ParallelConfig(ep=case['ep'], cp=case['cp'])
     bundle = protocol.build_model(
-        _prefix_config(case['experts']), impl_cfg=_impl(case, parallel)
+        _prefix_config(case['experts'], case.get('hidden_size')),
+        impl_cfg=_impl(case, parallel),
     )
     schedulers = [
         torch.optim.lr_scheduler.StepLR(o, step_size=1, gamma=0.8)
@@ -383,8 +391,10 @@ def test_dcp_resume_is_bitwise_host_optimizer(
 @pytest.mark.gpus(2, min_architecture='blackwell')
 @pytest.mark.parametrize('segmented', [False, True])
 @pytest.mark.parametrize('trainable', [False, True])
-@pytest.mark.parametrize('ep,quantized', [(1, True), (2, False)])
-def test_dcp_resume_is_bitwise_on_gpu(tmp_path, ep, quantized, trainable, segmented):
+@pytest.mark.parametrize('ep', [1, 2])
+def test_dcp_resume_is_bitwise_on_gpu(tmp_path, ep, trainable, segmented):
+    # VERL's fused cross entropy needs hidden_size % 128 == 0 (the reduced 40L
+    # fixture's width); the CPU prefix is narrower.
     case = dict(
         device='cuda',
         ep=ep,
@@ -392,6 +402,7 @@ def test_dcp_resume_is_bitwise_on_gpu(tmp_path, ep, quantized, trainable, segmen
         experts=2,
         trainable=trainable,
         segmented=segmented,
-        quantized=quantized,
+        quantized=False,
+        hidden_size=128,
     )
     _run(tmp_path, case)
