@@ -6,22 +6,16 @@ from torch.autograd.function import once_differentiable
 
 
 def _canonical(x):
-    """Same values in standard contiguous strides.
+    """Same values in contiguous strides.
 
     The reference VJP runs eager reductions/GEMMs whose kernel choice follows
     operand strides. Upstream gradients of equal value arrive in different
     layouts (e.g. a PP carrier slice vs. an einsum-transposed PP1 gradient),
-    so the owned gradient must not see producer strides.
+    so the owned gradient must not see producer strides. Strides of size-1
+    dimensions are not a layout (torch treats such tensors as contiguous) and
+    are left alone to avoid a full activation copy per backward call.
     """
-    if x is None:
-        return None
-    strides, step = [], 1
-    for size in reversed(x.shape):
-        strides.append(step)
-        step *= max(size, 1)
-    if x.stride() == tuple(reversed(strides)):
-        return x
-    return x.clone(memory_format=torch.contiguous_format)
+    return None if x is None else x.contiguous()
 
 
 class _Visible(torch.autograd.Function):
