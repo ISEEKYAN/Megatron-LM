@@ -509,14 +509,15 @@ class CompressedSparseAttention(nn.Module):
             sequence = ContiguousCPSequence(
                 geometry.total, geometry.cp_rank, geometry.cp_size, geometry.cp_group
             )
-        outputs, states, rows, offset = [], [], [], 0
+        outputs, states, inputs, rows, offset = [], [], [], [], 0
         for doc in range(geometry.num_documents):
             start, stop = geometry.owned(doc)
             count = stop - start
             begin, end = geometry.boundaries[doc], geometry.boundaries[doc + 1]
+            inputs.append(_document_state(state, doc))
             output, doc_state = self._forward_cross_layer(
                 x[:, offset : offset + count],
-                _document_state(state, doc),
+                inputs[-1],
                 candidate_mask=(
                     None
                     if candidate_mask is None
@@ -530,6 +531,12 @@ class CompressedSparseAttention(nn.Module):
             offset += count
         if offset != x.shape[1]:
             raise ValueError("Packed CSA input does not match the rank's real rows")
+        if not (self.owns_kv or self.owns_index):
+            # Consumers pass state through unchanged; return the caller's object
+            # so recompute can check that no consuming layer published state.
+            if any(out is not inp for out, inp in zip(states, inputs)):
+                raise RuntimeError("A state-consuming CSA layer changed its state")
+            return torch.cat(outputs, 1), state
         return torch.cat(outputs, 1), _packed_state(states, rows)
 
     def _forward_cross_layer(self, x, state, *, candidate_mask=None, cp_context=None):

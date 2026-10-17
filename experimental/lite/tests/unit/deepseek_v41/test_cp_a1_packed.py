@@ -299,3 +299,33 @@ def test_end_to_end_within_tolerance(model, monkeypatch, lengths):
         grad_error,
     )
     assert error < 1e-5 and grad_error < 1e-4
+
+
+@pytest.mark.parametrize('lengths', [(7, 1, 3, 9, 2), (2, 2, 2, 2, 2, 2)])
+def test_full_recompute_runs_the_packed_slice(model, lengths):
+    """Recompute checks that state-consuming layers hand their state through."""
+    bounds = _bounds(lengths)
+    torch.manual_seed(17)
+    ids = torch.randint(1, 64, (1, bounds[-1]))
+    cu = torch.tensor(bounds, dtype=torch.int32)
+
+    def run():
+        model.zero_grad(set_to_none=True)
+        logits = model(ids, cu_seqlens=cu)['logits']
+        weight = torch.linspace(-1, 1, logits.numel()).view_as(logits)
+        (logits * weight).sum().backward()
+        return logits.detach(), [
+            None if p.grad is None else p.grad.clone() for p in model.parameters()
+        ]
+
+    plain_logits, plain_grads = run()
+    model.recompute = 'full'
+    try:
+        logits, grads = run()
+    finally:
+        model.recompute = None
+    assert torch.equal(logits, plain_logits)
+    for got, want in zip(grads, plain_grads):
+        assert (got is None) == (want is None)
+        if got is not None:
+            assert torch.equal(got, want)
