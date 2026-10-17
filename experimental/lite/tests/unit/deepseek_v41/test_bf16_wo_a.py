@@ -30,11 +30,6 @@ def _build(config, **kwargs):
     return protocol.build_model(config, impl_cfg=protocol.ImplConfig(**impl)).chunks[0]
 
 
-def test_bf16_wo_a_requires_deployment_math(v41_core_te):
-    with pytest.raises(ValueError, match='BF16 wo_a requires deployment math'):
-        _build(_bf16_wo_a_config())
-
-
 def test_bf16_wo_a_exports_plain_weight_and_loads_release_fp8(v41_core_te, tmp_path):
     from megatron.lite.model.deepseek_v41.lite import checkpoint
     from megatron.lite.primitive.ckpt.hf_weights import (

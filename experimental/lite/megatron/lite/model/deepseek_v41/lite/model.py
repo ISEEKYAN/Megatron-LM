@@ -225,13 +225,12 @@ class DeepseekV41Model(nn.Module):
         wo_a_dtype = getattr(t, 'wo_a_dtype', 'fp8')
         if wo_a_dtype not in ('fp8', 'bf16'):
             raise ValueError(f'Unsupported wo_a_dtype {wo_a_dtype!r}')
+        # Both contracts are part of the model, not of the deployment math: the
+        # standard path runs them too (BF16 wo_a through the plain grouped
+        # projection; experts through the official group-32 MLP and FMA combine).
         self.wo_a_bf16 = wo_a_dtype == 'bf16'
-        if self.wo_a_bf16 and not deployment_math:
-            raise ValueError('A BF16 wo_a requires deployment math')
-        if official_expert_contract and not (w4a8_experts and deployment_math):
-            raise ValueError(
-                'The official expert contract requires deployment-math W4A8 experts'
-            )
+        if official_expert_contract and not w4a8_experts:
+            raise ValueError('The official expert contract requires W4A8 experts')
         dim, copies, eps = t.hidden_size, t.hc_mult, t.rms_norm_eps
         local_experts = ensure_divisible(t.n_routed_experts, self.ps.ep_size)
         expert_start = self.ps.ep_rank * local_experts
