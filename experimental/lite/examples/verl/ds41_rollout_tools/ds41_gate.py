@@ -1,37 +1,22 @@
 #!/usr/bin/env python3
-"""DS4.1 training gate driver: one fixed training step, receipts for bitwise comparison.
+"""DS4.1 training gate driver: one fixed training step, log-probabilities for bitwise comparison.
 
 MLite only (no verl, Ray or vLLM engine). Builds the recipe's actor (quantized
 W4A8 experts, Muon with segmented host state, frozen Engram) on the requested
 partition and runs one forward_backward over a fixed global batch: every record
 of --records is one sequence, data-parallel ranks take contiguous blocks, one
-sequence per micro-batch (the recipe's micro batch 1 per GPU).
+sequence per micro-batch (the recipe's micro batch 1 per GPU). Under CP the CP
+ranks of a DP rank score the same sequences, each its own rows of the CP-A
+whole-pack split (contiguous, ceil(T / cp) rows per rank, tail padding).
 
 Receipts (rank 0 writes):
   logprobs.jsonl  per global sequence: the token log-probabilities (FP32 values)
-  grads.json      per parameter (global name): bit fingerprint, L2 norm and a
-                  fixed signed-projection sketch, after the dense SUM over DP
-                  (experts are reported by their owner rank)
-  record.json     configuration, memory and timings
+  record.json     configuration, memory, timings and the gradient check: every
+                  finalized gradient (what the optimizer consumes) finite
 
-Gradients are read after the runtime's finalize_grads, i.e. exactly what the
-optimizer consumes (dense averaged over DP x CP, experts summed over expert-DP
-and scaled the same way); replicas must agree bitwise.
-
---save-grads DIR writes every parameter's FP32 gradient under DIR on each node
-that holds a replica of it (by the lowest replica rank there), after checking
-that node's free space; --compare-grads DIR makes the owner of each parameter
-stream the saved gradient of another run back from its node and record its
-error: max |a - b| and that over max |b| (the test_cp_ep_parity measures).
-Both are meant for node-local storage inside one job; the comparing run's
-owners must sit on nodes where the saving run had replicas (e.g. a run that
-replicates the model on every node saves, a pipelined one compares).
-
-Comparisons (gate_compare.py): same configuration in fresh processes or
---repeats inside one process must be bitwise (so must recompute none vs full
-and a resumed run); a different parallel partition (DP, PP, CP or EP) compares
-log-probs bitwise, requires each side to be bitwise run to run, and reports the
-gradient errors across the two (element-wise with --compare-grads).
+Judgement (gate_compare.py): forward only -- log-probabilities bitwise, for
+the same configuration and across parallel partitions alike; gradients only
+have to be finite.
 
   torchrun --nproc_per_node 4 ds41_gate.py --model M --records R --out O --ep 4 --path deployment
 """
@@ -42,7 +27,6 @@ import time
 from pathlib import Path
 
 GiB = 2**30
-SKETCH = 16
 
 
 def parse():
@@ -67,14 +51,6 @@ def parse():
     ap.add_argument('--recompute', choices=('none', 'full'), default='none')
     ap.add_argument('--host-engram', action='store_true')
     ap.add_argument('--repeats', type=int, default=1, help='steps inside this process')
-    ap.add_argument(
-        '--save-grads', default=None, help='write FP32 gradients (first step) here'
-    )
-    ap.add_argument(
-        '--compare-grads',
-        default=None,
-        help='element-wise error of the first step against gradients saved here',
-    )
     return ap.parse_args()
 
 
@@ -112,46 +88,6 @@ def impl_cfg(args, token_map):
     return cfg
 
 
-def _words(tensor):
-    import torch
-
-    flat = tensor.detach().contiguous().reshape(-1)
-    if flat.numel() * flat.element_size() % 4 == 0:
-        return flat.view(torch.int32)
-    return flat.view(torch.uint8)
-
-
-def fingerprint(tensor, chunk=1 << 26):
-    """Two 64-bit sums over the raw bits, on the device; chunking cannot change them."""
-    import torch
-
-    words = _words(tensor)
-    plain = weighted = 0
-    for start in range(0, words.numel(), chunk):
-        part = words[start : start + chunk].to(torch.int64)
-        index = torch.arange(start, start + part.numel(), device=part.device)
-        plain = (plain + int(part.sum())) % 2**64
-        weighted = (
-            weighted + int((part * ((index * 2654435761) % 2147483647 + 1)).sum())
-        ) % 2**64
-    return [plain, weighted]
-
-
-def sketch(tensor, chunk=1 << 24):
-    """Fixed signed projections of the FP64 values (index-hashed signs), for tolerance checks."""
-    import torch
-
-    flat = tensor.detach().reshape(-1)
-    out = torch.zeros(SKETCH, dtype=torch.float64, device=flat.device)
-    for start in range(0, flat.numel(), chunk):
-        part = flat[start : start + chunk].double()
-        index = torch.arange(start, start + part.numel(), device=flat.device)
-        for j in range(SKETCH):
-            sign = (((index * (2 * j + 3) * 2654435761 + j) >> 7) & 1) * 2 - 1
-            out[j] += (part * sign).sum()
-    return [float(v) for v in out]
-
-
 def gpu_memory(device):
     import torch
 
@@ -161,95 +97,26 @@ def gpu_memory(device):
     )
 
 
-def _grad_path(directory, name):
-    return Path(directory) / f'{name}.pt'
+def cp_rows(total, cp_rank, cp_size, local_length):
+    """Global row of each of this rank's ``local_length`` rows (-1 for padding).
 
-
-def first_on_node(group):
-    """Whether this rank is the lowest rank of ``group`` on its own node."""
-    import socket
-
-    import torch.distributed as dist
-
-    host = socket.gethostname()
-    if group is None:
-        return True
-    hosts = [None] * dist.get_world_size(group)
-    dist.all_gather_object(hosts, host, group=group)
-    return hosts.index(host) == dist.get_rank(group)
-
-
-def check_space(directory, handle, saver):
-    """Fail before writing when a node-local disk cannot hold that node's gradients."""
-    import shutil
-    import socket
-
-    import torch.distributed as dist
-
-    Path(directory).mkdir(parents=True, exist_ok=True)
-    mine = sum(
-        p.numel() * 4
-        for chunk in handle._extras.get('model_chunks', [handle._model])
-        for name, p in chunk.named_parameters()
-        if p.requires_grad and saver(name)
-    )
-    everyone = [None] * dist.get_world_size()
-    dist.all_gather_object(everyone, (socket.gethostname(), mine))
-    total = sum(size for host, size in everyone if host == socket.gethostname())
-    free = shutil.disk_usage(directory).free
-    if free < int(total * 1.05):
-        raise SystemExit(
-            f'DS41_GATE_SPACE: {total / GiB:.1f} GiB of gradients, '
-            f'{free / GiB:.1f} GiB free in {directory}'
-        )
-
-
-def save_grads(directory, owned):
-    import torch
-
-    for name, grad in owned:
-        torch.save(grad.cpu(), _grad_path(directory, name))
-
-
-def versus(directory, name, grad):
-    """test_cp_ep_parity's per-parameter error: max |a - b| and over max |b|."""
-    import torch
-
-    path = _grad_path(directory, name)
-    if not path.exists():
-        return dict(missing=True)
-    reference = torch.load(path, map_location=grad.device)
-    if reference.shape != grad.shape:
-        return dict(shape=[list(reference.shape), list(grad.shape)])
-    error = float((grad - reference).abs().max()) if grad.numel() else 0.0
-    scale = float(reference.abs().max()) if grad.numel() else 0.0
-    del reference
-    return dict(abs=error, rel=error / (scale or 1.0), max_reference=scale)
-
-
-def cp_rows(total, cp_rank, cp_size, cp_group=None):
-    """Global row of each local row under the runtime's CP slicing (-1 for padding).
-
-    Uses CP-A's PackedCPGeometry when the tree has it, else the CP slicing the
-    protocol uses (ContiguousCPSequence); both split the whole pack
-    contiguously, ``ceil(T / cp)`` rows per rank, padding only the tail.
+    CP-A layout contract (PackedCPGeometry): the whole pack is split
+    contiguously, rank ``r`` owning rows ``[r * width, (r + 1) * width)`` with
+    ``width = ceil(T / cp)``; only the tail is padded. A runtime may return the
+    padded width or only the real rows; both start at ``r * width``.
     """
     import torch
 
-    try:
-        from megatron.lite.primitive.modules.attention.packed_geometry import (
-            PackedCPGeometry,
+    width = -(-total // cp_size)
+    start = cp_rank * width
+    real = max(min(total - start, width), 0)
+    if local_length not in (real, width):
+        raise RuntimeError(
+            f'CP rank {cp_rank}/{cp_size} returned {local_length} rows of a '
+            f'{total}-token sequence (expected {real} or {width})'
         )
-
-        geometry = PackedCPGeometry.from_cu_seqlens(
-            torch.tensor([0, total]), cp_rank, cp_size, cp_group
-        )
-    except ImportError:
-        from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
-
-        geometry = ContiguousCPSequence(total, cp_rank, cp_size, cp_group)
-    ids = torch.arange(1, total + 1)[None]  # 0 marks padding after slicing
-    return geometry.slice(ids, seq_dim=1)[0] - 1
+    rows = torch.arange(start, start + local_length)
+    return torch.where(rows < total, rows, torch.full_like(rows, -1))
 
 
 def cp_loss(log_probs, rows, total, cp_size):
@@ -331,23 +198,6 @@ def main():
         dp_size, dp_rank = 1, 0
     else:
         dp_size, dp_rank = dist.get_world_size(dp_group), dist.get_rank(dp_group)
-    ep_dp_rank = 0 if ps.ep_dp_group is None else dist.get_rank(ps.ep_dp_group)
-
-    def owner(name):
-        # One comparer per parameter: expert-DP rank 0 for experts, DP rank 0
-        # (of each pipeline stage) for dense parameters.
-        return (ep_dp_rank if '.ffn.experts.' in name else dp_rank) == 0
-
-    first = (
-        dict(dense=first_on_node(dp_group), expert=first_on_node(ps.ep_dp_group))
-        if args.save_grads
-        else {}
-    )
-
-    def saver(name):
-        # One writer per parameter and node holding a replica of it.
-        return first['expert' if '.ffn.experts.' in name else 'dense']
-
     records = load_records(args.records)[: args.sequences]
     if len(records) % dp_size:
         raise ValueError(f'{len(records)} sequences do not split over DP {dp_size}')
@@ -384,9 +234,9 @@ def main():
         collected = []
 
         def loss_fn(raw_output, runtime_batch, loss_context):
-            log_probs = raw_output['log_probs']
+            log_probs = raw_output['log_probs'].reshape(-1)
             total = int(runtime_batch.seq_lens.sum())
-            rows = cp_rows(total, ps.cp_rank, ps.cp_size, ps.cp_group)
+            rows = cp_rows(total, ps.cp_rank, ps.cp_size, log_probs.numel())
             collected.append((rows, log_probs.detach().float().cpu()))
             return cp_loss(log_probs, rows, total, ps.cp_size), {}
 
@@ -407,40 +257,20 @@ def main():
         gathered = [None] * world
         dist.all_gather_object(gathered, local)
         logprobs = merge_fragments(gathered)
-        grads, owned = {}, []
-        if repeat == 0 and args.save_grads:
-            check_space(args.save_grads, handle, saver)
+        # Gradients are not compared, only checked: every finalized gradient
+        # (what the optimizer consumes) must be finite.
+        nonfinite, checked = [], 0
         for chunk in handle._extras.get('model_chunks', [handle._model]):
             for name, parameter in chunk.named_parameters():
                 grad = getattr(parameter, 'main_grad', None)
                 grad = parameter.grad if grad is None else grad
                 if grad is None:
                     continue
-                # finalize_grads already synchronized replicas; take it as is.
-                grad = grad.detach().float()
-                grads[name] = dict(
-                    fingerprint=fingerprint(grad),
-                    norm=float(grad.double().norm()),
-                    sketch=sketch(grad),
-                )
-                if repeat == 0 and args.save_grads and saver(name):
-                    owned.append((name, grad))
-                if repeat == 0 and args.compare_grads and owner(name):
-                    grads[name]['versus'] = versus(args.compare_grads, name, grad)
-        if owned:
-            save_grads(args.save_grads, owned)
-            owned.clear()
+                checked += 1
+                if not bool(torch.isfinite(grad).all()):
+                    nonfinite.append(name)
         everyone = [None] * world
-        dist.all_gather_object(everyone, grads)
-        merged, conflicts = {}, []
-        for part in everyone:
-            for name, value in part.items():
-                if (
-                    name in merged
-                    and merged[name]['fingerprint'] != value['fingerprint']
-                ):
-                    conflicts.append(name)  # replicas must agree after the SUM
-                merged.setdefault(name, value)
+        dist.all_gather_object(everyone, (checked, nonfinite))
         suffix = '' if repeat == 0 else f'-repeat{repeat}'
         if rank == 0:
             with (out / f'logprobs{suffix}.jsonl').open('w') as f:
@@ -449,12 +279,13 @@ def main():
                         json.dumps(dict(sequence=index, logprobs=logprobs[index]))
                         + '\n'
                     )
-            (out / f'grads{suffix}.json').write_text(json.dumps(merged))
         record[f'step{suffix or "-0"}'] = dict(
             step_s=step_s,
             memory=gpu_memory(device),
-            parameters=len(merged),
-            replica_conflicts=conflicts[:10],
+            gradients_checked=sum(count for count, _ in everyone),
+            gradients_nonfinite=sorted({n for _, names in everyone for n in names})[
+                :20
+            ],
         )
     if rank == 0:
         (out / 'record.json').write_text(json.dumps(record, indent=1))
