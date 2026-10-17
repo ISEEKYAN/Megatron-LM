@@ -95,6 +95,31 @@ def _build(case):
     return bundle, schedulers, parallel
 
 
+def _digest(tensors):
+    import hashlib
+
+    hasher = hashlib.sha256()
+    for tensor in tensors:
+        if tensor is not None:
+            hasher.update(
+                tensor.detach().reshape(-1).view(torch.uint8).cpu().numpy().tobytes()
+            )
+    return hasher.hexdigest()[:16]
+
+
+def _grads(model):
+    out = []
+    for p in model.parameters():
+        g = p.main_grad if getattr(p, 'main_grad', None) is not None else p.grad
+        out.append(g)
+    return out
+
+
+def _masters(optimizer):
+    host = optimizer.host_update
+    return [] if host is None else list(host.masters.values())
+
+
 def _rng_digests():
     import hashlib
     import pickle
@@ -138,6 +163,12 @@ def _step(bundle, schedulers):
     assert loss.requires_grad and torch.isfinite(loss), 'RESUME_LOSS'
     loss.backward()
     rng['backward'] = _rng_digests()
+    # Stage fingerprints: a run-to-run difference names the first stage that differs.
+    embed = model.tensor_bindings['embed.weight'].tensor
+    stages = dict(
+        embed_grad=_digest(_grads(torch.nn.ModuleList([model.embed]))),
+        grads=_digest(_grads(model)),
+    )
     head = model.tensor_bindings['head.weight'].tensor
     grad = head.main_grad if getattr(head, 'main_grad', None) is not None else head.grad
     assert (
@@ -145,12 +176,18 @@ def _step(bundle, schedulers):
     ), 'RESUME_GRADIENT: missing native gradient at head.weight'
     if bundle.finalize_grads is not None:
         bundle.finalize_grads()
+    stages['finalized_grads'] = _digest(_grads(model))
+    stages['masters_before'] = _digest(_masters(optimizer))
     accepted, norm = optimizer.step()[:2]
     rng['optimizer'] = _rng_digests()
+    stages['masters_after'] = _digest(_masters(optimizer))
+    stages['embed_after'] = _digest([embed])
+    stages['parameters_after'] = _digest(list(model.parameters()))
     assert accepted, 'RESUME_UPDATE: the training step must publish an update'
     for scheduler in schedulers:
         scheduler.step()
     return dict(
+        stages=stages,
         rng=rng,
         ids=ids.cpu().tolist(),
         # The global gradient norm the update was clipped with.
