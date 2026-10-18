@@ -355,6 +355,78 @@ def test_p6_cpu_and_gpu_resolve_full_recompute(tmp_path, monkeypatch):
         assert resolved.actor_rollout_ref[role].engine.impl_cfg.recompute == 'full'
 
 
+def _resolve_4l(tmp_path, monkeypatch, name, **extra):
+    """Run command.py --config-only for the 4L C8 environment; resolved config or error."""
+    import os
+    import subprocess
+    import sys
+
+    for key in ('DS41_EP', 'DS41_CP', 'DS41_WORLD', 'DS41_PP', 'DS41_MICRO_BATCH'):
+        monkeypatch.delenv(key, raising=False)
+    spec = importlib.util.spec_from_file_location(
+        'ds41_4l_production', ROOT / 'tests/smoke/workflows/test_ds41_grpo_recipe.py'
+    )
+    smoke = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(smoke)
+    inputs = tmp_path / name
+    env = smoke.production_environment(4, 1, inputs)
+    model = inputs / '4l/model'
+    model.mkdir(parents=True)
+    (model / 'config.json').write_text(
+        json.dumps(
+            {'text_config': {'expert_activation_group_size': 32, 'wo_a_dtype': 'bf16'}}
+        )
+    )
+    (model / 'token-map.json').write_text(json.dumps(list(range(64))))
+    Path(env['DS41_DATA']).write_bytes(b'config-only input; no dataset read')
+    env.update(DS41_OUTPUT=str(inputs / 'resolved'), **extra)
+    completed = subprocess.run(
+        [
+            sys.executable,
+            str(ROOT / 'examples/verl/scripts/ds41_w4a8_proxy/command.py'),
+            '--config-only',
+        ],
+        env=env,
+        capture_output=True,
+        text=True,
+    )
+    if completed.returncode:
+        return completed.stderr
+    from omegaconf import OmegaConf
+
+    return OmegaConf.load(Path(env['DS41_OUTPUT']) / 'resolved.yaml')
+
+
+def test_micro_batch_packs_several_sequences_and_defaults_to_one(tmp_path, monkeypatch):
+    """DS41_MICRO_BATCH sets the actor and both log-prob microbatches; 1 by default."""
+    pytest.importorskip(
+        'verl', reason='real Hydra resolution requires the recipe VERL runtime'
+    )
+
+    def micro(resolved):
+        a = resolved.actor_rollout_ref
+        return (
+            a.actor.ppo_micro_batch_size_per_gpu,
+            a.ref.log_prob_micro_batch_size_per_gpu,
+            a.rollout.log_prob_micro_batch_size_per_gpu,
+            a.actor.use_dynamic_bsz,
+        )
+
+    assert micro(_resolve_4l(tmp_path, monkeypatch, 'default')) == (1, 1, 1, False)
+    cp2 = dict(DS41_EP='8', DS41_CP='2', DS41_WORLD='8', DS41_TRAIN_BATCH='6')
+    packed = _resolve_4l(tmp_path, monkeypatch, 'packed', DS41_MICRO_BATCH='3', **cp2)
+    assert micro(packed) == (3, 3, 3, False)
+    # 8 prompts x 4 over DP4 is 8 sequences per rank, which 3 does not divide.
+    error = _resolve_4l(
+        tmp_path,
+        monkeypatch,
+        'uneven',
+        DS41_MICRO_BATCH='3',
+        **dict(cp2, DS41_TRAIN_BATCH='8'),
+    )
+    assert 'DS41_MICRO_BATCH must divide' in error
+
+
 def _forwarded_env(script):
     """Keys a launcher forwards into enroot: bare --env and host-set-only loops."""
     import re

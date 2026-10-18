@@ -61,6 +61,14 @@ before submission; both preparation and GPU workers receive these settings.
 does not require or grant GPU authorization. The default submits the CPU gate
 and its dependent GPU job.
 
+`DS41_MICRO_BATCH` (default 1) sets how many sequences one training
+microbatch packs, for the actor update and both log-prob passes. CP runs
+that must cover several documents per packed forward need
+`DS41_MICRO_BATCH>1`; with equal-length samples (for example the 4L C8's
+12800+128) use an odd count such as 3, so a document crosses the CP cut. It
+must divide each data-parallel rank's sequences per step, so set
+`DS41_TRAIN_BATCH` accordingly (for example 6 for 4L EP8 x CP2).
+
 For a source/native overlay runtime, set `DS41_OVERLAY_SETUP` to its published
 shell setup file. Both CPU and GPU stages source that same file before Enroot;
 it must pin the runtime mounts, not replace the recipe workflow.

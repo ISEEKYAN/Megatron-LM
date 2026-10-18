@@ -87,6 +87,13 @@ if train_batch < 1 or (train_batch * 4) % (world // cp):
     raise ValueError(
         'DS41_TRAIN_BATCH x n=4 must divide evenly over data-parallel ranks'
     )
+# Sequences packed into one THD microbatch (actor update and both log-prob
+# passes); >1 packs several documents per forward, as CP multi-document gates need.
+micro_batch = int(os.environ.get('DS41_MICRO_BATCH', '1'))
+if micro_batch < 1 or (train_batch * 4 // (world // (cp * pp))) % micro_batch:
+    raise ValueError(
+        'DS41_MICRO_BATCH must divide each data-parallel rank\'s sequences per step'
+    )
 if not os.environ.get('DS41_DATA'):
     raise ValueError('DS41_DATA must point to the DAPO training parquet')
 os.environ['W4_GRPO_DATA'] = os.environ['DS41_DATA']
@@ -158,7 +165,7 @@ args = [
     'actor_rollout_ref.model.use_remove_padding=true',
     'actor_rollout_ref.model.use_fused_kernels=false',
     f'actor_rollout_ref.actor.ppo_mini_batch_size={train_batch}',
-    'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1',
+    f'actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu={micro_batch}',
     'actor_rollout_ref.actor.use_dynamic_bsz=false',
     'actor_rollout_ref.actor.ppo_epochs=1',
     'actor_rollout_ref.actor.shuffle=false',
@@ -227,7 +234,7 @@ args = [
             **split_layer,
         }.items()
     ],
-    'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu=1',
+    f'actor_rollout_ref.ref.log_prob_micro_batch_size_per_gpu={micro_batch}',
     '+actor_rollout_ref.ref.engine.full_determinism=true',
     '+actor_rollout_ref.ref.engine.seed=42',
     'actor_rollout_ref.rollout.name=vllm',
@@ -245,7 +252,7 @@ args = [
     'actor_rollout_ref.rollout.ignore_eos=true',
     'actor_rollout_ref.rollout.calculate_log_probs=true',
     'actor_rollout_ref.rollout.logprobs_mode=raw_logprobs',
-    'actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1',
+    f'actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu={micro_batch}',
     f'actor_rollout_ref.rollout.max_model_len={context_length}',
     'actor_rollout_ref.rollout.max_num_seqs=4',
     f'actor_rollout_ref.rollout.max_num_batched_tokens={context_length}',

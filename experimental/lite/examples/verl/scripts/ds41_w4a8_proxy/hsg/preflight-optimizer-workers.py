@@ -58,7 +58,7 @@ def check_optimizer_worker():
 
 
 nodes = [node['NodeID'] for node in ray.nodes() if node['Alive']]
-assert len(nodes) == 2
+assert len(nodes) == int(os.environ.get('RECIPE_NNODES', '2'))
 futures = [
     check_optimizer_worker.options(
         scheduling_strategy=NodeAffinitySchedulingStrategy(node_id=node, soft=False),
@@ -67,5 +67,7 @@ futures = [
     for node in nodes
 ]
 results = ray.get(futures, timeout=240)
-assert len({row['host'] for row in results}) == 2
+assert len({row['host'] for row in results}) == int(
+    os.environ.get('RECIPE_NNODES', '2')
+)
 print('RECIPE_ACTUAL_CPU_OPTIMIZER_WORKERS_OK', json.dumps(results), flush=True)

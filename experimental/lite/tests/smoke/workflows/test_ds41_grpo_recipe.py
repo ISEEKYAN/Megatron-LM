@@ -97,6 +97,12 @@ def _check_indexer_probes(layers, pp, events):
     return probes
 
 
+def _verifier_ranks(layers, base):
+    """The run's world for the verifiers; omitted at their default of 8 ranks."""
+    ranks = int(base.get('DS41_WORLD', '64' if layers == 40 else '8'))
+    return ['--ranks', str(ranks)] if layers == 40 or ranks != 8 else []
+
+
 def production_environment(layers, bi, inputs):
     base = os.environ.copy()
     base.pop('DS41_RELEASE', None)
@@ -204,7 +210,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                     '--frozen-tables',
                     FROZEN_TABLES.get(layers, '1'),
                     *(['--frozen-resend'] if layers in FROZEN_TABLES else []),
-                    *(['--ranks', '64'] if layers == 40 else []),
+                    *_verifier_ranks(layers, base),
                 ],
                 run / 'verified.json',
                 base,
@@ -274,7 +280,7 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
                 str(RECIPE / 'verify_checkpoint.py'),
                 str(output / 'fresh'),
                 str(output / 'resumed'),
-                *(['--ranks', '64'] if layers == 40 else []),
+                *_verifier_ranks(layers, base),
             ],
             output / 'checkpoint-verified.json',
             base,
