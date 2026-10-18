@@ -201,3 +201,8 @@ def test_more_than_two_stages_need_explicit_owner_safe_cuts():
         _build(parallel=ParallelConfig(pp=4))
     with pytest.raises(NotImplementedError, match="V4.1_PP_CSA2_PAYLOAD_UNSUPPORTED"):
         _build(parallel=ParallelConfig(pp=3), pipeline_split_layer=(8, 10))
+
+
+def test_deepep_with_cp_fails_closed_before_distributed_setup():
+    with pytest.raises(NotImplementedError, match="V4.1_DEEPEP_CP_UNSUPPORTED"):
+        _build(use_deepep=True, parallel=ParallelConfig(cp=2))

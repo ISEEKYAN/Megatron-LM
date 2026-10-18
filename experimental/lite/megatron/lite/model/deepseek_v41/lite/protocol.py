@@ -135,6 +135,12 @@ def _validate_parallel(c, p, cut=20):
         )
     if type(p.cp) is not int or p.cp < 1:
         raise ValueError('CP size must be a positive integer')
+    if c.use_deepep and p.cp > 1:
+        # No CP x DeepEP parity gate exists; fail closed until one does.
+        raise NotImplementedError(
+            'V4.1_DEEPEP_CP_UNSUPPORTED: DeepEP dispatch with CP>1 is not gated; '
+            'use the all-to-all dispatcher (use_deepep=False) or CP=1'
+        )
     # EP-over-CP as in MCore and DeepSeek V4: dense ranks decompose as
     # (TP, CP, DP, PP) and experts as (ETP, EP, EDP, PP); the MoE dispatcher
     # exchanges every CP shard's tokens within the EP group.
