@@ -90,7 +90,7 @@ def install(event):
                     'columns': keys.shape[1],
                     'truncated_rows': int(truncated.sum().item()),
                     'changed_topk_rows': int((changed & truncated).sum().item()),
-                    'max_score_abs_diff': error.max().item(),
+                    'max_score_abs_diff': error.max().item() if error.numel() else 0.0,
                     'input_weights_dtype': str(weights.dtype),
                 }
             )
