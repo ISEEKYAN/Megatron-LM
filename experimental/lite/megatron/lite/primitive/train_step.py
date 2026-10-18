@@ -13,7 +13,11 @@ from megatron.lite.primitive.protocols import (
     ExpertClassifierFn,
     default_expert_classifier,
 )
-from megatron.lite.runtime.contracts.loss import split_loss_context, use_loss_context
+from megatron.lite.runtime.contracts.loss import (
+    mark_external_normalization,
+    split_loss_context,
+    use_loss_context,
+)
 
 
 def run_microbatch_loop(
@@ -51,11 +55,14 @@ def run_microbatch_loop(
             matching backward scaling. Other outputs retain the last microbatch.
         prepare_microbatches: Prepare the native loss denominator in both training
             and validation; this hook must not depend on gradients. External
-            ``loss_fn`` callbacks own normalization and bypass this hook. For
+            ``loss_fn`` callbacks own normalization and bypass this hook; their
+            loss contexts are marked ``external_normalization``. For
             V4.1 SFT, preparation makes averaging equivalent to a token-weighted
             objective; averaging unprepared local token means would be incorrect.
     """
-    if prepare_microbatches is not None and loss_fn is None:
+    if loss_fn is not None:
+        data_iter = mark_external_normalization(data_iter)
+    elif prepare_microbatches is not None:
         data_iter = iter(prepare_microbatches(data_iter, num_microbatches))
     last_out = None
     validation_loss = None

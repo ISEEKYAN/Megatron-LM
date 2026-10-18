@@ -583,7 +583,9 @@ class MegatronLiteRuntime(RuntimeBase):
             try:
                 prepare = handle._extras.get("prepare_microbatches")
                 # Match the non-PP SFT policy before shape inspection and scheduling.
-                if prepare is not None and loss_fn is None:
+                if loss_fn is not None:
+                    data_iter = _imports_loss.mark_external_normalization(data_iter)
+                elif prepare is not None:
                     data_iter = iter(prepare(data_iter, num_microbatches))
                 first_item = next(data_iter)
                 first_batch, _loss_context = split_loss_context(first_item)

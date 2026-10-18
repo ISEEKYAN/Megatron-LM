@@ -177,3 +177,23 @@ def test_cp_without_prepared_denominator_fails_loud(v41_core_te, with_context):
             batch,
             cp_context=ContiguousCPSequence(7, 0, 2),
         )
+
+
+def test_cp_external_normalization_skips_the_native_loss(v41_core_te):
+    from megatron.lite.primitive.modules.attention.cp import ContiguousCPSequence
+    from megatron.lite.runtime.contracts.loss import LossContext
+
+    batch = SimpleNamespace(
+        input_ids=torch.arange(7),
+        labels=torch.arange(7) % 3,
+        loss_mask=torch.ones(7),
+        cu_seqlens=torch.tensor([0, 7]),
+    )
+    with use_loss_context(LossContext(external_normalization=True)):
+        result = text_output(
+            torch.ones(4, 2),
+            torch.ones(3, 2),
+            batch,
+            cp_context=ContiguousCPSequence(7, 0, 2),
+        )
+    assert 'loss' not in result and result['log_probs'].shape == (4,)

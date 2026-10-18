@@ -493,9 +493,14 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
         raise ValueError("Labels must match packed input shape")
     if batch.loss_mask is not None and batch.loss_mask.shape != batch.labels.shape:
         raise ValueError("Loss mask must match packed input shape")
-    if cp_context is not None and (
-        context is None or context.normalization_denominator is None
-    ):
+    # Under CP a rank's native loss needs the prepared global denominator. An
+    # external loss_fn owns normalization, so the native loss is skipped there.
+    native_loss = (
+        cp_context is None
+        or context is not None
+        and context.normalization_denominator is not None
+    )
+    if not native_loss and (context is None or not context.external_normalization):
         raise ValueError('V4.1_CP_NORMALIZATION_REQUIRED: use prepare_microbatches')
     labels, mask, denominator = _cp_targets(batch, cp_context)
     if logits is None:
@@ -510,12 +515,14 @@ def text_output(hidden, weight, batch, *, cp_context=None, tp_group=None, logits
             if context is not None and context.calculate_entropy
             else None
         )
-    if context is not None and context.normalization_denominator is not None:
-        denominator = context.normalization_denominator
-        if not math.isfinite(denominator) or denominator <= 0:
-            raise ValueError("Loss denominator must be finite and positive")
-    loss = -(log_probs * mask).sum() / denominator
-    result = {"loss": loss * (1.0 if context is None else context.loss_scale)}
+    result = {}
+    if native_loss:
+        if context is not None and context.normalization_denominator is not None:
+            denominator = context.normalization_denominator
+            if not math.isfinite(denominator) or denominator <= 0:
+                raise ValueError("Loss denominator must be finite and positive")
+        loss = -(log_probs * mask).sum() / denominator
+        result["loss"] = loss * (1.0 if context is None else context.loss_scale)
     if context is None or context.return_log_probs:
         result["log_probs"] = log_probs
     if context is not None and context.calculate_entropy:

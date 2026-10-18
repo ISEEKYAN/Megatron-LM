@@ -6,7 +6,7 @@ from __future__ import annotations
 from collections.abc import Iterator
 from contextlib import contextmanager
 from contextvars import ContextVar
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 
@@ -20,6 +20,9 @@ class LossContext:
     loss_scale: float = 1.0
     source_batch: Any | None = None
     normalization_denominator: float | None = None
+    # Set by the runtime when an external loss_fn owns normalization, so a
+    # model's native loss (and its denominator) is not consumed.
+    external_normalization: bool = False
 
 
 _CURRENT_LOSS_CONTEXT: ContextVar[LossContext | None] = ContextVar(
@@ -50,4 +53,25 @@ def split_loss_context(item):
     return item, None
 
 
-__all__ = ["LossContext", "get_loss_context", "split_loss_context", "use_loss_context"]
+def mark_external_normalization(data_iter):
+    """Mark microbatch contexts whose loss an external loss_fn computes.
+
+    Items without a LossContext are passed through unchanged, keeping the
+    two-argument loss_fn call for callers that never supplied one.
+    """
+    for item in data_iter:
+        batch, context = split_loss_context(item)
+        yield (
+            item
+            if context is None
+            else (batch, replace(context, external_normalization=True))
+        )
+
+
+__all__ = [
+    "LossContext",
+    "get_loss_context",
+    "mark_external_normalization",
+    "split_loss_context",
+    "use_loss_context",
+]
