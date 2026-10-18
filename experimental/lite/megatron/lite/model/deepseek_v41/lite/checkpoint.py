@@ -215,6 +215,12 @@ def _export_stage_hf_weights(
                 boundaries = tuple(lookup.boundaries)
             hasher = getattr(model, 'engram_hash', None)
             cuts = set(boundaries)
+            # Rollout can reuse training PP ranks as DP table owners. Refine
+            # the census to the full world so every balanced DP divisor can
+            # verify its resident rows without gathering another owner's bytes.
+            if dist.is_initialized():
+                world = dist.get_world_size()
+                cuts.update(boundaries[-1] * i // world for i in range(world + 1))
             if hasher is not None:
                 layer_id = int(name.split('.')[1])
                 index = model.engram_layer_ids.index(layer_id)

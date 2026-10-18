@@ -325,7 +325,7 @@ def test_receiver_rejects_fabricated_initial_shard_census(v41_core_te, monkeypat
     receiver.abort()
 
 
-def _ep8_frozen_census_worker(rank, directory):
+def _ep8_frozen_census_worker(rank, directory, source_partitions, receiver_layout):
     import hashlib
     import runpy
     from datetime import timedelta
@@ -365,14 +365,20 @@ def _ep8_frozen_census_worker(rank, directory):
         timeout=timedelta(seconds=120),
     )
     try:
-        cuts = tuple(17 * i // 8 for i in range(9))
+        world_cuts = tuple(17 * i // 8 for i in range(9))
+        cuts = tuple(17 * i // source_partitions for i in range(source_partitions + 1))
+        group = dist.group.WORLD
+        if source_partitions == 4:
+            groups = [dist.new_group(list(range(a, a + 4))) for a in (0, 4)]
+            group = groups[rank // 4]
         raw = ((torch.arange(17 * 32).reshape(17, 32) % 63) + 32).to(torch.uint8)
         scale = (118 + torch.arange(17) % 17).to(torch.uint8).reshape(17, 1)
-        a, b = cuts[rank : rank + 2]
+        local_rank = rank % source_partitions
+        a, b = cuts[local_rank : local_rank + 2]
         table = ShardedEngramTable(
             raw[a:b].clone().view(torch.float8_e4m3fn),
             scale[a:b].clone().view(torch.float8_e8m0fnu),
-            RowLookup(cuts, dist.group.WORLD),
+            RowLookup(cuts, group),
         )
         model = torch.nn.Module()
         model.anchor = torch.nn.Parameter(torch.ones(2))
@@ -396,7 +402,11 @@ def _ep8_frozen_census_worker(rank, directory):
         consumer = adapter(None)
         target = receiver_model(monkeypatch)
         head_cuts = (0, 3, 7, 12, 17)
-        begin, end = head_cuts[rank % 4 : rank % 4 + 2]
+        begin, end = (
+            head_cuts[rank % 4 : rank % 4 + 2]
+            if receiver_layout == 'head'
+            else world_cuts[rank : rank + 2]
+        )
         target.table.weight = torch.nn.Parameter(
             torch.zeros_like(raw[begin:end]).view(torch.float8_e4m3fn),
             requires_grad=False,
@@ -416,7 +426,7 @@ def _ep8_frozen_census_worker(rank, directory):
                 digest.update(value.numpy().tobytes())
             return digest.hexdigest()
 
-        census_cuts = sorted(set(cuts).union(head_cuts))
+        census_cuts = sorted(set(cuts).union(head_cuts, world_cuts))
         expected = [
             dict(start=a, end=b, sha256=independent_digest(a, b))
             for a, b in zip(census_cuts, census_cuts[1:])
@@ -437,7 +447,7 @@ def _ep8_frozen_census_worker(rank, directory):
             ):
                 item = decode_transport(*pair)
                 if isinstance(item, FrozenTables):
-                    assert item.manifest == {key: expected} and item.reuse == reuse
+                    assert item.reuse == reuse
                     manifest = item.manifest
                     receiver.receive([pair])
                     received.append(pair)
@@ -448,6 +458,14 @@ def _ep8_frozen_census_worker(rank, directory):
                 elif pair[0].startswith('__'):
                     receiver.receive([pair])
                     received.append(pair)
+            verify_storage_census(
+                manifest[key],
+                target.table.weight,
+                target.table.weight_scale_inv,
+                start=begin,
+                total_rows=17,
+            )
+            assert manifest == {key: expected}
             # The census comes from the real exporter on both generations.
             # Damage only one installed DP shard; other ranks remain valid.
             for plane in (target.table.weight, target.table.weight_scale_inv):
@@ -494,7 +512,7 @@ def _ep8_frozen_census_worker(rank, directory):
             broken.receive([frozen_tables_transport(manifest, True)])
         broken.abort()
         for plane in (table.weight, table.scale):
-            if rank == 7:
+            if local_rank == source_partitions - 1:
                 plane.view(torch.uint8)[0, 0] ^= 1
             with pytest.raises(ValueError, match='storage changed'):
                 next(
@@ -508,7 +526,7 @@ def _ep8_frozen_census_worker(rank, directory):
                         buffer_max_size_bytes=65536,
                     )
                 )
-            if rank == 7:
+            if local_rank == source_partitions - 1:
                 plane.view(torch.uint8)[0, 0] ^= 1
 
     finally:
@@ -516,10 +534,18 @@ def _ep8_frozen_census_worker(rank, directory):
         monkeypatch.undo()
 
 
-def test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption(tmp_path):
-    """Real fresh/reuse exports reject single-DP-shard W/S damage at census."""
+@pytest.mark.parametrize(
+    'source_partitions,receiver_layout', [(8, 'head'), (8, 'dp'), (4, 'dp')]
+)
+def test_ep8_frozen_census_roundtrip_reuse_and_rank7_corruption(
+    tmp_path, source_partitions, receiver_layout
+):
+    """Actual exports cover PP-local DP4 -> rollout DP8, reuse and W/S damage."""
     torch.multiprocessing.spawn(
-        _ep8_frozen_census_worker, args=(str(tmp_path),), nprocs=8, join=True
+        _ep8_frozen_census_worker,
+        args=(str(tmp_path), source_partitions, receiver_layout),
+        nprocs=8,
+        join=True,
     )
 
 
