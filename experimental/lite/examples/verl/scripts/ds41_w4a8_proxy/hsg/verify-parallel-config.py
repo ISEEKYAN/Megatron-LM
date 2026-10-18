@@ -102,12 +102,10 @@ else:
             raw['actor_rollout_ref']['model']['path']
         )
         stages = protocol._pipeline_stages(model_cfg, actor_impl, actor_impl.parallel)
+        # This rank's global [start, end) layer range, as in the stage receipts.
+        span = stages[ps.pp_rank]
         model = protocol._construct_model(
-            model_cfg,
-            replace(actor_impl, device='meta'),
-            ps,
-            stages[ps.pp_rank],
-            stages,
+            model_cfg, replace(actor_impl, device='meta'), ps, span, stages
         )
         if actor_impl.text_only:
             for binding in model.parameter_bindings():
