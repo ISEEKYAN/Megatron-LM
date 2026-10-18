@@ -78,13 +78,13 @@ def _parameter_counts(layers):
     return known.get(layers) or os.environ['DS41_PARAMETER_COUNTS']
 
 
-def _indexer_probe_enabled(layers, pp):
-    return layers == 4 and pp == 1
+def _indexer_probe_enabled(layers, pp, cp=1):
+    return layers == 4 and pp == 1 and cp == 1
 
 
-def _check_indexer_probes(layers, pp, events):
+def _check_indexer_probes(layers, pp, events, *, cp=1):
     probes = [row for row in events if row['kind'] == 'indexer_fp32_definition_probe']
-    if _indexer_probe_enabled(layers, pp):
+    if _indexer_probe_enabled(layers, pp, cp):
         assert probes, 'The long-input BF16/FP32-definition probe did not execute'
         assert all(
             row['native_replay_equal']
@@ -119,7 +119,11 @@ def production_environment(layers, bi, inputs):
         DS41_PROMPT_LENGTH=PROMPT_LENGTHS.get(layers, '256'),
         VLLM_BATCH_INVARIANT=str(bi),
         DS41_INDEXER_DIAGNOSTIC=str(
-            int(_indexer_probe_enabled(layers, int(base.get('DS41_PP', '1'))))
+            int(
+                _indexer_probe_enabled(
+                    layers, int(base.get('DS41_PP', '1')), int(base.get('DS41_CP', '1'))
+                )
+            )
         ),
         DS41_INDEXER_DIAGNOSTIC_LIMIT='1',
     )
@@ -266,7 +270,10 @@ def test_two_updates_and_checkpoint_resume(layers, bi):
             )
         if layers == 4:
             probes = _check_indexer_probes(
-                layers, int(base.get('DS41_PP', '1')), events
+                layers,
+                int(base.get('DS41_PP', '1')),
+                events,
+                cp=int(base.get('DS41_CP', '1')),
             )
             (run / 'indexer-probes.json').write_text(
                 json.dumps(probes, indent=2) + '\n'

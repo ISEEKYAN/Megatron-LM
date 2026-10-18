@@ -54,7 +54,7 @@ def install(event):
         result = original(model, batch, **kwargs)
         # Re-entering forward is unsafe under PP: the receiving stage has
         # consumed its carrier. This diagnostic is valid only for PP1.
-        if model.ps.pp_size > 1:
+        if model.ps.pp_size > 1 or model.ps.cp_size > 1:
             return result
         if (
             model.training
