@@ -283,38 +283,108 @@ def test_packed_loss_head_gradient_with_ddp_unused_detection(bundle, tmp_path):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('parallel', [dict(cp_size=2), dict(dp_size=2)])
-def test_remote_nonfinite_skips_replicated_optimizer(bundle, monkeypatch, parallel):
+def _remote_nonfinite_worker(rank, directory, parallel, scenario):
+    """Two real Gloo ranks hold the same replicated owners; rank 1 alone fails."""
+    import runpy
+    from datetime import timedelta
+    from pathlib import Path
+
+    import torch.distributed as dist
+
+    fixtures = runpy.run_path(str(Path(__file__).parents[2] / 'conftest.py'))
+    import megatron.core.fp8_utils  # noqa: F401
+    import megatron.core.transformer.experimental_attention_variant.csa  # noqa: F401
+    import megatron.core.transformer.hyper_connection  # noqa: F401
+
+    fixtures['transformer_engine_import_stub'].__wrapped__(pytest.MonkeyPatch())()
+    from megatron.lite.model.deepseek_v41.lite import protocol
     from megatron.lite.model.deepseek_v41.lite.optimizer_groups import V41Optimizer
     from megatron.lite.model.deepseek_v41.vision_config import OptimizerConfig
 
-    model = bundle[0].chunks[0]
-    group, seen = object(), []
-    opt = V41Optimizer(
-        model,
-        OptimizerConfig(lr=1e-3, ns_steps=2, coefficient_type='quintic'),
-        dp_group=group,
-        ps=replace(model.ps, **parallel),
+    torch.set_num_threads(1)
+    dist.init_process_group(
+        'gloo',
+        init_method=f'file://{directory}/store',
+        rank=rank,
+        world_size=2,
+        timeout=timedelta(seconds=300),
     )
-    output = model(torch.tensor([[1, 3, 5, 7]], device=model.head.weight.device))
-    opt.accumulate_modality_loads(output['modality_loads'])
-    output['logits'].square().mean().backward()
-    before = {n: p.detach().clone() for n, p in model.named_parameters()}
-    biases = [block.ffn.gate.bias.clone() for block in model.layers]
+    try:
+        torch.manual_seed(351)
+        impl = protocol.ImplConfig(
+            device='cpu',
+            dtype=torch.float32,
+            token_map=list(range(64)),
+            trainable_engram=True,
+            # Sharded Engram rows need CUDA; replicate the table on CPU ranks.
+            shard_engram=False,
+            quantized=False,
+        )
+        model = protocol.build_model(release_config(), impl_cfg=impl).chunks[0]
+        opt = V41Optimizer(
+            model,
+            OptimizerConfig(lr=1e-3, ns_steps=2, coefficient_type='quintic'),
+            dp_group=dist.group.WORLD,
+            ps=replace(model.ps, **parallel),
+        )
+        output = model(torch.tensor([[1, 3, 5, 7]]))
+        opt.accumulate_modality_loads(output['modality_loads'])
+        output['logits'].square().mean().backward()
+        before = {n: p.detach().clone() for n, p in model.named_parameters()}
+        biases = [block.ffn.gate.bias.clone() for block in model.layers]
+        if scenario == 'reduced_nan':
+            # A non-finite gradient on one replica reaches every replica
+            # through the DP/CP gradient reduction that precedes the step.
+            if rank == 1:
+                next(p for p in model.parameters() if p.grad is not None).grad[...] = (
+                    float('nan')
+                )
+            for p in model.parameters():
+                if p.grad is not None:
+                    dist.all_reduce(p.grad)
+                    p.grad.div_(2)
+        elif scenario == 'remote_candidate' and rank == 1:
+            # Only rank 1's prepared update is non-finite (the remote vote).
+            opt._local_finite = lambda tensors: False
+        stepped = opt.step()[0]
+        unchanged = all(torch.equal(p, before[n]) for n, p in model.named_parameters())
+        biases_unchanged = all(
+            torch.equal(b.ffn.gate.bias, old) for b, old in zip(model.layers, biases)
+        )
+        torch.save(
+            dict(stepped=stepped, unchanged=unchanged, biases=biases_unchanged),
+            f'{directory}/{rank}.pt',
+        )
+    finally:
+        dist.destroy_process_group()
 
-    def remote_nan(flag, *, op=None, group):
-        assert flag.numel() == 1 and op == torch.distributed.ReduceOp.MIN
-        assert flag.item() == 1
-        seen.append(group)
-        flag.zero_()
 
-    monkeypatch.setattr(torch.distributed, 'all_reduce', remote_nan)
-    assert not opt.step()[0]
-    assert seen == [group]
-    assert all(torch.equal(p, before[n]) for n, p in model.named_parameters())
-    assert all(
-        torch.equal(b.ffn.gate.bias, old) for b, old in zip(model.layers, biases)
+@pytest.mark.parametrize('scenario', ['control', 'reduced_nan', 'remote_candidate'])
+@pytest.mark.parametrize('parallel', [dict(cp_size=2), dict(dp_size=2)])
+def test_remote_nonfinite_skips_replicated_optimizer(
+    v41_core_te, tmp_path, parallel, scenario
+):
+    """Real two-rank Gloo: one rank's non-finite update skips the step everywhere.
+
+    The vote is one MIN all-reduce over every training rank, so no rank
+    publishes while another holds a non-finite gradient or update.
+    """
+    import torch.multiprocessing as mp
+
+    mp.start_processes(
+        _remote_nonfinite_worker,
+        args=(str(tmp_path), parallel, scenario),
+        nprocs=2,
+        join=True,
+        start_method='spawn',
     )
+    results = [torch.load(tmp_path / f'{rank}.pt') for rank in range(2)]
+    if scenario == 'control':
+        assert all(r['stepped'] and not r['unchanged'] for r in results), results
+    else:
+        assert all(
+            not r['stepped'] and r['unchanged'] and r['biases'] for r in results
+        ), results
 
 
 def test_image_tokens_backpropagate_into_vision_and_aligner(bundle):

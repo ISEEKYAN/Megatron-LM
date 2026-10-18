@@ -53,6 +53,13 @@ def test_bound_training_routes_and_skill_contract():
         'parallel/cp.py': 'test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce',
         'train_step.py': 'test_redo_cp_loss.py::test_cp_loss_matches_global_token_weighted_ce',
         'modules/experts.py': 'test_redo_moe_dual_bias.py::test_dispatch_option_reaches_model_and_preserves_local_moe',
+        'modules/packed_row_memory.py': 'test_packed_hashes.py::test_packed_hashes_equal_document_hashes_then_cp_slice',
+        'modules/deployment_math/packed_cache.py': 'test_packed_cache_geometry.py::test_document_pages_and_local_queries_match_independent_requests',
+        'modules/attention/packed_candidates.py': 'test_packed_candidates.py::test_packed_candidate_mask_equals_full_document_then_cp_slice',
+        'modules/attention/packed_transport.py': 'test_packed_transport.py::test_gloo_halo_and_compressed_rows_match_full_documents',
+        'modules/attention/standard_sparse.py': 'test_standard_sparse_attention.py::test_sparse_addresses_preserve_dense_document_outputs_and_gradients',
+        'modules/attention/packed_indices.py': 'test_packed_sparse_indices.py::test_core_indices_match_document_slots_and_attention',
+        'modules/deployment_math/sparse.py': 'test_packed_sparse_indices.py::test_core_indices_match_document_slots_and_attention',
     }
     assert routes == {
         source: 'deepseek_v41/' + target for source, target in required.items()

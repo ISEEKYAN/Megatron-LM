@@ -537,6 +537,7 @@ def test_v41_optimizer_policy_survives_engine_scheduler(
     import megatron.core.fp8_utils  # noqa: F401
     import megatron.core.transformer.experimental_attention_variant.csa  # noqa: F401
     import megatron.core.transformer.hyper_connection  # noqa: F401
+    from verl_mlite.engine import mlite_engine
 
     transformer_engine_import_stub()
     sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "deepseek_v41"))
@@ -551,7 +552,6 @@ def test_v41_optimizer_policy_survives_engine_scheduler(
     )
     from megatron.lite.runtime.contracts.handle import ModelHandle
     from test_pp_stage_training import prefix_config
-    from verl_mlite.engine import mlite_engine
 
     raw = prefix_config().to_hf_dict()
     raw["text_config"].update(engram_layer_ids=[1], engram_num_embeddings=[18])
