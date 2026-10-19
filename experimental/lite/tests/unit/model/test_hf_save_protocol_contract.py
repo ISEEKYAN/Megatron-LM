@@ -14,7 +14,7 @@ from megatron.lite.model.registry import TRAIN_RUNTIME_MODULES
 
 LITE_ROOT = Path(__file__).resolve().parents[3]
 _REGISTERED_PROTOCOLS = sorted(TRAIN_RUNTIME_MODULES.items())
-HF_SAVE_UNSUPPORTED = {"deepseek_v41": "HF export is outside this PR"}
+HF_SAVE_UNSUPPORTED = {"deepseek_v41": "HF export is outside this PR", "deepseek_v41_vllm": "Live resync is not general HF save"}
 
 
 @pytest.mark.parametrize(

@@ -127,7 +127,7 @@ def _optimizer(chunks, cfg, impl, ps):
     return optimizer, lambda: finalize_dist_opt_grads(chunks, optimizer)
 
 
-def build_model(model_cfg, *, impl_cfg):
+def build_model(model_cfg, *, impl_cfg, _model_class=None):
     _validate(model_cfg, impl_cfg)
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
@@ -151,7 +151,8 @@ def build_model(model_cfg, *, impl_cfg):
         path = Path(impl_cfg.hf_path) / "token_map.pt"
         if path.is_file():
             token_map = torch.load(path, map_location="cpu", weights_only=True)
-    chunks = [DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map)]
+    constructor = DeepseekV41Model if _model_class is None else _model_class
+    chunks = [constructor(model_cfg, impl_cfg, ps, token_map=token_map)]
     chunks[0].ds41_module_inventory = chunks[0].module_inventory()
     optimizer, finalize = (None, None)
     if impl_cfg.optimizer is not None:
