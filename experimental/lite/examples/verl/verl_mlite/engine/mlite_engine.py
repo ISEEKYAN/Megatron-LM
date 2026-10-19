@@ -6,6 +6,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -15,6 +16,7 @@ import torch.distributed as dist
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.modules import router_replay
+from megatron.lite.primitive.modules.lora import disable_lora_adapters
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -318,6 +320,18 @@ class MegatronLiteEngine(BaseEngine):
     def eval_mode(self, **kwargs):
         self._require_initialized()
         return _MegatronLiteModeCtx(self, mode="eval", **kwargs)
+
+    @contextmanager
+    def disable_adapter(self):
+        """Run forward as the frozen base model, as VERL does for LoRA reference log-probs."""
+        self._require_initialized()
+        with disable_lora_adapters(self.module) as num_adapters:
+            if num_adapters == 0:
+                raise RuntimeError(
+                    "VERL requested the LoRA base model, but this Megatron Lite model has no "
+                    "LoRA adapters; configure engine.impl_cfg.lora to train adapters."
+                )
+            yield
 
     def optimizer_zero_grad(self):
         self._require_initialized()

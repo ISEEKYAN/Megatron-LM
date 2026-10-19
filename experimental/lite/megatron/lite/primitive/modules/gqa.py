@@ -16,7 +16,12 @@ from megatron.lite.primitive.modules.gqa_utils import (
     split_grouped_qkvg,
     split_grouped_qkvg_for_tp,
 )
-from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig, normalize_lora_config
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    LoraConfig,
+    lora_active,
+    normalize_lora_config,
+)
 from megatron.lite.primitive.modules.mrope import MultimodalRotaryEmbedding
 from megatron.lite.primitive.parallel import (
     ColumnParallelLinear,
@@ -216,7 +221,7 @@ class GQAttention(nn.Module):
         self, x: torch.Tensor, position_ids: torch.Tensor | None = None, packed_seq_params=None
     ) -> torch.Tensor:
         qkv = self.qkv(x)
-        if self.qkv_lora is not None:
+        if lora_active(self.qkv_lora):
             qkv = qkv + self.qkv_lora(self._qkv_lora_input(x))
         if self._replicate_kv:
             qkv = all_gather_last_dim_with_grad_reduce(qkv, self.ps.tp_group)
@@ -336,7 +341,7 @@ class GQAttention(nn.Module):
             gate_fp32 = gate.reshape(attn_out.shape).float().sigmoid()
             attn_out = (attn_out.float() * gate_fp32).to(attn_out.dtype)
         output = self.proj(attn_out)
-        if self.proj_lora is not None:
+        if lora_active(self.proj_lora):
             output = output + self.proj_lora(attn_out)
         return output
 

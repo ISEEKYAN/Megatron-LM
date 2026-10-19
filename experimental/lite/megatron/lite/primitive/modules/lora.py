@@ -7,6 +7,8 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -367,6 +369,7 @@ class LinearLoRA(nn.Module):
         b_tensor_model_parallel: bool = False,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for LinearLoRA.")
         self.rank = int(rank)
@@ -477,6 +480,7 @@ class GroupedLinearLoRA(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
@@ -528,6 +532,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
@@ -563,3 +568,29 @@ __all__ = [
     "normalize_lora_config",
     "trainable_param_stats",
 ]
+
+
+_LORA_MODULE_TYPES = (LinearLoRA, GroupedLinearLoRA, SharedGroupedLinearLoRA)
+
+
+def lora_active(adapter: nn.Module | None) -> bool:
+    """Whether an optional adapter adds its delta to the base projection output."""
+    return adapter is not None and not adapter.disabled
+
+
+@contextmanager
+def disable_lora_adapters(model: nn.Module) -> Iterator[int]:
+    """Run ``model`` as its frozen base model: no LoRA adapter under it adds a delta.
+
+    Yields the number of adapters bypassed and restores each adapter's previous
+    state on exit, including when the body raises.
+    """
+    adapters = [module for module in model.modules() if isinstance(module, _LORA_MODULE_TYPES)]
+    previous = [adapter.disabled for adapter in adapters]
+    for adapter in adapters:
+        adapter.disabled = True
+    try:
+        yield len(adapters)
+    finally:
+        for adapter, disabled in zip(adapters, previous):
+            adapter.disabled = disabled

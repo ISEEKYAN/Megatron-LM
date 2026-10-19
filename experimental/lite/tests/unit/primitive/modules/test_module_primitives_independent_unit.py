@@ -11,7 +11,9 @@ from megatron.lite.primitive.modules.lora import (
     GroupedLinearLoRA,
     LinearLoRA,
     SharedGroupedLinearLoRA,
+    disable_lora_adapters,
     freeze_non_lora_params,
+    lora_active,
     normalize_lora_config,
     trainable_param_stats,
 )
@@ -85,6 +87,28 @@ def test_shared_grouped_lora_uses_one_adapter_for_all_experts():
     output = layer(torch.tensor([[3.0, 1.0], [4.0, 7.0]]), [1, 1])
 
     torch.testing.assert_close(output, torch.tensor([[8.0, 12.0], [-12.0, -18.0]]))
+
+
+def test_disable_lora_adapters_bypasses_every_adapter_and_restores_state():
+    linear = LinearLoRA(3, 2, rank=1, alpha=1, dropout=0.0)
+    grouped = GroupedLinearLoRA(1, 3, 2, rank=1, alpha=1, dropout=0.0)
+    shared = SharedGroupedLinearLoRA(1, 3, 2, rank=1, alpha=1, dropout=0.0)
+    shared.disabled = True
+    model = nn.ModuleList([linear, nn.ModuleList([grouped, shared]), nn.Linear(3, 2)])
+
+    assert lora_active(linear) and not lora_active(shared) and not lora_active(None)
+    with disable_lora_adapters(model) as num_adapters:
+        assert num_adapters == 3
+        assert not any(lora_active(adapter) for adapter in (linear, grouped, shared))
+    assert lora_active(linear) and lora_active(grouped) and not lora_active(shared)
+
+    with pytest.raises(RuntimeError, match="body failed"):
+        with disable_lora_adapters(model):
+            raise RuntimeError("body failed")
+    assert lora_active(linear) and lora_active(grouped) and not lora_active(shared)
+
+    with disable_lora_adapters(nn.Linear(3, 2)) as num_adapters:
+        assert num_adapters == 0
 
 
 def test_mrope_interleaves_text_height_and_width_sections():
