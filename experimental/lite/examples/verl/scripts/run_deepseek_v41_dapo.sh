@@ -86,7 +86,7 @@ esac
 CHAT_TEMPLATE="$(<"${SCRIPT_DIR}/deepseek_v41_${PROMPT_MODE}_template.jinja")"
 
 case "${ROLLOUT_SPEC,,}" in
-  true|1) SPEC_ARGS=("+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={method:dspark,num_speculative_tokens:5,draft_sample_method:probabilistic,rejection_sample_method:standard,enable_adaptive_verification:false}") ;;
+  true|1) SPEC_ARGS=("+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={method:dspark,num_speculative_tokens:5,draft_sample_method:probabilistic,rejection_sample_method:block,enable_adaptive_verification:false}") ;;
   *) SPEC_ARGS=() ;;
 esac
 
@@ -171,6 +171,7 @@ COMMAND=(
   "actor_rollout_ref.actor.engine.grad_offload=${GRAD_OFFLOAD}"
   "actor_rollout_ref.actor.engine.attention_backend_override=null"
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
+  "actor_rollout_ref.actor.engine.export_dtype=null"
   "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
   "+actor_rollout_ref.actor.engine.full_determinism=True"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"

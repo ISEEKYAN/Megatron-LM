@@ -965,6 +965,17 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         with set_current_vllm_config(_vllm_config(model)):
             initialize_layerwise_reload(model)
         model._verl_mlite_dsv41_reload_active = True
+        # DS4.1 ``load_weights`` derives the mHC broadcast weight from layer
+        # ``start_layer``'s ``hc_attn_fn`` at the end of every call. VERL streams
+        # buckets, so a call can end while that layer is still staged (meta);
+        # derive it once after the whole reload instead, as a cold load does.
+        deferred = [m for m in model.modules() if hasattr(type(m), "finalize_mhc_broadcast_weights")]
+        for module in deferred:
+            module.finalize_mhc_broadcast_weights = lambda: None
+        model._verl_mlite_dsv41_deferred = deferred
+        from verl_mlite import c8_probe
+
+        model._verl_mlite_c8_sync = c8_probe.SyncRecorder() if c8_probe.enabled() else None
         return _DSV41_RELOAD_STATE
 
     @wraps(original_process)
@@ -978,8 +989,16 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         try:
             with set_current_vllm_config(config):
                 finalize_layerwise_processing(model, config.model_config)
+                for module in getattr(model, "_verl_mlite_dsv41_deferred", ()):
+                    del module.finalize_mhc_broadcast_weights
+                    module.finalize_mhc_broadcast_weights()
+                model._verl_mlite_dsv41_deferred = ()
+            recorder = getattr(model, "_verl_mlite_c8_sync", None)
+            if recorder is not None:
+                recorder.finish(model)
         finally:
             model._verl_mlite_dsv41_reload_active = False
+            model._verl_mlite_c8_sync = None
         # Layerwise staging tensors are dead now; return their blocks before the
         # colocated trainer/rollout memory handoff.
         gc.collect()
@@ -995,6 +1014,9 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         # The receiver reuses its bucket buffer after this callback, while the
         # layerwise loader may hold tensors until their layer is complete.
         weights = [(name, tensor.clone()) for name, tensor in weights]
+        recorder = getattr(model, "_verl_mlite_c8_sync", None)
+        if recorder is not None:
+            recorder.add(weights)
         try:
             from vllm.model_executor.model_loader.mtp_validation import (
                 disable_mtp_completeness_check,
@@ -1014,6 +1036,34 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
     quant_utils.load_quanted_weights = load_quanted_weights
     # utils.py binds load_quanted_weights at import time.
     rollout_utils.load_quanted_weights = load_quanted_weights
+    return True
+
+
+def _patch_vllm_rollout_sleep_level() -> bool:
+    """Pin the hybrid rollout sleep level (``VERL_MLITE_ROLLOUT_SLEEP_LEVEL``).
+
+    Level 2 discards every GPU weight and relies on the actor sync to restore
+    them. DS4.1 syncs only the trained tensors: frozen Engram tables, the dspark
+    drafter and derived buffers come from the release load, so they must survive
+    sleep (level 1).
+    """
+    level = os.environ.get("VERL_MLITE_ROLLOUT_SLEEP_LEVEL", "").strip()
+    if level not in ("1", "2") or not _vllm_importable():
+        return False
+    try:
+        server = importlib.import_module("verl.workers.rollout.vllm_rollout.vllm_async_server")
+    except Exception:
+        return False
+    cls = getattr(server, "vLLMHttpServer", None)
+    if cls is None or getattr(cls._sleep_hybrid, "_verl_mlite_level", None) == level:
+        return cls is not None
+
+    async def _sleep_hybrid(self):
+        await self.engine.sleep(level=int(level))
+        await self.engine.reset_encoder_cache()
+
+    _sleep_hybrid._verl_mlite_level = level
+    cls._sleep_hybrid = _sleep_hybrid
     return True
 
 
@@ -1486,6 +1536,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_verl_dsv41_layerwise_reload()
     _trace_runtime_patch("08d.verl_dsv41_layerwise_reload", result)
+    result = _patch_vllm_rollout_sleep_level()
+    _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")
