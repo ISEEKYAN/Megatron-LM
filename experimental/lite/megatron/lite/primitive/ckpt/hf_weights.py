@@ -353,7 +353,7 @@ _FP4_E2M1_TABLE = (
     3.0,
     4.0,
     6.0,
-    0.0,
+    -0.0,  # code 0x8: keeps the sign so a requantized master reproduces release bytes
     -0.5,
     -1.0,
     -1.5,
