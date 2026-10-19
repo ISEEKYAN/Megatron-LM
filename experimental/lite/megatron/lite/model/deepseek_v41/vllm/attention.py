@@ -195,10 +195,35 @@ class _Compress(torch.autograd.Function):
         return dscore, None, dweight, None, None, None
 
 
-def compressor(x, positions, wkv, wgate, norm_weight, eps, ratio, cu_seqlens=None):
-    """Per-token latent bf16 [T,512] (valid at ``(pos+1) % ratio == 0`` rows only)."""
+class ContextParallel(SimpleNamespace):
+    """Contiguous equal CP row slices: ``group``, ``offset`` (first local row) and the
+    global ``positions`` of all ranks' rows."""
+
+
+class _GatherRows(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, x, group):
+        ctx.group = group
+        out = x.new_empty((x.shape[0] * group.size(), *x.shape[1:]))
+        torch.distributed.all_gather_into_tensor(out, x.contiguous(), group=group)
+        return out
+
+    @staticmethod
+    def backward(ctx, grad):
+        out = grad.new_empty((grad.shape[0] // ctx.group.size(), *grad.shape[1:]))
+        torch.distributed.reduce_scatter_tensor(out, grad.contiguous(), group=ctx.group)
+        return out, None
+
+
+def compressor(x, positions, wkv, wgate, norm_weight, eps, ratio, cu_seqlens=None, cp=None):
+    """Per-token latent bf16 [T,512] (valid at ``(pos+1) % ratio == 0`` rows only).
+
+    With ``cp`` the scores are gathered and the latent covers all ranks' rows."""
     weight = wkv if wgate is None else torch.cat((wkv, wgate))
     kv_score = linear(x, weight, fp8=False)
+    if cp is not None:
+        kv_score = _GatherRows.apply(kv_score, cp.group)
+        positions = cp.positions
     return _Compress.apply(
         kv_score.contiguous(), positions.contiguous(), norm_weight, eps, ratio, cu_seqlens
     )
@@ -233,13 +258,15 @@ def indexer_topk(
     owns_k,
     candidate,
     cu_seqlens=None,
+    cp=None,
 ):
     """Top-k compressed indices of every row, vLLM's BI prefill indexer.
 
     ``qa``: the shared MXFP8 Q (codes, swizzled scales); ``latent``: the KV
     source's per-token compressor latent; ``p``: wq_b, weights_proj (+ wk, k_norm
     when ``owns_k``). ``candidate``: None, "write" or "read". Returns int32
-    [T, 512] document-local indices, ascending, -1 at the tail.
+    [T, 512] document-local indices, ascending, -1 at the tail. With ``cp``,
+    ``latent`` covers all ranks' rows and only the local query rows are scored.
     """
     from vllm.model_executor.kernels import batch_invariant
     from vllm.model_executor.layers.sparse_attn_indexer import (
@@ -252,7 +279,9 @@ def indexer_topk(
     from vllm.utils.deep_gemm import fp8_fp4_mqa_logits, mqa_logits_mx_inputs
 
     device, tokens = x.device, x.shape[0]
-    cu, lens, owner = _segments(cu_seqlens, tokens, device)
+    offset, k_positions = (0, positions) if cp is None else (cp.offset, cp.positions)
+    cu, lens, k_owner = _segments(cu_seqlens, k_positions.shape[0], device)
+    owner = k_owner[offset : offset + tokens]
     counts = [n // ratio for n in lens]
     k_start = torch.tensor([sum(counts[:r]) for r in range(len(lens))], device=device)
     if owns_k:
@@ -261,9 +290,9 @@ def indexer_topk(
         pages = -(-max(sum(counts), 1) // page)
         cache = torch.zeros(pages, page * (INDEX_DIM + 4), dtype=torch.uint8, device=device)
         cache = cache.view(pages, page, INDEX_DIM + 4)
-        slots = k_start[owner.long()] + positions.long() // ratio
+        slots = k_start[k_owner.long()] + k_positions.long() // ratio
         indexer_k_norm_rope_store(
-            k_pre, positions, cos_sin_cache, p.k_norm.bfloat16(), eps, cache, slots, ratio, False
+            k_pre, k_positions, cos_sin_cache, p.k_norm.bfloat16(), eps, cache, slots, ratio, False
         )
         flat = cache.view(pages, -1)
         values = flat[:, : page * INDEX_DIM].reshape(-1, INDEX_DIM)[: sum(counts)]
@@ -296,6 +325,9 @@ def indexer_topk(
         state.candidates = torch.full((tokens, 2048), -1, dtype=torch.int32, device=device)
         candidates = state.candidates
     for r, (a, b) in enumerate(zip(cu[:-1], cu[1:])):
+        a, b = max(a, offset) - offset, min(b, offset + tokens) - offset
+        if a >= b:
+            continue
         logits = fp8_fp4_mqa_logits(
             (q_fp8[a:b], q_scale[a:b]), (k_values, k_scales), w[a:b], ks[a:b], ke[a:b], counts[r]
         )

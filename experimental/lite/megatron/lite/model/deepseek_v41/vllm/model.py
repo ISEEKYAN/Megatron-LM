@@ -7,7 +7,8 @@ reading the live native parameters by their release names. The attention core
 comes from M (mega) or F (FlashMLA) per tracks.md; select with
 ``DSV41_ATTENTION_CORE=mega|flashmla`` (default mega, the B_bi1_mega rollout).
 
-Scope: PP=1, TP=1, CP=1; EP any (MegaMoE symmetric buffer over the EP group).
+Scope: PP=1, TP=1; CP any (contiguous equal THD slices, as the native protocol
+packs them); EP any (MegaMoE symmetric buffer over the EP group).
 """
 
 import os
@@ -18,9 +19,11 @@ import torch
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
 from megatron.lite.model.deepseek_v41.lite.checkpoint import source_name
+from megatron.lite.model.deepseek_v41.lite.components.config import validate_runtime_cp
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
 
 from . import forward as F
+from .attention import ContextParallel
 from .head import head_log_probs, head_logits
 from .moe import MegaMoE
 from .norm import ModelNorm
@@ -163,18 +166,33 @@ class DeepseekV41Model(NativeModel):
     ):
         if not (self.layout.has_embed and self.layout.has_head) or hidden_states is not None:
             raise NotImplementedError('Deployment DS4.1 forward is PP=1')
-        if self.ps.cp_size > 1 or self.ps.tp_size > 1:
-            raise NotImplementedError('Deployment DS4.1 forward is TP=1, CP=1')
+        if self.ps.tp_size > 1:
+            raise NotImplementedError('Deployment DS4.1 forward is TP=1')
         params = packed_seq_params
         ids = input_ids.reshape(-1)
         rows = ids.shape[0]
         prefix = params.cu_seqlens_q_padded
         if prefix is None:
             prefix = params.cu_seqlens_q
-        positions = doc_positions(prefix, rows)
+        cp = None
+        offset = self.ps.cp_rank * rows if self.ps.cp_size > 1 else 0
+        if self.ps.cp_size > 1:
+            validate_runtime_cp(self.release, self.ps.cp_group, params)
+            if full_input_ids is None or full_input_ids.numel() != rows * self.ps.cp_size:
+                raise ValueError('DS4.1 CP needs the full packed IDs over equal slices')
+            cp = ContextParallel(
+                group=self.ps.cp_group,
+                offset=offset,
+                positions=doc_positions(prefix, rows * self.ps.cp_size),
+            )
+            positions = cp.positions[offset : offset + rows]
+        else:
+            full_input_ids = ids
+            positions = doc_positions(prefix, rows)
         hashes = None
         if self.engrams:
-            hashes = self.hash(ids.reshape(1, -1), cu_seqlens=prefix).transpose(0, 1)
+            hashes = self.hash(full_input_ids.reshape(1, -1), cu_seqlens=prefix)
+            hashes = hashes[:, offset : offset + rows].transpose(0, 1)
 
         def engram_rows(layer):
             module = self.engrams[str(layer)]
@@ -197,8 +215,9 @@ class DeepseekV41Model(NativeModel):
             cu_seqlens=prefix,
             layout='mega' if kind == 'mega' else 'flashmla',
             keep=None if token_mask is None else token_mask.reshape(-1).bool(),
+            cp=cp,
         )
-        output = {'rows': torch.arange(rows, device=ids.device)}
+        output = {'rows': torch.arange(rows, device=ids.device) + offset}
         if labels is None:
             output['logits'] = head_logits(hidden, self.head.weight)
             return output
