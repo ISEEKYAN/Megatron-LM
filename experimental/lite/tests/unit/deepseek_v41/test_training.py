@@ -187,7 +187,8 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True)
                 (rows.tolist(), values.float().tolist()) for rows, values in captured
             ]
     if sft:
-        assert sum(losses[-7:]) <= sum(losses[:7]) * 0.8, losses
+        if not (impl and (impl.get("lora") or {}).get("rank")):  # LoRA: test_lora G4
+            assert sum(losses[-7:]) <= sum(losses[:7]) * 0.8, losses
         record["losses"] = losses
     record["peak_bytes"] = torch.cuda.max_memory_allocated()
     (Path(root) / f"rank-{rank}.json").write_text(json.dumps(record))

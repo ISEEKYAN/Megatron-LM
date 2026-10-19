@@ -179,8 +179,14 @@ def test_pipeline_stage_without_adapters_fails_loud(tmp_path):
 
 @pytest.mark.gpus(1)
 def test_lora_sft_loss_decreases(tmp_path):
-    impl = dict(lora=LORA, optimizer_config=dict(lr=0.03, min_lr=0.03, weight_decay=0.0))
-    _run(tmp_path / "sft", (1, 1, 1, None), sft=True, impl=impl)
+    """Product initialization (B = 0). lr and threshold from the frozen calibration r2
+    (job 8065264: lr=0 control 1.0000, lr 3e-3 0.9002); each 8-step window covers all 8 batches."""
+    impl = dict(lora=LORA, optimizer_config=dict(lr=3e-3, min_lr=3e-3, weight_decay=0.0))
+    (record,) = _run(tmp_path / "sft", (1, 1, 1, None), sft=True, impl=impl, seed=False)
+    losses = torch.tensor(record["losses"])
+    ratio = (losses[16:24].mean() / losses[:8].mean()).item()
+    print("L1_SFT_RECORD", json.dumps(dict(ratio=ratio, threshold=0.951, losses=losses.tolist())))
+    assert torch.isfinite(losses).all() and ratio <= 0.951, ratio
 
 
 @pytest.mark.parametrize(
