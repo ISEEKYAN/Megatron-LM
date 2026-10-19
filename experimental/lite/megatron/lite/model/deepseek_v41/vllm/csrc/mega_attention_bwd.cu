@@ -1,7 +1,9 @@
 // Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 //
 // Sparse MLA backward with attention sink for the DS4.1 mega attention core
-// (64 heads, K = V, d = 512), on rotated operands. One CTA per query row holds
+// (64 heads, K = V, d = 512). Reads the unrotated query in the kernel's fused
+// layout and the output gradient in the fused output layout, applies the RoPE
+// VJPs itself and writes dq in the fused query layout. One CTA per query row holds
 // all 64 heads and walks the row's index list in blocks of 32 KV slots twice:
 //   pass 1: S = Q K^T, dP = dO K^T, P = exp(S - LSE), D = sum_j P dP;
 //   pass 2: dS = scale * P (dP - D); dQ += dS K; dK_j += dS^T Q + P^T dO.
@@ -18,6 +20,7 @@ namespace {
 constexpr int H = 64;
 constexpr int D = 512;
 constexpr int B = 32;  // KV slots per block
+constexpr int ROPE = 64;
 constexpr int THREADS = 512;
 
 struct Smem {
@@ -100,13 +103,20 @@ __device__ __forceinline__ void score_tiles(const Smem& s, int mt, int nt, int l
   }
 }
 
+__device__ __forceinline__ float2 rotate(float2 x, float c, float s) {
+  // The mega forward kernel's apply_rope: fma({x, x}, {c, s}, {-y s, y c}).
+  return make_float2(fmaf(x.x, c, -x.y * s), fmaf(x.x, s, x.y * c));
+}
+
 __global__ void __launch_bounds__(THREADS, 1)
-    mega_attention_bwd_kernel(const __nv_bfloat16* __restrict__ qr,
-                              const __nv_bfloat16* __restrict__ dout,
+    mega_attention_bwd_kernel(const __nv_bfloat16* __restrict__ q_fused,
+                              const __nv_bfloat16* __restrict__ grad_fused,
+                              const int* __restrict__ positions,
+                              const float* __restrict__ cos_sin,
                               const __nv_bfloat16* __restrict__ kv, int64_t kv_rows,
                               const int* __restrict__ indices, int64_t index_stride,
                               const int* __restrict__ lens, const float* __restrict__ lse2,
-                              float scale, float scale_log2, float* __restrict__ dq,
+                              float scale, float scale_log2, __nv_bfloat16* __restrict__ dq_fused,
                               float* __restrict__ dkv, float* __restrict__ delta_out) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
@@ -114,17 +124,34 @@ __global__ void __launch_bounds__(THREADS, 1)
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
   const int len = lens[row];
   const int nblocks = (len + B - 1) / B;
+  const float* cs = cos_sin + (int64_t)positions[row] * ROPE;
 
   {
-    const __nv_bfloat16* qrow = qr + (int64_t)row * H * D;
-    const __nv_bfloat16* grow = dout + (int64_t)row * H * D;
+    // q: fused layout [d / 16][h][16]; grad: [group][d / 32][h % 8][32].
+    const __nv_bfloat16* qrow = q_fused + (int64_t)row * H * D;
+    const __nv_bfloat16* grow = grad_fused + (int64_t)row * H * D;
     for (int c = tid; c < H * D / 8; c += THREADS) {
-      const int r = c / (D / 8), col = (c % (D / 8)) * 8;
-      cp_async16(&s.q[wide(r, col)], qrow + r * D + col);
-      cp_async16(&s.dout[wide(r, col)], grow + r * D + col);
+      const int f = c * 8;
+      cp_async16(&s.q[wide((f & 1023) >> 4, (f >> 10) * 16 + (f & 15))], qrow + f);
+      const int rem = f & 4095;
+      cp_async16(&s.dout[wide((f >> 12) * 8 + ((rem & 255) >> 5), (rem >> 8) * 32 + (rem & 31))],
+                 grow + f);
     }
     if (tid < H) s.lse2[tid] = lse2[(int64_t)row * H + tid];
     cp_async_wait_all();
+    __syncthreads();
+    // Q RoPE as the forward kernel (FP32 FMA, RN to bf16); dO = R(theta) do,
+    // the transpose of the output's conjugate RoPE.
+    for (int p = tid; p < H * (ROPE / 2); p += THREADS) {
+      const int h = p / (ROPE / 2), i = p % (ROPE / 2), d = D - ROPE + 2 * i;
+      const float c = cs[i], sn = cs[ROPE / 2 + i];
+      __nv_bfloat162* qp = reinterpret_cast<__nv_bfloat162*>(&s.q[wide(h, d)]);
+      __nv_bfloat162* gp = reinterpret_cast<__nv_bfloat162*>(&s.dout[wide(h, d)]);
+      const float2 qy = rotate(__bfloat1622float2(*qp), c, sn);
+      const float2 gy = rotate(__bfloat1622float2(*gp), c, sn);
+      *qp = __floats2bfloat162_rn(qy.x, qy.y);
+      *gp = __floats2bfloat162_rn(gy.x, gy.y);
+    }
     __syncthreads();
   }
 
@@ -298,7 +325,8 @@ __global__ void __launch_bounds__(THREADS, 1)
     __syncthreads();
   }
 
-  float* qrow = dq + (int64_t)row * H * D;
+  // dq of the unrotated query: R(theta)^T on the RoPE dims, fused layout.
+  __nv_bfloat16* qrow = dq_fused + (int64_t)row * H * D;
 #pragma unroll
   for (int m = 0; m < 4; ++m)
 #pragma unroll
@@ -307,33 +335,43 @@ __global__ void __launch_bounds__(THREADS, 1)
       for (int half = 0; half < 2; ++half) {
         const int h = 16 * m + (lane >> 2) + 8 * half;
         const int d = dcol + 8 * n + 2 * (lane & 3);
-        *reinterpret_cast<float2*>(qrow + h * D + d) =
-            make_float2(acc_q[m][n][2 * half], acc_q[m][n][2 * half + 1]);
+        float2 g = make_float2(acc_q[m][n][2 * half], acc_q[m][n][2 * half + 1]);
+        if (d >= D - ROPE) {
+          const int i = (d - (D - ROPE)) / 2;
+          g = rotate(g, cs[i], -cs[ROPE / 2 + i]);
+        }
+        *reinterpret_cast<__nv_bfloat162*>(qrow + (d >> 4) * (H * 16) + h * 16 + (d & 15)) =
+            __floats2bfloat162_rn(g.x, g.y);
       }
 }
 
 }  // namespace
 
-void backward(torch::Tensor qr, torch::Tensor dout, torch::Tensor kv, torch::Tensor indices,
-              torch::Tensor lens, torch::Tensor lse2, double scale, torch::Tensor dq,
-              torch::Tensor dkv, torch::Tensor delta) {
-  TORCH_CHECK(qr.is_cuda() && qr.scalar_type() == at::kBFloat16 && qr.is_contiguous());
-  TORCH_CHECK(qr.dim() == 3 && qr.size(1) == H && qr.size(2) == D);
-  TORCH_CHECK(dout.sizes() == qr.sizes() && dout.scalar_type() == at::kBFloat16 &&
-              dout.is_contiguous());
+void backward(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
+              torch::Tensor cos_sin, torch::Tensor kv, torch::Tensor indices, torch::Tensor lens,
+              torch::Tensor lse2, double scale, torch::Tensor dq, torch::Tensor dkv,
+              torch::Tensor delta) {
+  TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.is_contiguous());
+  TORCH_CHECK(q.dim() == 3 && q.size(1) == H && q.size(2) == D);
+  const int64_t rows = q.size(0);
+  TORCH_CHECK(grad.numel() == rows * H * D && grad.scalar_type() == at::kBFloat16 &&
+              grad.is_contiguous());
+  TORCH_CHECK(positions.numel() == rows && positions.scalar_type() == at::kInt &&
+              positions.is_contiguous());
+  TORCH_CHECK(cos_sin.dim() == 2 && cos_sin.size(1) == ROPE &&
+              cos_sin.scalar_type() == at::kFloat && cos_sin.is_contiguous());
   TORCH_CHECK(kv.dim() == 2 && kv.size(1) == D && kv.scalar_type() == at::kBFloat16 &&
               kv.is_contiguous());
-  TORCH_CHECK(indices.dim() == 2 && indices.size(0) == qr.size(0) &&
+  TORCH_CHECK(indices.dim() == 2 && indices.size(0) == rows &&
               indices.scalar_type() == at::kInt && indices.stride(1) == 1);
-  TORCH_CHECK(lens.numel() == qr.size(0) && lens.scalar_type() == at::kInt);
-  TORCH_CHECK(lse2.sizes() == at::IntArrayRef({qr.size(0), H}) &&
-              lse2.scalar_type() == at::kFloat && lse2.is_contiguous());
-  TORCH_CHECK(dq.sizes() == qr.sizes() && dq.scalar_type() == at::kFloat && dq.is_contiguous());
+  TORCH_CHECK(lens.numel() == rows && lens.scalar_type() == at::kInt && lens.is_contiguous());
+  TORCH_CHECK(lse2.sizes() == at::IntArrayRef({rows, H}) && lse2.scalar_type() == at::kFloat &&
+              lse2.is_contiguous());
+  TORCH_CHECK(dq.sizes() == q.sizes() && dq.scalar_type() == at::kBFloat16 && dq.is_contiguous());
   TORCH_CHECK(dkv.sizes() == kv.sizes() && dkv.scalar_type() == at::kFloat &&
               dkv.is_contiguous());
   TORCH_CHECK(delta.sizes() == lse2.sizes() && delta.scalar_type() == at::kFloat &&
               delta.is_contiguous());
-  const int rows = qr.size(0);
   if (rows == 0) return;
   const size_t smem = sizeof(Smem);
   cudaFuncSetAttribute(mega_attention_bwd_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize,
@@ -341,11 +379,12 @@ void backward(torch::Tensor qr, torch::Tensor dout, torch::Tensor kv, torch::Ten
   const float scale_f = static_cast<float>(scale);
   const float scale_log2 = static_cast<float>(scale * 1.4426950408889634);
   mega_attention_bwd_kernel<<<rows, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __nv_bfloat16*>(qr.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(dout.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()), kv.size(0),
-      indices.data_ptr<int>(), indices.stride(0), lens.data_ptr<int>(), lse2.data_ptr<float>(),
-      scale_f, scale_log2, dq.data_ptr<float>(), dkv.data_ptr<float>(),
+      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+      reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr()), positions.data_ptr<int>(),
+      cos_sin.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),
+      kv.size(0), indices.data_ptr<int>(), indices.stride(0), lens.data_ptr<int>(),
+      lse2.data_ptr<float>(), scale_f, scale_log2,
+      reinterpret_cast<__nv_bfloat16*>(dq.data_ptr()), dkv.data_ptr<float>(),
       delta.data_ptr<float>());
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }

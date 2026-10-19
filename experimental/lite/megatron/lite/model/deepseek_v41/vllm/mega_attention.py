@@ -288,19 +288,23 @@ def _extension():
     return _EXTENSION
 
 
-def attention_backward_kernel(qr, grad, kv, indices, lens, lse_full, scale):
-    """Owned sparse-attention VJP on rotated operands (no RoPE, no layouts).
+def attention_backward_kernel(q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale):
+    """Owned VJP of the mega kernel's attention, RoPE and layouts included.
 
-    ``qr``/``grad`` bf16 ``[S, 64, 512]`` natural layout; ``kv`` bf16 ``[M, 512]``;
-    ``lse_full`` FP32 ``[S, 64]`` natural-log LSE including the sink. Returns
-    FP32 ``dq [S, 64, 512]``, ``dkv [M, 512]`` and ``D [S, 64]``.
+    ``q`` bf16 ``[S, 64, 512]`` fused query layout (unrotated); ``grad`` the
+    gradient of the dequantized output, ``[S, 8, 8 * 512]`` fused output layout;
+    ``kv`` bf16 ``[M, 512]`` (rotated, dequantized); ``lse_full`` FP32 ``[S, 64]``
+    natural-log LSE including the sink. Returns bf16 ``dq`` (fused layout), FP32
+    ``dkv [M, 512]`` w.r.t. the rotated KV, and FP32 ``D [S, 64]``.
     """
-    dq = torch.empty(qr.shape, dtype=torch.float32, device=qr.device)
-    dkv = torch.zeros(kv.shape, dtype=torch.float32, device=qr.device)
-    delta = torch.empty(qr.shape[:2], dtype=torch.float32, device=qr.device)
+    dq = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
+    dkv = torch.zeros(kv.shape, dtype=torch.float32, device=q.device)
+    delta = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
     _extension().backward(
-        qr.contiguous(),
-        grad.contiguous(),
+        q.contiguous(),
+        grad.bfloat16().contiguous(),
+        positions.to(torch.int32).contiguous(),
+        cos_sin_cache.float().contiguous(),
         kv.contiguous(),
         indices.contiguous(),
         lens.contiguous(),
@@ -321,7 +325,14 @@ class _MegaAttention(torch.autograd.Function):
     ):
         rank, size = (group.rank(), group.size()) if group is not None else (0, 1)
         local = q.shape[0]
-        swa_full, latent_full = swa_kv.detach(), None if latent is None else latent.detach()
+        swa_full, latent_full, boundary = swa_kv.detach(), None, None
+        if latent is not None:
+            # Compact boundary rows -> the per-token latent vLLM's insert reads.
+            boundary = ((positions + 1) % ratio == 0).nonzero().squeeze(1)
+            if boundary.numel() != latent.shape[0]:
+                raise ValueError("comp_latent must hold one row per local group-boundary token")
+            latent_full = latent.new_zeros(local, HEAD_DIM)
+            latent_full[boundary] = latent.detach()
         if size > 1:
             swa_full = _all_gather(swa_full, group)
             latent_full = None if latent_full is None else _all_gather(latent_full, group)
@@ -335,35 +346,32 @@ class _MegaAttention(torch.autograd.Function):
             None if topk is None else topk.to(torch.int32).contiguous(),
             positions, sink32, cos_sin_cache, ratio, window, top_k, plan,
         )
-        ctx.save_for_backward(q, kv, indices, lens, lse, positions, sink32, cos_sin_cache)
-        ctx.meta = (plan, ratio, group, rank, size, swa_kv.dtype, swa_kv.shape,
-                    None if latent is None else (latent.dtype, latent.shape), sink.dtype)
+        ctx.save_for_backward(q, kv, indices, lens, lse, positions, sink32, cos_sin_cache, boundary)
+        ctx.meta = (plan, ratio, group, rank, size, swa_kv.dtype,
+                    None if latent is None else latent.dtype, sink.dtype)
         ctx.mark_non_differentiable(data, scale)
         carrier = torch.zeros((), dtype=torch.bfloat16, device=q.device).expand(data.shape)
         return data, scale, carrier
 
     @staticmethod
     def backward(ctx, _data, _scale, grad):
-        q, kv, indices, lens, lse, positions, sink, cos_sin_cache = ctx.saved_tensors
-        plan, ratio, group, rank, size, swa_dtype, swa_shape, latent_meta, sink_dtype = ctx.meta
+        q, kv, indices, lens, lse, positions, sink, cos_sin_cache, boundary = ctx.saved_tensors
+        plan, ratio, group, rank, size, swa_dtype, latent_dtype, sink_dtype = ctx.meta
         if grad is None:
             grad = torch.zeros(q.shape[0], HEADS // WV_GROUP, WV_GROUP * HEAD_DIM, device=q.device)
-        # o = R(-theta) O, so dL/dO = R(theta) dL/do.
-        grad_o = rope(o_from_fused(grad.float()), cos_sin_cache, positions).bfloat16()
-        qr = rope(q_from_fused(q), cos_sin_cache, positions).bfloat16()
         lse_full = torch.logaddexp(lse, sink.unsqueeze(0))
-        scale = HEAD_DIM**-0.5
-        dqr, dkv, delta = attention_backward_kernel(
-            qr, grad_o, kv.view(-1, HEAD_DIM), indices, lens, lse_full, scale
+        dq, dkv, delta = attention_backward_kernel(
+            q, grad, positions, cos_sin_cache, kv.view(-1, HEAD_DIM), indices, lens, lse_full,
+            HEAD_DIM**-0.5,
         )
-        dq = q_to_fused(rope(dqr, cos_sin_cache, positions, inverse=True)).to(q.dtype)
+        dq = dq.to(q.dtype)
         dsink = -(torch.exp(sink.unsqueeze(0) - lse_full) * delta).sum(0).to(sink_dtype)
         comp_rows, swa_rows = _kv_rows(plan, ratio, q.device)
         total = q.shape[0] * size
         dswa = torch.zeros(total, HEAD_DIM, dtype=torch.float32, device=q.device)
         dswa[swa_rows[1]] = rope(dkv[swa_rows[0]], cos_sin_cache, swa_rows[2], inverse=True)
         dlatent = None
-        if latent_meta is not None:
+        if latent_dtype is not None:
             dlatent = torch.zeros(total, HEAD_DIM, dtype=torch.float32, device=q.device)
             dlatent[comp_rows[1]] = rope(
                 dkv[comp_rows[0]], cos_sin_cache, comp_rows[2], inverse=True
@@ -373,7 +381,7 @@ class _MegaAttention(torch.autograd.Function):
             dlatent = None if dlatent is None else _reduce_scatter(dlatent, group)
         dswa = dswa.to(swa_dtype)
         if dlatent is not None:
-            dlatent = dlatent.to(latent_meta[0])
+            dlatent = dlatent[boundary].to(latent_dtype)
         return dq, dswa, dlatent, None, None, dsink, None, None, None, None, None, None
 
 
@@ -409,9 +417,10 @@ def mega_attention(
     Args:
         q: bf16 ``[S_local, 64, 512]`` ``wq_b`` output in the fused query layout.
         swa_kv: bf16 ``[S_local, 512]`` ``kv_norm`` output, before RoPE.
-        comp_latent: bf16 ``[S_local, 512]`` per-token compressor latent (as vLLM's
-            ``fused_save_compress_norm``; only group-boundary rows are read and
-            receive gradient), or ``None`` for ratio 0.
+        comp_latent: bf16 ``[N_local, 512]`` compressor latent of the local
+            group-boundary tokens (``(position + 1) % ratio == 0``) in token
+            order, i.e. those rows of vLLM's per-token ``fused_save_compress_norm``
+            output; ``None`` for ratio 0.
         topk_local: int32 ``[S_local, top_k]`` document-local compressed indices,
             ascending, ``-1`` at the end; ``None`` for ratio 0.
         positions: ``[S_local]`` within-document positions of the local rows.

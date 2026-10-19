@@ -86,10 +86,12 @@ def _inputs(length, ratio, seed=0, docs=None):
 def _ours(x, **kwargs):
     from megatron.lite.model.deepseek_v41.vllm.mega_attention import mega_attention
 
+    # The interface takes the boundary-token rows of the per-token latent.
+    latent = None if x.latent is None else x.latent[(x.positions + 1) % x.ratio == 0]
     return mega_attention(
         x.q,
         x.swa_kv,
-        x.latent,
+        latent,
         x.topk,
         x.positions,
         x.sink,
@@ -465,10 +467,11 @@ def test_backward_rejects_planted_errors():
     calls = []
     original = mega.attention_backward_kernel
 
-    def no_sink(qr, g, kv, indices, lens, lse_full, scale):
+    def no_sink(*args):
         calls.append(1)
+        *head, lse_full, scale = args
         lse = lse_full + torch.log1p(-torch.exp(x.sink[None] - lse_full))
-        return original(qr, g, kv, indices, lens, lse, scale)
+        return original(*head, lse, scale)
 
     mega.attention_backward_kernel = no_sink
     try:
