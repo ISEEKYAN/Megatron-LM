@@ -142,6 +142,10 @@ def _plan(cu_seqlens, row_start, row_end, ratio):
 
 def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, window, top_k, plan):
     """Steps 1-5 of the module docstring; returns (out data, out scale, lse, kv, indices, lens)."""
+    from vllm import envs
+
+    if not envs.VLLM_BATCH_INVARIANT:
+        raise RuntimeError("mega attention replays the BI=1 rollout; set VLLM_BATCH_INVARIANT=1")
     from vllm.models.deepseek_v41.common.ops import (
         combine_topk_swa_indices,
         dequantize_and_gather_k_cache,

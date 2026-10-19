@@ -29,7 +29,8 @@ struct Smem {
   __nv_bfloat16 k[B * D];
   __nv_bfloat16 p[H * B];
   __nv_bfloat16 ds[H * B];
-  float dpart[4][H];
+  float red[2][H][B + 8];  // the k-split halves' partial S / dP
+  float dpart[2][H];
   float delta[H];
   float lse2[H];
   int idx[B];
@@ -85,22 +86,56 @@ __device__ __forceinline__ uint32_t pack_bf16(float lo, float hi) {
   return *reinterpret_cast<uint32_t*>(&v);
 }
 
-// S and dP tiles of this warp: heads [16 mt, +16) x slots [8 nt, +8), K = 512.
-__device__ __forceinline__ void score_tiles(const Smem& s, int mt, int nt, int lane,
-                                            float (&acc_s)[4], float (&acc_dp)[4]) {
+// S = Q K^T and dP = dO K^T for one KV block. Warp (mt, kh, nh) multiplies
+// heads [16 mt, +16) by slots [16 nh, +16) over dims [256 kh, +256); the kh = 1
+// half hands its partial sums to kh = 0 through shared memory (fixed order).
+// Returns whether this warp holds reduced tiles: acc[t] covers slots
+// [16 nh + 8 t, +8) in the m16n8 accumulator layout.
+__device__ __forceinline__ bool score_tiles(Smem& s, int warp, int lane, float (&acc_s)[2][4],
+                                            float (&acc_dp)[2][4]) {
+  const int mt = warp & 3, kh = (warp >> 2) & 1, nh = warp >> 3;
 #pragma unroll
-  for (int i = 0; i < 4; ++i) acc_s[i] = acc_dp[i] = 0.f;
+  for (int t = 0; t < 2; ++t)
+#pragma unroll
+    for (int i = 0; i < 4; ++i) acc_s[t][i] = acc_dp[t][i] = 0.f;
   const int arow = 16 * mt + (lane & 15);
-  const int brow = 8 * nt + (lane & 7);
+  const int brow = 16 * nh + (lane & 7) + ((lane >> 4) << 3);
+  const int bk = ((lane >> 3) & 1) * 8;
 #pragma unroll 4
-  for (int k = 0; k < D; k += 16) {
-    uint32_t a[4], g[4], b[2];
+  for (int k = 256 * kh; k < 256 * kh + 256; k += 16) {
+    uint32_t a[4], g[4], b[4];
     ldsm_x4(a, &s.q[wide(arow, k + (lane >> 4) * 8)]);
     ldsm_x4(g, &s.dout[wide(arow, k + (lane >> 4) * 8)]);
-    ldsm_x2(b, &s.k[wide(brow, k + ((lane >> 3) & 1) * 8)]);
-    mma(acc_s, a, b[0], b[1]);
-    mma(acc_dp, g, b[0], b[1]);
+    ldsm_x4(b, &s.k[wide(brow, k + bk)]);
+    mma(acc_s[0], a, b[0], b[1]);
+    mma(acc_s[1], a, b[2], b[3]);
+    mma(acc_dp[0], g, b[0], b[1]);
+    mma(acc_dp[1], g, b[2], b[3]);
   }
+  const int h0 = 16 * mt + (lane >> 2);
+  if (kh == 1) {
+#pragma unroll
+    for (int t = 0; t < 2; ++t) {
+      const int c = 16 * nh + 8 * t + 2 * (lane & 3);
+      *reinterpret_cast<float2*>(&s.red[0][h0][c]) = make_float2(acc_s[t][0], acc_s[t][1]);
+      *reinterpret_cast<float2*>(&s.red[0][h0 + 8][c]) = make_float2(acc_s[t][2], acc_s[t][3]);
+      *reinterpret_cast<float2*>(&s.red[1][h0][c]) = make_float2(acc_dp[t][0], acc_dp[t][1]);
+      *reinterpret_cast<float2*>(&s.red[1][h0 + 8][c]) = make_float2(acc_dp[t][2], acc_dp[t][3]);
+    }
+  }
+  __syncthreads();
+  if (kh == 1) return false;
+#pragma unroll
+  for (int t = 0; t < 2; ++t) {
+    const int c = 16 * nh + 8 * t + 2 * (lane & 3);
+#pragma unroll
+    for (int i = 0; i < 4; ++i) {
+      const int h = h0 + (i >> 1) * 8, slot = c + (i & 1);
+      acc_s[t][i] += s.red[0][h][slot];
+      acc_dp[t][i] += s.red[1][h][slot];
+    }
+  }
+  return true;
 }
 
 __device__ __forceinline__ float2 rotate(float2 x, float c, float s) {
@@ -175,21 +210,25 @@ __global__ void __launch_bounds__(THREADS, 1)
     __syncthreads();
   };
 
-  const int mt = warp >> 2, nt = warp & 3;
+  const int mt = warp & 3, nh = warp >> 3;
   const int h0 = 16 * mt + (lane >> 2), h1 = h0 + 8;
-  const int c0 = 8 * nt + 2 * (lane & 3);
+  const int c0 = 16 * nh + 2 * (lane & 3);  // + 8 t + (i & 1)
 
   // ---- pass 1: D = sum_j P_j dP_j ----
   float dsum0 = 0.f, dsum1 = 0.f;
   for (int block = 0; block < nblocks; ++block) {
     load_kv(block);
-    float acc_s[4], acc_dp[4];
-    score_tiles(s, mt, nt, lane, acc_s, acc_dp);
+    float acc_s[2][4], acc_dp[2][4];
+    if (score_tiles(s, warp, lane, acc_s, acc_dp)) {
 #pragma unroll
-    for (int i = 0; i < 4; ++i) {
-      const int h = i < 2 ? h0 : h1, slot = c0 + (i & 1);
-      const float p = s.idx[slot] >= 0 ? exp2f(acc_s[i] * scale_log2 - s.lse2[h]) : 0.f;
-      (i < 2 ? dsum0 : dsum1) += p * acc_dp[i];
+      for (int t = 0; t < 2; ++t)
+#pragma unroll
+        for (int i = 0; i < 4; ++i) {
+          const int h = i < 2 ? h0 : h1, slot = c0 + 8 * t + (i & 1);
+          const float p =
+              s.idx[slot] >= 0 ? exp2f(acc_s[t][i] * scale_log2 - s.lse2[h]) : 0.f;
+          (i < 2 ? dsum0 : dsum1) += p * acc_dp[t][i];
+        }
     }
     __syncthreads();
   }
@@ -198,13 +237,13 @@ __global__ void __launch_bounds__(THREADS, 1)
     dsum0 += __shfl_xor_sync(0xffffffff, dsum0, off);
     dsum1 += __shfl_xor_sync(0xffffffff, dsum1, off);
   }
-  if ((lane & 3) == 0) {
-    s.dpart[nt][h0] = dsum0;
-    s.dpart[nt][h1] = dsum1;
+  if (((warp >> 2) & 1) == 0 && (lane & 3) == 0) {
+    s.dpart[nh][h0] = dsum0;
+    s.dpart[nh][h1] = dsum1;
   }
   __syncthreads();
   if (tid < H) {
-    const float d = ((s.dpart[0][tid] + s.dpart[1][tid]) + s.dpart[2][tid]) + s.dpart[3][tid];
+    const float d = s.dpart[0][tid] + s.dpart[1][tid];
     s.delta[tid] = d;
     delta_out[(int64_t)row * H + tid] = d;
   }
@@ -224,21 +263,26 @@ __global__ void __launch_bounds__(THREADS, 1)
   for (int block = 0; block < nblocks; ++block) {
     load_kv(block);
     {
-      float acc_s[4], acc_dp[4];
-      score_tiles(s, mt, nt, lane, acc_s, acc_dp);
-      float pv[4], dsv[4];
+      float acc_s[2][4], acc_dp[2][4];
+      if (score_tiles(s, warp, lane, acc_s, acc_dp)) {
 #pragma unroll
-      for (int i = 0; i < 4; ++i) {
-        const int h = i < 2 ? h0 : h1, slot = c0 + (i & 1);
-        const bool valid = s.idx[slot] >= 0;
-        const float p = valid ? exp2f(acc_s[i] * scale_log2 - s.lse2[h]) : 0.f;
-        pv[i] = p;
-        dsv[i] = valid ? scale * p * (acc_dp[i] - s.delta[h]) : 0.f;
+        for (int t = 0; t < 2; ++t) {
+          float pv[4], dsv[4];
+#pragma unroll
+          for (int i = 0; i < 4; ++i) {
+            const int h = i < 2 ? h0 : h1, slot = c0 + 8 * t + (i & 1);
+            const bool valid = s.idx[slot] >= 0;
+            const float p = valid ? exp2f(acc_s[t][i] * scale_log2 - s.lse2[h]) : 0.f;
+            pv[i] = p;
+            dsv[i] = valid ? scale * p * (acc_dp[t][i] - s.delta[h]) : 0.f;
+          }
+          const int c = c0 + 8 * t;
+          *reinterpret_cast<uint32_t*>(&s.p[narrow(h0, c)]) = pack_bf16(pv[0], pv[1]);
+          *reinterpret_cast<uint32_t*>(&s.p[narrow(h1, c)]) = pack_bf16(pv[2], pv[3]);
+          *reinterpret_cast<uint32_t*>(&s.ds[narrow(h0, c)]) = pack_bf16(dsv[0], dsv[1]);
+          *reinterpret_cast<uint32_t*>(&s.ds[narrow(h1, c)]) = pack_bf16(dsv[2], dsv[3]);
+        }
       }
-      *reinterpret_cast<uint32_t*>(&s.p[narrow(h0, c0)]) = pack_bf16(pv[0], pv[1]);
-      *reinterpret_cast<uint32_t*>(&s.p[narrow(h1, c0)]) = pack_bf16(pv[2], pv[3]);
-      *reinterpret_cast<uint32_t*>(&s.ds[narrow(h0, c0)]) = pack_bf16(dsv[0], dsv[1]);
-      *reinterpret_cast<uint32_t*>(&s.ds[narrow(h1, c0)]) = pack_bf16(dsv[2], dsv[3]);
     }
     __syncthreads();
 
