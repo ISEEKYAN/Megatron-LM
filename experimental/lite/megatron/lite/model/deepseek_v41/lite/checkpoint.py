@@ -218,7 +218,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
     model = chunk
     while hasattr(model, "module"):
         model = model.module
-    state = list(model.named_parameters())
+    state = [(n, p) for n, p in model.named_parameters() if "_lora." not in n]  # adapters: lora.py
     # Core router bias and frozen Engram tables are persistent training state.
     state += [
         (n, v)
@@ -259,7 +259,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
             n
             for m, module in model.named_modules()
             for n in (f"{m}.{b}".lstrip(".") for b in local_tensors(module))
-            if n not in loaded and not n.endswith(".ape")
+            if n not in loaded and not n.endswith(".ape") and "_lora." not in n
         )
         if unread or unloaded:
             raise ValueError(f"DS4.1 release load: unread {unread[:8]}, unloaded {unloaded[:8]}")

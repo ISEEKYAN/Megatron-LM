@@ -1,0 +1,184 @@
+# Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+"""DS4.1 LoRA on the attention projections and the shared expert of a layer range.
+
+Adapters are sibling modules added to the frozen base outputs by forward hooks, so
+base parameter names (release mapping, DCP keys) are unchanged. ``wo_a`` is a raw
+grouped weight inside Core's forward: the core-attention output is tapped and the
+grouped delta is added to the ``wo_b`` (``linear_proj``) input, which is linear in it.
+"""
+import json
+import re
+from pathlib import Path
+
+import torch
+import torch.distributed as dist
+from torch import nn
+
+from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig
+
+_ATTENTION = {
+    "wq_a": "linear_q_down_proj",
+    "wq_b": "linear_q_up_proj",
+    "wkv": "linear_kv_proj",
+    "wo_b": "linear_proj",
+}
+TARGETS = (*_ATTENTION, "wo_a", "shared_experts")
+_PARAM = re.compile(
+    r"layers\.(\d+)\.(?:attention\.(\w+)_lora|ffn\.shared_experts\.(w[123])_lora)\.lora_([ab])"
+)
+
+
+class GroupedLoRA(nn.Module):
+    """One adapter per output group of a block-diagonal (grouped) projection."""
+
+    def __init__(self, groups, in_features, out_features, rank, scale):
+        super().__init__()
+        self.scale = scale
+        self.lora_a = nn.Parameter(torch.empty(groups, rank, in_features))
+        self.lora_b = nn.Parameter(torch.zeros(groups, out_features, rank))
+        for a in self.lora_a.data:
+            nn.init.kaiming_uniform_(a, a=5**0.5)
+
+    def forward(self, x):
+        x = x.unflatten(-1, (self.lora_a.shape[0], -1))
+        hidden = torch.einsum("...gd,grd->...gr", x, self.lora_a)
+        return (torch.einsum("...gr,gor->...go", hidden, self.lora_b) * self.scale).flatten(-2)
+
+
+def lora_layers(cfg, num_layers):
+    """Default: the last 20 decoder layers (DS4.1: 20-39, every ratio-one layer)."""
+    start, end = cfg.layers or (max(0, num_layers - 20), num_layers)
+    if not 0 <= start < end <= num_layers:
+        raise ValueError(f"DS4.1 LoRA layers [{start}, {end}) outside [0, {num_layers})")
+    return start, end
+
+
+def attach_lora(model, cfg, dtype):
+    """Add adapters to the local layers in range; the caller freezes everything else."""
+    targets = set(
+        TARGETS if cfg.target_modules == LoraConfig().target_modules else cfg.target_modules
+    )
+    if targets - set(TARGETS) or cfg.dropout:
+        raise ValueError(f"DS4.1 LoRA supports targets {TARGETS} without dropout")
+    start, end = lora_layers(cfg, model.release.num_hidden_layers)
+    with torch.random.fork_rng(devices=[]):  # base initialization stays unchanged
+        for key, block in model.layers.items():
+            if not start <= int(key) < end:
+                continue
+            attention, shared = block.attention, block.ffn.shared_experts
+            for name, base in _ATTENTION.items():
+                if name in targets:
+                    _add(attention, name, getattr(attention, base), cfg, dtype)
+            if "wo_a" in targets:
+                groups = attention.o_local_groups
+                rank_out, width = attention.linear_o_group_proj.shape
+                lora = GroupedLoRA(groups, width, rank_out // groups, cfg.rank, cfg.scale)
+                attention.wo_a_lora = lora.to(dtype)
+                attention.core_attention.register_forward_hook(
+                    lambda m, args, out, a=attention: setattr(a, "_wo_a_input", out)
+                )
+                attention.linear_proj.register_forward_pre_hook(
+                    lambda m, args, a=attention: (
+                        args[0]
+                        + a.wo_a_lora(
+                            a.__dict__.pop("_wo_a_input").reshape(*args[0].shape[:-1], -1)
+                        ),
+                    )
+                    + args[1:]
+                )
+            if "shared_experts" in targets:
+                out, width = shared.linear_fc1.weight.shape
+                pair = [LinearLoRA(width, out // 2, cfg.rank, alpha=cfg.alpha) for _ in "13"]
+                shared.w1_lora, shared.w3_lora = (p.to(dtype) for p in pair)
+                shared.linear_fc1.register_forward_hook(
+                    lambda m, args, out, s=shared: (
+                        out[0] + torch.cat((s.w1_lora(args[0]), s.w3_lora(args[0])), -1),
+                        *out[1:],
+                    )
+                )
+                _add(shared, "w2", shared.linear_fc2, cfg, dtype)
+
+
+def _add(owner, name, base, cfg, dtype):
+    out, width = base.weight.shape
+    lora = LinearLoRA(width, out, cfg.rank, alpha=cfg.alpha).to(dtype)
+    setattr(owner, f"{name}_lora", lora)
+    base.register_forward_hook(lambda m, args, out, f=lora: (out[0] + f(args[0]), *out[1:]))
+
+
+def lora_state(chunk):
+    """This stage's adapter tensors under release-style names (the resync payload)."""
+    while hasattr(chunk, "module"):
+        chunk = chunk.module
+    state = {}
+    for name, parameter in chunk.named_parameters():
+        match = _PARAM.fullmatch(name)
+        if match:
+            layer, attn, ffn, side = match.groups()
+            owner = f"attn.{attn}" if attn else f"ffn.shared_experts.{ffn}"
+            state[f"layers.{layer}.{owner}.lora_{side.upper()}.weight"] = parameter
+    return state
+
+
+def _stage_writer(ps):
+    return ps.dp_cp_rank == 0 and ps.ep_rank == 0
+
+
+def save_lora_hf(chunks, path, cfg, ps):
+    """PEFT-style safetensors of all stages' adapters, written by global rank 0."""
+    from safetensors.torch import save_file
+
+    local = {}
+    if _stage_writer(ps):
+        for chunk in chunks:
+            local.update({k: v.detach().cpu() for k, v in lora_state(chunk).items()})
+    parts = [None] * dist.get_world_size()
+    dist.all_gather_object(parts, local)
+    if dist.get_rank() == 0:
+        state = {k: v for part in parts for k, v in part.items()}
+        Path(path).mkdir(parents=True, exist_ok=True)
+        save_file(state, str(Path(path) / "adapter_model.safetensors"))
+        layers = sorted({int(k.split(".")[1]) for k in state})
+        config = dict(peft_type="LORA", r=cfg.rank, lora_alpha=cfg.alpha or cfg.rank)
+        config.update(target_modules=sorted(TARGETS), layers_to_transform=layers)
+        (Path(path) / "adapter_config.json").write_text(json.dumps(config, indent=1))
+    dist.barrier()
+
+
+@torch.no_grad()
+def load_lora_hf(chunks, path):
+    """Copy this rank's adapters from PEFT safetensors; every local adapter must be present."""
+    from safetensors.torch import load_file
+
+    saved = load_file(str(Path(path) / "adapter_model.safetensors"))
+    for chunk in chunks:
+        for key, tensor in lora_state(chunk).items():
+            if key not in saved or saved[key].shape != tensor.shape:
+                raise ValueError(f"DS4.1 LoRA adapter file lacks or misshapes {key}")
+            tensor.copy_(saved[key])
+
+
+def _lora_sharded(chunks, ps):
+    from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+
+    state = {}
+    for chunk in chunks:
+        if not getattr(chunk, "_mlite_dist_opt_sharded_state_dict", False):
+            attach_checkpoint_metadata([chunk], ps)
+        state.update({k: v for k, v in chunk.sharded_state_dict().items() if "_lora." in k})
+    return state
+
+
+def save_lora_dcp(chunks, path, ps):
+    """LoRA-only Core dist checkpoint, separate from the base and optimizer state."""
+    from megatron.core import dist_checkpointing
+
+    Path(path).mkdir(parents=True, exist_ok=True)
+    dist_checkpointing.save(_lora_sharded(chunks, ps), str(path))
+
+
+def load_lora_dcp(chunks, path, ps):
+    """Load in place; a training caller then refreshes the optimizer's main parameters."""
+    from megatron.core import dist_checkpointing
+
+    dist_checkpointing.load(_lora_sharded(chunks, ps), str(path))

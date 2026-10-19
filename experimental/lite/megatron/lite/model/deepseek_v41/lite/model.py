@@ -35,12 +35,18 @@ from megatron.lite.model.deepseek_v41.lite.components.engram import (
     hash_multipliers,
     prime_buckets,
 )
+from megatron.lite.model.deepseek_v41.lite.lora import attach_lora
 from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
 from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.modules.engram import NgramHash
+from megatron.lite.primitive.modules.lora import freeze_non_lora_params, normalize_lora_config
 from megatron.lite.primitive.modules.projection import ModelNorm
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.source_state import KVSourceState
+
+
+def lora_config(impl):
+    return normalize_lora_config(getattr(impl, "lora", None))
 
 
 class CoreAttentionSources(DS41AttentionSources):
@@ -160,6 +166,10 @@ class DeepseekV41Model(MegatronModule):
             if isinstance(module, MegatronModule) and getattr(module, "tp_group", None) is None:
                 groups = getattr(module, "pg_collection", None)
                 module.tp_group = getattr(groups, "tp", None) or ps.tp_group
+        if lora_config(impl).enabled:
+            attach_lora(self, lora_config(impl), config.params_dtype)
+            freeze_non_lora_params(self)
+            config.moe_router_bias_update_rate = 0.0  # the router expert bias is base state too
         self.to(device=impl.device)
 
     def set_input_tensor(self, value):

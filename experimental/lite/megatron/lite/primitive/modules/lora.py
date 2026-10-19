@@ -30,6 +30,7 @@ class LoraConfig:
     alpha: int | None = None
     dropout: float = 0.0
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
+    layers: tuple[int, int] | None = None  # [start, end) decoder layers; model default if None
 
     @property
     def enabled(self) -> bool:
@@ -65,8 +66,9 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
         values["target_modules"] = values.pop("targets")
     else:
         values.pop("targets", None)
-    if "target_modules" in values and not isinstance(values["target_modules"], tuple):
-        values["target_modules"] = tuple(values["target_modules"])
+    for key in ("target_modules", "layers"):
+        if values.get(key) is not None and not isinstance(values[key], tuple):
+            values[key] = tuple(values[key])
     return LoraConfig(**values)
 
 

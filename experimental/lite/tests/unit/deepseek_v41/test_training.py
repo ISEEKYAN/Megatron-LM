@@ -54,7 +54,7 @@ def _initialize(model, ps, root):
         if n.endswith(("expert_bias", "tid2eid", "embed.embedding.weight"))
     ]
     for name, tensor in state:
-        if name.endswith(".ape"):
+        if name.endswith(".ape") or "_lora." in name:
             continue
         value = tensor.detach().cpu()
         keys = _expert_sources(name, model.release, ps)
@@ -81,7 +81,16 @@ def _initialize(model, ps, root):
     load_hf_weights(model, str(path), model.release, ps)
 
 
-def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
+def _seed_adapters(model):
+    """Nonzero adapters, identical for a name in every configuration."""
+    for name, parameter in model.named_parameters():
+        if "_lora." in name:
+            seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
+            value = torch.randn(parameter.shape, generator=torch.Generator().manual_seed(seed))
+            parameter.data.copy_(value * 0.05)
+
+
+def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False, impl=None):
     from megatron.lite.runtime import create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -98,6 +107,7 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
     if pp > 1:
         options["pipeline_split_layer"] = [9] if pp == 2 else [3, 9]
     options["recompute"] = recompute
+    options.update(impl or {})
     cfg = MegatronLiteConfig(
         model_name="deepseek_v41",
         impl="lite",
@@ -115,14 +125,16 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
     return rt, handle, model, ps
 
 
-def _worker(rank, root, world, ep, cp, pp, recompute, sft):
+def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True):
     from megatron.lite.runtime.contracts import LossContext, PackedBatch
 
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", f"file://{root}/store", rank=rank, world_size=world)
     torch.use_deterministic_algorithms(not sft, warn_only=True)
-    rt, handle, model, ps = _build(root, ep, cp, pp, recompute, sft)
+    rt, handle, model, ps = _build(root, ep, cp, pp, recompute, sft, impl)
     _initialize(model, ps, root)
+    if impl and impl.get("lora") and seed:
+        _seed_adapters(model)
     if sft:
         handle._optimizer.reload_model_params()
     if not sft:
@@ -160,6 +172,7 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
                 n for n, g in grads.items() if g is None
             ]
             names = "linear_kv_proj.weight linear_q_up_proj.weight compressor.linear_wkv.weight main_projection.weight".split()
+            names = ["lora_b"] if impl and (impl.get("lora") or {}).get("rank") else names
             main = [g for n, g in grads.items() if any(k in n for k in names)]
             assert main and all(g.abs().sum() > 0 for g in main)
         if sft:
@@ -178,13 +191,16 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
     dist.destroy_process_group()
 
 
-def _run(root, shape, sft=False):
+def _run(root, shape, sft=False, impl=None, seed=True):
     root.mkdir()
     (root / "config.json").write_text(json.dumps(asdict(tiny_config())))
     ep, cp, pp, recompute = shape
     world = max(ep, cp * pp)
     mp.start_processes(
-        _worker, (str(root), world, ep, cp, pp, recompute, sft), nprocs=world, start_method="spawn"
+        _worker,
+        (str(root), world, ep, cp, pp, recompute, sft, impl, seed),
+        nprocs=world,
+        start_method="spawn",
     )
     records = [json.loads((root / f"rank-{r}.json").read_text()) for r in range(world)]
     if sft:
