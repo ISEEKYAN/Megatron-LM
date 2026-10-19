@@ -28,7 +28,7 @@ from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite import qat_export
+from verl_mlite import c8_probe, qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
@@ -325,7 +325,9 @@ class MegatronLiteEngine(BaseEngine):
 
     def optimizer_step(self):
         self._require_initialized()
-        _, grad_norm, _ = self.runtime.optimizer_step(self.handle)
+        _, grad_norm, _ = c8_probe.optimizer_step(
+            self.handle, lambda: self.runtime.optimizer_step(self.handle)
+        )
         return grad_norm
 
     def lr_scheduler_step(self):
@@ -753,6 +755,7 @@ class MegatronLiteEngine(BaseEngine):
                 )
             )
 
+        self._c8_forward_only = forward_only
         runtime_loss_fn = None
         reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
         if loss_function is not None or forward_only:
@@ -943,6 +946,7 @@ class MegatronLiteEngine(BaseEngine):
                 raw_output=raw_output, runtime_batch=runtime_batch
             )
             raw_output["_verl_model_output"] = model_output
+            c8_probe.dump_logprobs(model_output, micro_batch, self._c8_forward_only)
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output,
