@@ -2,10 +2,12 @@
 """Selection/lifecycle identity only; CPU does not execute deployment kernels."""
 import inspect
 
+import torch
+
 from megatron.lite.model.deepseek_v41.lite import protocol as native
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
 from megatron.lite.model.deepseek_v41.vllm import protocol
-from megatron.lite.model.deepseek_v41.vllm.model import DeepseekV41Model
+from megatron.lite.model.deepseek_v41.vllm.model import DeepseekV41Model, doc_positions
 from megatron.lite.model.registry import get_train_runtime_module, resolve_runtime_model_name
 
 
@@ -25,8 +27,13 @@ def test_registry_reuses_native_lifecycle_and_dist_opt():
     assert inspect.signature(native.build_model).parameters['_model_class'].default is None
 
 
-def test_unported_attention_provider_is_explicit_not_target_parity():
+def test_deployment_forward_runs_on_the_native_parameter_tree():
     assert DeepseekV41Model._build_attention is NativeModel._build_attention
-    assert 'NOT_TARGET_PARITY' in DeepseekV41Model.deployment_providers['attention']
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
-    assert DeepseekV41Model.forward is NativeModel.forward
+    assert DeepseekV41Model.forward is not NativeModel.forward
+    assert 'tracks.md' in DeepseekV41Model.deployment_providers['attention']
+
+
+def test_packed_positions_restart_per_document():
+    positions = doc_positions(torch.tensor([0, 3, 5, 9]), 9)
+    assert positions.tolist() == [0, 1, 2, 0, 1, 0, 1, 2, 3]

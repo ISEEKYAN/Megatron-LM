@@ -32,24 +32,40 @@ def _compute_weight_rows(hidden, weight, start, stop):
 
 
 def _project(hidden, compute):
+    """Deployment logits: vLLM's default head_dtype (= model dtype) rounds the
+    FP32-accumulated BI GEMM to BF16 (``linear_batch_invariant``)."""
     if not hidden.is_cuda:
-        return torch.nn.functional.linear(hidden.float(), compute)
+        return torch.nn.functional.linear(hidden.float(), compute).bfloat16()
     from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import bf16_fixed_mm
 
-    return bf16_fixed_mm(hidden.bfloat16(), compute)
+    return bf16_fixed_mm(hidden.bfloat16(), compute).to(torch.bfloat16)
 
 
 def head_logits(hidden, weight):
-    """The whole FP32 deployment logits, same arithmetic as one head block."""
+    """The whole BF16 deployment logits, same arithmetic as one head block."""
     if hidden.is_cuda:
         from .linear import linear
 
-        return linear(hidden, weight, fp8=False)
-    return torch.nn.functional.linear(hidden.float(), weight.float())
+        return _RoundBF16.apply(linear(hidden, weight, fp8=False))
+    return torch.nn.functional.linear(hidden.float(), weight.float()).bfloat16()
+
+
+class _RoundBF16(torch.autograd.Function):
+    """BF16 logits of the deployment head; identity (STE) derivative."""
+
+    @staticmethod
+    def forward(ctx, x):
+        return x.to(torch.bfloat16)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad.float()
 
 
 def _probabilities(logits, labels, temperature, entropy):
-    distribution = log_softmax(logits.float() / temperature)
+    # vLLM raw logprobs ignore temperature; T == 1 keeps the bytes (x / 1.0 == x).
+    logits = logits.float()
+    distribution = log_softmax(logits if float(temperature) == 1.0 else logits / temperature)
     picked = distribution.gather(-1, labels.unsqueeze(-1)).squeeze(-1)
     spread = -(distribution.exp() * distribution).sum(-1) if entropy else None
     return picked, spread
@@ -106,7 +122,9 @@ class _HeadLogProbs(torch.autograd.Function):
                 logits = block.new_empty((block.shape[0], vocab))
                 with torch.no_grad():
                     for v0, v1 in slices:
-                        logits[:, v0:v1] = block @ _compute_weight_rows(hidden, weight, v0, v1).T
+                        logits[:, v0:v1] = (
+                            block @ _compute_weight_rows(hidden, weight, v0, v1).T
+                        ).bfloat16()
                 logits.requires_grad_()
                 with torch.enable_grad():
                     outputs = _probabilities(logits, labels[start:stop], temperature, entropy)
@@ -138,7 +156,7 @@ def head_log_probs(hidden, weight, labels, temperature, *, entropy, rows=None):
     """Target log-probs and (optionally) entropy of ``hidden @ weight.T``.
 
     ``hidden`` is ``[rows, hidden]``, ``labels`` ``[rows]``. Forward is bitwise
-    ``log_softmax(head_logits(hidden, weight) / temperature)`` gathered at the
+    ``log_softmax(head_logits(hidden, weight).float() / temperature)`` gathered at the
     labels, because the GEMM and log-softmax are row-invariant (vLLM's
     batch-invariant kernels on CUDA). Neither the logits nor their gradient
     exist for more than ``rows`` rows at once: backward recomputes each block

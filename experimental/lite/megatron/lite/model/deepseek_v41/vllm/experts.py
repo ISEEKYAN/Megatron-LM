@@ -177,3 +177,43 @@ def shared_rows(x, module, encoded, limit):
     first = _Shared.apply(x, module.linear_fc1.weight, encoded)
     hidden, encoded = activation(first, x.new_ones(x.shape[0]), limit)
     return _Shared.apply(hidden, module.linear_fc2.weight, encoded)
+
+
+def local_moe(x, ids, weights, fc1, fc2, shared_fc1, shared_fc2, limit):
+    """All experts on this rank (EP=1): the MegaMoE chain of :class:`moe.MegaMoE`.
+
+    ``ids`` int [T,k] global expert ids, ``weights`` fp32 [T,k] (routed scale
+    included); ``fc1``/``fc2`` per-expert BF16 masters. Returns bf16 [T,H].
+    """
+    codes, scale = quantize_activation(x)
+    shared = (
+        _Shared.apply(x, shared_fc1, (codes, scale))
+        if shared_fc1 is not None
+        else None
+    )
+    if shared is not None:
+        hidden, encoded = activation(shared, x.new_ones(x.shape[0]), limit)
+        shared = _Shared.apply(hidden, shared_fc2, encoded)
+    else:
+        shared = x * 0
+    flat = ids.flatten()
+    positions = [(flat == e).nonzero().flatten() for e in range(len(fc1))]
+    splits = tuple(p.numel() for p in positions)
+    position = torch.cat(positions)
+    token = position // ids.shape[1]
+    rows = expert_rows(
+        x[token], fc1, fc2, splits, weights.flatten()[position],
+        (codes[token], scale[token]), limit,
+    )
+    slots = rows.new_zeros((ids.numel(), x.shape[1])).index_copy(0, position, rows)
+    return combine(slots.view(ids.shape[0], ids.shape[1], -1), ids, shared)
+
+
+def combine(slots, indices, shared):
+    """MegaMoE combine: FP32 ``((0 + shared) + slot0) + ...`` in slot order, then BF16."""
+    result = torch.zeros_like(shared, dtype=torch.float32) + shared.float()
+    for slot in range(indices.shape[1]):
+        result = torch.where(
+            (indices[:, slot] >= 0).unsqueeze(-1), result + slots[:, slot].float(), result
+        )
+    return result.bfloat16()

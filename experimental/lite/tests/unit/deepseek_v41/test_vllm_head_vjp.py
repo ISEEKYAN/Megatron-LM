@@ -14,7 +14,10 @@ def test_chunked_head_owned_vjp_matches_dense_fp32_reference(rows, entropy):
     weight = torch.randn(32, 16, requires_grad=True)
     labels = torch.tensor([0, 31, 2, 4, 11, 8, 3])
     picked, spread = _HeadLogProbs.apply(hidden, weight, labels, 0.7, entropy, rows)
-    distribution = (hidden @ weight.T / 0.7).log_softmax(-1)
+    # Deployment logits are BF16 (vLLM head_dtype); rounding is an identity STE.
+    logits = hidden @ weight.T
+    logits = logits + (logits.bfloat16().float() - logits).detach()
+    distribution = (logits / 0.7).log_softmax(-1)
     target = distribution.gather(1, labels[:, None]).squeeze(1)
     loss = picked.sum()
     reference = target.sum()
