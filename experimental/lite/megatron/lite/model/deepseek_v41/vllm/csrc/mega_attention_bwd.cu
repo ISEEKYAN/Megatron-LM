@@ -152,11 +152,18 @@ __global__ void __launch_bounds__(THREADS, 1)
                               const int* __restrict__ indices, int64_t index_stride,
                               const int* __restrict__ lens, const float* __restrict__ lse2,
                               float scale, float scale_log2, __nv_bfloat16* __restrict__ dq_fused,
-                              float* __restrict__ dkv, float* __restrict__ delta_out) {
+                              float* __restrict__ dkv, float* __restrict__ delta_out,
+                              int row0, int row1, float* __restrict__ scratch,
+                              __nv_bfloat16* __restrict__ partial) {
   extern __shared__ __align__(128) unsigned char smem_raw[];
   Smem& s = *reinterpret_cast<Smem*>(smem_raw);
-  const int row = blockIdx.x;
   const int tid = threadIdx.x, lane = tid & 31, warp = tid >> 5;
+  // This CTA's P / dP of one row, [2][H][index_stride] FP32: pass 1 writes
+  // what pass 2 reads (same thread, same addresses), so pass 2 does not
+  // recompute S and dP. Small enough per CTA to stay in L2.
+  float* sp = scratch + (int64_t)blockIdx.x * 2 * H * index_stride;
+  float* sdp = sp + (int64_t)H * index_stride;
+  for (int row = row0 + blockIdx.x; row < row1; row += gridDim.x) {
   const int len = lens[row];
   const int nblocks = (len + B - 1) / B;
   const float* cs = cos_sin + (int64_t)positions[row] * ROPE;
@@ -228,7 +235,16 @@ __global__ void __launch_bounds__(THREADS, 1)
           const float p =
               s.idx[slot] >= 0 ? exp2f(acc_s[t][i] * scale_log2 - s.lse2[h]) : 0.f;
           (i < 2 ? dsum0 : dsum1) += p * acc_dp[t][i];
+          acc_s[t][i] = p;
         }
+#pragma unroll
+      for (int t = 0; t < 2; ++t) {
+        const int64_t c = block * B + c0 + 8 * t;
+        *reinterpret_cast<float2*>(sp + h0 * index_stride + c) = make_float2(acc_s[t][0], acc_s[t][1]);
+        *reinterpret_cast<float2*>(sp + h1 * index_stride + c) = make_float2(acc_s[t][2], acc_s[t][3]);
+        *reinterpret_cast<float2*>(sdp + h0 * index_stride + c) = make_float2(acc_dp[t][0], acc_dp[t][1]);
+        *reinterpret_cast<float2*>(sdp + h1 * index_stride + c) = make_float2(acc_dp[t][2], acc_dp[t][3]);
+      }
     }
     __syncthreads();
   }
@@ -263,18 +279,21 @@ __global__ void __launch_bounds__(THREADS, 1)
   for (int block = 0; block < nblocks; ++block) {
     load_kv(block);
     {
-      float acc_s[2][4], acc_dp[2][4];
-      if (score_tiles(s, warp, lane, acc_s, acc_dp)) {
+      if (((warp >> 2) & 1) == 0) {
 #pragma unroll
         for (int t = 0; t < 2; ++t) {
-          float pv[4], dsv[4];
+          const int64_t g = block * B + c0 + 8 * t;
+          const float2 p0 = *reinterpret_cast<const float2*>(sp + h0 * index_stride + g);
+          const float2 p1 = *reinterpret_cast<const float2*>(sp + h1 * index_stride + g);
+          const float2 d0 = *reinterpret_cast<const float2*>(sdp + h0 * index_stride + g);
+          const float2 d1 = *reinterpret_cast<const float2*>(sdp + h1 * index_stride + g);
+          const float pv[4] = {p0.x, p0.y, p1.x, p1.y};
+          const float dp[4] = {d0.x, d0.y, d1.x, d1.y};
+          float dsv[4];
 #pragma unroll
           for (int i = 0; i < 4; ++i) {
-            const int h = i < 2 ? h0 : h1, slot = c0 + 8 * t + (i & 1);
-            const bool valid = s.idx[slot] >= 0;
-            const float p = valid ? exp2f(acc_s[t][i] * scale_log2 - s.lse2[h]) : 0.f;
-            pv[i] = p;
-            dsv[i] = valid ? scale * p * (acc_dp[t][i] - s.delta[h]) : 0.f;
+            const int h = i < 2 ? h0 : h1;
+            dsv[i] = scale * pv[i] * (dp[i] - s.delta[h]);
           }
           const int c = c0 + 8 * t;
           *reinterpret_cast<uint32_t*>(&s.p[narrow(h0, c)]) = pack_bf16(pv[0], pv[1]);
@@ -358,6 +377,18 @@ __global__ void __launch_bounds__(THREADS, 1)
         const int slot = 16 * m + (lane >> 2) + 8 * half;
         const int id = s.idx[slot];
         if (id < 0) continue;
+        if (partial != nullptr) {
+          // Deterministic mode: this row's slot partial, reduced later in a
+          // fixed order by segment_reduce_kernel.
+          __nv_bfloat16* dst = partial +
+                               ((int64_t)(row - row0) * index_stride + block * B + slot) * D +
+                               dcol + 2 * (lane & 3);
+#pragma unroll
+          for (int n = 0; n < 4; ++n)
+            *reinterpret_cast<__nv_bfloat162*>(dst + 8 * n) =
+                __floats2bfloat162_rn(acc_k[m][n][2 * half], acc_k[m][n][2 * half + 1]);
+          continue;
+        }
         float* dst = dkv + (int64_t)id * D + dcol + 2 * (lane & 3);
 #pragma unroll
         for (int n = 0; n < 4; ++n) {
@@ -387,6 +418,43 @@ __global__ void __launch_bounds__(THREADS, 1)
         *reinterpret_cast<__nv_bfloat162*>(qrow + (d >> 4) * (H * 16) + h * 16 + (d & 15)) =
             __floats2bfloat162_rn(g.x, g.y);
       }
+    __syncthreads();
+  }
+}
+
+// dkv[r] += the chunk's partials of KV row r, summed in sorted (row-major)
+// order. One 128-thread block per KV row, each warp a quarter of the dims; the
+// row's pairs are [starts[r], starts[r + 1]) of the sorted order.
+__global__ void segment_reduce_kernel(const int64_t* __restrict__ starts,
+                                      const int64_t* __restrict__ order, int64_t flat0,
+                                      const __nv_bfloat16* __restrict__ partial,
+                                      float* __restrict__ dkv) {
+  const int64_t r = blockIdx.x;
+  const int64_t begin = starts[r], end = starts[r + 1];
+  if (begin == end) return;
+  const int lane = threadIdx.x & 31;
+  const int dim = (threadIdx.x >> 5) * 128 + 4 * lane;
+  constexpr int U = 8;
+  float acc[4] = {0.f, 0.f, 0.f, 0.f};
+  for (int64_t q = begin; q < end; q += U) {
+    uint2 v[U];
+#pragma unroll
+    for (int u = 0; u < U; ++u)
+      if (q + u < end)
+        v[u] = __ldcs(reinterpret_cast<const uint2*>(partial + (order[q + u] - flat0) * D + dim));
+#pragma unroll
+    for (int u = 0; u < U; ++u) {
+      if (q + u < end) {
+        const __nv_bfloat162* h = reinterpret_cast<const __nv_bfloat162*>(&v[u]);
+        const float2 f0 = __bfloat1622float2(h[0]), f1 = __bfloat1622float2(h[1]);
+        acc[0] += f0.x; acc[1] += f0.y; acc[2] += f1.x; acc[3] += f1.y;
+      }
+    }
+  }
+  float4* dst = reinterpret_cast<float4*>(dkv + r * D + dim);
+  float4 d = *dst;
+  d.x += acc[0]; d.y += acc[1]; d.z += acc[2]; d.w += acc[3];
+  *dst = d;
 }
 
 }  // namespace
@@ -394,7 +462,8 @@ __global__ void __launch_bounds__(THREADS, 1)
 void backward(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
               torch::Tensor cos_sin, torch::Tensor kv, torch::Tensor indices, torch::Tensor lens,
               torch::Tensor lse2, double scale, torch::Tensor dq, torch::Tensor dkv,
-              torch::Tensor delta) {
+              torch::Tensor delta, torch::Tensor starts, torch::Tensor order,
+              int64_t chunk_rows) {
   TORCH_CHECK(q.is_cuda() && q.scalar_type() == at::kBFloat16 && q.is_contiguous());
   TORCH_CHECK(q.dim() == 3 && q.size(1) == H && q.size(2) == D);
   const int64_t rows = q.size(0);
@@ -422,15 +491,41 @@ void backward(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
                        (int)smem);
   const float scale_f = static_cast<float>(scale);
   const float scale_log2 = static_cast<float>(scale * 1.4426950408889634);
-  mega_attention_bwd_kernel<<<rows, THREADS, smem, c10::cuda::getCurrentCUDAStream()>>>(
-      reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
-      reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr()), positions.data_ptr<int>(),
-      cos_sin.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),
-      kv.size(0), indices.data_ptr<int>(), indices.stride(0), lens.data_ptr<int>(),
-      lse2.data_ptr<float>(), scale_f, scale_log2,
-      reinterpret_cast<__nv_bfloat16*>(dq.data_ptr()), dkv.data_ptr<float>(),
-      delta.data_ptr<float>());
-  C10_CUDA_KERNEL_LAUNCH_CHECK();
+  int device = 0, sms = 0;
+  cudaGetDevice(&device);
+  cudaDeviceGetAttribute(&sms, cudaDevAttrMultiProcessorCount, device);
+  const int64_t grid = std::min<int64_t>(rows, sms);
+  TORCH_CHECK(indices.stride(0) % 2 == 0 && indices.size(1) % B == 0);
+  auto scratch = torch::empty({grid, 2, H, indices.stride(0)}, dkv.options());
+  const bool deterministic = starts.numel() > 0;
+  const int64_t chunk = deterministic ? chunk_rows : rows;
+  torch::Tensor partial;
+  if (deterministic) {
+    TORCH_CHECK(starts.scalar_type() == at::kLong && order.scalar_type() == at::kLong &&
+                starts.numel() == (rows + chunk_rows - 1) / chunk_rows * kv.size(0) + 1);
+    partial = torch::empty({chunk * indices.stride(0), D}, dkv.options().dtype(at::kBFloat16));
+  }
+  auto stream = c10::cuda::getCurrentCUDAStream();
+  for (int64_t row0 = 0, c = 0; row0 < rows; row0 += chunk, ++c) {
+    const int64_t row1 = std::min(rows, row0 + chunk);
+    mega_attention_bwd_kernel<<<std::min<int64_t>(grid, row1 - row0), THREADS, smem, stream>>>(
+        reinterpret_cast<const __nv_bfloat16*>(q.data_ptr()),
+        reinterpret_cast<const __nv_bfloat16*>(grad.data_ptr()), positions.data_ptr<int>(),
+        cos_sin.data_ptr<float>(), reinterpret_cast<const __nv_bfloat16*>(kv.data_ptr()),
+        kv.size(0), indices.data_ptr<int>(), indices.stride(0), lens.data_ptr<int>(),
+        lse2.data_ptr<float>(), scale_f, scale_log2,
+        reinterpret_cast<__nv_bfloat16*>(dq.data_ptr()), dkv.data_ptr<float>(),
+        delta.data_ptr<float>(), (int)row0, (int)row1, scratch.data_ptr<float>(),
+        deterministic ? reinterpret_cast<__nv_bfloat16*>(partial.data_ptr()) : nullptr);
+    C10_CUDA_KERNEL_LAUNCH_CHECK();
+    if (deterministic) {
+      segment_reduce_kernel<<<kv.size(0), 128, 0, stream>>>(
+          starts.data_ptr<int64_t>() + c * kv.size(0), order.data_ptr<int64_t>(),
+          row0 * indices.stride(0), reinterpret_cast<const __nv_bfloat16*>(partial.data_ptr()),
+          dkv.data_ptr<float>());
+      C10_CUDA_KERNEL_LAUNCH_CHECK();
+    }
+  }
 }
 
 PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("backward", &backward); }
