@@ -3,6 +3,7 @@
 import json
 from dataclasses import asdict
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 import torch
@@ -43,6 +44,36 @@ def test_serving_expansion_matches_the_per_expert_layout():
         state[f"layers.9.ffn.experts.{expert}.lora_down_A.weight"] = c[expert]
     served = lora.serving_lora_state(state, e, scale)
     assert all(torch.equal(served[f"layers.9.ffn.experts.{k}.weight"], v) for k, v in out.items())
+
+
+@pytest.mark.parametrize("targets", [("wq_a",), ("wq_a", "wq_b")])
+def test_subset_export_metadata_matches_saved_adapters(tmp_path, monkeypatch, targets):
+    from safetensors.torch import load_file
+
+    attention = torch.nn.Module()
+    for name in ("linear_q_down_proj", "linear_q_up_proj"):
+        setattr(attention, name, torch.nn.Linear(4, 4))
+    model = SimpleNamespace(
+        release=SimpleNamespace(num_hidden_layers=1),
+        layers={
+            "0": SimpleNamespace(
+                attention=attention,
+                ffn=SimpleNamespace(shared_experts=torch.nn.Module(), experts=torch.nn.Module()),
+            )
+        },
+    )
+    cfg = LoraConfig(rank=2, target_modules=targets)
+    lora.attach_lora(model, cfg, torch.float32)
+    monkeypatch.setattr(dist, "get_world_size", lambda: 1)
+    monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "all_gather_object", lambda parts, local: parts.__setitem__(0, local))
+    monkeypatch.setattr(dist, "barrier", lambda: None)
+    lora.save_lora_hf([model], tmp_path, cfg)
+    config = json.loads((tmp_path / "adapter_config.json").read_text())
+    saved = load_file(str(tmp_path / "adapter_model.safetensors"))
+    assert config["target_modules"] == sorted(targets)
+    assert set(saved) == {f"layers.0.attn.{t}.lora_{f}.weight" for t in targets for f in "AB"}
+    assert all(any(f".attn.{t}.lora_" in k for k in saved) for t in config["target_modules"])
 
 
 @pytest.mark.gpus(1)

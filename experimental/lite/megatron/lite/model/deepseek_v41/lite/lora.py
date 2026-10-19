@@ -168,7 +168,10 @@ def save_lora_hf(chunks, path, cfg):
         save_file(state, str(Path(path) / "adapter_model.safetensors"))
         layers = sorted({int(k.split(".")[1]) for k in state})
         config = dict(peft_type="LORA", r=cfg.rank, lora_alpha=cfg.alpha or cfg.rank)
-        config.update(target_modules=sorted(TARGETS), layers_to_transform=layers)
+        targets = (
+            TARGETS if cfg.target_modules == LoraConfig().target_modules else cfg.target_modules
+        )
+        config.update(target_modules=sorted(set(targets)), layers_to_transform=layers)
         (Path(path) / "adapter_config.json").write_text(json.dumps(config, indent=1))
     dist.barrier()
 
