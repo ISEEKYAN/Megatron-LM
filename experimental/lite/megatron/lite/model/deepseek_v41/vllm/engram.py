@@ -95,4 +95,7 @@ def engram(hidden, rows, wkv_weight, q_weight, k_weight, mask=None, *, eps):
     kv = linear(rows, wkv_weight, fp8=True)
     if mask is not None:
         mask = mask.contiguous()
+    # vLLM holds q/k as BF16 (the release/export RNE of the FP32 masters); the cast's
+    # derivative is the identity onto the master.
+    q_weight, k_weight = q_weight.to(torch.bfloat16), k_weight.to(torch.bfloat16)
     return _Gate.apply(hidden.contiguous(), kv.contiguous(), q_weight, k_weight, mask, eps)
