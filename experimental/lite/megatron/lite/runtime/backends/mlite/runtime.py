@@ -419,6 +419,16 @@ class MegatronLiteRuntime(RuntimeBase):
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
+        # With overlapped DistOpt parameter gathering, the last step's updates reach
+        # the other data-parallel replicas only in the next forward's pre-hooks; an
+        # export before that would publish each rank's stale copy of every parameter
+        # shard it does not own. Finish the gather first (as checkpoint save does).
+        wrapped = handle._model if isinstance(handle._model, (list, tuple)) else [handle._model]
+        synced = set()
+        for chunk in [*model_chunks, *wrapped]:
+            if id(chunk) not in synced and callable(getattr(chunk, "start_param_sync", None)):
+                chunk.start_param_sync(force_sync=True)
+                synced.add(id(chunk))
 
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)
