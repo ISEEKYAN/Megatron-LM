@@ -179,7 +179,7 @@ def test_pipeline_stage_without_adapters_fails_loud(tmp_path):
 
 @pytest.mark.gpus(1)
 def test_lora_sft_loss_decreases(tmp_path):
-    impl = dict(lora=LORA, optimizer_config=dict(lr=0.01, min_lr=0.01, weight_decay=0.0))
+    impl = dict(lora=LORA, optimizer_config=dict(lr=0.03, min_lr=0.03, weight_decay=0.0))
     _run(tmp_path / "sft", (1, 1, 1, None), sft=True, impl=impl)
 
 
