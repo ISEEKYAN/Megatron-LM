@@ -65,3 +65,55 @@ def route(logits, router, tokens):
         router.topk,
         router.config.moe_router_topk_scaling_factor or 1.0,
     )
+
+
+IMAGE_TOKENS = (129264, 129269)
+
+
+class _MegaRoute(torch.autograd.Function):
+    """vLLM BI router (``VLLM_BI_MEGA_GATE=1``): DeepGEMM ``bf16_mega_gate``.
+
+    Forward ids/weights come from the fused gate on (x, weight); ``logits`` (the
+    same BF16 GEMM computed separately) only carries the owned slot-weight
+    derivative, as in :class:`_Route`.
+    """
+
+    @staticmethod
+    def forward(ctx, logits, x, weight, bias, image_bias, tokens, topk, factor):
+        if not x.is_cuda:
+            raise RuntimeError('Deployment routing requires CUDA')
+        from vllm.utils.deep_gemm import bf16_mega_gate
+
+        mask = None
+        if image_bias is not None:
+            if tokens is None:
+                raise ValueError("Image-bias routing requires the packed input token IDs")
+            mask = (tokens >= IMAGE_TOKENS[0]) & (tokens < IMAGE_TOKENS[1])
+        weights, ids = bf16_mega_gate(
+            x.detach().bfloat16().contiguous(),
+            weight.detach().bfloat16().contiguous(),
+            topk,
+            scoring_func="sqrtsoftplus",
+            routed_scaling_factor=factor,
+            ep_rank=0,
+            bias=bias,
+            image_bias=image_bias,
+            image_token_mask=mask,
+        )
+        ctx.save_for_backward(logits, ids)
+        ctx.factor = factor
+        ctx.mark_non_differentiable(ids)
+        return weights, ids
+
+    @staticmethod
+    def backward(ctx, grad, ignored_ids):
+        dz = _Route.backward(ctx, grad, ignored_ids)[0]
+        return dz, None, None, None, None, None, None, None
+
+
+def mega_route(x, weight, bias, topk, factor, *, image_bias=None, tokens=None):
+    """``(weights fp32 [T,k] incl. routed_scaling_factor, ids int64 [T,k])``."""
+    from .linear import linear
+
+    logits = linear(x, weight, fp8=False)
+    return _MegaRoute.apply(logits, x, weight, bias, image_bias, tokens, topk, factor)
