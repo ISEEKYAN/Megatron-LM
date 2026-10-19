@@ -177,26 +177,50 @@ def model_forward(
     return hidden
 
 
-def interface_core(fn, layer_cfg):
-    """Adapt a tracks.md attention core ``fn(q, swa_kv, comp_latent, topk_local, positions,
-    attn_sink, layer_cfg, rope_cache, *, cu_seqlens)`` to :func:`attention_layer`.
+def interface_core(kind):
+    """The tracks.md attention core of ``kind`` ("mega": M's ``mega_attention``;
+    "flashmla": F's ``flashmla_attention_core``) as an :func:`attention_layer` core.
 
-    ``comp_latent`` is the boundary rows (``(pos+1) % cr == 0``) in token order.
+    ``comp_latent`` is passed as the boundary rows (``(pos+1) % cr == 0``) in token order.
     """
+    if kind == "mega":
+        from .mega_attention import mega_attention as fn
+
+        def call(q, kv, comp, topk, positions, sink, ratio, cache, cu_seqlens):
+            return fn(
+                q,
+                kv,
+                comp,
+                topk,
+                positions,
+                sink,
+                compress_ratio=ratio,
+                cos_sin_cache=cache,
+                cu_seqlens=cu_seqlens,
+            )
+
+    elif kind == "flashmla":
+        from .flashmla_attention import FlashMLALayerConfig, flashmla_attention_core as fn
+
+        def call(q, kv, comp, topk, positions, sink, ratio, cache, cu_seqlens):
+            return fn(
+                q,
+                kv,
+                comp,
+                topk,
+                positions,
+                sink,
+                FlashMLALayerConfig(compress_ratio=ratio),
+                cache,
+                cu_seqlens=cu_seqlens,
+            )
+
+    else:
+        raise ValueError(f"Unknown DS4.1 attention core {kind!r}")
 
     def core(*, layer, q, kv, latent, topk, positions, attn_sink, ratio, cos_sin_cache, cu_seqlens):
         comp = None if latent is None else latent[(positions + 1) % ratio == 0]
-        return fn(
-            q,
-            kv,
-            comp,
-            topk,
-            positions,
-            attn_sink,
-            layer_cfg(ratio),
-            cos_sin_cache,
-            cu_seqlens=cu_seqlens,
-        )
+        return call(q, kv, comp, topk, positions, attn_sink, ratio, cos_sin_cache, cu_seqlens)
 
     return core
 

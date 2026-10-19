@@ -316,7 +316,8 @@ def mega_moe(
 
     ``fc1``/``fc2``: this rank's local experts (global ids ``rank*L .. rank*L+L-1``).
     ``group``: EP process group (None: single-rank group of the default PG).
-    ``max_tokens``: symmetric-buffer tokens per rank (inference max_num_batched_tokens).
+    ``max_tokens``: symmetric-buffer tokens per rank (inference max_num_batched_tokens);
+    more rows run in chunks, every EP rank launching the same number of chunks.
     """
     if group is None:
         group = torch.distributed.group.WORLD
@@ -327,4 +328,15 @@ def mega_moe(
         group, len(fc1) * world, max_tokens, ids.shape[1], x.shape[1], fc1[0].shape[0] // 2
     )
     options = (group if world > 1 else None, buffer, limit, packed, len(fc1))
-    return _MegaMoE.apply(x, weights, ids, options, *fc1, *fc2, shared_fc1, shared_fc2)
+    chunks = torch.tensor([max(1, -(-x.shape[0] // max_tokens))], device=x.device)
+    if world > 1:
+        torch.distributed.all_reduce(chunks, torch.distributed.ReduceOp.MAX, group=group)
+    outputs = []
+    for c in range(int(chunks)):
+        rows = slice(c * max_tokens, (c + 1) * max_tokens)
+        outputs.append(
+            _MegaMoE.apply(
+                x[rows], weights[rows], ids[rows], options, *fc1, *fc2, shared_fc1, shared_fc2
+            )
+        )
+    return outputs[0] if len(outputs) == 1 else torch.cat(outputs)

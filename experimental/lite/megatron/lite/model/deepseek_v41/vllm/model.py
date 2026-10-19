@@ -25,11 +25,6 @@ from .head import head_log_probs, head_logits
 from .moe import MegaMoE
 from .norm import ModelNorm
 
-CORES = {
-    "mega": (".mega_attention", "mega_attention", "MegaAttentionLayerConfig"),
-    "flashmla": (".flashmla_attention", "flashmla_attention_core", "FlashMLALayerConfig"),
-}
-
 
 class Head(ColumnParallelLinear):
     def forward(self, x, weight=None, **kwargs):
@@ -150,18 +145,8 @@ class DeepseekV41Model(NativeModel):
         return get
 
     def _core(self):
-        import importlib
-
         kind = os.environ.get('DSV41_ATTENTION_CORE', 'mega')
-        module, function, config = CORES[kind]
-        try:
-            mod = importlib.import_module(module, __package__)
-        except ImportError as exc:
-            raise NotImplementedError(
-                f'DS4.1 attention core {kind!r} ({module}) not delivered yet (track M/F)'
-            ) from exc
-        layer_cfg = getattr(mod, config)
-        return F.interface_core(getattr(mod, function), lambda ratio: layer_cfg(ratio)), kind
+        return F.interface_core(kind), kind
 
     def forward(
         self,

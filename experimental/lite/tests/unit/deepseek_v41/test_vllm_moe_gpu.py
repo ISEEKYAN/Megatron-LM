@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Single small native-Core MoE vs fused MegaMoE, one configuration per job."""
+"""Native-Core MegaMoE module vs a direct DeepGEMM fused MegaMoE launch, one job."""
 import json
 import os
 import time
@@ -12,7 +12,7 @@ import torch.distributed as dist
 pytestmark = [pytest.mark.gpus, pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')]
 
 
-def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
+def test_megamoe_module_matches_direct_fused_launch(tmp_path):
     from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs
     from vllm.utils.deep_gemm import _import_deep_gemm
 
@@ -21,9 +21,8 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.lite.model.deepseek_v41.lite.components.config import core_groups
     from megatron.lite.model.deepseek_v41.vllm.experts import packed_scales, quantize_activation
-    from megatron.lite.model.deepseek_v41.vllm.linear import linear
     from megatron.lite.model.deepseek_v41.vllm.moe import MegaMoE
-    from megatron.lite.model.deepseek_v41.vllm.routing import route
+    from megatron.lite.model.deepseek_v41.vllm.routing import mega_route
     from megatron.lite.primitive.parallel import init_parallel
     from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
     from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
@@ -120,8 +119,8 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
     )
     try:
         with torch.no_grad():
-            scores, ids = route(
-                linear(x.squeeze(1), model.router.weight, fp8=False), model.router, None
+            scores, ids = mega_route(
+                x.squeeze(1), model.router.weight, model.router.expert_bias.float(), k, 2.5
             )
             block = dg.get_block_m_for_mega_moe(
                 1, e, buffer.num_max_tokens_per_rank, n, k, 'fp8xfp4'
