@@ -23,6 +23,7 @@ class SharedOuterExpertLoRA(MegatronModule):
             raise ValueError("Expert LoRA hooks the unfused Core grouped linears")
         self.scale, self.rank = alpha / rank, rank
         self.offset = groups.ep.rank() * num_local_experts
+        self.tp_group = groups.expt_tp  # explicit: Core's sharded state would read global mpu
         dtype = config.params_dtype
         self.fc1_lora_a = nn.Parameter(torch.empty(rank, hidden, dtype=dtype))
         self.fc2_lora_b = nn.Parameter(torch.zeros(hidden, rank, dtype=dtype))

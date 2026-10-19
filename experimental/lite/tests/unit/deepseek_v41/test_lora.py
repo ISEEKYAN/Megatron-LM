@@ -203,6 +203,6 @@ def test_lora_parallel_forward_matches_single(tmp_path, monkeypatch, shape):
         assert error.max() <= 0.125 and torch.quantile(error, 0.99) <= 0.03
         torch.testing.assert_close(reference.mean(), actual.mean(), atol=0.02, rtol=0.005)
     else:
-        (tmp_path / "cp-report.json").write_text(
-            json.dumps({"report_only_max_abs": (reference - actual).abs().max().item()})
-        )
+        error = (reference - actual).abs()
+        report = dict(max_abs=error.max().item(), p99=torch.quantile(error, 0.99).item())
+        print("L1_CP_REPORT", json.dumps(report), flush=True)  # report-only, kept in the job log
