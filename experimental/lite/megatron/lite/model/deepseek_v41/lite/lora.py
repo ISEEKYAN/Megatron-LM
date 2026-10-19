@@ -187,7 +187,7 @@ def load_lora_hf(chunks, path):
 
 
 def _lora_sharded(chunks, ps):
-    from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+    from megatron.lite.primitive.ckpt.row_state import attach_checkpoint_metadata
 
     state = {}
     for chunk in chunks:
