@@ -39,27 +39,32 @@ def _cfg(cr):
     return _module().FlashMLALayerConfig(compress_ratio=cr)
 
 
-def _visible(inputs, cfg, cos_sin, cp_group=None):
-    """Training forward internals: (q_rope, workspace, indices, lens, out, lse, plan)."""
+def _visible(inputs, cfg, cos_sin):
+    """Training forward internals: (q_rope, workspace, indices, lens, out, lse, plan).
+
+    ``out``/``lse`` come from the attention path the installed vLLM serves;
+    ``workspace``/``indices``/``lens`` are the BF16 gather view backward uses.
+    """
     m = _module()
     total = inputs.q.shape[0]
     plan = m._plan(inputs.cu, 0, total, cfg, inputs.q.device)
     latent = inputs.latent.contiguous() if inputs.latent is not None else None
-    ops = m._forward_ops(
+    q_rope, caches = m._insert(
         inputs.q,
         inputs.kv,
         inputs.kv,
         latent,
-        inputs.topk,
         inputs.positions,
         inputs.positions,
-        inputs.sink,
         cfg,
         cos_sin,
         plan,
         False,
     )
-    return (*ops, plan)
+    attend = m._attend_paged if m.inference_path() == "paged" else m._attend_gather
+    out, lse = attend(q_rope, caches, inputs.topk, inputs.sink, cfg, plan)
+    workspace, indices, lens = m._gather(caches, inputs.topk, total, cfg, plan)
+    return q_rope, workspace, indices, lens, out, lse, plan
 
 
 def _serving_schedules(lengths):
@@ -278,7 +283,11 @@ def test_backward_gate_rejects_planted_errors(planted, monkeypatch):
     ref = reference_grads(inputs, cfg, cos_sin, _token_view(inputs, cfg, cos_sin), d_o)
     m = _module()
     if planted == "no_rope_transpose":
-        monkeypatch.setattr(m, "_rope_transpose", lambda grad, *a, **k: grad.float())
+        monkeypatch.setattr(
+            m,
+            "_rope_transpose",
+            lambda grad, *a, out_dtype=None, **k: grad.to(out_dtype or grad.dtype),
+        )
         dq = _candidate_grads(inputs, cfg, cos_sin, d_o)[0]
         assert _metrics(dq, ref.q)["rel_l2"] > REL_L2
     else:

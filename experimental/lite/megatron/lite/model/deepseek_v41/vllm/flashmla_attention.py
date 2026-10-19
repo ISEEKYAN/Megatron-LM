@@ -1,16 +1,20 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Sparse FlashMLA attention core on the deployment arithmetic (FLASHMLA_SPARSE_DSV41).
 
-Forward replays vLLM's batch-invariant prefill path of ``DeepseekV4FlashMLAAttention``
-op for op: Q RoPE fused with the MXFP8 SWA cache insert, NVFP4 compressed cache
-insert, dequantize-and-gather, ``combine_topk_swa_indices``,
-``flash_mla_sparse_fwd`` and ``fused_inv_rope_fp8_quant`` (the head of
-``dsv41_o_proj``). Only the cache paging and workspace layout differ from serving,
-which the kernels do not observe, so the output bits are the serving bits.
+Forward replays vLLM's batch-invariant path of ``DeepseekV4FlashMLAAttention`` op for
+op: Q RoPE fused with the MXFP8 SWA cache insert, the NVFP4 compressed cache insert,
+then the attention the installed vLLM serves (``inference_path``): ``gather``
+(d667e410e1: dequantize-and-gather, ``combine_topk_swa_indices``,
+``flash_mla_sparse_fwd``) or ``paged`` (``flashmla-bi-direct``:
+``sparse_paged_indices`` and the unsplit ``flash_mla_with_kvcache`` on the quantized
+caches), then ``fused_inv_rope_fp8_quant`` (the head of ``dsv41_o_proj``). Only cache
+paging and workspace layout differ from serving, which the kernels do not observe,
+so the output bits are the serving bits.
 
 Backward is cuDNN's DSA sparse-attention backward (what Core's
-``CSASparseAttnFunc`` uses) on the forward's own Q, gathered KV, output and LSE,
-plus closed-form RoPE transposes. Gradient contract:
+``CSASparseAttnFunc`` uses) on the forward's Q, output and LSE and the KV the
+caches dequantize to (re-gathered from the saved caches), plus closed-form RoPE
+transposes. Gradient contract:
 
 * the output FP8 cast, the KV caches' MXFP8/NVFP4 casts and the BF16 roundings
   after RoPE are identity STEs (gradient w.r.t. the dequantized value passes to
@@ -83,20 +87,26 @@ def _cos_sin(cos_sin_cache, positions, rope_dim):
     return rows[:, :half], rows[:, half:rope_dim]
 
 
-def _rope_transpose(grad, positions, cos_sin_cache, rope_dim, inverse):
-    """FP32 VJP of the forward (``inverse=False``) or inverse rotation."""
-    grad = grad.float()
+def _rope_transpose(
+    grad, positions, cos_sin_cache, rope_dim, inverse, out_dtype=None, in_place=False
+):
+    """VJP of the forward (``inverse=False``) or inverse rotation.
+
+    The rotated dims are computed in FP32 and rounded once to ``out_dtype``
+    (default: ``grad``'s dtype); the other dims are copied, or kept when
+    ``in_place`` (``grad`` is then overwritten and returned).
+    """
+    out = grad if in_place else grad.to(out_dtype or grad.dtype, copy=True)
     lead = grad.shape[1:-1]
     cos, sin = _cos_sin(cos_sin_cache, positions, rope_dim)
     cos = cos.view(cos.shape[0], *([1] * len(lead)), -1)
     sin = sin.view(sin.shape[0], *([1] * len(lead)), -1)
-    pairs = grad[..., -rope_dim:].unflatten(-1, (rope_dim // 2, 2))
+    pairs = grad[..., -rope_dim:].float().unflatten(-1, (rope_dim // 2, 2))
     even, odd = pairs[..., 0], pairs[..., 1]
     if inverse:  # y_e = x_e c + x_o s, y_o = x_o c - x_e s
         d_even, d_odd = even * cos - odd * sin, even * sin + odd * cos
     else:  # y_e = x_e c - x_o s, y_o = x_o c + x_e s
         d_even, d_odd = even * cos + odd * sin, odd * cos - even * sin
-    out = grad.clone()
     out[..., -rope_dim:] = torch.stack((d_even, d_odd), -1).flatten(-2)
     return out
 
@@ -121,8 +131,13 @@ class _Plan:
     comp_lens: Optional[torch.Tensor]  # [R] int32
     n: int  # compressed rows per request in the workspace
     m: int  # workspace rows per request
+    token_to_req: torch.Tensor  # [S_local] int32
+    is_valid: torch.Tensor  # [S_local] bool
+    replay_start: torch.Tensor  # [R] int32 zeros
     swa_dest: torch.Tensor  # [R * M] int64 global token row or -1
     comp_dest: Optional[torch.Tensor]  # [R * M] int64 global compressed row or -1
+    swa_src: torch.Tensor  # [S_total] int64 workspace row of each token, R * M if none
+    comp_src: Optional[torch.Tensor]  # [N_total] int64 workspace row of each entry
 
 
 def _plan(cu_seqlens, row_begin, row_end, cfg, device):
@@ -162,21 +177,28 @@ def _plan(cu_seqlens, row_begin, row_end, cfg, device):
         comp_table = torch.zeros(len(requests), comp_width, dtype=torch.int32)
         comp_lens = torch.tensor([seq // cr for *_, seq in requests], dtype=torch.int32)
     swa_dest = torch.full((len(requests), m), -1, dtype=torch.int64)
+    swa_src = torch.full((cu[-1],), len(requests) * m, dtype=torch.int64)
+    comp_src = torch.full((comp_rows,), len(requests) * m, dtype=torch.int64) if cr else None
     comp_dest = torch.full((len(requests), m), -1, dtype=torch.int64) if cr else None
     for r, ((doc, _, _, seq), g) in enumerate(zip(requests, gather)):
         blocks = -(-seq // SWA_BLOCK)
         swa_table[r, :blocks] = torch.arange(blocks) + swa_block_start[doc]
         swa_dest[r, n : n + g] = cu[doc] + seq - g + torch.arange(g)
+        swa_src[cu[doc] + seq - g : cu[doc] + seq] = r * m + n + torch.arange(g)
         if cr:
             entries = seq // cr
             cblocks = -(-entries // COMPRESSED_BLOCK)
             comp_table[r, :cblocks] = torch.arange(cblocks) + comp_block_start[doc]
             comp_dest[r, :entries] = comp_offset[doc] + torch.arange(entries)
+            comp_src[comp_offset[doc] : comp_offset[doc] + entries] = r * m + torch.arange(entries)
 
     def dev(t):
         return None if t is None else t.to(device, non_blocking=True)
 
     starts = [0] + [qb for _, _, qb, _ in requests]
+    token_to_req = torch.cat(
+        [torch.full((qb - qa,), r, dtype=torch.int32) for r, (_, qa, qb, _) in enumerate(requests)]
+    )
     return _Plan(
         swa_slots=dev(torch.cat(swa_slots)),
         comp_slots=dev(torch.cat(comp_slots)) if cr else None,
@@ -191,8 +213,13 @@ def _plan(cu_seqlens, row_begin, row_end, cfg, device):
         comp_lens=dev(comp_lens),
         n=n,
         m=m,
+        token_to_req=dev(token_to_req),
+        is_valid=dev(torch.ones(token_to_req.shape[0], dtype=torch.bool)),
+        replay_start=dev(torch.zeros(len(requests), dtype=torch.int32)),
         swa_dest=dev(swa_dest.flatten()),
         comp_dest=dev(comp_dest.flatten()) if cr else None,
+        swa_src=dev(swa_src),
+        comp_src=dev(comp_src),
     )
 
 
@@ -208,25 +235,37 @@ def _require_batch_invariant():
         raise RuntimeError("the FlashMLA training core replays the VLLM_BATCH_INVARIANT=1 path")
 
 
-def _forward_ops(
-    q, kv_all, kv_local, latent_all, topk, positions, positions_all, sink, cfg, cos_sin, plan, cp
-):
-    """Return (q_rope, kv workspace, indices, lens, out, lse)."""
-    from vllm.models.deepseek_v41.common.ops import (
-        combine_topk_swa_indices,
-        dequantize_and_gather_k_cache,
-    )
+def inference_path() -> str:
+    """Which BI attention path the installed vLLM serves FLASHMLA_SPARSE_DSV41 with.
+
+    ``paged``: every causal row on FlashMLA's unsplit sparse decode kernel over
+    the quantized caches (``sparse_paged_indices``, vllm ``dsv41-bi/flashmla-bi-direct``).
+    ``gather``: dequantize-and-gather to BF16, then the sparse prefill kernel
+    (vLLM d667e410e1).
+    """
+    from vllm.model_executor.kernels import batch_invariant
+
+    return "paged" if hasattr(batch_invariant, "sparse_paged_indices") else "gather"
+
+
+@dataclass
+class _Caches:
+    swa: torch.Tensor  # [blocks, SWA_BLOCK, 528] uint8
+    compressed: Optional[torch.Tensor]  # [blocks, COMPRESSED_BLOCK, 288] uint8
+
+
+def _insert(q, kv_all, kv_local, latent_all, positions, positions_all, cfg, cos_sin, plan, cp):
+    """Serving's cache writes; returns (q_rope, caches)."""
     from vllm.models.deepseek_v41.common.ops.fused_compress_quant_cache import rope_quant_insert
-    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
 
     device, cr = q.device, cfg.compress_ratio
-    swa_cache = torch.zeros(
+    swa = torch.zeros(
         plan.num_swa_blocks, SWA_BLOCK, SWA_RECORD_BYTES, dtype=torch.uint8, device=device
     )
     if cp:
         # Serving's PCP order: KV of every rank first, then the rank-local Q.
         torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-            kv_all, swa_cache, plan.swa_slots, positions_all, cos_sin, SWA_BLOCK, None, True
+            kv_all, swa, plan.swa_slots, positions_all, cos_sin, SWA_BLOCK, None, True
         )
         slots = plan.swa_slots[:0]
     else:
@@ -234,33 +273,50 @@ def _forward_ops(
     q_rope = torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
         q,
         kv_local,
-        swa_cache.view(plan.num_swa_blocks, -1),
+        swa.view(plan.num_swa_blocks, -1),
         slots,
         positions,
         cos_sin,
         cfg.num_heads,
         0.0,
         SWA_BLOCK,
-        False,
-        True,
-        True,
-        False,
+        False,  # apply_q_norm: Q is normed before wq_b
+        True,  # kv_mxfp8: the V4.1 528 B record
+        True,  # apply_q_rope
+        False,  # is_q_interleaved
     )
-
-    requests = plan.seq_lens.shape[0]
-    workspace = torch.empty(requests, plan.m, cfg.head_dim, dtype=torch.bfloat16, device=device)
+    compressed = None
     if cr:
-        comp_cache = torch.zeros(
+        compressed = torch.zeros(
             plan.num_comp_blocks,
             COMPRESSED_BLOCK,
             COMPRESSED_RECORD_BYTES,
             dtype=torch.uint8,
             device=device,
         )
-        rope_quant_insert(latent_all, plan.comp_positions, cos_sin, comp_cache, plan.comp_slots, cr)
+        rope_quant_insert(latent_all, plan.comp_positions, cos_sin, compressed, plan.comp_slots, cr)
+    return q_rope, _Caches(swa, compressed)
+
+
+def _gather(caches, topk, rows, cfg, plan):
+    """BF16 KV workspace and combined indices of the gather path (d667e410e1).
+
+    Also the backward's view of either path: the same KV values per row.
+    """
+    from vllm.models.deepseek_v41.common.ops import (
+        combine_topk_swa_indices,
+        dequantize_and_gather_k_cache,
+    )
+
+    cr = cfg.compress_ratio
+    device = caches.swa.device
+    workspace = torch.empty(
+        plan.seq_lens.shape[0], plan.m, cfg.head_dim, dtype=torch.bfloat16, device=device
+    )
+    if cr:
         dequantize_and_gather_k_cache(
             workspace,
-            comp_cache,
+            caches.compressed,
             seq_lens=plan.comp_lens,
             gather_lens=None,
             block_table=plan.comp_table,
@@ -269,7 +325,7 @@ def _forward_ops(
         )
     dequantize_and_gather_k_cache(
         workspace,
-        swa_cache,
+        caches.swa,
         seq_lens=plan.seq_lens,
         gather_lens=plan.gather_lens,
         block_table=plan.swa_table,
@@ -277,7 +333,7 @@ def _forward_ops(
         offset=plan.n,
     )
     if topk is None:
-        topk = torch.full((q.shape[0], 1), -1, dtype=torch.int32, device=device)
+        topk = torch.full((rows, 1), -1, dtype=torch.int32, device=device)
     indices, lens = combine_topk_swa_indices(
         topk,
         plan.query_start_loc,
@@ -289,6 +345,13 @@ def _forward_ops(
         plan.m,
         plan.n,
     )
+    return workspace, indices, lens
+
+
+def _attend_gather(q_rope, caches, topk, sink, cfg, plan):
+    from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+    workspace, indices, lens = _gather(caches, topk, q_rope.shape[0], cfg, plan)
     out = torch.empty_like(q_rope)
     out, _, lse = flash_mla_sparse_fwd(
         q=q_rope,
@@ -299,7 +362,73 @@ def _forward_ops(
         topk_length=lens,
         out=out,
     )
-    return q_rope, workspace, indices, lens, out, lse
+    return out, lse
+
+
+# One CTA per row along grid.y in the unsplit decode kernel.
+_PAGED_MAX_ROWS = 65535
+
+
+def _attend_paged(q_rope, caches, topk, sink, cfg, plan):
+    """``DeepseekV4FlashMLAAttention._forward_bi`` of ``flashmla-bi-direct``."""
+    from vllm.model_executor.kernels.batch_invariant import sparse_paged_indices
+    from vllm.v1.attention.ops.flashmla import FlashMLASchedMeta, flash_mla_with_kvcache
+
+    rows, cr, window = q_rope.shape[0], cfg.compress_ratio, cfg.window
+    device = q_rope.device
+    top_k = cfg.top_k if cr else 0
+    indices = torch.empty(rows, window + top_k, dtype=torch.int32, device=device)
+    swa_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    extra_lens = torch.empty(rows, dtype=torch.int32, device=device)
+    swa_indices = indices[:, :window]
+    extra_indices = indices[:, window:] if cr else None
+    sparse_paged_indices(
+        topk if cr else None,
+        plan.token_to_req,
+        plan.is_valid,
+        plan.query_start_loc,
+        plan.seq_lens,
+        plan.replay_start,
+        plan.comp_table,
+        COMPRESSED_BLOCK,
+        plan.swa_table,
+        SWA_BLOCK,
+        0,
+        rows,
+        window,
+        cr,
+        top_k,
+        swa_indices,
+        swa_lens,
+        extra_indices,
+        extra_lens if cr else None,
+    )
+    out = torch.empty_like(q_rope)
+    lse = torch.empty(rows, cfg.num_heads, dtype=torch.float32, device=device)
+    swa_cache = caches.swa.unsqueeze(-2)
+    extra_cache = caches.compressed.unsqueeze(-2) if cr else None
+    for start in range(0, rows, _PAGED_MAX_ROWS):
+        end = min(start + _PAGED_MAX_ROWS, rows)
+        _, block_lse = flash_mla_with_kvcache(
+            q=q_rope[start:end].unsqueeze(1),
+            k_cache=swa_cache,
+            block_table=None,
+            head_dim_v=cfg.head_dim,
+            tile_scheduler_metadata=FlashMLASchedMeta(),
+            cache_seqlens=None,
+            is_fp8_kvcache=True,
+            indices=swa_indices[start:end].unsqueeze(1),
+            topk_length=swa_lens[start:end],
+            softmax_scale=cfg.softmax_scale,
+            attn_sink=sink,
+            extra_k_cache=extra_cache,
+            extra_indices_in_kvcache=None if not cr else extra_indices[start:end].unsqueeze(1),
+            extra_topk_length=None if not cr else extra_lens[start:end],
+            out=out[start:end].unsqueeze(1),
+            enable_batch_invariant=True,
+        )
+        lse[start:end] = block_lse.reshape(end - start, cfg.num_heads)
+    return out, lse
 
 
 def _output_quant(out, positions, cos_sin, cfg):
@@ -407,36 +536,23 @@ class _FlashMLAAttnCore(torch.autograd.Function):
                 f"!= {expected} compressed entries"
             )
             latent_all = latent_all.contiguous()
-        q_rope, workspace, indices, lens, out, lse = _forward_ops(
+        q_rope, caches = _insert(
             q.contiguous(),
             kv_all.contiguous(),
             swa_kv.contiguous(),
             latent_all,
-            topk,
             positions,
             positions_all,
-            attn_sink.contiguous(),
             cfg,
             cos_sin,
             plan,
             cp,
         )
+        attend = _attend_paged if inference_path() == "paged" else _attend_gather
+        out, lse = attend(q_rope, caches, topk, attn_sink.contiguous(), cfg, plan)
         data, scale = _output_quant(out, positions, cos_sin, cfg)
-        ctx.save_for_backward(
-            q_rope,
-            workspace,
-            indices,
-            lens,
-            out,
-            lse,
-            attn_sink,
-            positions,
-            positions_all,
-            cos_sin,
-            plan.swa_dest,
-            plan.comp_dest if plan.comp_dest is not None else lens.new_empty(0),
-            plan.comp_positions if plan.comp_positions is not None else lens.new_empty(0),
-        )
+        ctx.plan, ctx.caches = plan, caches
+        ctx.save_for_backward(q_rope, topk, out, lse, attn_sink, positions, positions_all, cos_sin)
         ctx.meta = (
             cfg,
             cp_group if cp else None,
@@ -453,30 +569,20 @@ class _FlashMLAAttnCore(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, _d_data, _d_scale, d_o):
-        (
-            q_rope,
-            workspace,
-            indices,
-            lens,
-            out,
-            lse,
-            sink,
-            positions,
-            positions_all,
-            cos_sin,
-            swa_dest,
-            comp_dest,
-            comp_positions,
-        ) = ctx.saved_tensors
+        q_rope, topk, out, lse, sink, positions, positions_all, cos_sin = ctx.saved_tensors
+        plan, caches = ctx.plan, ctx.caches
         cfg, group, rank, row_counts, comp_counts, total, comp_total, deterministic = ctx.meta
         rows, heads, dim = out.shape
+        workspace, indices, lens = _gather(caches, topk, rows, cfg, plan)
         d_o = d_o.reshape(rows, heads, dim)
-        d_out = _rope_transpose(d_o, positions, cos_sin, cfg.rope_dim, inverse=True)
+        d_out = _rope_transpose(
+            d_o, positions, cos_sin, cfg.rope_dim, inverse=True, out_dtype=out.dtype
+        )
         d_q_rope, d_kv, d_sink = _sparse_backward(
             q_rope,
             workspace.view(-1, dim),
             out,
-            d_out.to(out.dtype),
+            d_out,
             lse,
             sink,
             indices,
@@ -484,23 +590,29 @@ class _FlashMLAAttnCore(torch.autograd.Function):
             cfg.softmax_scale,
             deterministic,
         )
-        d_q = _rope_transpose(d_q_rope, positions, cos_sin, cfg.rope_dim, inverse=False)
-        d_kv = d_kv.float()
-
-        swa_mask = swa_dest >= 0
-        d_swa = d_kv.new_zeros(total, dim)
-        d_swa.index_copy_(0, swa_dest[swa_mask], d_kv[swa_mask])
-        d_swa = _rope_transpose(d_swa, positions_all, cos_sin, cfg.rope_dim, inverse=False)
+        del workspace
+        del d_out
+        d_q = _rope_transpose(
+            d_q_rope, positions, cos_sin, cfg.rope_dim, inverse=False, in_place=True
+        )
+        # Each token / compressed entry takes its workspace row's gradient;
+        # rows this rank did not gather read the appended zero row.
+        d_kv = torch.cat([d_kv.float(), d_kv.new_zeros(1, dim, dtype=torch.float32)])
+        d_swa = _rope_transpose(
+            d_kv[plan.swa_src], positions_all, cos_sin, cfg.rope_dim, inverse=False, in_place=True
+        )
         d_latent = None
         if cfg.compress_ratio:
-            comp_mask = comp_dest >= 0
-            idx = comp_dest[comp_mask]
-            d_latent = d_kv.new_zeros(comp_total, dim)
-            d_latent.index_copy_(0, idx, d_kv[comp_mask])
-            rope_positions = comp_positions // cfg.compress_ratio * cfg.compress_ratio
+            rope_positions = plan.comp_positions // cfg.compress_ratio * cfg.compress_ratio
             d_latent = _rope_transpose(
-                d_latent, rope_positions, cos_sin, cfg.rope_dim, inverse=False
+                d_kv[plan.comp_src],
+                rope_positions,
+                cos_sin,
+                cfg.rope_dim,
+                inverse=False,
+                in_place=True,
             )
+        del d_kv
         if group is not None:
             d_swa = _reduce_scatter_rows(d_swa, group, row_counts, rank)
             if d_latent is not None:
