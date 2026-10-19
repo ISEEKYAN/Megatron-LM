@@ -49,6 +49,8 @@ class ImplConfig:
     mtp_detach_encoder: bool = False
     mtp_loss_scaling_factor: float = 0.1
     deterministic: bool = False
+    # Generic MLite QAT schema; DS4.1 fake-quant is part of the deployment forward.
+    qat: object = None
 
     def __post_init__(self):
         if self.deterministic:
@@ -69,6 +71,9 @@ def validate_impl_cfg_keys(values):
     extra = set(values) - {f.name for f in fields(ImplConfig)}
     if extra:
         raise ValueError(f"Unsupported DS4.1 implementation options: {sorted(extra)}")
+    qat = values.get("qat") or {}
+    if qat.get("enabled") or qat.get("enable"):
+        raise ValueError("DS4.1 applies deployment fake-quant itself; MLite QAT must stay off")
     for key, required in _CONNECTOR_REQUIRED.items():
         if key in values and bool(values[key]) != required:
             raise ValueError(f"DS4.1 requires {key}={required}, got {values[key]!r}")

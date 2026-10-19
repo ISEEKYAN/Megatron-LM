@@ -96,3 +96,15 @@ def test_native_cp_config_readers_are_unreachable_from_ds41_attention():
             and n.func.attr == "get_rotary_seq_len"
             for n in ast.walk(tree)
         )
+
+
+def test_verl_connector_defaults_accepted_and_unsupported_values_rejected():
+    # verl_mlite always injects these keys; only DS4.1's own values may pass.
+    protocol.validate_impl_cfg_keys(
+        {"use_thd": True, "cross_entropy_fusion": False, "mtp_enable": False,
+         "deterministic": True, "qat": {"enabled": False, "format": "mxfp4"}}
+    )
+    for bad in ({"cross_entropy_fusion": True}, {"mtp_enable": True},
+                {"qat": {"enabled": True}}, {"unknown_knob": 1}):
+        with pytest.raises(ValueError):
+            protocol.validate_impl_cfg_keys(bad)

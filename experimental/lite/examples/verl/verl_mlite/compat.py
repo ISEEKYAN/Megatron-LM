@@ -72,10 +72,25 @@ def _register_opaque_hf_config() -> bool:
 
     from transformers import AutoConfig, PretrainedConfig
 
+    def __init__(self, **kwargs):
+        text = kwargs.get("text_config")
+        PretrainedConfig.__init__(self, **kwargs)
+        if isinstance(text, dict):
+            # Multimodal checkpoints (DS4.1) keep the decoder under ``text_config``;
+            # VERL and Transformers read it as a config object. Field-for-field copy:
+            # no RoPE standardization or validation of foreign keys.
+            config = PretrainedConfig()
+            config.__dict__.update(text)
+            self.text_config = config
+
+    def get_text_config(self, *args, **kwargs):
+        text = getattr(self, "text_config", None)
+        return text if isinstance(text, PretrainedConfig) else self
+
     config_cls = type(
         "MLiteOpaqueConfig",
         (PretrainedConfig,),
-        {"model_type": model_type},
+        {"model_type": model_type, "__init__": __init__, "get_text_config": get_text_config},
     )
     try:
         AutoConfig.register(model_type, config_cls)
