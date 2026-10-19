@@ -173,7 +173,9 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True)
                 n for n, g in grads.items() if g is None
             ]
             names = "linear_kv_proj.weight linear_q_up_proj.weight compressor.linear_wkv.weight main_projection.weight".split()
-            names = ["lora_b"] if impl and (impl.get("lora") or {}).get("rank") else names
+            # LoRA: per-expert factors of an idle routed expert rightly stay zero (test_lora G2).
+            lora = ["_lora.lora_b", "fc2_lora_b"]
+            names = lora if impl and (impl.get("lora") or {}).get("rank") else names
             main = [g for n, g in grads.items() if any(k in n for k in names)]
             assert main and all(g.abs().sum() > 0 for g in main)
         if sft:

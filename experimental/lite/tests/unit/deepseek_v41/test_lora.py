@@ -84,6 +84,16 @@ def _worker(rank, root, world, case):
                 if torch.is_tensor(t) and "lora" not in n
             }
             before = {n: p.detach().clone() for n, p in adapters.items()}
+            idle = set()  # per-expert factors of routed experts that receive no token
+            for key, block in model.layers.items():
+                block.ffn.experts.linear_fc1.register_forward_hook(
+                    lambda m, args, out, k=key: idle.update(
+                        f"layers.{k}.ffn.experts.lora.{f}.weight{i}"
+                        for i, n in enumerate(args[1])
+                        if int(n) == 0
+                        for f in ("fc1_lora_b", "fc2_lora_a")
+                    )
+                )
             ids = torch.arange(81, device="cuda") % 127 + 1
             batch = PackedBatch(ids, ids, torch.tensor([5, 1, 75], device="cuda"))
             loss = lambda out, batch, ctx=None: (-(out["log_probs"] * out["valid_mask"]).mean(), {})
@@ -94,9 +104,12 @@ def _worker(rank, root, world, case):
                 )
             grads = {n: getattr(p, "main_grad", p.grad) for n, p in model.named_parameters()}
             record["trainable"] = sorted(n for n, p in model.named_parameters() if p.requires_grad)
-            record["bad_grads"] = [
-                n for n in adapters if not (torch.isfinite(grads[n]).all() and grads[n].abs().sum())
+            record["bad_grads"] = [  # idle: exactly zero; otherwise finite and non-zero
+                n
+                for n in adapters
+                if not torch.isfinite(grads[n]).all() or bool(grads[n].abs().sum()) == (n in idle)
             ]
+            record["idle"] = sorted(idle)
             optimized = handle._optimizer.optimizers
             record["optimizer_numel"] = sum(
                 p.numel() for o in optimized for g in o.param_groups for p in g["params"]
@@ -104,7 +117,9 @@ def _worker(rank, root, world, case):
             assert rt.optimizer_step(handle)[0]
             after = model.state_dict()
             record["base_changed"] = [n for n, t in frozen.items() if not torch.equal(t, after[n])]
-            record["unmoved"] = [n for n, p in adapters.items() if torch.equal(before[n], p)]
+            record["unmoved"] = [
+                n for n, p in adapters.items() if torch.equal(before[n], p) != (n in idle)
+            ]
         else:  # checkpoint: LoRA-only DCP and PEFT safetensors, then the resync payload
             saved = {n: p.detach().clone() for n, p in adapters.items()}
             lora.save_lora_dcp(chunks, Path(root, "dcp"), ps)
