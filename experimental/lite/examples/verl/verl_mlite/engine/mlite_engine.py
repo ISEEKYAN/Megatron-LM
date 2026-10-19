@@ -946,7 +946,7 @@ class MegatronLiteEngine(BaseEngine):
                 raw_output=raw_output, runtime_batch=runtime_batch
             )
             raw_output["_verl_model_output"] = model_output
-            c8_probe.dump_logprobs(model_output, micro_batch, self._c8_forward_only)
+            c8_probe.dump_logprobs(model_output, micro_batch, getattr(self, "_c8_forward_only", None))
             if loss_function is not None:
                 loss, metrics = loss_function(
                     model_output=model_output,
