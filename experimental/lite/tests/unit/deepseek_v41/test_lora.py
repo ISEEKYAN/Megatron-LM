@@ -84,6 +84,15 @@ def _worker(rank, root, world, case):
                 if torch.is_tensor(t) and "lora" not in n
             }
             before = {n: p.detach().clone() for n, p in adapters.items()}
+            shared_local = {}
+            for name, parameter in adapters.items():
+                if name.endswith(("lora.fc1_lora_a", "lora.fc2_lora_b")):
+                    assert parameter.allreduce
+                    parameter.register_hook(
+                        lambda g, n=name: shared_local.setdefault(n, []).append(
+                            g.detach().float().clone()
+                        )
+                    )
             splits = record["m_splits"] = {}  # raw per-forward routed counts, by layer
             for key, block in model.layers.items():
                 block.ffn.experts.linear_fc1.register_forward_hook(
@@ -100,6 +109,26 @@ def _worker(rank, root, world, case):
                     handle, iter([(batch, LossContext(return_log_probs=True))]), loss_fn=loss
                 )
             grads = {n: getattr(p, "main_grad", p.grad) for n, p in model.named_parameters()}
+            for name, pieces in shared_local.items():
+                expected = sum(pieces)
+                dist.all_reduce(expected, group=ps.dp_group)
+                expected /= ps.dp_size
+                checked = expected.new_zeros(())
+                for optimizer in getattr(
+                    handle._optimizer, "chained_optimizers", [handle._optimizer]
+                ):
+                    if adapters[name] in optimizer.model_param_gbuf_map:
+                        span = optimizer._get_model_param_range_map(adapters[name])["param"]
+                        checked += span.end - span.start
+                        torch.testing.assert_close(
+                            grads[name].flatten()[span.start : span.end],
+                            expected.flatten()[span.start : span.end],
+                            rtol=1e-3,
+                            atol=1e-6,
+                        )
+                dist.all_reduce(checked, group=ps.dp_group)
+                assert checked.item() == expected.numel()
+            assert shared_local
             idle = {  # experts with no token over the whole step (all microbatches)
                 f"layers.{k}.ffn.experts.lora.{f}.weight{i}"
                 for k, counts in splits.items()
@@ -116,10 +145,22 @@ def _worker(rank, root, world, case):
             ]
             record["idle"] = sorted(idle)
             optimized = handle._optimizer.optimizers
-            record["optimizer_numel"] = sum(
-                p.numel() for o in optimized for g in o.param_groups for p in g["params"]
+            counts = torch.tensor(
+                [
+                    sum(p.numel() for o in optimized for g in o.param_groups for p in g["params"]),
+                    sum(
+                        p.numel() / (ps.dp_size if p.allreduce else ps.expert_dp_size)
+                        for p in adapters.values()
+                    ),
+                ],
+                device="cuda",
+                dtype=torch.float64,
             )
+            dist.all_reduce(counts, group=ps.dp_group)
+            record["optimizer_numel"], record["adapter_unique_numel"] = counts.tolist()
             assert rt.optimizer_step(handle)[0]
+            for chunk in handle._extras["model_chunks"]:
+                chunk.start_param_sync(force_sync=True)
             after = model.state_dict()
             record["base_changed"] = [n for n, t in frozen.items() if not torch.equal(t, after[n])]
             record["unmoved"] = [
@@ -144,19 +185,25 @@ def _worker(rank, root, world, case):
     dist.destroy_process_group()
 
 
-@pytest.mark.gpus(1)
-def test_gradients_only_on_adapters_and_base_frozen(tmp_path):
-    (record,) = _spawn(tmp_path / "grad", 1, "grad")
+@pytest.mark.gpus(2)
+@pytest.mark.parametrize("world", [1, 2])
+def test_gradients_only_on_adapters_and_base_frozen(tmp_path, world):
+    records = _spawn(tmp_path / "grad", world, "grad")
+    for record in records:
+        _check_grad_record(record, world)
+
+
+def _check_grad_record(record, world):
     assert record["active_experts"] and record["m_splits"]  # no vacuous pass
     assert record["trainable"] == record["adapters"] and len(record["adapters"]) == 4 * (
-        16 + 2 + 2 * 8
+        16 + 2 + 2 * (8 // world)
     )
     assert not record["bad_grads"] and not record["unmoved"], (
         record["bad_grads"],
         record["unmoved"],
     )
     assert not record["base_changed"], record["base_changed"]
-    assert record["optimizer_numel"] == record["adapter_numel"]
+    assert record["optimizer_numel"] == record["adapter_unique_numel"]
 
 
 @pytest.mark.gpus(2)

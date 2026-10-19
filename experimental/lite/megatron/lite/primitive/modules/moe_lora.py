@@ -27,6 +27,7 @@ class SharedOuterExpertLoRA(MegatronModule):
         dtype = config.params_dtype
         self.fc1_lora_a = nn.Parameter(torch.empty(rank, hidden, dtype=dtype))
         self.fc2_lora_b = nn.Parameter(torch.zeros(hidden, rank, dtype=dtype))
+        self.fc1_lora_a.allreduce = self.fc2_lora_b.allreduce = True
         grouped = lambda i, o: TEColumnParallelGroupedLinear(
             num_local_experts,
             i,
