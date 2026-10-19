@@ -84,14 +84,11 @@ def _worker(rank, root, world, case):
                 if torch.is_tensor(t) and "lora" not in n
             }
             before = {n: p.detach().clone() for n, p in adapters.items()}
-            idle = set()  # per-expert factors of routed experts that receive no token
+            splits = record["m_splits"] = {}  # raw per-forward routed counts, by layer
             for key, block in model.layers.items():
                 block.ffn.experts.linear_fc1.register_forward_hook(
-                    lambda m, args, out, k=key: idle.update(
-                        f"layers.{k}.ffn.experts.lora.{f}.weight{i}"
-                        for i, n in enumerate(args[1])
-                        if int(n) == 0
-                        for f in ("fc1_lora_b", "fc2_lora_a")
+                    lambda m, args, out, k=key: splits.setdefault(k, []).append(
+                        [int(n) for n in args[1]]
                     )
                 )
             ids = torch.arange(81, device="cuda") % 127 + 1
@@ -103,6 +100,14 @@ def _worker(rank, root, world, case):
                     handle, iter([(batch, LossContext(return_log_probs=True))]), loss_fn=loss
                 )
             grads = {n: getattr(p, "main_grad", p.grad) for n, p in model.named_parameters()}
+            idle = {  # experts with no token over the whole step (all microbatches)
+                f"layers.{k}.ffn.experts.lora.{f}.weight{i}"
+                for k, counts in splits.items()
+                for i, total in enumerate(map(sum, zip(*counts)))
+                if total == 0
+                for f in ("fc1_lora_b", "fc2_lora_a")
+            }
+            record["active_experts"] = [n for n in adapters if ".weight" in n and n not in idle]
             record["trainable"] = sorted(n for n, p in model.named_parameters() if p.requires_grad)
             record["bad_grads"] = [  # idle: exactly zero; otherwise finite and non-zero
                 n
@@ -132,6 +137,7 @@ def _worker(rank, root, world, case):
             record["resync"] = sorted(lora.lora_state(model))
         record["adapters"] = sorted(adapters)
         record["adapter_numel"] = sum(p.numel() for p in adapters.values())
+        print("L1_LORA_RECORD", rank, json.dumps(record), flush=True)  # receipt in the job log
     except ValueError as error:
         record["error"] = str(error)
     Path(root, f"rank-{rank}.json").write_text(json.dumps(record))
@@ -141,6 +147,7 @@ def _worker(rank, root, world, case):
 @pytest.mark.gpus(1)
 def test_gradients_only_on_adapters_and_base_frozen(tmp_path):
     (record,) = _spawn(tmp_path / "grad", 1, "grad")
+    assert record["active_experts"] and record["m_splits"]  # no vacuous pass
     assert record["trainable"] == record["adapters"] and len(record["adapters"]) == 4 * (
         16 + 2 + 2 * 8
     )
