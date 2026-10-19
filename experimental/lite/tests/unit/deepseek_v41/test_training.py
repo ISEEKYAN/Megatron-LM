@@ -54,7 +54,7 @@ def _initialize(model, ps, root):
         if n.endswith(("expert_bias", "tid2eid", "embed.embedding.weight"))
     ]
     for name, tensor in state:
-        if name.endswith(".ape") or "_lora." in name:
+        if name.endswith(".ape") or "lora" in name:
             continue
         value = tensor.detach().cpu()
         keys = _expert_sources(name, model.release, ps)
@@ -82,12 +82,13 @@ def _initialize(model, ps, root):
 
 
 def _seed_adapters(model):
-    """Nonzero adapters, identical for a name in every configuration."""
-    for name, parameter in model.named_parameters():
-        if "_lora." in name:
-            seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
-            value = torch.randn(parameter.shape, generator=torch.Generator().manual_seed(seed))
-            parameter.data.copy_(value * 0.05)
+    """Nonzero adapters, identical for a release name (global expert) in every configuration."""
+    from megatron.lite.model.deepseek_v41.lite.lora import lora_state
+
+    for name, parameter in lora_state(model).items():
+        seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
+        value = torch.randn(parameter.shape, generator=torch.Generator().manual_seed(seed))
+        parameter.data.copy_(value * 0.05)
 
 
 def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False, impl=None):

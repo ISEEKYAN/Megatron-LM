@@ -1,13 +1,13 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 LoRA on the attention projections and the shared expert of a layer range.
+"""DS4.1 LoRA on the attention projections and the shared/routed experts of a layer range.
 
 Adapters are sibling modules added to the frozen base outputs by forward hooks, so
 base parameter names (release mapping, DCP keys) are unchanged. ``wo_a`` is a raw
 grouped weight inside Core's forward: the core-attention output is tapped and the
 grouped delta is added to the ``wo_b`` (``linear_proj``) input, which is linear in it.
+Routed experts use the shared-outer expert LoRA primitive (verl#8257 structure).
 """
 import json
-import re
 from pathlib import Path
 
 import torch
@@ -15,6 +15,7 @@ import torch.distributed as dist
 from torch import nn
 
 from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig
+from megatron.lite.primitive.modules.moe_lora import SharedOuterExpertLoRA, expand_shared_outer
 
 _ATTENTION = {
     "wq_a": "linear_q_down_proj",
@@ -22,10 +23,7 @@ _ATTENTION = {
     "wkv": "linear_kv_proj",
     "wo_b": "linear_proj",
 }
-TARGETS = (*_ATTENTION, "wo_a", "shared_experts")
-_PARAM = re.compile(
-    r"layers\.(\d+)\.(?:attention\.(\w+)_lora|ffn\.shared_experts\.(w[123])_lora)\.lora_([ab])"
-)
+TARGETS = (*_ATTENTION, "wo_a", "shared_experts", "experts")
 
 
 class GroupedLoRA(nn.Module):
@@ -97,6 +95,17 @@ def attach_lora(model, cfg, dtype):
                     )
                 )
                 _add(shared, "w2", shared.linear_fc2, cfg, dtype)
+            if "experts" in targets:
+                experts, release = block.ffn.experts, model.release
+                SharedOuterExpertLoRA(
+                    experts.num_local_experts,
+                    release.hidden_size,
+                    release.moe_intermediate_size,
+                    cfg.rank,
+                    cfg.alpha or cfg.rank,
+                    config=experts.config,
+                    groups=model.context.groups,
+                ).attach(experts)
 
 
 def _add(owner, name, base, cfg, dtype):
@@ -107,31 +116,50 @@ def _add(owner, name, base, cfg, dtype):
 
 
 def lora_state(chunk):
-    """This stage's adapter tensors under release-style names (the resync payload)."""
+    """This rank's adapter tensors under release-style names (the resync payload)."""
     while hasattr(chunk, "module"):
         chunk = chunk.module
     state = {}
-    for name, parameter in chunk.named_parameters():
-        match = _PARAM.fullmatch(name)
-        if match:
-            layer, attn, ffn, side = match.groups()
-            owner = f"attn.{attn}" if attn else f"ffn.shared_experts.{ffn}"
-            state[f"layers.{layer}.{owner}.lora_{side.upper()}.weight"] = parameter
+    for key, block in chunk.layers.items():
+        shared = block.ffn.shared_experts
+        owners = [(f"attn.{n}", getattr(block.attention, f"{n}_lora", None)) for n in TARGETS[:5]]
+        owners += [
+            (f"ffn.shared_experts.{w}", getattr(shared, f"{w}_lora", None))
+            for w in "w1 w3 w2".split()
+        ]
+        for owner, module in owners:
+            if module is not None:
+                state[f"layers.{key}.{owner}.lora_A.weight"] = module.lora_a
+                state[f"layers.{key}.{owner}.lora_B.weight"] = module.lora_b
+        experts = getattr(block.ffn.experts, "lora", None)
+        if experts is not None:
+            state.update({f"layers.{key}.ffn.experts.{k}": v for k, v in experts.factors().items()})
     return state
 
 
-def _stage_writer(ps):
-    return ps.dp_cp_rank == 0 and ps.ep_rank == 0
+def serving_lora_state(state, num_experts, scale):
+    """Expand each layer's routed factors to the per-expert serving layout; others unchanged."""
+    out = {k: v for k, v in state.items() if ".ffn.experts." not in k}
+    for stem in sorted({k.split(".lora_gate_up_A")[0] for k in state if "lora_gate_up_A" in k}):
+        stack = lambda f: torch.stack(
+            [state[f"{stem}.{e}.lora_{f}.weight"] for e in range(num_experts)]
+        )
+        expanded = expand_shared_outer(
+            state[f"{stem}.lora_gate_up_A.weight"],
+            stack("gate_up_B"),
+            stack("down_A"),
+            state[f"{stem}.lora_down_B.weight"],
+            scale,
+        )
+        out.update({f"{stem}.{k}.weight": v for k, v in expanded.items()})
+    return out
 
 
-def save_lora_hf(chunks, path, cfg, ps):
-    """PEFT-style safetensors of all stages' adapters, written by global rank 0."""
+def save_lora_hf(chunks, path, cfg):
+    """PEFT-style safetensors of every stage's and expert's adapters, written by global rank 0."""
     from safetensors.torch import save_file
 
-    local = {}
-    if _stage_writer(ps):
-        for chunk in chunks:
-            local.update({k: v.detach().cpu() for k, v in lora_state(chunk).items()})
+    local = {k: v.detach().cpu() for chunk in chunks for k, v in lora_state(chunk).items()}
     parts = [None] * dist.get_world_size()
     dist.all_gather_object(parts, local)
     if dist.get_rank() == 0:
@@ -165,7 +193,7 @@ def _lora_sharded(chunks, ps):
     for chunk in chunks:
         if not getattr(chunk, "_mlite_dist_opt_sharded_state_dict", False):
             attach_checkpoint_metadata([chunk], ps)
-        state.update({k: v for k, v in chunk.sharded_state_dict().items() if "_lora." in k})
+        state.update({k: v for k, v in chunk.sharded_state_dict().items() if "lora" in k})
     return state
 
 

@@ -13,6 +13,7 @@ from test_training import _build, _initialize, _run, _seed_adapters
 
 from megatron.lite.model.deepseek_v41.lite import lora
 from megatron.lite.primitive.modules.lora import LoraConfig, normalize_lora_config
+from megatron.lite.primitive.modules.moe_lora import expand_shared_outer
 
 LORA = dict(rank=8, alpha=16, layers=(8, 12))  # the fixture's ratio-one layers
 
@@ -22,6 +23,26 @@ def test_lora_layer_range_defaults_to_the_last_twenty():
     assert normalize_lora_config(dict(rank=8, layers=[8, 12])).layers == (8, 12)
     with pytest.raises(ValueError, match="outside"):
         lora.lora_layers(LoraConfig(rank=8, layers=(30, 41)), 40)
+
+
+def test_serving_expansion_matches_the_per_expert_layout():
+    e, h, i, r, scale = 3, 8, 4, 2, 2.0
+    a, b, c, d = (torch.randn(s) for s in ((r, h), (e, 2 * i, r), (e, r, i), (h, r)))
+    out = expand_shared_outer(a, b, c, d, scale)
+    for expert in range(e):  # per expert: A rows expert-major, B column rank * E + expert
+        assert torch.equal(out["gate_up.lora_A"].view(e, r, h)[expert], a)
+        assert torch.equal(out["gate_up.lora_B"].view(2 * i, r, e)[..., expert], scale * b[expert])
+        assert torch.equal(out["down.lora_A"].view(e, r, i)[expert], c[expert])
+        assert torch.equal(out["down.lora_B"].view(h, r, e)[..., expert], scale * d)
+    state = {
+        "layers.9.ffn.experts.lora_gate_up_A.weight": a,
+        "layers.9.ffn.experts.lora_down_B.weight": d,
+    }
+    for expert in range(e):
+        state[f"layers.9.ffn.experts.{expert}.lora_gate_up_B.weight"] = b[expert]
+        state[f"layers.9.ffn.experts.{expert}.lora_down_A.weight"] = c[expert]
+    served = lora.serving_lora_state(state, e, scale)
+    assert all(torch.equal(served[f"layers.9.ffn.experts.{k}.weight"], v) for k, v in out.items())
 
 
 @pytest.mark.gpus(1)
@@ -53,14 +74,14 @@ def _worker(rank, root, world, case):
         rt, handle, model, ps = _build(root, ep=world, sft=case == "grad", impl=dict(lora=LORA))
         _initialize(model, ps, root)
         _seed_adapters(model)
-        adapters = {n: p for n, p in model.named_parameters() if "_lora." in n}
+        adapters = {n: p for n, p in model.named_parameters() if "lora" in n}
         chunks = [model]
         if case == "grad":
             handle._optimizer.reload_model_params()
             frozen = {
                 n: t.clone()
                 for n, t in model.state_dict().items()
-                if torch.is_tensor(t) and "_lora." not in n
+                if torch.is_tensor(t) and "lora" not in n
             }
             before = {n: p.detach().clone() for n, p in adapters.items()}
             ids = torch.arange(81, device="cuda") % 127 + 1
@@ -89,7 +110,7 @@ def _worker(rank, root, world, case):
         else:  # checkpoint: LoRA-only DCP and PEFT safetensors, then the resync payload
             saved = {n: p.detach().clone() for n, p in adapters.items()}
             lora.save_lora_dcp(chunks, Path(root, "dcp"), ps)
-            lora.save_lora_hf(chunks, Path(root, "hf"), normalize_lora_config(LORA), ps)
+            lora.save_lora_hf(chunks, Path(root, "hf"), normalize_lora_config(LORA))
             for path, load in (("dcp", lora.load_lora_dcp), ("hf", lora.load_lora_hf)):
                 for p in adapters.values():
                     p.data.zero_()
@@ -107,7 +128,9 @@ def _worker(rank, root, world, case):
 @pytest.mark.gpus(1)
 def test_gradients_only_on_adapters_and_base_frozen(tmp_path):
     (record,) = _spawn(tmp_path / "grad", 1, "grad")
-    assert record["trainable"] == record["adapters"] and len(record["adapters"]) == 4 * 16
+    assert record["trainable"] == record["adapters"] and len(record["adapters"]) == 4 * (
+        16 + 2 + 2 * 8
+    )
     assert record["good_grads"] and record["adapters_moved"] and record["base_unchanged"]
     assert record["optimizer_numel"] == record["adapter_numel"]
 
@@ -119,8 +142,7 @@ def test_lora_checkpoints_round_trip_bitwise(tmp_path):
 
     saved = load_file(str(tmp_path / "ckpt" / "hf" / "adapter_model.safetensors"))
     assert all(r["dcp"] and r["hf"] for r in records)
-    assert sorted(saved) == records[0]["resync"] and len(saved) == len(records[0]["adapters"])
-    assert sum(t.numel() for t in saved.values()) == records[0]["adapter_numel"]
+    assert sorted(saved) == sorted({k for r in records for k in r["resync"]})  # 8 experts over EP2
     metadata = json.loads((tmp_path / "ckpt" / "hf" / "adapter_config.json").read_text())
     assert metadata["r"] == 8 and metadata["layers_to_transform"] == [8, 9, 10, 11]
 
