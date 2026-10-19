@@ -94,19 +94,17 @@ def _worker(rank, root, world, case):
                 )
             grads = {n: getattr(p, "main_grad", p.grad) for n, p in model.named_parameters()}
             record["trainable"] = sorted(n for n, p in model.named_parameters() if p.requires_grad)
-            record["good_grads"] = all(
-                torch.isfinite(grads[n]).all() and grads[n].abs().sum() > 0 for n in adapters
-            )
+            record["bad_grads"] = [
+                n for n in adapters if not (torch.isfinite(grads[n]).all() and grads[n].abs().sum())
+            ]
             optimized = handle._optimizer.optimizers
             record["optimizer_numel"] = sum(
                 p.numel() for o in optimized for g in o.param_groups for p in g["params"]
             )
             assert rt.optimizer_step(handle)[0]
             after = model.state_dict()
-            record["base_unchanged"] = all(torch.equal(t, after[n]) for n, t in frozen.items())
-            record["adapters_moved"] = all(
-                not torch.equal(before[n], p) for n, p in adapters.items()
-            )
+            record["base_changed"] = [n for n, t in frozen.items() if not torch.equal(t, after[n])]
+            record["unmoved"] = [n for n, p in adapters.items() if torch.equal(before[n], p)]
         else:  # checkpoint: LoRA-only DCP and PEFT safetensors, then the resync payload
             saved = {n: p.detach().clone() for n, p in adapters.items()}
             lora.save_lora_dcp(chunks, Path(root, "dcp"), ps)
@@ -131,7 +129,11 @@ def test_gradients_only_on_adapters_and_base_frozen(tmp_path):
     assert record["trainable"] == record["adapters"] and len(record["adapters"]) == 4 * (
         16 + 2 + 2 * 8
     )
-    assert record["good_grads"] and record["adapters_moved"] and record["base_unchanged"]
+    assert not record["bad_grads"] and not record["unmoved"], (
+        record["bad_grads"],
+        record["unmoved"],
+    )
+    assert not record["base_changed"], record["base_changed"]
     assert record["optimizer_numel"] == record["adapter_numel"]
 
 
