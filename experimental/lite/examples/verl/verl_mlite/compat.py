@@ -901,6 +901,107 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
     return True
 
 
+_DSV41_RELOAD_STATE = object()
+
+
+def _is_deepseek_v41(model: Any) -> bool:
+    return type(model).__name__.startswith("DeepseekV41")
+
+
+def _patch_verl_dsv41_layerwise_reload() -> bool:
+    """DS4.1 resync = vLLM's own checkpoint-format reload, nothing else.
+
+    The trainer exports release-format tensors (block-FP8 / MXFP4 codes and
+    scales, BF16/FP32 rest; ``deepseek_v41.lite.export``).  On the rollout side
+    VERL's FP8 refit would requantize or restage them; instead hand them to the
+    model's ``load_weights`` under vLLM's layerwise reload lifecycle, which
+    re-runs each layer's post-load processing and copies the result into the
+    live (CUDA-graph-captured) storage, exactly as a cold load produces it.
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        quant_utils = importlib.import_module("verl.utils.vllm.vllm_quant_utils")
+        rollout_utils = importlib.import_module("verl.workers.rollout.vllm_rollout.utils")
+    except Exception:
+        return False
+    original_prepare = getattr(quant_utils, "prepare_quanted_weights_for_loading", None)
+    original_process = getattr(quant_utils, "process_quanted_weights_after_loading", None)
+    original_load = getattr(quant_utils, "load_quanted_weights", None)
+    if original_prepare is None or original_process is None or original_load is None:
+        return False
+    if getattr(original_load, "_verl_mlite_dsv41", False):
+        return True
+
+    def _vllm_config(model):
+        for module in model.modules():
+            config = getattr(module, "vllm_config", None)
+            if config is not None:
+                return config
+        raise RuntimeError("DS4.1 layerwise reload: no vllm_config on the rollout model")
+
+    @wraps(original_prepare)
+    def prepare_quanted_weights_for_loading(model, *args, **kwargs):
+        if not _is_deepseek_v41(model):
+            return original_prepare(model, *args, **kwargs)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import initialize_layerwise_reload
+
+        with set_current_vllm_config(_vllm_config(model)):
+            initialize_layerwise_reload(model)
+        model._verl_mlite_dsv41_reload_active = True
+        return _DSV41_RELOAD_STATE
+
+    @wraps(original_process)
+    def process_quanted_weights_after_loading(model, reload_state, *args, **kwargs):
+        if reload_state is not _DSV41_RELOAD_STATE:
+            return original_process(model, reload_state, *args, **kwargs)
+        from vllm.config import set_current_vllm_config
+        from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
+
+        config = _vllm_config(model)
+        try:
+            with set_current_vllm_config(config):
+                finalize_layerwise_processing(model, config.model_config)
+        finally:
+            model._verl_mlite_dsv41_reload_active = False
+        # Layerwise staging tensors are dead now; return their blocks before the
+        # colocated trainer/rollout memory handoff.
+        gc.collect()
+        import torch
+
+        torch.cuda.empty_cache()
+
+    @wraps(original_load)
+    def load_quanted_weights(weights, model_runner, is_drafter=False, *args, **kwargs):
+        model = model_runner.model
+        if is_drafter or not getattr(model, "_verl_mlite_dsv41_reload_active", False):
+            return original_load(weights, model_runner, is_drafter, *args, **kwargs)
+        # The receiver reuses its bucket buffer after this callback, while the
+        # layerwise loader may hold tensors until their layer is complete.
+        weights = [(name, tensor.clone()) for name, tensor in weights]
+        try:
+            from vllm.model_executor.model_loader.mtp_validation import (
+                disable_mtp_completeness_check,
+            )
+        except ImportError:
+            from contextlib import nullcontext as disable_mtp_completeness_check
+        from vllm.config import set_current_vllm_config
+
+        with set_current_vllm_config(_vllm_config(model)), disable_mtp_completeness_check():
+            return model.load_weights(weights)
+
+    for fn in (prepare_quanted_weights_for_loading, process_quanted_weights_after_loading,
+               load_quanted_weights):
+        fn._verl_mlite_dsv41 = True
+    quant_utils.prepare_quanted_weights_for_loading = prepare_quanted_weights_for_loading
+    quant_utils.process_quanted_weights_after_loading = process_quanted_weights_after_loading
+    quant_utils.load_quanted_weights = load_quanted_weights
+    # utils.py binds load_quanted_weights at import time.
+    rollout_utils.load_quanted_weights = load_quanted_weights
+    return True
+
+
 def _patch_verl_dsv4_fp8_process_weights() -> bool:
     """Restore the proven pre-dense-bridge DS4 post-reload behavior.
 
@@ -1368,6 +1469,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_verl_dsv4_native_layerwise_reload()
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
+    result = _patch_verl_dsv41_layerwise_reload()
+    _trace_runtime_patch("08d.verl_dsv41_layerwise_reload", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")
