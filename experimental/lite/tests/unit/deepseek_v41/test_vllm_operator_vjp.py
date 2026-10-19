@@ -70,3 +70,32 @@ def test_mhc_adapter_reads_actual_native_parameter_contract():
     mixes = HyperConnectionModule(config, 1)
     with pytest.raises(RuntimeError, match="CUDA"):
         joint(torch.zeros(2, 1, 4, 32), torch.zeros(2, 1, 4), torch.ones(32), mixes)
+
+
+@pytest.mark.parametrize("fused", [True, False])
+def test_wo_a_owned_vjp_matches_autograd_on_decoded_operands(fused):
+    """wo_a backward: d(dequantized core output) into the carrier, d(master) through the
+    column permutation of the fused layout (identity STE on both quantizations)."""
+    from megatron.lite.model.deepseek_v41.vllm.attention import _WoA, dequantize_output
+
+    tokens, groups, rank, width = 3, 8, 16, 4096
+    data = torch.randn(tokens, groups, width).to(torch.float8_e4m3fn)
+    scale = torch.randint(120, 131, (tokens, groups, 128), dtype=torch.uint8).view(torch.int32)
+    weight = torch.randn(groups * rank, width)
+    perm = torch.randperm(width) if fused else None
+    decoded = (weight if perm is None else weight[:, perm]).bfloat16()
+    grad = torch.randn(tokens, groups, rank)
+    ctx = SimpleNamespace(
+        saved_tensors=(data, scale, decoded, perm),
+        weight_shape=weight.shape,
+        weight_dtype=weight.dtype,
+    )
+    _, _, d_out, d_weight, _ = _WoA.backward(ctx, grad)
+    out = dequantize_output(data, scale).requires_grad_(True)
+    master = weight.clone().requires_grad_(True)
+    layout = master if perm is None else master[:, perm]
+    layout = layout + (decoded.float() - layout).detach()
+    z = torch.einsum("bhr,hdr->bhd", out, layout.view(groups, rank, width))
+    expected_out, expected_weight = torch.autograd.grad(z, (out, master), grad)
+    torch.testing.assert_close(d_out, expected_out.bfloat16())
+    torch.testing.assert_close(d_weight, expected_weight, rtol=1e-5, atol=1e-4)
