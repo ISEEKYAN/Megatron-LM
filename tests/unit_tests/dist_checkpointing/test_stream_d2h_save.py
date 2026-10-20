@@ -22,7 +22,10 @@ class TestStreamedD2HSave:
         """Device tensors reach the writer unstaged, round-trip bitwise, and pages are dropped."""
         Utils.initialize_model_parallel(1, 1)
         big = torch.arange(64 * 64, dtype=torch.float32, device="cuda").reshape(64, 64) + Utils.rank
-        small = torch.randn(3, 5, device="cuda", dtype=torch.bfloat16)
+        # Replicated across ranks: every rank holds the same values.
+        small = torch.randn(3, 5, generator=torch.Generator().manual_seed(0)).to(
+            "cuda", torch.bfloat16
+        )
         state = {
             "big": ShardedTensor.from_rank_offsets("big", big, (0, Utils.rank, Utils.world_size)),
             "small": ShardedTensor.from_rank_offsets("small", small, replica_id=Utils.rank),

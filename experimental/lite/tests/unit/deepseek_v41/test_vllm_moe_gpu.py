@@ -73,7 +73,7 @@ def test_megamoe_module_matches_direct_fused_launch(tmp_path):
         layer_number=1,
         pg_collection=core_groups(ps, SimpleNamespace(cp_size=1)),
         hash_moe_layer_threshold=0,
-    )
+    ).cuda()
     torch.manual_seed(73)
     with torch.no_grad():
         for parameter in model.parameters():
