@@ -397,7 +397,10 @@ def _module_sharded_state_dict(
     sharded_offsets: tuple[tuple[int, int, int], ...] = (),
 ) -> dict[str, ShardedTensor]:
     state: dict[str, ShardedTensor] = {}
+    from_release = _release_restored_tensor_ids(module)
     for name, param in module.named_parameters():
+        if id(param) in from_release:
+            continue
         state[f"{prefix}{name}"] = _make_sharded_tensor(
             f"{prefix}{name}",
             param,
@@ -407,6 +410,8 @@ def _module_sharded_state_dict(
             sharded_offsets=sharded_offsets,
         )
     for name, buffer in module.named_buffers():
+        if id(buffer) in from_release:
+            continue
         state[f"{prefix}{name}"] = _make_sharded_tensor(
             f"{prefix}{name}",
             buffer,
@@ -416,6 +421,16 @@ def _module_sharded_state_dict(
             sharded_offsets=sharded_offsets,
         )
     return state
+
+
+def _release_restored_tensor_ids(module: nn.Module) -> set[int]:
+    """Tensors of modules marked ``restored_from_release`` (frozen tables reloaded at init)."""
+    ids: set[int] = set()
+    for sub in module.modules():
+        if getattr(sub, "restored_from_release", False):
+            ids.update(id(t) for t in sub.parameters())
+            ids.update(id(t) for t in sub.buffers())
+    return ids
 
 
 def _make_sharded_tensor(
