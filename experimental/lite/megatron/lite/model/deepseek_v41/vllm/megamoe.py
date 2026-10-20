@@ -181,14 +181,29 @@ def _decode_activation(x):
     return dequantize_activation(*quantize_activation(x.detach().bfloat16()))
 
 
+def _requant_l2(h):
+    """The kernel's L1-epilogue requant of the FP32 activation, decoded: 1x32 groups, UE8M0
+    scale = smallest power of two with amax / scale <= 448 (DeepGEMM ``get_ue8m0_sf_exp``,
+    exponent floor 2^-22), E4M3 round-to-nearest-even."""
+    groups = h.detach().float().reshape(*h.shape[:-1], -1, 32)
+    bits = groups.abs().amax(-1, keepdim=True).view(torch.int32).to(torch.int64)
+    exp = torch.clamp((bits + 0x7FFFFF - 0x600000) >> 23, min=113) - 8
+    codes = (groups * torch.exp2((127 - exp).float())).to(torch.float8_e4m3fn)
+    return (codes.float() * torch.exp2((exp - 127).float())).reshape(h.shape)
+
+
 def _mlp_grads(a, score, grad, w1, w2, limit, need):
-    """VJP of ``q(swiglu(a @ w1.T) * score) @ w2.T`` over decoded operands; ``q`` is
-    the FP8 requant (identity STE). Returns (da, dscore, dw1, dw2), None where unneeded."""
+    """VJP of ``q(swiglu(bf16(a @ w1.T)) * score) @ w2.T`` over decoded operands, as the
+    fused kernel computes it: the GEMM1 accumulator is rounded to BF16 before the clamp and
+    SwiGLU, ``q`` is the FP8 requant of the FP32 activation (both identity STE).
+    Returns (da, dscore, dw1, dw2), None where unneeded."""
     with torch.enable_grad():
         leaves = [t.detach().requires_grad_(n) for t, n in zip((a, score, w1, w2), need)]
         a_, s_, w1_, w2_ = leaves
-        h = _swiglu(a_ @ w1_.T, limit) * s_.unsqueeze(-1)
-        h = h + (_decode_activation(h) - h).detach()
+        h = a_ @ w1_.T
+        h = h + (h.detach().bfloat16().float() - h).detach()
+        h = _swiglu(h, limit) * s_.unsqueeze(-1)
+        h = h + (_requant_l2(h) - h).detach()
         y = h @ w2_.T
         wanted = [t for t in leaves if t.requires_grad]
         grads = iter(torch.autograd.grad(y, wanted, grad) if wanted else ())
