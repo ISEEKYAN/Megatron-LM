@@ -368,16 +368,20 @@ class MegatronLiteEngine(BaseEngine):
         micro_batches, indices = prepare_micro_batches(
             data=data, dp_group=self.get_data_parallel_group(), same_micro_num_in_dp=True
         )
+        c8_probe.note_micro_batches(micro_batches)
 
         # Megatron drives every forward through the runtime's forward_backward
         # callback; the engine never calls the module directly.
-        return self._forward_backward_batch_with_runtime(
+        result = self._forward_backward_batch_with_runtime(
             data=data,
             micro_batches=micro_batches,
             indices=indices,
             loss_function=loss_function,
             forward_only=forward_only,
         )
+        if forward_only:
+            c8_probe.pack_ab(self, data, loss_function, result)
+        return result
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()

@@ -20,7 +20,7 @@ import time
 
 import torch
 
-_STATE = {"optim_steps": 0, "seq": 0, "sync": 0}
+_STATE = {"optim_steps": 0, "seq": 0, "sync": 0, "suppress": False, "packab": 0}
 
 
 def enabled():
@@ -48,7 +48,7 @@ def _cpu(t):
 
 def dump_logprobs(model_output, micro_batch, forward_only):
     """Record one actor micro-batch (called from the engine's runtime loss hook)."""
-    if not enabled():
+    if not enabled() or _STATE["suppress"]:
         return
     from verl.workers.utils.padding import no_padding_2_padding
 
@@ -61,6 +61,8 @@ def dump_logprobs(model_output, micro_batch, forward_only):
         "dtype": str(lp.dtype),
         "log_probs_padded": _cpu(no_padding_2_padding(lp, micro_batch)),
         "input_ids": _cpu(micro_batch["input_ids"]),
+        "n_docs": len(micro_batch),
+        "n_tokens": int(micro_batch["input_ids"].offsets()[-1]),
     }
     for key in ("rollout_log_probs", "response_mask", "old_log_probs", "advantages"):
         if key in micro_batch.keys():
@@ -226,3 +228,69 @@ class SyncRecorder:
             path = os.path.join(root, f"payload_v{self.version}", "payload.safetensors")
             save_file(self.saved, path)
             self.saved = {}
+
+
+def _seq_lens(data):
+    return (data["input_ids"].offsets()[1:] - data["input_ids"].offsets()[:-1]).tolist()
+
+
+def pack_ab(engine, data, loss_function, result):
+    """Packing A/C check on the old-logprob path (``Y_C8_PACK_AB=1``).
+
+    Recomputes the same batch under (a) one sequence per micro-batch budget and (b) the
+    recipe budget with the document order reversed, and compares every token's log-prob
+    bitwise with the production pass. Called on every DP rank (micro counts are synced).
+    """
+    if not enabled() or os.environ.get("Y_C8_PACK_AB") != "1" or _STATE["suppress"]:
+        return
+    from verl.utils import tensordict_utils as tu
+
+    base = (result or {}).get("model_output", {}).get("log_probs")
+    if base is None:
+        return
+    n = len(data)
+    sp = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
+    budget = int(tu.get_non_tensor_data(data=data, key="max_token_len_per_gpu", default=0))
+    lens = _seq_lens(data)
+    variants = {
+        "one_seq_budget": (list(range(n)), -(-max(lens) // sp)),
+        "reversed_order": (list(range(n))[::-1], budget),
+    }
+    rec = {"optim_step": _STATE["optim_steps"], "n_docs": n, "seq_lens": lens, "sp": sp,
+           "budget_per_gpu": budget, "variants": {}}
+    base_rows = base.unbind()
+    _STATE["suppress"] = True
+    try:
+        for name, (perm, b) in variants.items():
+            d2 = tu.index_select_tensor_dict(data, perm)
+            tu.assign_non_tensor(d2, max_token_len_per_gpu=b)
+            groups = []
+            _STATE["groups"] = groups
+            out = engine.forward_backward_batch(d2, loss_function, forward_only=True)
+            rows = out["model_output"]["log_probs"].unbind()
+            mism, maxd, tok = 0, 0.0, 0
+            for i, j in enumerate(perm):
+                a, c = base_rows[j], rows[i]
+                tok += a.numel()
+                if a.shape != c.shape:
+                    mism += a.numel()
+                    continue
+                ne = a.ne(c)
+                mism += int(ne.sum())
+                if ne.any():
+                    maxd = max(maxd, float((a.float() - c.float()).abs().max()))
+            rec["variants"][name] = {"budget_per_gpu": b, "tokens": tok, "mismatch": mism,
+                                     "max_abs_diff": maxd, "micro_batches": groups}
+    finally:
+        _STATE["suppress"] = False
+        _STATE.pop("groups", None)
+    _STATE["packab"] += 1
+    with open(os.path.join(_dir("packab"), f"{_tag()}_{_STATE['packab']:03d}.json"), "w") as f:
+        json.dump(rec, f)
+
+
+def note_micro_batches(micro_batches):
+    """Record (docs, tokens) per micro-batch for the active pack_ab variant."""
+    groups = _STATE.get("groups")
+    if groups is not None:
+        groups.extend((len(mb), int(mb["input_ids"].offsets()[-1])) for mb in micro_batches)
