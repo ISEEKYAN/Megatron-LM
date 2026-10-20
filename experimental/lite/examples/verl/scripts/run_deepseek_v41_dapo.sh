@@ -46,9 +46,8 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Level 2: the per-step sync rewrites every trained weight; a level-1 host backup of the full
 # rollout weights pins ~590 GB/node (measured). Parameters the sync never sends are kept by
 # vLLM across level 2: the untrained router bias (bias_vl) and the frozen DSpark drafter.
-# Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. verl_mlite
-# compat 08f (default VERL_MLITE_L2_RETENTION=unnamed) keeps the ~1.2 GiB/GPU of tensor
-# attributes and ownerless weights-pool bytes no name reaches.
+# Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. Needs vLLM
+# with 00474aeec6 (mega-attn load permutations on host; the post-sleep reload reads them).
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
@@ -66,6 +65,10 @@ TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
 SAVE_FREQ="${SAVE_FREQ:-20}"
 TEST_FREQ="${TEST_FREQ:-5}"
 VAL_BEFORE_TRAIN="${VAL_BEFORE_TRAIN:-True}"
+# AIME 2024: 8 samples per problem at the rollout temperature, 4096-token output budget
+# (fixed; does not follow MAX_RESPONSE_LENGTH).
+VAL_N="${VAL_N:-8}"
+VAL_MAX_TOKENS="${VAL_MAX_TOKENS:-4096}"
 RESUME_MODE="${RESUME_MODE:-auto}"
 
 [[ "${VERBOSE:-0}" == "1" ]] && set -x
@@ -84,6 +87,7 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1
 # Transformers has no deepseek_v41 config class; register an opaque one in every process.
 export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v41
 export VERL_MLITE_ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL}"
+export VERL_MLITE_VAL_MAX_TOKENS="${VAL_MAX_TOKENS}"
 export VLLM_BATCH_INVARIANT=1 VERL_FULL_DETERMINISM=1
 export VLLM_BI_MXFP8_GEMM=tensor_core VLLM_BI_MEGA_MHC=1 VLLM_BI_BF16_GEMM=tensor_core
 export VLLM_BI_MEGA_ATTN=1 VLLM_BI_MXFP8_PREQUANT=1 VLLM_BI_MHC_OVERLAP=1
@@ -213,10 +217,11 @@ COMMAND=(
   "actor_rollout_ref.rollout.temperature=1.0"
   "actor_rollout_ref.rollout.top_p=1.0"
   "actor_rollout_ref.rollout.top_k=-1"
-  "actor_rollout_ref.rollout.val_kwargs.temperature=0.0"
+  "actor_rollout_ref.rollout.val_kwargs.temperature=1.0"
   "actor_rollout_ref.rollout.val_kwargs.top_p=1.0"
-  "actor_rollout_ref.rollout.val_kwargs.do_sample=False"
-  "actor_rollout_ref.rollout.val_kwargs.n=1"
+  "actor_rollout_ref.rollout.val_kwargs.top_k=-1"
+  "actor_rollout_ref.rollout.val_kwargs.do_sample=True"
+  "actor_rollout_ref.rollout.val_kwargs.n=${VAL_N}"
   "actor_rollout_ref.rollout.free_cache_engine=True"
   "actor_rollout_ref.rollout.load_format=auto"
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"

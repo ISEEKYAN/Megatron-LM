@@ -188,3 +188,27 @@ def test_level2_retention_keeps_weights_pool_bytes_not_rewritten_by_sync(
         (1040, 20),
         (1080, 20),
     ]
+
+
+def test_val_max_tokens_caps_only_validation(monkeypatch) -> None:
+    import asyncio
+
+    seen = []
+
+    class AgentLoopWorker:
+        async def _run_agent_loop(self, sampling_params, trajectory, *, agent_name, trace=True):
+            seen.append(dict(sampling_params))
+
+    module = ModuleType("verl.experimental.agent_loop.agent_loop")
+    module.AgentLoopWorker = AgentLoopWorker
+    monkeypatch.setitem(sys.modules, module.__name__, module)
+    monkeypatch.setenv("VERL_MLITE_VAL_MAX_TOKENS", "4096")
+
+    assert compat._patch_verl_val_max_tokens()
+    worker = AgentLoopWorker()
+    params = {"temperature": 1.0}
+    asyncio.run(worker._run_agent_loop(params, {"validate": True}, agent_name="a"))
+    asyncio.run(worker._run_agent_loop(params, {"validate": False}, agent_name="a"))
+
+    assert seen == [{"temperature": 1.0, "max_tokens": 4096}, {"temperature": 1.0}]
+    assert params == {"temperature": 1.0}
