@@ -1111,9 +1111,10 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
     drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
     address in the dspark proposer). Copies the gaps to host before suspend, back after the
-    weights wake (before the sync reload).
+    weights wake (before the sync reload). Opt-in fallback (``VERL_MLITE_L2_RETENTION=1``); the
+    recipe keeps the drafter and untrained parameters with ``sleep_preserve_parameter_names``.
     """
-    if not _vllm_importable():
+    if os.environ.get("VERL_MLITE_L2_RETENTION", "0") != "1" or not _vllm_importable():
         return False
     try:
         worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
@@ -1162,6 +1163,51 @@ def _patch_vllm_sleep_level2_retention() -> bool:
 
     sleep._verl_mlite_l2_retention = True
     worker_cls.sleep, worker_cls.wake_up = sleep, wake_up
+    return True
+
+
+def _patch_vllm_sleep_fingerprint() -> bool:
+    """Diagnostics: fingerprint target and drafter state at every level-2 sleep.
+
+    Enabled by ``VERL_MLITE_SLEEP_FP_DIR``. Sleep 1 sees the freshly loaded model, later sleeps
+    see the state after sync and rollout, so any byte the sleep cycle lost shows up as a diff.
+    """
+    out_dir = os.environ.get("VERL_MLITE_SLEEP_FP_DIR")
+    if not out_dir or not _vllm_importable():
+        return False
+    try:
+        worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
+    except Exception:
+        return False
+    worker_cls = getattr(worker_mod, "Worker", None)
+    if worker_cls is None or getattr(worker_cls.sleep, "_verl_mlite_sleep_fp", False):
+        return worker_cls is not None
+    orig_sleep = worker_cls.sleep
+
+    def sleep(self, level: int = 1) -> None:
+        if level == 2:
+            import json
+            import socket
+
+            from verl_mlite.c8_fingerprint import fingerprint_model
+
+            n = getattr(self, "_verl_mlite_sleep_n", 0) + 1
+            self._verl_mlite_sleep_n = n
+            draft = self.get_draft_model()
+            rank = self.vllm_config.parallel_config.data_parallel_rank
+            os.makedirs(out_dir, exist_ok=True)
+            with open(f"{out_dir}/{socket.gethostname()}_dp{rank}_sleep{n}.json", "w") as f:
+                json.dump(
+                    {
+                        "target": fingerprint_model(self.model_runner.model),
+                        "draft": {} if draft is None else fingerprint_model(draft),
+                    },
+                    f,
+                )
+        return orig_sleep(self, level)
+
+    sleep._verl_mlite_sleep_fp = True
+    worker_cls.sleep = sleep
     return True
 
 
@@ -1638,6 +1684,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
     result = _patch_vllm_sleep_level2_retention()
     _trace_runtime_patch("08f.vllm_sleep_level2_retention", result)
+    result = _patch_vllm_sleep_fingerprint()
+    _trace_runtime_patch("08g.vllm_sleep_fingerprint", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

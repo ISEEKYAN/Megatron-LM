@@ -23,7 +23,7 @@ NNODES="${NNODES:-16}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-4}"
 TOTAL_GPUS=$((NNODES * NGPUS_PER_NODE))
 ACTOR_PP="${ACTOR_PP:-1}"
-ACTOR_CP="${ACTOR_CP:-1}"
+ACTOR_CP="${ACTOR_CP:-2}"
 ACTOR_EP="${ACTOR_EP:-${TOTAL_GPUS}}"
 # One rollout replica per node: DP=EP=4 over the node's GPUs (DEP4).
 ROLLOUT_DP="${ROLLOUT_DP:-${NGPUS_PER_NODE}}"
@@ -44,8 +44,9 @@ ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}"
 # DSpark speculative decoding (drafter frozen at the release; target-only sync).
 ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Level 2: the per-step sync rewrites every trained weight; a level-1 host backup of the full
-# rollout weights pins ~590 GB/node (measured). verl_mlite compat 08f keeps the rest of the
-# weights pool (drafter, untrained params, tensor attributes) across level 2.
+# rollout weights pins ~590 GB/node (measured). Parameters the sync never sends are kept by
+# vLLM across level 2: the untrained router bias (bias_vl) and the frozen DSpark drafter.
+# Buffers are kept by vLLM itself; the Engram tables live in pinned host memory.
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
@@ -98,6 +99,9 @@ case "${ROLLOUT_SPEC,,}" in
   true|1) SPEC_ARGS=("+actor_rollout_ref.rollout.engine_kwargs.vllm.speculative_config={method:dspark,num_speculative_tokens:5,draft_sample_method:probabilistic,rejection_sample_method:block,enable_adaptive_verification:false}") ;;
   *) SPEC_ARGS=() ;;
 esac
+SLEEP_PRESERVE="'*.bias_vl'"
+[[ ${#SPEC_ARGS[@]} -gt 0 ]] && SLEEP_PRESERVE+=",'draft.*'"
+SPEC_ARGS+=("+actor_rollout_ref.rollout.engine_kwargs.vllm.sleep_preserve_parameter_names=[${SLEEP_PRESERVE}]")
 
 RUN_NAME="${RUN_NAME:-ds41_dapo_${TOTAL_GPUS}gpu_ep${ACTOR_EP}_cp${ACTOR_CP}_dep${ROLLOUT_DP}_bs${TRAIN_BATCH_SIZE}x${ROLLOUT_N}_r${MAX_RESPONSE_LENGTH}}"
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
