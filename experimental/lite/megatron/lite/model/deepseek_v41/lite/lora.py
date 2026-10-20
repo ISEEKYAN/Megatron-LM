@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 attention/shared/routed LoRA; hooks leave base parameter names unchanged."""
 import json
 from pathlib import Path
 
@@ -25,7 +24,6 @@ TARGETS = (*_ATTENTION, "wo_a", "shared_experts", "experts")
 
 
 class GroupedLoRA(nn.Module):
-    """One adapter per output group of a block-diagonal (grouped) projection."""
 
     def __init__(self, groups, in_features, out_features, rank, scale):
         super().__init__()
@@ -43,7 +41,6 @@ class GroupedLoRA(nn.Module):
 
 
 def lora_layers(cfg, num_layers):
-    """Default: the last 20 decoder layers (DS4.1: 20-39, every ratio-one layer)."""
     start, end = cfg.layers or (max(0, num_layers - 20), num_layers)
     if not 0 <= start < end <= num_layers:
         raise ValueError(f"DS4.1 LoRA layers [{start}, {end}) outside [0, {num_layers})")
@@ -51,7 +48,6 @@ def lora_layers(cfg, num_layers):
 
 
 def attach_lora(model, cfg, dtype):
-    """Add adapters to the local layers in range; the caller freezes everything else."""
     targets = set(
         TARGETS if cfg.target_modules == LoraConfig().target_modules else cfg.target_modules
     )
@@ -161,7 +157,6 @@ def lora_state(chunk):
 
 
 def serving_lora_state(state, num_experts, scale):
-    """Expand each layer's routed factors to the per-expert serving layout; others unchanged."""
     out = {k: v for k, v in state.items() if ".ffn.experts." not in k}
     for stem in sorted({k.split(".lora_gate_up_A")[0] for k in state if "lora_gate_up_A" in k}):
         stack = lambda f: torch.stack(
@@ -179,7 +174,6 @@ def serving_lora_state(state, num_experts, scale):
 
 
 def save_lora_hf(chunks, path, cfg):
-    """PEFT-style safetensors of every stage's and expert's adapters, written by global rank 0."""
     from safetensors.torch import save_file
 
     from megatron.lite.model.deepseek_v41.lite.export import export_hf_weights
@@ -200,7 +194,6 @@ def save_lora_hf(chunks, path, cfg):
 
 @torch.no_grad()
 def load_lora_hf(chunks, path):
-    """Copy this rank's adapters from PEFT safetensors; every local adapter must be present."""
     from safetensors.torch import load_file
 
     saved = load_file(str(Path(path) / "adapter_model.safetensors"))
@@ -223,7 +216,6 @@ def _lora_sharded(chunks, ps):
 
 
 def save_lora_dcp(chunks, path, ps):
-    """LoRA-only Core dist checkpoint, separate from the base and optimizer state."""
     from megatron.core import dist_checkpointing
 
     Path(path).mkdir(parents=True, exist_ok=True)
@@ -231,7 +223,6 @@ def save_lora_dcp(chunks, path, ps):
 
 
 def load_lora_dcp(chunks, path, ps):
-    """Load in place; a training caller then refreshes the optimizer's main parameters."""
     from megatron.core import dist_checkpointing
 
     dist_checkpointing.load(_lora_sharded(chunks, ps), str(path))

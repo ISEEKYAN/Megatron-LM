@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 LoRA gates on the random small model: zero adapter, gradients, checkpoints, SFT, parallel."""
 import json
 from dataclasses import asdict
 from pathlib import Path
@@ -115,11 +114,14 @@ def _worker(rank, root, world, case):
 
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", f"file://{root}/store", rank=rank, world_size=world)
+    case, _, recompute = case.partition(":")
     record, chunks = {}, None
     try:
         if case == "no_adapter_stage":
             _build(root, pp=2, sft=True, impl=dict(lora=dict(LORA, layers=(9, 12))))
-        rt, handle, model, ps = _build(root, ep=world, sft=case == "grad", impl=dict(lora=LORA))
+        rt, handle, model, ps = _build(
+            root, ep=world, sft=case == "grad", impl=dict(lora=LORA, recompute=recompute or None)
+        )
         _initialize(model, ps, root)
         _seed_adapters(model)
         adapters = {n: p for n, p in model.named_parameters() if "lora" in n}
@@ -234,9 +236,11 @@ def _worker(rank, root, world, case):
 
 
 @pytest.mark.gpus(2)
-@pytest.mark.parametrize("world", [1, 2])
-def test_gradients_only_on_adapters_and_base_frozen(tmp_path, world):
-    records = _spawn(tmp_path / "grad", world, "grad")
+@pytest.mark.parametrize(
+    "world,recompute", [(1, ""), (2, ""), (1, "full"), (1, "attn"), (1, "moe")]
+)
+def test_gradients_only_on_adapters_and_base_frozen(tmp_path, world, recompute):
+    records = _spawn(tmp_path / "grad", world, "grad:" + recompute)
     for record in records:
         _check_grad_record(record, world)
 
@@ -274,8 +278,6 @@ def test_pipeline_stage_without_adapters_fails_loud(tmp_path):
 
 @pytest.mark.gpus(1)
 def test_lora_sft_loss_decreases(tmp_path):
-    """Product initialization (B = 0). lr and threshold from the frozen calibration r2
-    (job 8065264: lr=0 control 1.0000, lr 3e-3 0.9002); each 8-step window covers all 8 batches."""
     impl = dict(lora=LORA, optimizer_config=dict(lr=3e-3, min_lr=3e-3, weight_decay=0.0))
     (record,) = _run(tmp_path / "sft", (1, 1, 1, None), sft=True, impl=impl, seed=False)
     losses = torch.tensor(record["losses"])
@@ -292,7 +294,6 @@ def test_lora_sft_loss_decreases(tmp_path):
     ],
 )
 def test_lora_parallel_forward_matches_single(tmp_path, monkeypatch, shape):
-    """The same comparison and tolerance as the base model's parallel contract (#255)."""
     monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
     impl = dict(lora=LORA)
     reference = _run(
@@ -307,3 +308,30 @@ def test_lora_parallel_forward_matches_single(tmp_path, monkeypatch, shape):
         error = (reference - actual).abs()
         report = dict(max_abs=error.max().item(), p99=torch.quantile(error, 0.99).item())
         print("L1_CP_REPORT", json.dumps(report), flush=True)  # report-only, kept in the job log
+
+
+def test_frozen_prefix_lora_checkpoint_gradients(cpu_core_checkpoint, monkeypatch):
+    from megatron.lite.model.deepseek_v41.lite.components.block import DS41Block
+    from megatron.lite.primitive.modules.lora import LinearLoRA
+    from megatron.lite.primitive.parallel.source_state import KVSourceState
+
+    block = DS41Block.__new__(DS41Block)
+    torch.nn.Module.__init__(block)
+    block.adapter = LinearLoRA(4, 4, rank=2)
+    torch.nn.init.ones_(block.adapter.lora_b)
+    monkeypatch.setattr(block, "_sublayer", lambda h, pre, *args: (h + block.adapter(h), pre))
+    prefix = torch.nn.Linear(4, 4).requires_grad_(False)
+    x, state, reference = prefix(torch.randn(2, 4)), KVSourceState(), None
+    kwargs = dict(packed_seq_params=None, source_state=state)
+    for mode in (None, "full", "attn", "moe"):
+        block.zero_grad(set_to_none=True)
+        hidden = x.clone()
+        with state.microbatch():
+            out, _ = block(hidden, torch.zeros_like(hidden), recompute=mode, **kwargs)
+        out.square().sum().backward()
+        grads = [p.grad.clone() for p in block.adapter.parameters()]
+        assert all(torch.isfinite(g).all() and g.abs().sum() > 0 for g in grads)
+        reference = reference or grads
+        for actual, expected in zip(grads, reference):
+            torch.testing.assert_close(actual, expected, rtol=1e-6, atol=1e-6)
+        assert x.grad_fn is None and not x.requires_grad

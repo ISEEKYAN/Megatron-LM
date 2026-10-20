@@ -582,17 +582,11 @@ def register_lora_adapter_type(adapter_type):
 
 
 def lora_active(adapter: nn.Module | None) -> bool:
-    """Whether an optional adapter adds its delta to the base projection output."""
     return adapter is not None and not adapter.disabled
 
 
 @contextmanager
 def disable_lora_adapters(model: nn.Module) -> Iterator[int]:
-    """Run ``model`` as its frozen base model: no LoRA adapter under it adds a delta.
-
-    Yields the number of adapters bypassed and restores each adapter's previous
-    state on exit, including when the body raises.
-    """
     adapters = [module for module in model.modules() if isinstance(module, _LORA_MODULE_TYPES)]
     previous = [adapter.disabled for adapter in adapters]
     for adapter in adapters:

@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Shared-outer routed LoRA: fc1 A / fc2 B replicated, other factors expert-sharded."""
 import math
 
 import torch
@@ -51,7 +50,6 @@ class SharedOuterExpertLoRA(MegatronModule):
         return [getattr(grouped, f"weight{i}") for i in range(grouped.num_gemms)]
 
     def attach(self, experts):
-        """Add the deltas to a Core TEGroupedMLP's fc1(x, splits) and fc2(x, splits) outputs."""
         experts.lora = self
         experts.linear_fc1.register_forward_hook(
             lambda m, args, out: (
@@ -71,7 +69,6 @@ class SharedOuterExpertLoRA(MegatronModule):
         return self.fc2_lora_a(x, splits)[0] @ self.fc2_lora_b.t() * self.scale
 
     def factors(self):
-        """Canonical tensors; per-expert names carry the global expert number."""
         state = {"lora_gate_up_A.weight": self.fc1_lora_a, "lora_down_B.weight": self.fc2_lora_b}
         for i, (b, a) in enumerate(
             zip(self.per_expert(self.fc1_lora_b), self.per_expert(self.fc2_lora_a))
@@ -82,11 +79,6 @@ class SharedOuterExpertLoRA(MegatronModule):
 
 
 def expand_shared_outer(gate_up_a, gate_up_b, down_a, down_b, scale):
-    """Per-expert serving layout (verl#8257 ``export_serving_lora``), ``scale`` folded into B.
-
-    gate_up_a [r, H], gate_up_b [E, 2I, r], down_a [E, r, I], down_b [H, r] ->
-    A rows expert-major ([E*r, H], [E*r, I]); B columns ``rank * E + expert``.
-    """
     e = gate_up_b.shape[0]
     return {
         "gate_up.lora_A": gate_up_a[None]

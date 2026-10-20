@@ -1,5 +1,4 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""VERL reference forward bypasses adapters and restores policy state."""
 import copy
 
 import pytest
@@ -31,7 +30,8 @@ def engine_type():
 
 def _engine(module, engine_type):
     engine = object.__new__(engine_type)
-    engine.runtime, engine.handle, engine.module = object(), object(), module
+    engine.runtime = engine.handle = object() if module is not None else None
+    engine.module = module
     return engine
 
 
@@ -53,15 +53,9 @@ def test_disable_adapter_forward_equals_base_and_policy_returns_after_exit(engin
         assert torch.equal(engine.module(x), policy_out)
 
 
-def test_disable_adapter_rejects_models_without_adapters(engine_type):
-    with pytest.raises(RuntimeError, match="no LoRA adapters"):
-        with _engine(nn.Sequential(_Chunk(False)), engine_type).disable_adapter():
-            pass
-
-
-def test_disable_adapter_requires_initialized_engine(engine_type):
-    engine = object.__new__(engine_type)
-    engine.runtime = engine.handle = None
-    with pytest.raises(RuntimeError, match="not initialized"):
-        with engine.disable_adapter():
-            pass
+@pytest.mark.parametrize(
+    "module,message", [(_Chunk(False), "no LoRA adapters"), (None, "not initialized")]
+)
+def test_disable_adapter_rejects_unavailable_engine(engine_type, module, message):
+    with pytest.raises(RuntimeError, match=message), _engine(module, engine_type).disable_adapter():
+        pass
