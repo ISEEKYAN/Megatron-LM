@@ -2,7 +2,7 @@
 """DS4.1 attention outside the core: vLLM BI=1 mega-attention prefill, op for op.
 
 Forward follows ``DeepseekV4MegaAttnAttention`` (vllm-project/vllm#62365 @ d667e410e1,
-flags of ``B_bi1_mega``) for a packed THD batch:
+BI=1 mega-attention flags) for a packed THD batch:
 
 1. ``qr_kv``: BI MXFP8 GEMM of ``cat(wq_a, wkv)`` (FlashInfer activation quant).
 2. ``fused_q_kv_rmsnorm_quant``: q_norm + MXFP8 Q (shared by both wq_b), kv_norm.
@@ -358,14 +358,15 @@ class _WoA(torch.autograd.Function):
 
     @staticmethod
     def forward(ctx, data, scale, carrier, weight, fused):
-        from megatron.lite.primitive.quantization.block_fp8 import (
-            dequantize_block_fp8,
-            quantize_block_fp8,
-        )
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             deepgemm_post_process_fp8_weight_block,
         )
         from vllm.utils.deep_gemm import fp8_einsum
+
+        from megatron.lite.primitive.quantization.block_fp8 import (
+            dequantize_block_fp8,
+            quantize_block_fp8,
+        )
 
         width = GROUPS * HEAD_DIM
         perm = o_fused_permutation(weight.device) if fused else None

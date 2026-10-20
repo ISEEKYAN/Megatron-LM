@@ -166,8 +166,19 @@ def _vllm_layer(x):
     positions = torch.arange(length, device=device)
     # The layer's own fused insert: Q half is a no-op at 64 interleaved heads.
     torch.ops._C.fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert(
-        x.q, x.swa_kv, packed, positions, positions, x.cos_sin, 0, 1e-6, block,
-        False, True, False, True,
+        x.q,
+        x.swa_kv,
+        packed,
+        positions,
+        positions,
+        x.cos_sin,
+        0,
+        1e-6,
+        block,
+        False,
+        True,
+        False,
+        True,
     )
 
     attention = DeepseekV4MegaAttnAttention.__new__(DeepseekV4MegaAttnAttention)
@@ -177,7 +188,9 @@ def _vllm_layer(x):
     attention.swa_cache_layer = swa
     attention.window_size = WINDOW
     attention.max_num_batched_tokens = length
-    attention.topk_indices_buffer = torch.full((length, TOP_K), -1, device=device, dtype=torch.int32)
+    attention.topk_indices_buffer = torch.full(
+        (length, TOP_K), -1, device=device, dtype=torch.int32
+    )
     compressed_builder = compressed_table = None
     if ratio:
         per_page = 128 // ratio
@@ -186,9 +199,7 @@ def _vllm_layer(x):
             1, compressed_pages
         )
         compressed = torch.zeros(compressed_pages, per_page, 288, device=device, dtype=torch.uint8)
-        rope_quant_insert(
-            x.latent, positions, x.cos_sin, compressed, positions // ratio, ratio
-        )
+        rope_quant_insert(x.latent, positions, x.cos_sin, compressed, positions // ratio, ratio)
         attention.is_kv_source = True
         attention.kv_cache = compressed
         spec = MLAAttentionSpec(
@@ -319,8 +330,17 @@ def _visible_kv(x):
     plan = mega._plan([0, length], length, 0, length, x.ratio, x.q.device)
     with torch.no_grad():
         *_, kv, _, _ = mega._forward(
-            x.q, x.swa_kv, x.latent, x.topk, x.positions, x.sink, x.cos_sin, x.ratio,
-            WINDOW, TOP_K, plan,
+            x.q,
+            x.swa_kv,
+            x.latent,
+            x.topk,
+            x.positions,
+            x.sink,
+            x.cos_sin,
+            x.ratio,
+            WINDOW,
+            TOP_K,
+            plan,
         )
     kv = kv[0].double()
     return kv[plan.n : plan.n + length], kv[: plan.n]
@@ -367,9 +387,7 @@ def _reference(x, grad_fused, *, chunk=128):
             ids = ids.clamp(min=0)
             tokens = ids * ratio + ratio - 1
             keys.append(
-                _Visible.apply(
-                    comp_vis[ids], _rotate(latent[tokens], x.cos_sin, ids * ratio, 1)
-                )
+                _Visible.apply(comp_vis[ids], _rotate(latent[tokens], x.cos_sin, ids * ratio, 1))
             )
             valid.append(ok)
         k = torch.cat(keys, 1)
@@ -423,7 +441,7 @@ def _grads(x, grad):
 def _upstream(length, generator, kind):
     grad = torch.randn(length, 8, 8 * DIM, device="cuda", generator=generator)
     if kind == "sparse":
-        grad *= (torch.rand(length, 1, 1, device="cuda", generator=generator) < 0.05)
+        grad *= torch.rand(length, 1, 1, device="cuda", generator=generator) < 0.05
     return grad.bfloat16()
 
 
@@ -527,14 +545,18 @@ def test_backward_is_finite_difference_consistent():
         return total
 
     shapes = [(length, HEADS, DIM), (length, DIM), (length, DIM), (HEADS,)]
-    leaves = [torch.zeros(s, dtype=torch.float64, device="cuda", requires_grad=True) for s in shapes]
+    leaves = [
+        torch.zeros(s, dtype=torch.float64, device="cuda", requires_grad=True) for s in shapes
+    ]
     loss(*leaves).backward()
     names = ("dq", "dswa", "dlatent", "dsink")
     eps = 1e-4
     for which, (leaf, name) in enumerate(zip(leaves, names)):
         # 1. FD of the surrogate confirms its autograd VJP (no cancellation issue:
         #    both sides are exact up to O(eps**2) and FP64 rounding).
-        direction = torch.randn(shapes[which], dtype=torch.float64, device="cuda", generator=generator)
+        direction = torch.randn(
+            shapes[which], dtype=torch.float64, device="cuda", generator=generator
+        )
         plus = [torch.zeros(s, dtype=torch.float64, device="cuda") for s in shapes]
         minus = [t.clone() for t in plus]
         plus[which] += eps * direction
@@ -636,8 +658,15 @@ def test_layers_after_the_first_do_not_sync(ratio):
     def layer():
         q = x.q.detach().requires_grad_()
         out = mega_attention(
-            q, x.swa_kv, latent, x.topk, x.positions, x.sink,
-            compress_ratio=ratio, cos_sin_cache=x.cos_sin, cu_seqlens=cu,
+            q,
+            x.swa_kv,
+            latent,
+            x.topk,
+            x.positions,
+            x.sink,
+            compress_ratio=ratio,
+            cos_sin_cache=x.cos_sin,
+            cu_seqlens=cu,
         )
         torch.autograd.backward(out.grad, grad)
         return out.data, q.grad

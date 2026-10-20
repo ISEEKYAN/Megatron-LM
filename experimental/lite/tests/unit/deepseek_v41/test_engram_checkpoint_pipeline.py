@@ -54,9 +54,9 @@ def _cp_loss_worker(rank, path, results, denominator):
         ps = SimpleNamespace(cp_size=2, cp_rank=rank, cp_group=dist.group.WORLD)
         ids = torch.arange(12)
         with use_loss_context(LossContext(normalization_denominator=denominator)):
-            loss = forward_step(_TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))[
-                "loss"
-            ]
+            loss = forward_step(
+                _TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6]))
+            )["loss"]
         loss.backward()
         results[rank] = (loss.detach(), weight.grad.clone())
     finally:
@@ -74,9 +74,9 @@ def test_forward_step_cp_loss_and_grads_match_cp1(tmp_path, denominator):
     ids = torch.arange(12)
     ps = SimpleNamespace(cp_size=1, cp_rank=0, cp_group=None)
     with use_loss_context(LossContext(normalization_denominator=denominator)):
-        expected = forward_step(_TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))[
-            "loss"
-        ]
+        expected = forward_step(
+            _TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6]))
+        )["loss"]
     expected.backward()
 
     results = mp.Manager().dict()

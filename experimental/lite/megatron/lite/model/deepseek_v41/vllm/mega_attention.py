@@ -86,9 +86,7 @@ def o_from_fused(o):
     """Output layout ``[S, groups, 8 * 512]`` (32-dim chunks across 8 heads) to natural."""
     s, g, width = o.shape
     d = width // WV_GROUP
-    return (
-        o.reshape(s, g, d // 32, WV_GROUP, 32).permute(0, 1, 3, 2, 4).reshape(s, g * WV_GROUP, d)
-    )
+    return o.reshape(s, g, d // 32, WV_GROUP, 32).permute(0, 1, 3, 2, 4).reshape(s, g * WV_GROUP, d)
 
 
 def dequantize_output(data, scale):
@@ -369,7 +367,16 @@ def _segments(indices, lens, kv_rows, chunk_rows):
 
 
 def attention_backward_kernel(
-    q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale, deterministic=None,
+    q,
+    grad,
+    positions,
+    cos_sin_cache,
+    kv,
+    indices,
+    lens,
+    lse_full,
+    scale,
+    deterministic=None,
     kernel=None,
 ):
     """Owned VJP of the mega kernel's attention, RoPE and layouts included.
@@ -417,8 +424,19 @@ def attention_backward_kernel(
 class _MegaAttention(torch.autograd.Function):
     @staticmethod
     def forward(
-        ctx, q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, window, top_k,
-        cu_seqlens, group,
+        ctx,
+        q,
+        swa_kv,
+        latent,
+        topk,
+        positions,
+        sink,
+        cos_sin_cache,
+        ratio,
+        window,
+        top_k,
+        cu_seqlens,
+        group,
     ):
         rank, size = (group.rank(), group.size()) if group is not None else (0, 1)
         local = q.shape[0]
@@ -437,14 +455,29 @@ class _MegaAttention(torch.autograd.Function):
         plan = _plan(cu_seqlens, local * size, rank, local, ratio, q.device)
         sink32 = sink.detach().float().contiguous()
         data, scale, lse, kv, indices, lens = _forward(
-            q.detach().contiguous(), swa_full.bfloat16().contiguous(),
+            q.detach().contiguous(),
+            swa_full.bfloat16().contiguous(),
             None if latent_full is None else latent_full.bfloat16().contiguous(),
             None if topk is None else topk.to(torch.int32).contiguous(),
-            positions, sink32, cos_sin_cache, ratio, window, top_k, plan,
+            positions,
+            sink32,
+            cos_sin_cache,
+            ratio,
+            window,
+            top_k,
+            plan,
         )
         ctx.save_for_backward(q, kv, indices, lens, lse, positions, sink32, cos_sin_cache, compact)
-        ctx.meta = (plan, ratio, group, rank, size, swa_kv.dtype,
-                    None if latent is None else (latent.dtype, latent.shape[0]), sink.dtype)
+        ctx.meta = (
+            plan,
+            ratio,
+            group,
+            rank,
+            size,
+            swa_kv.dtype,
+            None if latent is None else (latent.dtype, latent.shape[0]),
+            sink.dtype,
+        )
         ctx.mark_non_differentiable(data, scale)
         carrier = torch.zeros((), dtype=torch.bfloat16, device=q.device).expand(data.shape)
         return data, scale, carrier
@@ -457,7 +490,14 @@ class _MegaAttention(torch.autograd.Function):
             grad = torch.zeros(q.shape[0], HEADS // WV_GROUP, WV_GROUP * HEAD_DIM, device=q.device)
         lse_full = torch.logaddexp(lse, sink.unsqueeze(0))
         dq, dkv, delta = attention_backward_kernel(
-            q, grad, positions, cos_sin_cache, kv.view(-1, HEAD_DIM), indices, lens, lse_full,
+            q,
+            grad,
+            positions,
+            cos_sin_cache,
+            kv.view(-1, HEAD_DIM),
+            indices,
+            lens,
+            lse_full,
             HEAD_DIM**-0.5,
         )
         dq = dq.to(q.dtype)
@@ -545,8 +585,16 @@ def mega_attention(
         cp_group = None
     return MegaAttentionOutput(
         *_MegaAttention.apply(
-            q, swa_kv, comp_latent, topk_local, positions, attn_sink, cos_sin_cache,
-            compress_ratio, window, top_k,
+            q,
+            swa_kv,
+            comp_latent,
+            topk_local,
+            positions,
+            attn_sink,
+            cos_sin_cache,
+            compress_ratio,
+            window,
+            top_k,
             cu_seqlens,
             cp_group,
         )

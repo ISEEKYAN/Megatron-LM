@@ -48,7 +48,9 @@ def _worker(rank, root):
     expected = full[ids].float().unflatten(-1, (-1, 32)) * scales[ids].float().unsqueeze(-1)
     assert torch.equal(table(ids), expected.flatten(-2).to(torch.bfloat16))
     # Lite model layout [rows, 1, k]: rows differ per rank, padding must extend dim 0.
-    assert torch.equal(table(ids.unsqueeze(1)), expected.unsqueeze(1).flatten(-2).to(torch.bfloat16))
+    assert torch.equal(
+        table(ids.unsqueeze(1)), expected.unsqueeze(1).flatten(-2).to(torch.bfloat16)
+    )
     # The frozen release bytes stay out of training checkpoints; resume keeps the release load.
     module = torch.nn.Module()
     module.embed, module.proj = table, torch.nn.Linear(2, 2, bias=False).cuda()

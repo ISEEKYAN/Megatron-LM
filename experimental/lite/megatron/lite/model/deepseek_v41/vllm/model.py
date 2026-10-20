@@ -4,8 +4,8 @@
 The native model owns construction, release loading, DistOpt and checkpoints;
 this subclass only replaces ``forward`` with :func:`.forward.model_forward`,
 reading the live native parameters by their release names. The attention core
-comes from M (mega) or F (FlashMLA) per tracks.md; select with
-``DSV41_ATTENTION_CORE=mega|flashmla`` (default mega, the B_bi1_mega rollout).
+is the fused mega-attention op or the FlashMLA sparse core; select with
+``DSV41_ATTENTION_CORE=mega|flashmla`` (default mega, as in the BI=1 rollout).
 
 Scope: PP=1, TP=1; CP any (contiguous equal THD slices, as the native protocol
 packs them); EP any (MegaMoE symmetric buffer over the EP group).
@@ -64,7 +64,7 @@ def finish_param_gather(model):
 
 class DeepseekV41Model(NativeModel):
     deployment_providers = {
-        'attention': 'vLLM BI projections/compressor/indexer/wo_a/wo_b; core per tracks.md (M/F)',
+        'attention': 'vLLM BI projections/compressor/indexer/wo_a/wo_b; core mega or FlashMLA',
         'engram': 'frozen native FP8 rows; vLLM MXFP8 wkv + fused post-wkv gate',
         'moe': 'vLLM bf16_mega_gate + DeepGEMM fp8_fp4_mega_moe over the EP group',
         'mhc': 'vLLM pre_delayed / shifted_post_pre / post_tilelang / hc_collapse',
@@ -132,10 +132,14 @@ class DeepseekV41Model(NativeModel):
                     attn_mixes=block.attn_mixes,
                     ffn_mixes=block.ffn_mixes,
                     attn=F.attention_params(table.get, index),
-                    engram=None
-                    if engram is None
-                    else SimpleNamespace(
-                        wkv=engram.wkv.weight, q_weight=engram.q_weight, k_weight=engram.k_weight
+                    engram=(
+                        None
+                        if engram is None
+                        else SimpleNamespace(
+                            wkv=engram.wkv.weight,
+                            q_weight=engram.q_weight,
+                            k_weight=engram.k_weight,
+                        )
                     ),
                 )
             )

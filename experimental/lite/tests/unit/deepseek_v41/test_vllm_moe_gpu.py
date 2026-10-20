@@ -255,8 +255,6 @@ def test_megamoe_routes_image_sentinel_ids_with_bias_vl(tmp_path, monkeypatch):
             w, ids = mega_route(x.squeeze(1)[rows], model.router.weight, bias.float(), k, 2.5)
             assert torch.equal(routed['ids'][rows], ids)
             assert torch.equal(routed['weights'][rows].view(torch.int32), w.view(torch.int32))
-        assert torch.equal(
-            routed['ids'][image].sort(-1).values.cpu(), torch.arange(k).expand(4, k)
-        )
+        assert torch.equal(routed['ids'][image].sort(-1).values.cpu(), torch.arange(k).expand(4, k))
     finally:
         dist.destroy_process_group()

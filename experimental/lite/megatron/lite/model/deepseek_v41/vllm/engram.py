@@ -37,7 +37,6 @@ class _Gate(torch.autograd.Function):
         if not hidden.is_cuda:
             raise RuntimeError("Deployment Engram gate requires CUDA")
         import triton
-
         from vllm.models.deepseek_v41.common.engram import _fused_engram_post_wkv_kernel
 
         # vLLM holds q/k as BF16 (the release/export RNE of the FP32 masters). The gate sees

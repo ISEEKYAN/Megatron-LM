@@ -108,9 +108,11 @@ class _HeadLogProbs(torch.autograd.Function):
         dweight = (
             main
             if fused
-            else torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
-            if need_weight
-            else None
+            else (
+                torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+                if need_weight
+                else None
+            )
         )
         if not (need_hidden or need_weight) or not hidden.shape[0]:
             return dhidden, _weight_grad(weight, dweight, fused), None, None, None, None

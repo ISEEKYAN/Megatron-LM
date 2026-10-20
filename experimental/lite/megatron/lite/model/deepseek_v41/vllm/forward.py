@@ -309,8 +309,8 @@ def model_forward(
 
 
 def interface_core(kind):
-    """The tracks.md attention core of ``kind`` ("mega": M's ``mega_attention``;
-    "flashmla": F's ``flashmla_attention_core``) as an :func:`attention_layer` core.
+    """The attention core of ``kind`` ("mega": ``mega_attention``;
+    "flashmla": ``flashmla_attention_core``) as an :func:`attention_layer` core.
 
     ``comp_latent`` is passed as the boundary rows (``(pos+1) % cr == 0``) in token order.
     """
@@ -332,7 +332,8 @@ def interface_core(kind):
             )
 
     elif kind == "flashmla":
-        from .flashmla_attention import FlashMLALayerConfig, flashmla_attention_core as fn
+        from .flashmla_attention import FlashMLALayerConfig
+        from .flashmla_attention import flashmla_attention_core as fn
 
         def call(q, kv, comp, topk, positions, sink, ratio, cache, cu_seqlens, cp_group):
             return fn(

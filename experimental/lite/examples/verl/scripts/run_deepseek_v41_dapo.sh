@@ -36,7 +36,7 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
-# Packed tokens per GPU micro-batch (track P): training 5120, log-prob 10240 (one full sequence).
+# Packed tokens per GPU micro-batch: training 5120, log-prob 10240 (one full sequence).
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
 LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
 # Each Ray worker imports vLLM via the verl_mlite sitecustomize (~50 s); cap the prestarted pool.
@@ -87,7 +87,7 @@ OUTPUT_ROOT="${OUTPUT_ROOT:-${EXAMPLE_ROOT}/outputs/ds41_dapo}"
 export PYTHONPATH="${EXAMPLE_ROOT}:${LITE_ROOT}:${REPO_ROOT}:${PYTHONPATH:-}"
 
 # ---------------------------------------------------------------------------
-# Batch-invariant execution (rollout arm B_bi1_mega; the actor reads the same switch)
+# Batch-invariant execution (BI=1 mega-attention rollout; the actor reads the same switch)
 # ---------------------------------------------------------------------------
 export CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1
 # Transformers has no deepseek_v41 config class; register an opaque one in every process.
@@ -133,10 +133,10 @@ fi
 
 # Actor numerics switches reach every Ray actor through the job runtime_env, not only through
 # whatever environment the Ray cluster was started with (actors log the values they see).
-# Trainer MegaMoE processes packed rows in blocks of this many tokens per rank (track P: 2048
+# Trainer MegaMoE processes packed rows in blocks of this many tokens per rank (2048
 # keeps the 5120-token micro-batch in GPU memory; logprobs unchanged). vLLM does not read it.
 export DSV41_MEGAMOE_MAX_TOKENS="${DSV41_MEGAMOE_MAX_TOKENS:-2048}"
-# Mega-attention dKV with atomics (user decision); logprobs stay bitwise, gradients compared
+# Mega-attention dKV with atomics (default); logprobs stay bitwise, gradients compared
 # within tolerance. 1 makes dKV run-to-run reproducible for debugging.
 export DS41_MEGA_ATTN_DETERMINISTIC="${DS41_MEGA_ATTN_DETERMINISTIC:-0}"
 # Checkpoint save host memory: stage GPU tensors one at a time through one pinned buffer

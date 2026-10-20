@@ -40,8 +40,7 @@ def accumulate_wgrad(owners, dw, like):
     accumulation fusion does; otherwise ``dw`` itself (autograd casts it to ``like``'s
     dtype)."""
     if not owners or any(
-        getattr(o, "main_grad", None) is None or o.main_grad.dtype != torch.float32
-        for o in owners
+        getattr(o, "main_grad", None) is None or o.main_grad.dtype != torch.float32 for o in owners
     ):
         return torch.zeros_like(like) if dw is None else dw
     from megatron.lite.primitive.parallel.linear import _dummy_wgrad

@@ -31,7 +31,7 @@ def test_deployment_forward_runs_on_the_native_parameter_tree():
     assert DeepseekV41Model._build_attention is NativeModel._build_attention
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
     assert DeepseekV41Model.forward is not NativeModel.forward
-    assert 'tracks.md' in DeepseekV41Model.deployment_providers['attention']
+    assert 'FlashMLA' in DeepseekV41Model.deployment_providers['attention']
     assert (
         inspect.signature(DeepseekV41Model.forward).parameters['labels'].kind
         is inspect.Parameter.KEYWORD_ONLY
@@ -97,7 +97,6 @@ def test_param_gather_finisher_runs_only_core_ddp_readiness_hooks():
     from types import SimpleNamespace
 
     from megatron.core.distributed import DistributedDataParallel
-
     from megatron.lite.model.deepseek_v41.vllm.model import finish_param_gather
 
     seen, other = [], []

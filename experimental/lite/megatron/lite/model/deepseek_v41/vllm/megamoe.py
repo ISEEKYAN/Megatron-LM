@@ -270,7 +270,9 @@ class _MegaMoE(torch.autograd.Function):
                 capacity = torch.tensor([rows], device=x.device)
                 torch.distributed.all_reduce(capacity, torch.distributed.ReduceOp.MAX, group=group)
                 pad = int(capacity) - rows
-                padded = lambda t, v=0: torch.nn.functional.pad(t, (0, 0, 0, pad), value=v)  # noqa: E731
+                padded = lambda t, v=0: torch.nn.functional.pad(
+                    t, (0, 0, 0, pad), value=v
+                )  # noqa: E731
                 a_all = _all_gather(padded(a.bfloat16()), group)
                 g_all = _all_gather(padded(grad.bfloat16()), group)
                 w_all = _all_gather(padded(weights.float()), group)

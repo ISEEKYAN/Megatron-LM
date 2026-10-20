@@ -9,19 +9,34 @@ from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
 NAMES = [
-    ("layers.3.ffn.experts.linear_fc1.weight17", ["layers.3.ffn.experts.17.w1.weight",
-                                                  "layers.3.ffn.experts.17.w3.weight"], "mxfp4"),
+    (
+        "layers.3.ffn.experts.linear_fc1.weight17",
+        ["layers.3.ffn.experts.17.w1.weight", "layers.3.ffn.experts.17.w3.weight"],
+        "mxfp4",
+    ),
     ("layers.3.ffn.experts.linear_fc2.weight17", ["layers.3.ffn.experts.17.w2.weight"], "mxfp4"),
-    ("layers.3.ffn.shared_experts.linear_fc2.weight", ["layers.3.ffn.shared_experts.w2.weight"],
-     "fp8_block"),
+    (
+        "layers.3.ffn.shared_experts.linear_fc2.weight",
+        ["layers.3.ffn.shared_experts.w2.weight"],
+        "fp8_block",
+    ),
     ("layers.3.attention.linear_o_group_proj", ["layers.3.attn.wo_a.weight"], "fp8_block"),
     ("layers.3.attention.linear_q_up_proj.weight", ["layers.3.attn.wq_b.weight"], "fp8_block"),
-    ("layers.3.attention.core_attention.native.indexer.linear_wq_b.linear.weight",
-     ["layers.3.attn.indexer.wq_b.weight"], "fp8_block"),
-    ("layers.3.attention.core_attention.native.compressor.linear_wkv.weight",
-     ["layers.3.attn.compressor.wkv.weight"], torch.bfloat16),
-    ("layers.3.attention.core_attention.native.attn_sink", ["layers.3.attn.attn_sink"],
-     torch.float32),
+    (
+        "layers.3.attention.core_attention.native.indexer.linear_wq_b.linear.weight",
+        ["layers.3.attn.indexer.wq_b.weight"],
+        "fp8_block",
+    ),
+    (
+        "layers.3.attention.core_attention.native.compressor.linear_wkv.weight",
+        ["layers.3.attn.compressor.wkv.weight"],
+        torch.bfloat16,
+    ),
+    (
+        "layers.3.attention.core_attention.native.attn_sink",
+        ["layers.3.attn.attn_sink"],
+        torch.float32,
+    ),
     ("layers.3.ffn.router.expert_bias", ["layers.3.ffn.gate.bias"], torch.float32),
     ("layers.3.ffn.router.bias_vl", ["layers.3.ffn.gate.bias_vl"], torch.float32),
     ("layers.3.attn_mixes.mapping_proj.weight", ["layers.3.hc_attn_fn"], torch.float32),

@@ -82,7 +82,12 @@ def _pinned_stats():
         st = torch.cuda.host_memory_stats()
     except Exception:
         return None
-    return {k: v for k, v in st.items() if k.split(".")[0] in ("allocated_bytes", "reserved_bytes") and k.endswith(("current", "peak"))}
+    return {
+        k: v
+        for k, v in st.items()
+        if k.split(".")[0] in ("allocated_bytes", "reserved_bytes")
+        and k.endswith(("current", "peak"))
+    }
 
 
 def _host_bytes(optimizer):
@@ -160,16 +165,22 @@ def optimizer_step(handle, step_fn):
         "host_optimizer_bytes": _host_bytes(handle._optimizer),
         "trainable_numel": sum(p.numel() for p in params),
         "pinned_host_allocator": _pinned_stats(),
-        "non_bf16_params": sorted(
-            f"{n}:{str(p.dtype)[6:]}"
-            for chunk in chunks
-            for n, p in chunk.named_parameters()
-            if p.requires_grad and p.dtype != torch.bfloat16
-        )
-        if _STATE["optim_steps"] == 1
-        else None,
+        "non_bf16_params": (
+            sorted(
+                f"{n}:{str(p.dtype)[6:]}"
+                for chunk in chunks
+                for n, p in chunk.named_parameters()
+                if p.requires_grad and p.dtype != torch.bfloat16
+            )
+            if _STATE["optim_steps"] == 1
+            else None
+        ),
         "step_result": [
-            float(x) if isinstance(x, (int, float)) or torch.is_tensor(x) and x.numel() == 1 else str(x)
+            (
+                float(x)
+                if isinstance(x, (int, float)) or torch.is_tensor(x) and x.numel() == 1
+                else str(x)
+            )
             for x in (result if isinstance(result, tuple) else (result,))
         ],
         "ts": time.time(),
@@ -256,8 +267,14 @@ def pack_ab(engine, data, loss_function, result):
         "min_budget": (list(range(n)), -(-max(lens) // sp)),
         "reversed_order": (list(range(n))[::-1], budget),
     }
-    rec = {"optim_step": _STATE["optim_steps"], "n_docs": n, "seq_lens": lens, "sp": sp,
-           "budget_per_gpu": budget, "variants": {}}
+    rec = {
+        "optim_step": _STATE["optim_steps"],
+        "n_docs": n,
+        "seq_lens": lens,
+        "sp": sp,
+        "budget_per_gpu": budget,
+        "variants": {},
+    }
     base_rows = None if base is None else base.unbind()
     _STATE["suppress"] = True
     try:
@@ -284,8 +301,13 @@ def pack_ab(engine, data, loss_function, result):
                 mism += int(ne.sum())
                 if ne.any():
                     maxd = max(maxd, float((a.float() - c.float()).abs().max()))
-            rec["variants"][name] = {"budget_per_gpu": b, "tokens": tok, "mismatch": mism,
-                                     "max_abs_diff": maxd, "micro_batches": groups}
+            rec["variants"][name] = {
+                "budget_per_gpu": b,
+                "tokens": tok,
+                "mismatch": mism,
+                "max_abs_diff": maxd,
+                "micro_batches": groups,
+            }
     finally:
         _STATE["suppress"] = False
         _STATE.pop("groups", None)
