@@ -20,6 +20,8 @@ from types import SimpleNamespace
 
 import torch
 
+from megatron.lite.primitive.parallel.linear import _EmbeddingAccumulatingIntoMainGrad
+
 from . import attention as A
 from .engram import engram
 from .mhc import collapse, joint, post_mix
@@ -185,7 +187,10 @@ def model_forward(
     ``attn_mixes``, ``ffn_mixes``, ``attn``, ``engram`` (or None).
     ``moe(x, ids, layer)``, ``engram_rows(layer)`` and ``core(**kw)`` are callables.
     """
-    embedding = params.embed[ids]
+    # Lookup whose backward accumulates into the FP32 main_grad (as the native embedding
+    # does) instead of a per-rank BF16 grad: under CP each rank's partial sum would be
+    # rounded to BF16 before the cross-rank reduction.
+    embedding = _EmbeddingAccumulatingIntoMainGrad.apply(params.embed, ids)
     keep = (ids != IMAGE_SENTINEL) if keep is None else keep & (ids != IMAGE_SENTINEL)
     tap("embed.out", embedding)
     carry = embedding
