@@ -127,6 +127,13 @@ if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
   )
 fi
 
+# Actor numerics switches reach every Ray actor through the job runtime_env, not only through
+# whatever environment the Ray cluster was started with (actors log the values they see).
+RAY_ENV_ARGS=()
+for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS VERL_MLITE_VAL_MAX_TOKENS; do
+  [[ -n "${!key:-}" ]] && RAY_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${key}=${!key}")
+done
+
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
 CAPTURE="[6,12,18,24,30,36,48,60,72,96,120,144,192,240,288,384,480,576,768,1020,1536,2046,3072,4092,6144,8190]"
 REPLAY="[6,12,18,24,30,36,48,60,72,96,120,144,192,240,288,384,480,576,768,1020,1536,2048,2304,2560,2816,3072,3328,3584,3840,4096]"
@@ -265,6 +272,7 @@ COMMAND=(
   "+reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0"
   "+reward.reward_kwargs.overlong_buffer_cfg.log=False"
   "${OPTIM_ARGS[@]}"
+  "${RAY_ENV_ARGS[@]}"
   "$@"
 )
 
