@@ -7,7 +7,12 @@ import torch
 import torch.distributed as dist
 from torch import nn
 
-from megatron.lite.primitive.modules.lora import LinearLoRA, LoraConfig
+from megatron.lite.primitive.modules.lora import (
+    LinearLoRA,
+    LoraConfig,
+    lora_active,
+    register_lora_adapter_type,
+)
 from megatron.lite.primitive.modules.moe_lora import SharedOuterExpertLoRA, expand_shared_outer
 
 _ATTENTION = {
@@ -24,6 +29,7 @@ class GroupedLoRA(nn.Module):
 
     def __init__(self, groups, in_features, out_features, rank, scale):
         super().__init__()
+        self.disabled = False
         self.scale = scale
         self.lora_a = nn.Parameter(torch.empty(groups, rank, in_features))
         self.lora_b = nn.Parameter(torch.zeros(groups, out_features, rank))
@@ -66,16 +72,22 @@ def attach_lora(model, cfg, dtype):
                 lora = GroupedLoRA(groups, width, rank_out // groups, cfg.rank, cfg.scale)
                 attention.wo_a_lora = lora.to(dtype)
                 attention.core_attention.register_forward_hook(
-                    lambda m, args, out, a=attention: setattr(a, "_wo_a_input", out)
+                    lambda m, args, out, a=attention: (
+                        setattr(a, "_wo_a_input", out) if lora_active(a.wo_a_lora) else None
+                    )
                 )
                 attention.linear_proj.register_forward_pre_hook(
                     lambda m, args, a=attention: (
-                        args[0]
-                        + a.wo_a_lora(
-                            a.__dict__.pop("_wo_a_input").reshape(*args[0].shape[:-1], -1)
-                        ),
+                        args
+                        if not lora_active(a.wo_a_lora)
+                        else (
+                            args[0]
+                            + a.wo_a_lora(
+                                a.__dict__.pop("_wo_a_input").reshape(*args[0].shape[:-1], -1)
+                            ),
+                        )
+                        + args[1:]
                     )
-                    + args[1:]
                 )
             if "shared_experts" in targets:
                 out, width = shared.linear_fc1.weight.shape
@@ -83,8 +95,25 @@ def attach_lora(model, cfg, dtype):
                 shared.w1_lora, shared.w3_lora = (p.to(dtype) for p in pair)
                 shared.linear_fc1.register_forward_hook(
                     lambda m, args, out, s=shared: (
-                        out[0] + torch.cat((s.w1_lora(args[0]), s.w3_lora(args[0])), -1),
-                        *out[1:],
+                        out
+                        if not (lora_active(s.w1_lora) or lora_active(s.w3_lora))
+                        else (
+                            out[0]
+                            + torch.cat(
+                                tuple(
+                                    (
+                                        f(args[0])
+                                        if lora_active(f)
+                                        else out[0].new_zeros(
+                                            (*out[0].shape[:-1], out[0].shape[-1] // 2)
+                                        )
+                                    )
+                                    for f in (s.w1_lora, s.w3_lora)
+                                ),
+                                -1,
+                            ),
+                            *out[1:],
+                        )
                     )
                 )
                 _add(shared, "w2", shared.linear_fc2, cfg, dtype)
@@ -105,7 +134,9 @@ def _add(owner, name, base, cfg, dtype):
     out, width = base.weight.shape
     lora = LinearLoRA(width, out, cfg.rank, alpha=cfg.alpha).to(dtype)
     setattr(owner, f"{name}_lora", lora)
-    base.register_forward_hook(lambda m, args, out, f=lora: (out[0] + f(args[0]), *out[1:]))
+    base.register_forward_hook(
+        lambda m, args, out, f=lora: out if not lora_active(f) else (out[0] + f(args[0]), *out[1:])
+    )
 
 
 def lora_state(chunk):
@@ -204,3 +235,7 @@ def load_lora_dcp(chunks, path, ps):
     from megatron.core import dist_checkpointing
 
     dist_checkpointing.load(_lora_sharded(chunks, ps), str(path))
+
+
+register_lora_adapter_type(GroupedLoRA)
+register_lora_adapter_type(SharedOuterExpertLoRA)

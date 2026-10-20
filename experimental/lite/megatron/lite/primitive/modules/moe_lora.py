@@ -6,6 +6,7 @@ import torch
 from torch import nn
 
 from megatron.core.transformer.module import MegatronModule
+from megatron.lite.primitive.modules.lora import lora_active
 
 
 class SharedOuterExpertLoRA(MegatronModule):
@@ -15,6 +16,7 @@ class SharedOuterExpertLoRA(MegatronModule):
         super().__init__(config=config)
         if config.use_transformer_engine_op_fuser:
             raise ValueError("Expert LoRA hooks the unfused Core grouped linears")
+        self.disabled = False
         self.scale, self.rank = alpha / rank, rank
         self.offset = groups.ep.rank() * num_local_experts
         self.tp_group = groups.expt_tp  # explicit: Core's sharded state would read global mpu
@@ -52,10 +54,14 @@ class SharedOuterExpertLoRA(MegatronModule):
         """Add the deltas to a Core TEGroupedMLP's fc1(x, splits) and fc2(x, splits) outputs."""
         experts.lora = self
         experts.linear_fc1.register_forward_hook(
-            lambda m, args, out: (out[0] + self.fc1_delta(*args[:2]), *out[1:])
+            lambda m, args, out: (
+                out if not lora_active(self) else (out[0] + self.fc1_delta(*args[:2]), *out[1:])
+            )
         )
         experts.linear_fc2.register_forward_hook(
-            lambda m, args, out: (out[0] + self.fc2_delta(*args[:2]), *out[1:])
+            lambda m, args, out: (
+                out if not lora_active(self) else (out[0] + self.fc2_delta(*args[:2]), *out[1:])
+            )
         )
 
     def fc1_delta(self, x, splits):

@@ -95,6 +95,14 @@ def test_zero_adapter_forward_matches_base(tmp_path, monkeypatch):
         )
 
 
+@pytest.mark.gpus(1)
+def test_disabled_nonzero_adapters_forward_matches_base(tmp_path, monkeypatch):
+    monkeypatch.setenv("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+    base = _run(tmp_path / "base", (1, 1, 1, None))
+    disabled = _run(tmp_path / "disabled", (1, 1, 1, None), impl=dict(lora=LORA), bypass=True)
+    assert torch.equal(base.view(torch.int32), disabled.view(torch.int32))
+
+
 def _spawn(root, world, case):
     root.mkdir()
     (root / "config.json").write_text(json.dumps(asdict(tiny_config())))

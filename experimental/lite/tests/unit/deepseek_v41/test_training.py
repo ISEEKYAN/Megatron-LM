@@ -2,6 +2,7 @@
 """Random small full-model gates; real Core/TE/FHT/FlashMLA, synthetic release-format weights, no downloaded weights."""
 import hashlib
 import json
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 
@@ -126,7 +127,7 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False, impl=None):
     return rt, handle, model, ps
 
 
-def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True):
+def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True, bypass=False):
     from megatron.lite.runtime.contracts import LossContext, PackedBatch
 
     torch.cuda.set_device(rank)
@@ -136,6 +137,11 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True)
     _initialize(model, ps, root)
     if impl and impl.get("lora") and seed:
         _seed_adapters(model)
+    stack = ExitStack()
+    if bypass:
+        from megatron.lite.primitive.modules.lora import disable_lora_adapters
+
+        assert stack.enter_context(disable_lora_adapters(model)) > 0
     if sft:
         handle._optimizer.reload_model_params()
     if not sft:
@@ -192,17 +198,18 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True)
         record["losses"] = losses
     record["peak_bytes"] = torch.cuda.max_memory_allocated()
     (Path(root) / f"rank-{rank}.json").write_text(json.dumps(record))
+    stack.close()
     dist.destroy_process_group()
 
 
-def _run(root, shape, sft=False, impl=None, seed=True):
+def _run(root, shape, sft=False, impl=None, seed=True, bypass=False):
     root.mkdir()
     (root / "config.json").write_text(json.dumps(asdict(tiny_config())))
     ep, cp, pp, recompute = shape
     world = max(ep, cp * pp)
     mp.start_processes(
         _worker,
-        (str(root), world, ep, cp, pp, recompute, sft, impl, seed),
+        (str(root), world, ep, cp, pp, recompute, sft, impl, seed, bypass),
         nprocs=world,
         start_method="spawn",
     )
