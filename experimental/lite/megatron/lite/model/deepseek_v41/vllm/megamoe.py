@@ -185,7 +185,7 @@ def _requant_l2(h):
     """The kernel's L1-epilogue requant of the FP32 activation, decoded: 1x32 groups, UE8M0
     scale = smallest power of two with amax / scale <= 448 (DeepGEMM ``get_ue8m0_sf_exp``,
     exponent floor 2^-22), E4M3 round-to-nearest-even."""
-    groups = h.detach().float().reshape(*h.shape[:-1], -1, 32)
+    groups = h.detach().float().reshape(*h.shape[:-1], h.shape[-1] // 32, 32)
     bits = groups.abs().amax(-1, keepdim=True).view(torch.int32).to(torch.int64)
     exp = torch.clamp((bits + 0x7FFFFF - 0x600000) >> 23, min=113) - 8
     codes = (groups * torch.exp2((127 - exp).float())).to(torch.float8_e4m3fn)

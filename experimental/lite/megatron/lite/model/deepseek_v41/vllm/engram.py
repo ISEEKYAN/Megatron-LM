@@ -15,11 +15,12 @@ from .linear import linear
 CLAMP = 1e-6
 
 
-def _reference(hidden, kv, q_weight, k_weight, mask, eps):
+def reference(hidden, kv, q_weight, k_weight, eps, mask):
+    """FP32 gate and residual add of the post-wkv kernel; ``mask`` False rows pass through."""
     copies, dim = hidden.shape[-2:]
     h = hidden.float()
-    key = kv[:, : copies * dim].float().unflatten(-1, (copies, dim))
-    value = kv[:, copies * dim :].float()
+    key = kv[..., : copies * dim].float().unflatten(-1, (copies, dim))
+    value = kv[..., copies * dim :].float()
     hidden_rms = torch.rsqrt(h.square().sum(-1) / dim + eps)
     key_rms = torch.rsqrt(key.square().sum(-1) / dim + eps)
     dot = (h * q_weight.float() * k_weight.float() * key).sum(-1)
@@ -83,7 +84,7 @@ class _Gate(torch.autograd.Function):
             live = [
                 t.detach().requires_grad_(n) for t, n in zip((hidden, kv, q_weight, k_weight), need)
             ]
-            out = _reference(*live, mask, ctx.eps)
+            out = reference(*live, ctx.eps, mask)
             wanted = [t for t, n in zip(live, need) if n]
             grads = iter(torch.autograd.grad(out, wanted, grad.float(), allow_unused=True))
         result = [next(grads) if n else None for n in need]

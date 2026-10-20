@@ -32,6 +32,10 @@ def test_deployment_forward_runs_on_the_native_parameter_tree():
     assert DeepseekV41Model.set_input_tensor is NativeModel.set_input_tensor
     assert DeepseekV41Model.forward is not NativeModel.forward
     assert 'tracks.md' in DeepseekV41Model.deployment_providers['attention']
+    assert (
+        inspect.signature(DeepseekV41Model.forward).parameters['labels'].kind
+        is inspect.Parameter.KEYWORD_ONLY
+    )
 
 
 def test_packed_positions_restart_per_document():
