@@ -74,6 +74,15 @@ def test_subset_export_metadata_matches_saved_adapters(tmp_path, monkeypatch, ta
     assert config["target_modules"] == sorted(targets)
     assert set(saved) == {f"layers.0.attn.{t}.lora_{f}.weight" for t in targets for f in "AB"}
     assert all(any(f".attn.{t}.lora_" in k for k in saved) for t in config["target_modules"])
+    monkeypatch.setattr(dist, "get_world_size", lambda: 2)
+
+    def gather(parts, local):
+        parts[:] = [local, {k: v.clone() for k, v in local.items()}]
+        next(iter(parts[1].values())).flatten()[0] += 1
+
+    monkeypatch.setattr(dist, "all_gather_object", gather)
+    with pytest.raises(ValueError, match="factors differ before export"):
+        lora.save_lora_hf([model], tmp_path, cfg)
 
 
 @pytest.mark.gpus(1)

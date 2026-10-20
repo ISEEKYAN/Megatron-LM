@@ -1,12 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""DS4.1 LoRA on the attention projections and the shared/routed experts of a layer range.
-
-Adapters are sibling modules added to the frozen base outputs by forward hooks, so
-base parameter names (release mapping, DCP keys) are unchanged. ``wo_a`` is a raw
-grouped weight inside Core's forward: the core-attention output is tapped and the
-grouped delta is added to the ``wo_b`` (``linear_proj``) input, which is linear in it.
-Routed experts use the shared-outer expert LoRA primitive (verl#8257 structure).
-"""
+"""DS4.1 attention/shared/routed LoRA; hooks leave base parameter names unchanged."""
 import json
 from pathlib import Path
 
@@ -116,7 +109,6 @@ def _add(owner, name, base, cfg, dtype):
 
 
 def lora_state(chunk):
-    """This rank's adapter tensors under release-style names (the resync payload)."""
     while hasattr(chunk, "module"):
         chunk = chunk.module
     state = {}
@@ -159,11 +151,10 @@ def save_lora_hf(chunks, path, cfg):
     """PEFT-style safetensors of every stage's and expert's adapters, written by global rank 0."""
     from safetensors.torch import save_file
 
-    local = {k: v.detach().cpu() for chunk in chunks for k, v in lora_state(chunk).items()}
-    parts = [None] * dist.get_world_size()
-    dist.all_gather_object(parts, local)
+    from megatron.lite.model.deepseek_v41.lite.export import export_hf_weights
+
+    state = dict(export_hf_weights(chunks, None, None, target="lora"))
     if dist.get_rank() == 0:
-        state = {k: v for part in parts for k, v in part.items()}
         Path(path).mkdir(parents=True, exist_ok=True)
         save_file(state, str(Path(path) / "adapter_model.safetensors"))
         layers = sorted({int(k.split(".")[1]) for k in state})

@@ -1,11 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Shared-outer LoRA for Core grouped experts.
-
-Structure of verl-project/verl#8257 ``MuseSparkExpertsLoRA``: fc1 (gate_up) A and fc2
-(down) B are shared by all experts; fc1 B and fc2 A are per expert. The per-expert
-factors are Core TE grouped linears (``is_expert=True``): expert-parallel gradient
-reduction and EP-sharded checkpoints come from Core, one grouped GEMM per factor.
-"""
+"""Shared-outer routed LoRA: fc1 A / fc2 B replicated, other factors expert-sharded."""
 import math
 
 import torch
