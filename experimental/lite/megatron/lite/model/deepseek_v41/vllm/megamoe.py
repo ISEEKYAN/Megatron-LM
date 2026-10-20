@@ -16,6 +16,8 @@ EP group with Core's autograd collectives.
 
 import torch
 
+from .linear import accumulate_wgrad, tc_mm
+
 _BUFFERS = {}
 
 
@@ -155,7 +157,7 @@ def launch(x, weights, ids, packed, buffer, limit, ep_size):
 def _mx(w):
     from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
 
-    return dequantize_mxfp4(*quantize_mxfp4(w.detach().bfloat16())).float()
+    return dequantize_mxfp4(*quantize_mxfp4(w.detach().bfloat16())).bfloat16()  # exact
 
 
 def _fp8(w):
@@ -165,7 +167,7 @@ def _fp8(w):
     )
 
     codes, scale = quantize_block_fp8(w.detach().bfloat16(), (32, 32), scale_format="e8m0")
-    return dequantize_block_fp8(codes, scale, (32, 32)).float()
+    return dequantize_block_fp8(codes, scale, (32, 32)).bfloat16()  # exact
 
 
 def _swiglu(h, limit):
@@ -196,18 +198,24 @@ def _mlp_grads(a, score, grad, w1, w2, limit, need):
     """VJP of ``q(swiglu(bf16(a @ w1.T)) * score) @ w2.T`` over decoded operands, as the
     fused kernel computes it: the GEMM1 accumulator is rounded to BF16 before the clamp and
     SwiGLU, ``q`` is the FP8 requant of the FP32 activation (both identity STE).
-    Returns (da, dscore, dw1, dw2), None where unneeded."""
+    GEMMs take BF16 operands on tensor cores with FP32 accumulation (decoded operands are
+    exact in BF16). Returns FP32 (da, dscore, dw1, dw2), None where unneeded."""
+    need_a, need_s, need_w1, need_w2 = need
+    h = tc_mm(a, w1.T).float()
     with torch.enable_grad():
-        leaves = [t.detach().requires_grad_(n) for t, n in zip((a, score, w1, w2), need)]
-        a_, s_, w1_, w2_ = leaves
-        h = a_ @ w1_.T
-        h = h + (h.detach().bfloat16().float() - h).detach()
-        h = _swiglu(h, limit) * s_.unsqueeze(-1)
-        h = h + (_requant_l2(h) - h).detach()
-        y = h @ w2_.T
-        wanted = [t for t in leaves if t.requires_grad]
-        grads = iter(torch.autograd.grad(y, wanted, grad) if wanted else ())
-    return [next(grads) if n else None for n in need]
+        h_ = h.requires_grad_(need_a or need_w1)
+        s_ = score.detach().float().requires_grad_(need_s)
+        act = _swiglu(h_, limit) * s_.unsqueeze(-1)
+    dw2 = tc_mm(grad.T, _requant_l2(act), torch.float32) if need_w2 else None
+    dh = ds = None
+    wanted = [t for t in (h_, s_) if t.requires_grad]
+    if wanted:
+        grads = iter(torch.autograd.grad(act, wanted, tc_mm(grad, w2, torch.float32)))
+        dh = next(grads) if h_.requires_grad else None
+        ds = next(grads) if s_.requires_grad else None
+    da = tc_mm(dh, w1, torch.float32) if need_a else None
+    dw1 = tc_mm(dh.T, a, torch.float32) if need_w1 else None
+    return da, ds, dw1, dw2
 
 
 def _all_gather(x, group):
@@ -234,8 +242,9 @@ class _MegaMoE(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
-        """FP32 decoded-operand VJP, one expert at a time (bounded memory). With EP > 1
-        tokens/grads are all-gathered and input/score grads reduce-scattered back."""
+        """Decoded-operand VJP, one expert at a time (bounded memory). With EP > 1 tokens and
+        grads are all-gathered (BF16: what the tensor-core GEMMs consume) and input/score
+        grads reduce-scattered back (FP32). Expert weight gradients go to ``main_grad``."""
         x, weights, ids, *masters = ctx.saved_tensors
         group, _, limit, _, local = ctx.options
         need_x, need_w = ctx.needs_input_grad[:2]
@@ -262,13 +271,13 @@ class _MegaMoE(torch.autograd.Function):
                 torch.distributed.all_reduce(capacity, torch.distributed.ReduceOp.MAX, group=group)
                 pad = int(capacity) - rows
                 padded = lambda t, v=0: torch.nn.functional.pad(t, (0, 0, 0, pad), value=v)  # noqa: E731
-                a_all = _all_gather(padded(a), group)
-                g_all = _all_gather(padded(grad), group)
+                a_all = _all_gather(padded(a.bfloat16()), group)
+                g_all = _all_gather(padded(grad.bfloat16()), group)
                 w_all = _all_gather(padded(weights.float()), group)
                 ids_all = _all_gather(padded(ids, -1), group)
             else:
                 a_all, g_all, w_all, ids_all = a, grad, weights.float(), ids
-            da_all = torch.zeros_like(a_all)
+            da_all = torch.zeros(a_all.shape, dtype=torch.float32, device=a_all.device)
             dw_all = torch.zeros_like(w_all)
             flat = ids_all.flatten()
             dfc1, dfc2 = [None] * local, [None] * local
@@ -276,9 +285,9 @@ class _MegaMoE(torch.autograd.Function):
                 pos = (flat == rank * local + e).nonzero().flatten()
                 if not pos.numel():
                     if need_m[e]:
-                        dfc1[e] = torch.zeros_like(fc1[e])
+                        dfc1[e] = accumulate_wgrad((fc1[e],), None, fc1[e])
                     if need_m[local + e]:
-                        dfc2[e] = torch.zeros_like(fc2[e])
+                        dfc2[e] = accumulate_wgrad((fc2[e],), None, fc2[e])
                     continue
                 token = pos // k
                 da, dsc, d1, d2 = _mlp_grads(
@@ -294,8 +303,8 @@ class _MegaMoE(torch.autograd.Function):
                     da_all.index_add_(0, token, da)
                 if dsc is not None:
                     dw_all.view(-1)[pos] = dsc
-                dfc1[e] = None if d1 is None else d1.to(fc1[e].dtype)
-                dfc2[e] = None if d2 is None else d2.to(fc2[e].dtype)
+                dfc1[e] = None if d1 is None else accumulate_wgrad((fc1[e],), d1, fc1[e])
+                dfc2[e] = None if d2 is None else accumulate_wgrad((fc2[e],), d2, fc2[e])
             if world > 1:
                 da_all = _reduce_scatter(da_all, group)[:rows]
                 dw_all = _reduce_scatter(dw_all, group)[:rows]
@@ -308,8 +317,8 @@ class _MegaMoE(torch.autograd.Function):
             None,
             *dfc1,
             *dfc2,
-            None if dw1s is None else dw1s.to(s1.dtype),
-            None if dw2s is None else dw2s.to(s2.dtype),
+            None if dw1s is None else accumulate_wgrad((s1,), dw1s, s1),
+            None if dw2s is None else accumulate_wgrad((s2,), dw2s, s2),
         )
 
 

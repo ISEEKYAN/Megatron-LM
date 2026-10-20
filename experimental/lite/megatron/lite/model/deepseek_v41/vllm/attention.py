@@ -100,7 +100,7 @@ def projections(x, p, eps, fused=True):
     Returns q (fused layout, bf16 [T,64,512]), kv (bf16 [T,512], normed, no
     RoPE) and the shared Q quantization ``(q_decoded, codes, scales)``.
     """
-    qr_kv = linear(x, torch.cat((p.wq_a, p.wkv)), fp8=True)
+    qr_kv = linear(x, (p.wq_a, p.wkv), fp8=True)
     qr, kv = qr_kv.split((p.wq_a.shape[0], p.wkv.shape[0]), -1)
     q_dec, kv, codes, scales = _QKVNorm.apply(qr, kv, p.q_norm, p.kv_norm, eps)
     shared = SimpleNamespace(data=codes, scale=scales)
@@ -219,8 +219,7 @@ def compressor(x, positions, wkv, wgate, norm_weight, eps, ratio, cu_seqlens=Non
     """Per-token latent bf16 [T,512] (valid at ``(pos+1) % ratio == 0`` rows only).
 
     With ``cp`` the scores are gathered and the latent covers all ranks' rows."""
-    weight = wkv if wgate is None else torch.cat((wkv, wgate))
-    kv_score = linear(x, weight, fp8=False)
+    kv_score = linear(x, wkv if wgate is None else (wkv, wgate), fp8=False)
     if cp is not None:
         kv_score = _GatherRows.apply(kv_score, cp.group)
         positions = cp.positions
@@ -404,30 +403,30 @@ class _WoA(torch.autograd.Function):
             )
         decoded_w = dequantize_block_fp8(codes, block_scales, (32, 32)).to(torch.bfloat16)
         ctx.save_for_backward(data, scale, decoded_w, perm)
-        ctx.weight_shape, ctx.weight_dtype = weight.shape, weight.dtype
+        ctx.weight_shape, ctx.weight = weight.shape, weight
         return z
 
     @staticmethod
     def backward(ctx, grad):
+        from .linear import accumulate_wgrad, tc_mm
+
         data, scale, decoded_w, perm = ctx.saved_tensors
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            o = dequantize_output(data, scale).float()  # [T, 8, 4096] fused layout
-            w = decoded_w.float().view(GROUPS, -1, GROUPS * HEAD_DIM)  # [g, d, r]
-            g = grad.float()  # [T, g, d]
-            do = torch.einsum("bhd,hdr->bhr", g, w)
-            dw_fused = torch.einsum("bhd,bhr->hdr", g, o).reshape(-1, GROUPS * HEAD_DIM)
+            # Decoded FP8 output and weight are exact in BF16: tensor-core GEMMs, FP32 sums.
+            o = dequantize_output(data, scale).bfloat16()  # [T, 8, 4096] fused layout
+            w = decoded_w.view(GROUPS, -1, GROUPS * HEAD_DIM)  # [g, d, r]
+            g = grad.bfloat16()  # [T, g, d]
+            do = torch.stack([tc_mm(g[:, h], w[h]) for h in range(GROUPS)], 1)
+            dw_fused = torch.stack(
+                [tc_mm(g[:, h].T, o[:, h], torch.float32) for h in range(GROUPS)]
+            ).reshape(-1, GROUPS * HEAD_DIM)
             if perm is None:
                 dw = dw_fused
             else:
                 dw = torch.empty_like(dw_fused)
                 dw[:, perm] = dw_fused
-        return (
-            None,
-            None,
-            do.to(torch.bfloat16),
-            dw.reshape(ctx.weight_shape).to(ctx.weight_dtype),
-            None,
-        )
+        dw = dw.reshape(ctx.weight_shape)
+        return None, None, do, accumulate_wgrad((ctx.weight,), dw, ctx.weight), None
 
 
 def dequantize_output(data, scale):
