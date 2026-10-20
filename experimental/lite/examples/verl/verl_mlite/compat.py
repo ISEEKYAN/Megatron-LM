@@ -207,6 +207,18 @@ def _install_vllm_triton_kernels_alias() -> bool:
     return True
 
 
+def _load_vllm_flashmla_first() -> bool:
+    """Load vLLM's FlashMLA before Megatron Core imports pip ``flash_mla``.
+
+    The two extensions share kernel symbols and the first loaded serves both;
+    see ``megatron.lite.model.deepseek_v41.vllm.load_vllm_flashmla``.
+    """
+    if os.environ.get("DSV41_ATTENTION_CORE") != "flashmla" or not _vllm_importable():
+        return False
+    importlib.import_module("vllm.v1.attention.ops.flashmla")
+    return True
+
+
 def _vllm_site_pythonpath_prefixes(site: str) -> list[str]:
     """Extra PYTHONPATH entries a rollout overlay needs ahead of its site root.
 
@@ -1765,6 +1777,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("04.vllm_triton_kernels_alias", result)
     result = _patch_verl_vllm_device_uuid()
     _trace_runtime_patch("05.verl_vllm_device_uuid", result)
+    result = _load_vllm_flashmla_first()
+    _trace_runtime_patch("05b.vllm_flashmla_first", result)
     # Importing VERL's vLLM utilities can rebuild Transformers' lazy top-level
     # module, which drops compatibility attributes installed on the old module.
     result = _patch_transformers_vision2seq_alias()

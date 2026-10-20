@@ -13,6 +13,8 @@ step 2^-8) inside sums of 128-640 terms, so its expected error is a few 1e-3;
 """
 
 import os
+import subprocess
+import sys
 
 import pytest
 import torch
@@ -396,3 +398,49 @@ def test_cp2_matches_cp1(cr, tmp_path):
         assert report["data_equal"] and report["scale_equal"] and report["dq_equal_cp1"]
         for name, m in report["vs_ref"].items():
             assert m["rel_l2"] <= REL_L2 and abs(m["norm_ratio"] - 1) <= NORM_RATIO, (name, m)
+
+
+_LOAD_ORDER = r"""
+import importlib, sys
+import torch
+from _flashmla_fixture import make_inputs, v41_rope
+from megatron.lite.model.deepseek_v41.vllm import flashmla_attention as m, load_vllm_flashmla
+if sys.argv[1] == "vllm_first":
+    load_vllm_flashmla()
+importlib.import_module("megatron.core.transformer.attention")
+assert "flash_mla.cuda" in sys.modules
+x = make_inputs([600], 2, seed=3, device=torch.device("cuda"))
+try:
+    m.flashmla_attention_core(
+        x.q, x.kv, x.latent, x.topk, x.positions, x.sink, m.FlashMLALayerConfig(2),
+        v41_rope(2, torch.device("cuda")),
+    )
+    torch.cuda.synchronize()
+    print("RESULT ok")
+except RuntimeError as exc:
+    print("RESULT", exc)
+"""
+
+
+@pytest.mark.gpus(1, min_architecture="blackwell")
+@pytest.mark.parametrize("order", ["vllm_first", "megatron_first"])
+def test_core_runs_beside_megatron_flash_mla(order):
+    """pip ``flash_mla`` (loaded by Megatron Core) and vLLM's FlashMLA share kernel
+    symbols and the first loaded serves both: with vLLM's loaded first the core
+    runs in a process that also imports Megatron's attention; the other order
+    fails at entry with an actionable error, not inside the kernel."""
+    env = {**os.environ, "VLLM_BATCH_INVARIANT": "1"}
+    env["PYTHONPATH"] = os.pathsep.join([os.path.dirname(__file__), env.get("PYTHONPATH", "")])
+    out = subprocess.run(
+        [sys.executable, "-c", _LOAD_ORDER, order],
+        env=env,
+        capture_output=True,
+        text=True,
+        timeout=600,
+    )
+    result = [line for line in out.stdout.splitlines() if line.startswith("RESULT")]
+    assert result, out.stderr[-2000:]
+    if order == "vllm_first":
+        assert result[-1] == "RESULT ok"
+    else:
+        assert "pip flash_mla was loaded before vLLM's FlashMLA" in result[-1]
