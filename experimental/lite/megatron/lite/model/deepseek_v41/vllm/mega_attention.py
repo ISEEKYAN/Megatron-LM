@@ -327,7 +327,10 @@ def _extension():
 
         _EXTENSION = load(
             name="ds41_mega_attention_bwd",
-            sources=[str(Path(__file__).with_name("csrc") / "mega_attention_bwd.cu")],
+            sources=[
+                str(Path(__file__).with_name("csrc") / name)
+                for name in ("mega_attention_bwd.cu", "mega_attention_bwd_sm100.cu")
+            ],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a"],
             verbose=False,
         )
@@ -339,6 +342,9 @@ def _extension():
 # atomics. Partials are bounded by DETERMINISTIC_PARTIAL_BYTES per row chunk.
 DETERMINISTIC_DKV = os.environ.get("DS41_MEGA_ATTN_DETERMINISTIC", "0") == "1"
 DETERMINISTIC_PARTIAL_BYTES = 1 << 30
+# Backward kernel: "umma" (tcgen05 + TMA gather4) or "mma" (mma.sync), same
+# contract; kept selectable for A/B.
+BACKWARD_KERNEL = os.environ.get("DS41_MEGA_ATTN_BWD_KERNEL", "umma")
 
 
 def _segments(indices, lens, kv_rows, chunk_rows):
@@ -363,7 +369,8 @@ def _segments(indices, lens, kv_rows, chunk_rows):
 
 
 def attention_backward_kernel(
-    q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale, deterministic=None
+    q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale, deterministic=None,
+    kernel=None,
 ):
     """Owned VJP of the mega kernel's attention, RoPE and layouts included.
 
@@ -383,7 +390,11 @@ def attention_backward_kernel(
     chunk_rows = max(1, DETERMINISTIC_PARTIAL_BYTES // (indices.shape[1] * HEAD_DIM * 2))
     if deterministic and q.shape[0]:
         starts, order = _segments(indices, lens, kv.shape[0], chunk_rows)
-    _extension().backward(
+    kernel = BACKWARD_KERNEL if kernel is None else kernel
+    if kernel not in ("umma", "mma"):
+        raise ValueError(f"unknown mega attention backward kernel {kernel!r}")
+    ext = _extension()
+    (ext.backward_sm100 if kernel == "umma" else ext.backward)(
         q.contiguous(),
         grad.bfloat16().contiguous(),
         positions.to(torch.int32).contiguous(),

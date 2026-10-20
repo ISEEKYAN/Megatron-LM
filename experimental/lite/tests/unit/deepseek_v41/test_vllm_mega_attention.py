@@ -586,6 +586,27 @@ def test_deterministic_dkv_is_bitwise_and_matches_atomics(ratio, monkeypatch):
         assert _metrics(getattr(a, name), getattr(atomic, name))["rel_l2"] < bar, name
 
 
+@pytest.mark.parametrize("ratio", [0, 2, 1])
+def test_umma_kernel_matches_mma_kernel(ratio, monkeypatch):
+    """The tcgen05 backward agrees with the mma.sync one up to summation order."""
+    from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
+
+    docs = [0, 700, 701, 2048]
+    x = _inputs(docs[-1], ratio, seed=19, docs=docs)
+    x.swa_kv = x.swa_kv.float()
+    if ratio:
+        x.latent = x.latent.float()
+    grad = _upstream(docs[-1], torch.Generator(device="cuda").manual_seed(19), "dense")
+    monkeypatch.setattr(mega, "BACKWARD_KERNEL", "umma")
+    _, umma = _grads(x, grad)
+    monkeypatch.setattr(mega, "BACKWARD_KERNEL", "mma")
+    _, mma = _grads(x, grad)
+    bars = {"dq": 1e-3, "dswa": 1e-4, "dlatent": 1e-4, "dsink": 1e-5}
+    for name in ("dq", "dswa", "dsink") + (("dlatent",) if ratio else ()):
+        m = _metrics(getattr(umma, name), getattr(mma, name))
+        assert m["rel_l2"] < bars[name], (name, m)
+
+
 def test_deterministic_dkv_matches_fp64_reference(monkeypatch):
     from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
 
