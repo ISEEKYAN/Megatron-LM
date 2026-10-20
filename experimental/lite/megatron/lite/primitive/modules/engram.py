@@ -6,7 +6,6 @@ from types import SimpleNamespace
 import numpy as np
 import torch
 from torch import nn
-from torch.nn import functional as F
 
 from megatron.core.tensor_parallel.mappings import (
     async_gather_from_sequence_parallel_region,
@@ -142,7 +141,7 @@ class ShardedFrozenTable(nn.Module):
                 ids.new_tensor([rows]), group=self.group
             )
             maximum = int(sizes.wait().max())
-            padded = F.pad(ids, (0, 0, 0, maximum - rows))
+            padded = torch.cat([ids, ids.new_zeros(maximum - rows, *ids.shape[1:])])
             ids = async_gather_from_sequence_parallel_region(padded, group=self.group).wait()
         begin, end = self.embedding.lookup.boundaries[self.group.rank() : self.group.rank() + 2]
         local = ids - begin
