@@ -41,3 +41,27 @@ def test_hash_routing_requires_real_ids_before_native_kernel_import():
     router = SimpleNamespace(tid2eid=torch.zeros(2, 1), is_hash_layer=True)
     with pytest.raises(ValueError, match='actual packed'):
         route(torch.zeros(1, 2), router, None)
+
+
+@pytest.mark.parametrize("rows", [0, 3])
+def test_activation_decode_accepts_empty_chunks(rows):
+    """MegaMoE runs the same chunk count on every EP rank, so a rank's last chunk may be empty."""
+    from megatron.lite.model.deepseek_v41.vllm.experts import dequantize_activation
+
+    scale = torch.exp2(torch.arange(rows * 4, dtype=torch.float32).reshape(rows, 4) - 3)
+    codes = torch.linspace(-2, 2, rows * 128).reshape(rows, 128).to(torch.float8_e4m3fn)
+    out = dequantize_activation(codes, scale)
+    assert out.shape == (rows, 128)
+    expected = codes.float().reshape(rows, 4, 32) * scale.unsqueeze(-1)
+    assert torch.equal(out, expected.reshape(rows, 128))
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_l2_requant_accepts_empty_chunks(rows):
+    from megatron.lite.model.deepseek_v41.vllm.megamoe import _requant_l2
+
+    h = torch.linspace(-600, 600, rows * 64).reshape(rows, 64)
+    out = _requant_l2(h)
+    assert out.shape == h.shape
+    if rows:
+        assert out.abs().max() <= 600 and torch.isfinite(out).all()

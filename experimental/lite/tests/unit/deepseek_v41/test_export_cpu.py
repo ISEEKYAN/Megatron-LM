@@ -23,6 +23,7 @@ NAMES = [
     ("layers.3.attention.core_attention.native.attn_sink", ["layers.3.attn.attn_sink"],
      torch.float32),
     ("layers.3.ffn.router.expert_bias", ["layers.3.ffn.gate.bias"], torch.float32),
+    ("layers.3.ffn.router.bias_vl", ["layers.3.ffn.gate.bias_vl"], torch.float32),
     ("layers.3.attn_mixes.mapping_proj.weight", ["layers.3.hc_attn_fn"], torch.float32),
     ("layers.3.ffn_mixes.alpha_post", ["layers.3.hc_ffn_scale#1"], torch.float32),
     ("engrams.14.wkv.weight", ["layers.14.engram.wkv.weight"], "fp8_block"),
@@ -60,3 +61,15 @@ def test_block_fp8_export_decodes_to_master():
     # onto a power-of-two boundary): bytes differ, decoded values do not.
     (_, codes2), (_, scale2) = to_release("layers.0.attn.wq_a.weight", decoded.bfloat16())
     assert torch.equal(dequantize_block_fp8(codes2, scale2, (32, 32)), decoded)
+
+
+def test_router_biases_are_the_exported_persistent_buffers():
+    """bias_vl must reach the rollout on every resync: layerwise reload restores only what is sent."""
+    from megatron.lite.model.deepseek_v41.lite.export import DeepseekV41WeightSpec
+
+    keys = ("layers.3.ffn.router.expert_bias", "layers.3.ffn.router.bias_vl", "hash.x")
+    plan = DeepseekV41WeightSpec(None).load_weight_map(None, None, keys)
+    assert plan == {
+        "layers.3.ffn.router.expert_bias": ["layers.3.ffn.gate.bias"],
+        "layers.3.ffn.router.bias_vl": ["layers.3.ffn.gate.bias_vl"],
+    }

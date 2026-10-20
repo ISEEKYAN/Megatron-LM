@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import math
 import os
+import sys
 import weakref
 from enum import Enum
 from types import SimpleNamespace
@@ -81,6 +82,29 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
         or str(pad_mode) in {"no_padding", "DatasetPadMode.NO_PADDING"}
     )
 
+
+
+# Environment that changes actor numerics; logged by key, never the whole environment.
+_ACTOR_ENV_KEYS = ("DS41_MEGA_ATTN_DETERMINISTIC", "DS41_MEGA_ATTN_BWD_KERNEL", "DSV41_MEGAMOE_MAX_TOKENS")
+_actor_env_logged = False
+
+
+def _log_actor_env_once() -> None:
+    """Record the numerics switches this actor actually runs with (after the first forward)."""
+    global _actor_env_logged
+    if _actor_env_logged:
+        return
+    _actor_env_logged = True
+    env = " ".join(f"{k}={os.environ.get(k)}" for k in _ACTOR_ENV_KEYS)
+    mega = sys.modules.get("megatron.lite.model.deepseek_v41.vllm.mega_attention")
+    used = (
+        f" mega_attention.DETERMINISTIC_DKV={getattr(mega, 'DETERMINISTIC_DKV', None)}"
+        f" BACKWARD_KERNEL={getattr(mega, 'BACKWARD_KERNEL', None)}"
+        if mega is not None
+        else " mega_attention=not-imported"
+    )
+    rank = dist.get_rank() if dist.is_initialized() else -1
+    print(f"verl_mlite actor env rank={rank} {env}{used}", flush=True)
 
 class _MegatronLiteLRScheduler:
     def __init__(
@@ -379,6 +403,7 @@ class MegatronLiteEngine(BaseEngine):
             loss_function=loss_function,
             forward_only=forward_only,
         )
+        _log_actor_env_once()
         if forward_only:
             c8_probe.pack_ab(self, data, loss_function, result)
         return result

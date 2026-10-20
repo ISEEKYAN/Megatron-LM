@@ -30,6 +30,64 @@ def test_forward_step_rows_are_original_unpadded_rows(rank):
     assert output["valid_mask"].sum() == (4 if rank == 0 else 5)
 
 
+class _TokenLogProbs(torch.nn.Module):
+    """log_prob of a token = weight[token id]; the loss is the local mean, as both DS4.1 models."""
+
+    def __init__(self, weight, ps):
+        super().__init__()
+        self.weight, self.ps = weight, ps
+
+    def forward(self, input_ids, loss_mask, **_):
+        log_probs = self.weight[input_ids.reshape(-1)]
+        mask = loss_mask.reshape(-1).to(log_probs.dtype)
+        return {"log_probs": log_probs, "loss": -(log_probs * mask).sum() / mask.sum().clamp_min(1)}
+
+
+def _cp_loss_worker(rank, path, results, denominator):
+    import torch.distributed as dist
+
+    from megatron.lite.runtime.contracts.loss import LossContext, use_loss_context
+
+    dist.init_process_group("gloo", init_method=f"file://{path}", rank=rank, world_size=2)
+    try:
+        weight = torch.linspace(-3, -1, 12, dtype=torch.float64).requires_grad_()
+        ps = SimpleNamespace(cp_size=2, cp_rank=rank, cp_group=dist.group.WORLD)
+        ids = torch.arange(12)
+        with use_loss_context(LossContext(normalization_denominator=denominator)):
+            loss = forward_step(_TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))[
+                "loss"
+            ]
+        loss.backward()
+        results[rank] = (loss.detach(), weight.grad.clone())
+    finally:
+        dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("denominator", [None, 7.0])
+def test_forward_step_cp_loss_and_grads_match_cp1(tmp_path, denominator):
+    """DDP averages over CP ranks: the CP2 mean of loss and gradients must equal CP=1."""
+    import torch.multiprocessing as mp
+
+    from megatron.lite.runtime.contracts.loss import LossContext, use_loss_context
+
+    weight = torch.linspace(-3, -1, 12, dtype=torch.float64).requires_grad_()
+    ids = torch.arange(12)
+    ps = SimpleNamespace(cp_size=1, cp_rank=0, cp_group=None)
+    with use_loss_context(LossContext(normalization_denominator=denominator)):
+        expected = forward_step(_TokenLogProbs(weight, ps), PackedBatch(ids, ids, torch.tensor([5, 1, 6])))[
+            "loss"
+        ]
+    expected.backward()
+
+    results = mp.Manager().dict()
+    mp.spawn(_cp_loss_worker, args=(str(tmp_path / "store"), results, denominator), nprocs=2)
+    loss = (results[0][0] + results[1][0]) / 2
+    grad = (results[0][1] + results[1][1]) / 2
+    torch.testing.assert_close(loss, expected.detach(), rtol=1e-12, atol=0)
+    torch.testing.assert_close(grad, weight.grad, rtol=1e-12, atol=0)
+    assert weight.grad.ne(0).sum() == 9  # 12 tokens, each document's last token is unlabelled
+
+
 def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     names = [
         "layers.0.attn_norm.weight",
@@ -67,6 +125,11 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     )
     with pytest.raises(ValueError, match="equal Core row shards"):
         _sharded_state(unequal, "", (), None, {})
+    from megatron.lite.primitive.modules.engram import ShardedFrozenTable
+
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    frozen = ShardedFrozenTable(4, 32, group, initialize=False)
+    assert _sharded_state(frozen, "embed.", (), None, {}) == {}  # resume keeps the release
     unread = stage()
     del unread.embed  # a stage-local release key nobody reads
     with pytest.raises(ValueError, match=r"unread \['embed.weight'\]"):
@@ -83,6 +146,33 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
     with pytest.raises(ValueError, match="unread.*bias_vl_extra"):
         load_hf_weights(stage(), str(tmp_path), cfg, ps)
+
+
+def test_vision_router_bias_loads_bitwise_and_counts_as_read(tmp_path):
+    """A model that routes image sentinels reads ffn.gate.bias_vl as exact FP32."""
+    bias_vl = torch.tensor([1 + 2**-20, -3.0e-7, 0.125, 7.0], dtype=torch.float32)
+    tensors = {
+        "layers.0.ffn.gate.weight": torch.ones(4, 2, dtype=torch.bfloat16),
+        "layers.0.ffn.gate.bias": torch.full((4,), 0.5),
+        "layers.0.ffn.gate.bias_vl": bias_vl,
+    }
+    save_file(tensors, tmp_path / "a.safetensors")
+    index = {"weight_map": {n: "a.safetensors" for n in tensors}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    model, layer = torch.nn.Module(), torch.nn.Module()
+    layer.ffn = torch.nn.Module()
+    layer.ffn.router = torch.nn.Module()
+    layer.ffn.router.weight = torch.nn.Parameter(torch.zeros(4, 2, dtype=torch.bfloat16))
+    layer.ffn.router.register_buffer("expert_bias", torch.zeros(4))
+    layer.ffn.router.register_buffer("bias_vl", torch.zeros(4))
+    model.layers, model.local_layer_range = torch.nn.ModuleDict({"0": layer}), (0, 1)
+    model.layout = SimpleNamespace(has_embed=False, has_head=False)
+    cfg, ps = SimpleNamespace(n_routed_experts=1), SimpleNamespace(ep_size=1, ep_rank=0)
+    load_hf_weights(model, str(tmp_path), cfg, ps)
+    router = model.layers["0"].ffn.router
+    assert torch.equal(router.bias_vl.view(torch.int32), bias_vl.view(torch.int32))
+    assert torch.equal(router.expert_bias, torch.full((4,), 0.5))
 
 
 @pytest.mark.gpus(1)

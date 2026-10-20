@@ -691,6 +691,9 @@ def flashmla_attention_core(
     """
     if not q.is_cuda:
         raise RuntimeError("the FlashMLA training core needs CUDA tensors")
+    from . import load_vllm_flashmla
+
+    load_vllm_flashmla()
     assert rope_cache.dtype == torch.float32 and rope_cache.shape[-1] == layer_cfg.rope_dim
     assert positions.dtype == torch.int64
     if layer_cfg.compress_ratio == 0:

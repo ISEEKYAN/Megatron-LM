@@ -58,9 +58,12 @@ def source_name(name):
         return (
             prefix
             + "ffn.gate."
-            + {"weight": "weight", "expert_bias": "bias", "tid2eid": "tid2eid"}[
-                suffix.removeprefix("ffn.router.")
-            ]
+            + {
+                "weight": "weight",
+                "expert_bias": "bias",
+                "bias_vl": "bias_vl",
+                "tid2eid": "tid2eid",
+            }[suffix.removeprefix("ffn.router.")]
         )
     for group in ("attn", "ffn"):
         key = suffix.removeprefix(group + "_mixes.")
@@ -164,14 +167,15 @@ def _record_reads(reader):
 
 def _stage_keys(index, model, cfg, ps):
     """Release keys this pipeline stage and EP rank must consume."""
+    vision = any(n.endswith(".router.bias_vl") for n, _ in model.named_buffers())
     start, end = model.local_layer_range
     local = cfg.n_routed_experts // ps.ep_size
     top = {"embed.weight"} if model.layout.has_embed else set()
     top |= {"head.weight", "norm.weight"} if model.layout.has_head else set()
     keys = set()
     for key in index:
-        if re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", key):
-            continue  # Release vision-only router bias; text routing uses ffn.gate.bias.
+        if not vision and re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", key):
+            continue  # Image-sentinel router bias; read only by models that route with it.
         layer = re.match(r"layers\.(\d+)\.(?:ffn\.experts\.(\d+)\.)?", key)
         if layer is None:
             keys |= {key} & top
@@ -192,7 +196,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
     state += [
         (n, v)
         for n, v in model.named_buffers()
-        if n.endswith("expert_bias")
+        if n.endswith(("expert_bias", ".router.bias_vl"))
         or n.endswith(("embed.embedding.weight", "embed.embedding.scale"))
         or n.endswith("tid2eid")
     ]
@@ -243,14 +247,17 @@ def _local_tensors(module):
 def _sharded_state(module, prefix, offsets, ps, metadata):
     """Core sharded state for the DS4.1 tree.
 
-    Native Core modules describe themselves (expert offsets, TP axes). A module
-    whose rows are sharded over ``lookup.group`` (frozen Engram table) keeps each
-    rank's rows at their global offset. Other lite modules are replicated.
+    Native Core modules describe themselves (expert offsets, TP axes). Modules marked
+    ``restored_from_release`` (the frozen Engram tables) are left out. A module whose rows
+    are sharded over ``lookup.group`` keeps each rank's rows at their global offset.
+    Other lite modules are replicated.
     """
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.core.transformer.module import MegatronModule
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+    if getattr(module, "restored_from_release", False):
+        return {}  # frozen Engram table: resume keeps the bytes loaded from the release
     lookup = getattr(module, "lookup", None)
     if getattr(lookup, "group", None) is not None:
         size, rank = lookup.group.size(), lookup.group.rank()

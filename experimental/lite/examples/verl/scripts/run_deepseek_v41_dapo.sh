@@ -36,6 +36,9 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
+# Packed tokens per GPU micro-batch (track P): training 5120, log-prob 10240 (one full sequence).
+PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
+LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
 # Each Ray worker imports vLLM via the verl_mlite sitecustomize (~50 s); cap the prestarted pool.
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-null}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
@@ -49,6 +52,9 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. Needs vLLM
 # with 00474aeec6 (mega-attn load permutations on host; the post-sleep reload reads them).
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
+# True gives the n samples of a prompt the same seed (identical siblings, so val n=8 degenerates
+# to one sample per problem). False needs the bias_vl routing fix (d844ca37b).
+ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-False}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
@@ -113,6 +119,7 @@ RUN_NAME="${RUN_NAME:-ds41_dapo_${TOTAL_GPUS}gpu_ep${ACTOR_EP}_cp${ACTOR_CP}_dep
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-${OUTPUT_ROOT}/val_dump}"
 mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}"
 export VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 
@@ -123,6 +130,26 @@ if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
     "+actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_state_offload_chunk_size_mb=${OPTIMIZER_STATE_CHUNK_MB}"
   )
 fi
+
+# Actor numerics switches reach every Ray actor through the job runtime_env, not only through
+# whatever environment the Ray cluster was started with (actors log the values they see).
+# Trainer MegaMoE processes packed rows in blocks of this many tokens per rank (track P: 2048
+# keeps the 5120-token micro-batch in GPU memory; logprobs unchanged). vLLM does not read it.
+export DSV41_MEGAMOE_MAX_TOKENS="${DSV41_MEGAMOE_MAX_TOKENS:-2048}"
+# Mega-attention dKV with atomics (user decision); logprobs stay bitwise, gradients compared
+# within tolerance. 1 makes dKV run-to-run reproducible for debugging.
+export DS41_MEGA_ATTN_DETERMINISTIC="${DS41_MEGA_ATTN_DETERMINISTIC:-0}"
+# Checkpoint save host memory: stage GPU tensors one at a time through one pinned buffer
+# (<= 4 GiB) instead of the whole shard, and fsync + drop written pages every 1 GiB so the
+# page cache the cgroup and Ray account stays bounded.
+export MCORE_DIST_CKPT_STREAM_D2H="${MCORE_DIST_CKPT_STREAM_D2H:-1}"
+export MCORE_DIST_CKPT_DROP_CACHE_BYTES="${MCORE_DIST_CKPT_DROP_CACHE_BYTES:-1073741824}"
+RAY_ENV_ARGS=()
+for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS \
+  VERL_MLITE_VAL_MAX_TOKENS MCORE_DIST_CKPT_STREAM_D2H MCORE_DIST_CKPT_DROP_CACHE_BYTES; do
+  # Quoted: Ray requires string env values and Hydra would parse 1 as an int.
+  [[ -n "${!key:-}" ]] && RAY_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${key}='${!key}'")
+done
 
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
 CAPTURE="[6,12,18,24,30,36,48,60,72,96,120,144,192,240,288,384,480,576,768,1020,1536,2046,3072,4092,6144,8190]"
@@ -166,7 +193,7 @@ COMMAND=(
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.actor.use_dynamic_bsz=True"
-  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}"
   "actor_rollout_ref.actor.use_kl_loss=False"
   "actor_rollout_ref.actor.kl_loss_coef=0.0"
   "actor_rollout_ref.actor.entropy_coeff=0"
@@ -207,7 +234,7 @@ COMMAND=(
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
   "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
-  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN}"
   "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}"
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
@@ -226,7 +253,7 @@ COMMAND=(
   "actor_rollout_ref.rollout.load_format=auto"
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
-  "actor_rollout_ref.rollout.full_determinism=True"
+  "actor_rollout_ref.rollout.full_determinism=${ROLLOUT_FULL_DETERMINISM}"
   "+${VLLM}.compilation_config={cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
   "+${VLLM}.max_cudagraph_capture_size=8190"
   "+${VLLM}.attention_backend=FLASHMLA_MEGA_ATTN_DSV41"
@@ -255,12 +282,14 @@ COMMAND=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
   "trainer.log_val_generations=10"
+  "trainer.validation_data_dir=${VAL_DATA_DIR}"
   # reward (DAPO overlong shaping as in the DS4 recipe)
   "+reward.reward_kwargs.overlong_buffer_cfg.enable=True"
   "+reward.reward_kwargs.overlong_buffer_cfg.len=${OVERLONG_BUFFER_LEN}"
   "+reward.reward_kwargs.overlong_buffer_cfg.penalty_factor=1.0"
   "+reward.reward_kwargs.overlong_buffer_cfg.log=False"
   "${OPTIM_ARGS[@]}"
+  "${RAY_ENV_ARGS[@]}"
   "$@"
 )
 

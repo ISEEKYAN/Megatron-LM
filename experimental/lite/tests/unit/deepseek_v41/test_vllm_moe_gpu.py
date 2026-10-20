@@ -9,7 +9,7 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.gpus, pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')]
+pytestmark = [pytest.mark.gpus(1), pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')]
 
 
 def test_megamoe_module_matches_direct_fused_launch(tmp_path):
@@ -170,4 +170,93 @@ def test_megamoe_module_matches_direct_fused_launch(tmp_path):
             assert bias is None and not different.numel(), receipt
     finally:
         buffer.destroy()
+        dist.destroy_process_group()
+
+
+def test_megamoe_routes_image_sentinel_ids_with_bias_vl(tmp_path, monkeypatch):
+    """vLLM routes ids in [129264, 129269) with ffn.gate.bias_vl, sampled ids included.
+
+    Bug c8-rollout-tail-mismatch-distinct-siblings: MegaMoE routed them with the text
+    bias, so a sampled sentinel made every later rollout logprob differ.
+    """
+    from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
+    from megatron.core.transformer.transformer_config import TransformerConfig
+    from megatron.lite.model.deepseek_v41.lite.components.config import core_groups
+    from megatron.lite.model.deepseek_v41.vllm import megamoe
+    from megatron.lite.model.deepseek_v41.vllm.moe import MegaMoE
+    from megatron.lite.model.deepseek_v41.vllm.routing import mega_route
+    from megatron.lite.primitive.parallel import init_parallel
+    from megatron.lite.runtime.contracts import ParallelConfig
+
+    dist.init_process_group(
+        'nccl', init_method=f'file://{tmp_path / "group"}', rank=0, world_size=1
+    )
+    try:
+        ps = init_parallel(ParallelConfig())
+        h, e, k = 1024, 16, 6
+        cfg = TransformerConfig(
+            num_layers=1,
+            hidden_size=h,
+            num_attention_heads=8,
+            ffn_hidden_size=512,
+            num_moe_experts=e,
+            moe_ffn_hidden_size=512,
+            moe_shared_expert_intermediate_size=512,
+            moe_router_topk=k,
+            moe_router_score_function='sqrtsoftplus',
+            moe_router_pre_softmax=False,
+            moe_router_topk_scaling_factor=2.5,
+            moe_router_enable_expert_bias=True,
+            moe_router_load_balancing_type='none',
+            moe_grouped_gemm=True,
+            gated_linear_unit=True,
+            add_bias_linear=False,
+            params_dtype=torch.bfloat16,
+            bf16=True,
+            perform_initialization=False,
+        )
+        spec = get_mlp_module_spec(use_te=True, num_experts=e, moe_grouped_gemm=True)
+
+        def build(vision):
+            return MegaMoE(
+                cfg,
+                submodules=spec.keywords['submodules'],
+                layer_number=1,
+                pg_collection=core_groups(ps, SimpleNamespace(cp_size=1)),
+                hash_moe_layer_threshold=0,
+                vision_routing=vision,
+            ).cuda()
+
+        routed = {}
+
+        def capture(x, weights, indices, *args, **kwargs):
+            routed['ids'], routed['weights'] = indices, weights
+            return torch.zeros_like(x)
+
+        monkeypatch.setattr(megamoe, 'mega_moe', capture)
+        torch.manual_seed(5)
+        model = build(True)
+        assert not hasattr(build(False).router, 'bias_vl')
+        with torch.no_grad():
+            model.router.weight.copy_(torch.randn_like(model.router.weight) * 0.02)
+            model.router.expert_bias.copy_(torch.randn(e, device='cuda'))
+            # Far from the text bias: sentinel rows must land on experts 0..k-1.
+            model.router.bias_vl.copy_(-100 * torch.arange(e, device='cuda', dtype=torch.float32))
+        x = torch.randn(8, 1, h, device='cuda', dtype=torch.bfloat16)
+        tokens = torch.tensor(
+            [[129263], [129264], [129266], [129268], [129269], [5], [129267], [1]], device='cuda'
+        )
+        with pytest.raises(ValueError, match='token IDs'):
+            model(x)
+        model(x, input_ids=tokens)
+        image = (tokens.view(-1) >= 129264) & (tokens.view(-1) < 129269)
+        assert image.tolist() == [False, True, True, True, False, False, True, False]
+        for rows, bias in ((image, model.router.bias_vl), (~image, model.router.expert_bias)):
+            w, ids = mega_route(x.squeeze(1)[rows], model.router.weight, bias.float(), k, 2.5)
+            assert torch.equal(routed['ids'][rows], ids)
+            assert torch.equal(routed['weights'][rows].view(torch.int32), w.view(torch.int32))
+        assert torch.equal(
+            routed['ids'][image].sort(-1).values.cpu(), torch.arange(k).expand(4, k)
+        )
+    finally:
         dist.destroy_process_group()

@@ -81,9 +81,10 @@ class _Gate(torch.autograd.Function):
         hidden, kv, q_weight, k_weight, mask = ctx.saved_tensors
         need = ctx.needs_input_grad[:4]
         with torch.enable_grad(), torch.autocast(device_type=grad.device.type, enabled=False):
-            live = [
-                t.detach().requires_grad_(n) for t, n in zip((hidden, kv, q_weight, k_weight), need)
-            ]
+            # q/k leaves in FP32 (their BF16 values exactly): the gradient reaches the FP32
+            # masters without a BF16 rounding of the leaf gradient.
+            leaves = (hidden, kv, q_weight.float(), k_weight.float())
+            live = [t.detach().requires_grad_(n) for t, n in zip(leaves, need)]
             out = reference(*live, ctx.eps, mask)
             wanted = [t for t, n in zip(live, need) if n]
             grads = iter(torch.autograd.grad(out, wanted, grad.float(), allow_unused=True))

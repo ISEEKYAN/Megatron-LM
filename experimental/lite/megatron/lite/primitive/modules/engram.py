@@ -113,6 +113,9 @@ class ShardedFrozenTable(nn.Module):
     or dtype moves of the module leave the stored bytes on the host.
     """
 
+    # Frozen release bytes: training checkpoints skip them and resume keeps the release load.
+    restored_from_release = True
+
     def __init__(self, rows, width, group, *, block=32, initialize=True):
         super().__init__()
         if width % block:

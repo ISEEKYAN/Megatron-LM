@@ -1,5 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Gated table masking and the host FP8 row-sharded table: decode and checkpoint bytes."""
+"""Gated table masking and the host FP8 row-sharded table: decode, kept out of checkpoints."""
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -47,12 +47,13 @@ def _worker(rank, root):
     # The official decode: FP32 product per 32-wide block, then BF16.
     expected = full[ids].float().unflatten(-1, (-1, 32)) * scales[ids].float().unsqueeze(-1)
     assert torch.equal(table(ids), expected.flatten(-2).to(torch.bfloat16))
+    # The frozen release bytes stay out of training checkpoints; resume keeps the release load.
     module = torch.nn.Module()
-    module.embed, ps = table, SimpleNamespace(dp_cp_rank=rank, dp_cp_group=group)
-    attach_checkpoint_metadata([module], ps)
+    module.embed, module.proj = table, torch.nn.Linear(2, 2, bias=False).cuda()
+    attach_checkpoint_metadata([module], SimpleNamespace(dp_cp_rank=rank, dp_cp_group=group))
+    assert set(module.sharded_state_dict()) == {"proj.weight"}
     Path(root, "new").mkdir(exist_ok=True)  # both ranks
     dist_checkpointing.save(module.sharded_state_dict(), f"{root}/new")
-    weight.view(torch.uint8).zero_(), scale.view(torch.uint8).zero_()
     dist_checkpointing.load(module.sharded_state_dict(), f"{root}/new")
     assert all(
         torch.equal(a.view(torch.uint8), b.view(torch.uint8))
@@ -62,5 +63,5 @@ def _worker(rank, root):
 
 
 @pytest.mark.gpus(2, min_architecture="blackwell")
-def test_host_fp8_table_matches_the_official_decode_and_checkpoints_its_bytes(tmp_path):
+def test_host_fp8_table_matches_the_official_decode_and_stays_out_of_checkpoints(tmp_path):
     torch.multiprocessing.spawn(_worker, args=(str(tmp_path),), nprocs=2)

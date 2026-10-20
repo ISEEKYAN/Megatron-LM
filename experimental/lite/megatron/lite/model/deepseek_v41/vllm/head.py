@@ -3,6 +3,8 @@
 
 import torch
 
+from .linear import tc_mm
+
 
 def log_softmax(logits):
     if not logits.is_cuda:
@@ -26,9 +28,9 @@ def _compute_weight(hidden, weight):
 
 
 def _compute_weight_rows(hidden, weight, start, stop):
-    """FP32 value of ``_compute_weight`` for weight rows ``[start, stop)``."""
+    """``_compute_weight`` for weight rows ``[start, stop)``."""
     rows = weight[start:stop]
-    return rows.bfloat16().float() if hidden.is_cuda else rows.float()
+    return rows.bfloat16() if hidden.is_cuda else rows.float()
 
 
 def _project(hidden, compute):
@@ -97,14 +99,21 @@ class _HeadLogProbs(torch.autograd.Function):
         temperature, entropy, rows = ctx.options
         need_hidden, need_weight = ctx.needs_input_grad[:2]
         dhidden = torch.zeros_like(hidden) if need_hidden else None
-        # The only weight-sized buffer of backward; it becomes the gradient.
+        # CUDA: BF16 operands on tensor cores with FP32 accumulation (backward need not be
+        # batch-invariant); the weight gradient goes straight into an FP32 main_grad when
+        # DDP owns one, else into the only weight-sized FP32 buffer of backward.
+        tc = hidden.is_cuda
+        main = getattr(weight, "main_grad", None)
+        fused = tc and need_weight and main is not None and main.dtype == torch.float32
         dweight = (
-            torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
+            main
+            if fused
+            else torch.zeros(weight.shape, dtype=torch.float32, device=weight.device)
             if need_weight
             else None
         )
         if not (need_hidden or need_weight) or not hidden.shape[0]:
-            return dhidden, dweight, None, None, None, None
+            return dhidden, _weight_grad(weight, dweight, fused), None, None, None, None
         vocab = weight.shape[0]
         slices = [
             (start, min(start + HEAD_VOCAB_ROWS, vocab))
@@ -118,13 +127,12 @@ class _HeadLogProbs(torch.autograd.Function):
         with torch.autocast(device_type=hidden.device.type, enabled=False):
             for start in range(0, hidden.shape[0], rows):
                 stop = start + rows
-                block = hidden[start:stop].float()
-                logits = block.new_empty((block.shape[0], vocab))
+                block = hidden[start:stop].bfloat16() if tc else hidden[start:stop].float()
+                logits = block.new_empty((block.shape[0], vocab), dtype=torch.float32)
                 with torch.no_grad():
                     for v0, v1 in slices:
-                        logits[:, v0:v1] = (
-                            block @ _compute_weight_rows(hidden, weight, v0, v1).T
-                        ).bfloat16()
+                        w = _compute_weight_rows(hidden, weight, v0, v1)
+                        logits[:, v0:v1] = tc_mm(block, w.T) if tc else (block @ w.T).bfloat16()
                 logits.requires_grad_()
                 with torch.enable_grad():
                     outputs = _probabilities(logits, labels[start:stop], temperature, entropy)
@@ -139,17 +147,33 @@ class _HeadLogProbs(torch.autograd.Function):
                 del logits, outputs, pairs
                 # Same VJP as _BF16Linear, one block of rows and one slice of
                 # vocabulary at a time, accumulating in place.
-                dblock = block.new_zeros(block.shape) if need_hidden else None
+                dblock = block.new_zeros(block.shape, dtype=torch.float32) if need_hidden else None
                 for v0, v1 in slices:
+                    w = _compute_weight_rows(hidden, weight, v0, v1)
+                    if not tc:
+                        if need_hidden:
+                            dblock.addmm_(grad[:, v0:v1], w)
+                        if need_weight:
+                            dweight[v0:v1].addmm_(grad[:, v0:v1].T, block)
+                        continue
                     if need_hidden:
-                        dblock.addmm_(grad[:, v0:v1], _compute_weight_rows(hidden, weight, v0, v1))
+                        dblock += tc_mm(grad[:, v0:v1], w, torch.float32)
                     if need_weight:
-                        dweight[v0:v1].addmm_(grad[:, v0:v1].T, block)
+                        dweight[v0:v1] += tc_mm(grad[:, v0:v1].T, block, torch.float32)
                 if need_hidden:
                     dhidden[start:stop] = dblock.to(hidden.dtype)
-        if dweight is not None and weight.dtype != torch.float32:
-            dweight = dweight.to(weight.dtype)
-        return dhidden, dweight, None, None, None, None
+        return dhidden, _weight_grad(weight, dweight, fused), None, None, None, None
+
+
+def _weight_grad(weight, dweight, fused):
+    if dweight is None:
+        return None
+    if fused:
+        from megatron.lite.primitive.parallel.linear import _dummy_wgrad
+
+        weight.grad_added_to_main_grad = True
+        return _dummy_wgrad(weight)
+    return dweight if weight.dtype == torch.float32 else dweight.to(weight.dtype)
 
 
 def head_log_probs(hidden, weight, labels, temperature, *, entropy, rows=None):

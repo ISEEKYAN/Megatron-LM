@@ -459,6 +459,15 @@ __global__ void segment_reduce_kernel(const int64_t* __restrict__ starts,
 
 }  // namespace
 
+// dkv += the fixed-order sums of chunk `chunk_index`'s bf16 partials.
+void segment_reduce(const torch::Tensor& starts, const torch::Tensor& order, int64_t chunk_index,
+                    int64_t flat0, const torch::Tensor& partial, torch::Tensor& dkv) {
+  segment_reduce_kernel<<<dkv.size(0), 128, 0, c10::cuda::getCurrentCUDAStream()>>>(
+      starts.data_ptr<int64_t>() + chunk_index * dkv.size(0), order.data_ptr<int64_t>(), flat0,
+      reinterpret_cast<const __nv_bfloat16*>(partial.data_ptr()), dkv.data_ptr<float>());
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
 void backward(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
               torch::Tensor cos_sin, torch::Tensor kv, torch::Tensor indices, torch::Tensor lens,
               torch::Tensor lse2, double scale, torch::Tensor dq, torch::Tensor dkv,
@@ -518,14 +527,17 @@ void backward(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
         delta.data_ptr<float>(), (int)row0, (int)row1, scratch.data_ptr<float>(),
         deterministic ? reinterpret_cast<__nv_bfloat16*>(partial.data_ptr()) : nullptr);
     C10_CUDA_KERNEL_LAUNCH_CHECK();
-    if (deterministic) {
-      segment_reduce_kernel<<<kv.size(0), 128, 0, stream>>>(
-          starts.data_ptr<int64_t>() + c * kv.size(0), order.data_ptr<int64_t>(),
-          row0 * indices.stride(0), reinterpret_cast<const __nv_bfloat16*>(partial.data_ptr()),
-          dkv.data_ptr<float>());
-      C10_CUDA_KERNEL_LAUNCH_CHECK();
-    }
+    if (deterministic) segment_reduce(starts, order, c, row0 * indices.stride(0), partial, dkv);
   }
 }
 
-PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) { m.def("backward", &backward); }
+void backward_sm100(torch::Tensor q, torch::Tensor grad, torch::Tensor positions,
+                    torch::Tensor cos_sin, torch::Tensor kv, torch::Tensor indices,
+                    torch::Tensor lens, torch::Tensor lse2, double scale, torch::Tensor dq,
+                    torch::Tensor dkv, torch::Tensor delta, torch::Tensor starts,
+                    torch::Tensor order, int64_t chunk_rows);
+
+PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
+  m.def("backward", &backward);
+  m.def("backward_sm100", &backward_sm100);
+}
