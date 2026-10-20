@@ -167,9 +167,9 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True,
                 handle,
                 iter([(batch, LossContext(return_log_probs=True))]),
                 loss_fn=loss_fn,
-                forward_only=not enabled,
+                forward_only=not enabled or bypass,
             )
-        if enabled:
+        if enabled and not bypass:
             grads = {
                 n: p.main_grad if hasattr(p, "main_grad") else p.grad
                 for n, p in model.named_parameters()
