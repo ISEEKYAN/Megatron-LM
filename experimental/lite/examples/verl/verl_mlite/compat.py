@@ -1042,10 +1042,10 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
 def _patch_vllm_rollout_sleep_level() -> bool:
     """Pin the hybrid rollout sleep level (``VERL_MLITE_ROLLOUT_SLEEP_LEVEL``).
 
-    Level 2 discards every GPU weight and relies on the actor sync to restore
-    them. DS4.1 syncs only the trained tensors: frozen Engram tables, the dspark
-    drafter and derived buffers come from the release load, so they must survive
-    sleep (level 1).
+    Level 1 backs every GPU weight up to host; level 2 discards them and relies on
+    the actor sync. DS4.1 syncs only the trained tensors (Engram tables are host
+    memory and survive either level), so level 2 needs the dspark drafter kept via
+    vLLM ``sleep_preserve_parameter_names=['draft.*']``.
     """
     level = os.environ.get("VERL_MLITE_ROLLOUT_SLEEP_LEVEL", "").strip()
     if level not in ("1", "2") or not _vllm_importable():
@@ -1064,6 +1064,104 @@ def _patch_vllm_rollout_sleep_level() -> bool:
 
     _sleep_hybrid._verl_mlite_level = level
     cls._sleep_hybrid = _sleep_hybrid
+    return True
+
+
+def _weights_pool_gaps(worker):
+    """Byte ranges of the CuMem ``weights`` pool not covered by target-model parameter storage.
+
+    Level-2 sleep discards the whole pool, but only the target parameters are rewritten by the
+    per-step sync; everything else there (drafter weights, ``bias_vl``-style untrained params,
+    rope caches, index maps, packed tables, speculator state allocated during load) must be kept.
+    """
+    from vllm.device_allocator.cumem import CuMemAllocator
+
+    pool = sorted(
+        (int(d.handle[2]), int(d.handle[1]))
+        for d in CuMemAllocator.get_instance().pointer_to_data.values()
+        if d.tag == "weights"
+    )
+    synced = []
+    for name, param in worker.model_runner.model.named_parameters():
+        if param.is_cuda and not name.endswith("bias_vl"):
+            st = param.untyped_storage()
+            if st.nbytes():
+                synced.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    synced.sort()
+    gaps, i = [], 0
+    for base, size in pool:
+        cur, end = base, base + size
+        while i < len(synced) and synced[i][1] <= cur:
+            i += 1
+        j = i
+        while j < len(synced) and synced[j][0] < end:
+            lo, hi = synced[j]
+            if lo > cur:
+                gaps.append((cur, lo - cur))
+            cur = max(cur, hi)
+            j += 1
+        if cur < end:
+            gaps.append((cur, end - cur))
+    return gaps
+
+
+def _patch_vllm_sleep_level2_retention() -> bool:
+    """Level-2 sleep keeps every weights-pool byte that the actor sync does not rewrite.
+
+    vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
+    drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
+    address in the dspark proposer). Copies the gaps to host before suspend, back after the
+    weights wake (before the sync reload).
+    """
+    if not _vllm_importable():
+        return False
+    try:
+        worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
+    except Exception:
+        return False
+    worker_cls = getattr(worker_mod, "Worker", None)
+    if worker_cls is None:
+        return False
+    if getattr(worker_cls.sleep, "_verl_mlite_l2_retention", False):
+        return True
+    import ctypes
+
+    import torch
+
+    orig_sleep, orig_wake = worker_cls.sleep, worker_cls.wake_up
+
+    def _cuda():
+        return ctypes.CDLL("libcuda.so.1")
+
+    def sleep(self, level: int = 1) -> None:
+        if level == 2:
+            torch.cuda.synchronize()
+            cu, saved, total = _cuda(), [], 0
+            for ptr, size in _weights_pool_gaps(self):
+                host = torch.empty(size, dtype=torch.uint8).pin_memory()
+                rc = cu.cuMemcpyDtoH_v2(ctypes.c_void_p(host.data_ptr()), ctypes.c_uint64(ptr), ctypes.c_size_t(size))
+                if rc != 0:
+                    raise RuntimeError(f"level-2 retention copy-out failed ({rc}) at {hex(ptr)}+{size}")
+                saved.append((ptr, host))
+                total += size
+            self._verl_mlite_l2_saved = saved
+            print(f"verl_mlite: level-2 sleep keeps {len(saved)} weights-pool ranges, {total / 2**30:.2f} GiB", flush=True)
+        return orig_sleep(self, level)
+
+    def wake_up(self, tags=None) -> None:
+        orig_wake(self, tags)
+        saved = getattr(self, "_verl_mlite_l2_saved", None)
+        if saved and (tags is None or "weights" in tags):
+            cu = _cuda()
+            for ptr, host in saved:
+                rc = cu.cuMemcpyHtoD_v2(ctypes.c_uint64(ptr), ctypes.c_void_p(host.data_ptr()), ctypes.c_size_t(host.numel()))
+                if rc != 0:
+                    raise RuntimeError(f"level-2 retention copy-in failed ({rc}) at {hex(ptr)}")
+            self._verl_mlite_l2_saved = None
+            torch.cuda.synchronize()
+
+    sleep._verl_mlite_l2_retention = True
+    worker_cls.sleep, worker_cls.wake_up = sleep, wake_up
     return True
 
 
@@ -1538,6 +1636,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08d.verl_dsv41_layerwise_reload", result)
     result = _patch_vllm_rollout_sleep_level()
     _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
+    result = _patch_vllm_sleep_level2_retention()
+    _trace_runtime_patch("08f.vllm_sleep_level2_retention", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")

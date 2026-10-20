@@ -131,3 +131,60 @@ def test_non_ds4_keeps_verl_reload_path(monkeypatch) -> None:
     assert loaded[0][1] is source
     fp8_utils.process_quanted_weights_after_loading(runner, state)
     assert events == ["legacy-state"]
+
+
+def test_level2_retention_keeps_weights_pool_bytes_not_rewritten_by_sync(
+    monkeypatch,
+) -> None:
+    """Drafter weights, bias_vl and plain tensors share the pool with synced params."""
+
+    class _Storage:
+        def __init__(self, ptr, nbytes):
+            self._ptr, self._nbytes = ptr, nbytes
+
+        def data_ptr(self):
+            return self._ptr
+
+        def nbytes(self):
+            return self._nbytes
+
+    class _Param:
+        is_cuda = True
+
+        def __init__(self, ptr, nbytes):
+            self._st = _Storage(ptr, nbytes)
+
+        def untyped_storage(self):
+            return self._st
+
+    def chunk(ptr, size, tag="weights"):
+        return SimpleNamespace(handle=(0, size, ptr), tag=tag)
+
+    allocator = SimpleNamespace(
+        pointer_to_data={
+            0: chunk(1000, 100),
+            1: chunk(2000, 50),
+            2: chunk(5000, 10, tag="kv_cache"),
+        }
+    )
+    cumem = ModuleType("vllm.device_allocator.cumem")
+    cumem.CuMemAllocator = SimpleNamespace(get_instance=lambda: allocator)
+    monkeypatch.setitem(sys.modules, "vllm.device_allocator.cumem", cumem)
+    params = [
+        ("layers.0.w", _Param(1010, 30)),
+        ("layers.0.w_alias", _Param(1010, 30)),
+        ("layers.1.w", _Param(1060, 20)),
+        ("layers.0.gate.bias_vl", _Param(1080, 10)),
+        ("layers.2.w", _Param(2000, 50)),
+    ]
+    worker = SimpleNamespace(
+        model_runner=SimpleNamespace(
+            model=SimpleNamespace(named_parameters=lambda: iter(params))
+        )
+    )
+
+    assert compat._weights_pool_gaps(worker) == [
+        (1000, 10),
+        (1040, 20),
+        (1080, 20),
+    ]
