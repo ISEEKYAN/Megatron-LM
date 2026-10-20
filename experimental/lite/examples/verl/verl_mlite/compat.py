@@ -1142,6 +1142,53 @@ def _weights_pool_gaps(worker, exclude_named: bool = False):
     return gaps
 
 
+def _attr_tensor_ranges(worker, pattern: str = ""):
+    """Storage ranges of plain CUDA tensor attributes (not params/buffers) of target and drafter
+    modules whose ``<module>.@<attr>`` name contains ``pattern``."""
+    import torch
+
+    ranges = []
+    draft = worker.get_draft_model()
+    for prefix, root in (("", worker.model_runner.model), ("draft.", draft)):
+        if root is None:
+            continue
+        for mname, mod in root.named_modules():
+            for k, v in vars(mod).items():
+                if k in ("_parameters", "_buffers") or not isinstance(v, torch.Tensor):
+                    continue
+                if v.is_cuda and pattern in f"{prefix}{mname}.@{k}":
+                    st = v.untyped_storage()
+                    if st.nbytes():
+                        ranges.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
+    return sorted(ranges)
+
+
+def _clip_ranges(gaps, ranges, inside: bool):
+    """``gaps`` (ptr, size) intersected with (``inside``) or minus ``ranges`` (lo, hi)."""
+    out = []
+    for ptr, size in gaps:
+        cur, end = ptr, ptr + size
+        for lo, hi in ranges:
+            if hi <= cur or lo >= end:
+                continue
+            lo, hi = max(lo, cur), min(hi, end)
+            if inside:
+                out.append((lo, hi - lo))
+            elif lo > cur:
+                out.append((cur, lo - cur))
+            cur = max(cur, hi)
+        if not inside and cur < end:
+            out.append((cur, end - cur))
+    merged = []
+    for ptr, size in sorted(set(out)):
+        if merged and ptr < merged[-1][0] + merged[-1][1]:
+            last = merged[-1]
+            merged[-1] = (last[0], max(last[0] + last[1], ptr + size) - last[0])
+        else:
+            merged.append((ptr, size))
+    return merged
+
+
 def _patch_vllm_sleep_level2_retention() -> bool:
     """Level-2 sleep keeps every weights-pool byte that the actor sync does not rewrite.
 
@@ -1150,14 +1197,16 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     address in the dspark proposer). Copies the gaps to host before suspend, back after the
     weights wake (before the sync reload). ``VERL_MLITE_L2_RETENTION``: ``0`` (default)
     disables; ``unnamed`` keeps only bytes no parameter or buffer owns; ``1`` keeps every
-    unsynced byte. Off by default: vLLM keeps buffers and the ``sleep_preserve_parameter_names``
+    unsynced byte; ``attrs[:<pattern>]`` / ``ownerless`` split ``unnamed`` into plain tensor
+    attributes (optionally by ``<module>.@<attr>`` substring) and the rest. Off by default: vLLM keeps buffers and the ``sleep_preserve_parameter_names``
     matches (drafter, bias_vl), and the one ownerless state the reload read (mega-attn wq_b/wo_a
     load permutations) is host-resident since vLLM 00474aeec6.
     """
     mode = os.environ.get("VERL_MLITE_L2_RETENTION", "0")
-    if mode not in ("1", "unnamed") or not _vllm_importable():
+    known_mode = mode in ("1", "unnamed", "ownerless") or mode.startswith("attrs")
+    if not known_mode or not _vllm_importable():
         return False
-    exclude_named = mode == "unnamed"
+    exclude_named = mode != "1"
     try:
         worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
     except Exception:
@@ -1180,7 +1229,11 @@ def _patch_vllm_sleep_level2_retention() -> bool:
         if level == 2:
             torch.cuda.synchronize()
             cu, saved, total = _cuda(), [], 0
-            for ptr, size in _weights_pool_gaps(self, exclude_named):
+            gaps = _weights_pool_gaps(self, exclude_named)
+            if mode == "ownerless" or mode.startswith("attrs"):
+                pattern = mode.partition(":")[2]
+                gaps = _clip_ranges(gaps, _attr_tensor_ranges(self, pattern), mode != "ownerless")
+            for ptr, size in gaps:
                 # Exact-size page-locked copy (pin_memory() rounds each block up to a power of 2).
                 host = torch.empty(size, dtype=torch.uint8)
                 torch.cuda.check_error(
