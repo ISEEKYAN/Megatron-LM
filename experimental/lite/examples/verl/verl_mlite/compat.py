@@ -321,6 +321,35 @@ def _patch_verl_vllm_headless_api_server_count() -> bool:
     return True
 
 
+def _patch_verl_val_max_tokens() -> bool:
+    """Cap validation responses at ``VERL_MLITE_VAL_MAX_TOKENS`` tokens.
+
+    VERL validates with the rollout ``response_length``; the AIME output budget is fixed
+    separately (4096) and must not grow with the training response length.
+    """
+    limit = os.environ.get("VERL_MLITE_VAL_MAX_TOKENS")
+    if not limit:
+        return False
+    try:
+        mod = importlib.import_module("verl.experimental.agent_loop.agent_loop")
+    except Exception:
+        return False
+    worker_cls = getattr(mod, "AgentLoopWorker", None)
+    if worker_cls is None or getattr(worker_cls._run_agent_loop, "_verl_mlite_val_cap", False):
+        return worker_cls is not None
+    orig = worker_cls._run_agent_loop
+    cap = int(limit)
+
+    async def _run_agent_loop(self, sampling_params, trajectory, *args, **kwargs):
+        if trajectory.get("validate"):
+            sampling_params = {**sampling_params, "max_tokens": cap}
+        return await orig(self, sampling_params, trajectory, *args, **kwargs)
+
+    _run_agent_loop._verl_mlite_val_cap = True
+    worker_cls._run_agent_loop = _run_agent_loop
+    return True
+
+
 def _patch_vllm_server_profile() -> bool:
     profile = _vllm_server_profile_env()
     if not profile:
@@ -1119,13 +1148,13 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
     drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
     address in the dspark proposer). Copies the gaps to host before suspend, back after the
-    weights wake (before the sync reload). ``VERL_MLITE_L2_RETENTION``: ``unnamed`` (default)
-    keeps only bytes no parameter or buffer owns, since vLLM keeps buffers and the
-    ``sleep_preserve_parameter_names`` matches (drafter, bias_vl) itself; ``1`` keeps every
-    unsynced byte; ``0`` disables. With the preserve list alone, the full model's attention
-    wo_a/wq_b came back wrong after the post-sleep reload.
+    weights wake (before the sync reload). ``VERL_MLITE_L2_RETENTION``: ``0`` (default)
+    disables; ``unnamed`` keeps only bytes no parameter or buffer owns; ``1`` keeps every
+    unsynced byte. Off by default: vLLM keeps buffers and the ``sleep_preserve_parameter_names``
+    matches (drafter, bias_vl), and the one ownerless state the reload read (mega-attn wq_b/wo_a
+    load permutations) is host-resident since vLLM 00474aeec6.
     """
-    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "unnamed")
+    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "0")
     if mode not in ("1", "unnamed") or not _vllm_importable():
         return False
     exclude_named = mode == "unnamed"
@@ -1705,6 +1734,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08f.vllm_sleep_level2_retention", result)
     result = _patch_vllm_sleep_fingerprint()
     _trace_runtime_patch("08g.vllm_sleep_fingerprint", result)
+    result = _patch_verl_val_max_tokens()
+    _trace_runtime_patch("08h.verl_val_max_tokens", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
     _trace_runtime_patch("10.end")
