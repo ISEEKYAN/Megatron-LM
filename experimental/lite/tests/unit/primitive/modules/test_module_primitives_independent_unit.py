@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 from __future__ import annotations
 
+import copy
 from types import SimpleNamespace
 
 import pytest
@@ -109,6 +110,50 @@ def test_disable_lora_adapters_bypasses_every_adapter_and_restores_state():
 
     with disable_lora_adapters(nn.Linear(3, 2)) as num_adapters:
         assert num_adapters == 0
+
+
+def test_experts_forward_with_lora_bypassed_equals_experts_without_lora(
+    monkeypatch, transformer_engine_import_stub
+):
+    transformer_engine_import_stub()
+    from megatron.lite.primitive import transformer_engine as central_te
+    from megatron.lite.primitive.modules import experts
+
+    class GroupedLinear(nn.Module):
+        def __init__(self, groups, in_features, out_features, **_kwargs):
+            super().__init__()
+            self.weight = nn.Parameter(torch.randn(groups, out_features, in_features))
+
+        def forward(self, x, m_splits):
+            chunks = torch.split(x, list(m_splits))
+            return torch.cat([chunk @ weight.t() for chunk, weight in zip(chunks, self.weight)])
+
+    def swiglu(y, probs, swiglu_limit):
+        gate, up = y.chunk(2, dim=-1)
+        return torch.nn.functional.silu(gate) * up
+
+    monkeypatch.setattr(central_te._TE, "GroupedLinear", GroupedLinear, raising=False)
+    monkeypatch.setattr(experts, "swiglu_with_probs", swiglu)
+    ps = SimpleNamespace(ep_size=1, etp_size=1, etp_group=None, tp_size=1, tp_group=None)
+    config = SimpleNamespace(num_experts=2, hidden_size=4, moe_intermediate_size=3)
+    torch.manual_seed(0)
+    policy = experts.Experts(config, ps, lora_config={"rank": 2, "alpha": 2})
+    with torch.no_grad():
+        policy.fc1_lora.lora_b.normal_()
+        policy.fc2_lora.lora_b.normal_()
+    base = copy.deepcopy(policy)
+    base.fc1_lora = None
+    base.fc2_lora = None
+    x, tokens_per_expert = torch.randn(5, 4), torch.tensor([2, 3])
+
+    with torch.no_grad():
+        policy_out = policy(x, tokens_per_expert)
+        base_out = base(x, tokens_per_expert)
+        assert not torch.equal(policy_out, base_out)
+        with disable_lora_adapters(policy) as num_adapters:
+            assert num_adapters == 2
+            assert torch.equal(policy(x, tokens_per_expert), base_out)
+        assert torch.equal(policy(x, tokens_per_expert), policy_out)
 
 
 def test_mrope_interleaves_text_height_and_width_sections():
