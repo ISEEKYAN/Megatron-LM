@@ -1119,11 +1119,13 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
     drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
     address in the dspark proposer). Copies the gaps to host before suspend, back after the
-    weights wake (before the sync reload). Opt-in (``VERL_MLITE_L2_RETENTION=1``); with ``unnamed``
-    only bytes no parameter or buffer owns are kept (vLLM keeps the rest itself); the
-    recipe keeps the drafter and untrained parameters with ``sleep_preserve_parameter_names``.
+    weights wake (before the sync reload). ``VERL_MLITE_L2_RETENTION``: ``unnamed`` (default)
+    keeps only bytes no parameter or buffer owns, since vLLM keeps buffers and the
+    ``sleep_preserve_parameter_names`` matches (drafter, bias_vl) itself; ``1`` keeps every
+    unsynced byte; ``0`` disables. With the preserve list alone, the full model's attention
+    wo_a/wq_b came back wrong after the post-sleep reload.
     """
-    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "0")
+    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "unnamed")
     if mode not in ("1", "unnamed") or not _vllm_importable():
         return False
     exclude_named = mode == "unnamed"
@@ -1150,7 +1152,11 @@ def _patch_vllm_sleep_level2_retention() -> bool:
             torch.cuda.synchronize()
             cu, saved, total = _cuda(), [], 0
             for ptr, size in _weights_pool_gaps(self, exclude_named):
-                host = torch.empty(size, dtype=torch.uint8).pin_memory()
+                # Exact-size page-locked copy (pin_memory() rounds each block up to a power of 2).
+                host = torch.empty(size, dtype=torch.uint8)
+                torch.cuda.check_error(
+                    torch.cuda.cudart().cudaHostRegister(host.data_ptr(), size, 0)
+                )
                 rc = cu.cuMemcpyDtoH_v2(ctypes.c_void_p(host.data_ptr()), ctypes.c_uint64(ptr), ctypes.c_size_t(size))
                 if rc != 0:
                     raise RuntimeError(f"level-2 retention copy-out failed ({rc}) at {hex(ptr)}+{size}")
@@ -1169,8 +1175,10 @@ def _patch_vllm_sleep_level2_retention() -> bool:
                 rc = cu.cuMemcpyHtoD_v2(ctypes.c_uint64(ptr), ctypes.c_void_p(host.data_ptr()), ctypes.c_size_t(host.numel()))
                 if rc != 0:
                     raise RuntimeError(f"level-2 retention copy-in failed ({rc}) at {hex(ptr)}")
-            self._verl_mlite_l2_saved = None
             torch.cuda.synchronize()
+            for _, host in saved:
+                torch.cuda.cudart().cudaHostUnregister(host.data_ptr())
+            self._verl_mlite_l2_saved = None
 
     sleep._verl_mlite_l2_retention = True
     worker_cls.sleep, worker_cls.wake_up = sleep, wake_up

@@ -46,7 +46,9 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Level 2: the per-step sync rewrites every trained weight; a level-1 host backup of the full
 # rollout weights pins ~590 GB/node (measured). Parameters the sync never sends are kept by
 # vLLM across level 2: the untrained router bias (bias_vl) and the frozen DSpark drafter.
-# Buffers are kept by vLLM itself; the Engram tables live in pinned host memory.
+# Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. verl_mlite
+# compat 08f (default VERL_MLITE_L2_RETENTION=unnamed) keeps the ~1.2 GiB/GPU of tensor
+# attributes and ownerless weights-pool bytes no name reaches.
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
