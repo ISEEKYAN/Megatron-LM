@@ -214,6 +214,25 @@ def _original_rows(physical, lengths, padded):
     return torch.where(valid, starts[document] + offset, -1), valid
 
 
+def _token_sum_loss(log_probs, mask, ps, denominator):
+    """Masked token sum of this rank's rows, normalized so the CP layout does not change it.
+
+    Each CP rank holds a contiguous slice of the micro-batch and DDP averages gradients over
+    dp x cp, so the slice sum is scaled by cp_size: the CP-rank mean of the returned values (and
+    of their gradients) equals the CP=1 loss. Without an explicit denominator the micro-batch
+    mean divides by the loss-token count summed over the CP group, not by the local count.
+    """
+    mask = torch.ones_like(log_probs) if mask is None else mask.to(log_probs.dtype)
+    if denominator is None:
+        count = mask.sum().detach()
+        if ps.cp_size > 1:
+            torch.distributed.all_reduce(count, group=ps.cp_group)
+        denominator = count.clamp_min(1)
+    elif denominator <= 0:
+        raise ValueError("DS4.1 loss normalization denominator must be positive")
+    return -(log_probs * mask).sum() * ps.cp_size / denominator
+
+
 def forward_step(model, batch):
     ps = parallel_state_from_model(model)
     lens = batch.sizes().to(device=batch.input_ids.device)
@@ -260,14 +279,11 @@ def forward_step(model, batch):
         temperature=context.temperature if context else 1.0,
         calculate_entropy=context.calculate_entropy if context else False,
     )
-    if context is not None and context.normalization_denominator is not None and "loss" in output:
-        denominator = context.normalization_denominator
-        if denominator <= 0:
-            raise ValueError("DS4.1 loss normalization denominator must be positive")
-        mask = select(packed.loss_mask)
-        if mask is None:
-            mask = torch.ones_like(output["log_probs"])
-        output["loss"] = -(output["log_probs"] * mask).sum() / denominator
+    denominator = context.normalization_denominator if context is not None else None
+    if "loss" in output and (ps.cp_size > 1 or denominator is not None):
+        output["loss"] = _token_sum_loss(
+            output["log_probs"], select(packed.loss_mask), ps, denominator
+        )
     if "rows" in output:
         # Report rows in the caller's unpadded coordinates; padding rows are invalid.
         output["rows"], valid = _original_rows(output["rows"], lens, original.cu_seqlens_q_padded)
