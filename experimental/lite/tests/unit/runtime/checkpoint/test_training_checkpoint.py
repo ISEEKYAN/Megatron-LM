@@ -82,13 +82,14 @@ def test_optimizer_checkpoint_roundtrips_rank_local_state(tmp_path) -> None:
 
 
 class FakeDistOpt:
-    def __init__(self):
+    def __init__(self, expected_metadata=None):
+        self.expected_metadata = expected_metadata or DISTOPT_METADATA
         self.save_model_sd = None
         self.load_model_sd = None
         self.loaded_state = None
 
     def sharded_state_dict(self, model_sd, is_loading: bool = False, metadata=None):
-        assert metadata == DISTOPT_METADATA
+        assert metadata == self.expected_metadata
         if is_loading:
             self.load_model_sd = model_sd
         else:
@@ -114,7 +115,7 @@ class FakeWrapper(torch.nn.Module):
 
 
 DISTOPT_METADATA = {
-    "distrib_optim_sharding_type": "fully_reshardable",
+    "distrib_optim_sharding_type": "dp_reshardable",
     "distrib_optim_fully_reshardable_mem_efficient": False,
     "chained_optim_avoid_prefix": True,
 }
@@ -261,6 +262,10 @@ def test_dist_opt_model_state_keys_are_pp_and_vpp_aware() -> None:
 
 
 def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) -> None:
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load_content_metadata",
+        lambda checkpoint_dir: DISTOPT_METADATA,
+    )
     wrapped_module = torch.nn.Linear(4, 2)
     model = FakeWrapper(wrapped_module)
     optimizer = FakeDistOpt()
@@ -289,6 +294,25 @@ def test_dist_opt_checkpoint_loads_from_mcore_distckpt(monkeypatch, tmp_path) ->
     torch.testing.assert_close(wrapped_module.weight, expected_weight)
     torch.testing.assert_close(wrapped_module.bias, expected_bias)
     assert optimizer.loaded_state == {"loaded": True}
+
+
+def test_dist_opt_load_follows_sharding_type_saved_in_checkpoint(monkeypatch, tmp_path) -> None:
+    """Checkpoints written before the dp_reshardable default must still load."""
+    legacy = {**DISTOPT_METADATA, "distrib_optim_sharding_type": "fully_reshardable"}
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load_content_metadata",
+        lambda checkpoint_dir: legacy,
+    )
+    monkeypatch.setattr(
+        "megatron.lite.primitive.ckpt.distckpt.dist_checkpointing.load",
+        lambda sharded_state_dict, checkpoint_dir, **kwargs: {"step": 2, "optimizer": {}},
+    )
+    model = torch.nn.Linear(4, 2)
+    optimizer = FakeDistOpt(expected_metadata=legacy)
+    attach_model_sharded_state_dict([model], ParallelState())
+
+    step = dcp.load_training_checkpoint(model, optimizer, str(tmp_path / "step_2"), use_dcp=True)
+    assert step == 2
 
 
 def test_dist_opt_step_sync_traverses_multi_optimizer_chain_without_optimizer_property() -> None:
