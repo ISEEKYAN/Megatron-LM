@@ -36,6 +36,9 @@ MAX_PROMPT_LENGTH="${MAX_PROMPT_LENGTH:-2048}"
 MAX_RESPONSE_LENGTH="${MAX_RESPONSE_LENGTH:-8192}"
 MAX_SEQ_LEN=$((MAX_PROMPT_LENGTH + MAX_RESPONSE_LENGTH))
 OVERLONG_BUFFER_LEN="${OVERLONG_BUFFER_LEN:-4096}"
+# Packed tokens per GPU micro-batch (track P): training 5120, log-prob 10240 (one full sequence).
+PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
+LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
 # Each Ray worker imports vLLM via the verl_mlite sitecustomize (~50 s); cap the prestarted pool.
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-null}"
 ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
@@ -166,7 +169,7 @@ COMMAND=(
   "actor_rollout_ref.actor.ppo_mini_batch_size=${PPO_MINI_BATCH_SIZE}"
   "actor_rollout_ref.actor.ppo_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.actor.use_dynamic_bsz=True"
-  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.actor.ppo_max_token_len_per_gpu=${PPO_MAX_TOKEN_LEN}"
   "actor_rollout_ref.actor.use_kl_loss=False"
   "actor_rollout_ref.actor.kl_loss_coef=0.0"
   "actor_rollout_ref.actor.entropy_coeff=0"
@@ -207,7 +210,7 @@ COMMAND=(
   "actor_rollout_ref.rollout.n=${ROLLOUT_N}"
   "actor_rollout_ref.rollout.calculate_log_probs=True"
   "actor_rollout_ref.rollout.log_prob_use_dynamic_bsz=True"
-  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${MAX_SEQ_LEN}"
+  "actor_rollout_ref.rollout.log_prob_max_token_len_per_gpu=${LOG_PROB_MAX_TOKEN_LEN}"
   "actor_rollout_ref.rollout.log_prob_micro_batch_size_per_gpu=1"
   "actor_rollout_ref.rollout.prompt_length=${MAX_PROMPT_LENGTH}"
   "actor_rollout_ref.rollout.response_length=${MAX_RESPONSE_LENGTH}"
@@ -226,7 +229,8 @@ COMMAND=(
   "actor_rollout_ref.rollout.load_format=auto"
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
-  "actor_rollout_ref.rollout.full_determinism=True"
+  # True seeds every sibling of a prompt identically (16 distinct of 64 samples, track P).
+  "actor_rollout_ref.rollout.full_determinism=False"
   "+${VLLM}.compilation_config={cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
   "+${VLLM}.max_cudagraph_capture_size=8190"
   "+${VLLM}.attention_backend=FLASHMLA_MEGA_ATTN_DSV41"
