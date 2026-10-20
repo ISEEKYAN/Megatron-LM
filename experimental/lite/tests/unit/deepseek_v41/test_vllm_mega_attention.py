@@ -97,7 +97,7 @@ def _ours(x, **kwargs):
         x.sink,
         compress_ratio=x.ratio,
         cos_sin_cache=x.cos_sin,
-        cu_seqlens=None if len(x.docs) == 2 else x.docs,
+        cu_seqlens=None if not torch.is_tensor(x.docs) and len(x.docs) == 2 else x.docs,
         **kwargs,
     )
 
@@ -316,7 +316,7 @@ def _visible_kv(x):
     from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
 
     length = x.q.shape[0]
-    plan = mega._plan([0, length], 0, length, x.ratio)
+    plan = mega._plan([0, length], length, 0, length, x.ratio, x.q.device)
     with torch.no_grad():
         *_, kv, _, _ = mega._forward(
             x.q, x.swa_kv, x.latent, x.topk, x.positions, x.sink, x.cos_sin, x.ratio,
@@ -562,3 +562,92 @@ def test_backward_rows_are_reproducible():
     assert torch.equal(a.dq, b.dq) and torch.equal(a.dsink, b.dsink)
     for name in ("dswa", "dlatent"):
         assert _metrics(getattr(a, name), getattr(b, name))["rel_l2"] < 1e-5
+
+
+@pytest.mark.parametrize("ratio", [0, 2, 1])
+def test_deterministic_dkv_is_bitwise_and_matches_atomics(ratio, monkeypatch):
+    """Fixed-order dKV: two runs bitwise equal; within 2e-3 of the atomic mode (bf16 partials)."""
+    from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
+
+    x = _inputs(2048, ratio, seed=13)
+    x.swa_kv = x.swa_kv.float()
+    if ratio:
+        x.latent = x.latent.float()
+    grad = _upstream(2048, torch.Generator(device="cuda").manual_seed(6), "dense")
+    _, atomic = _grads(x, grad)
+    monkeypatch.setattr(mega, "DETERMINISTIC_DKV", True)
+    monkeypatch.setattr(mega, "DETERMINISTIC_PARTIAL_BYTES", 300 * 640 * 512 * 2)  # 7 chunks
+    _, a = _grads(x, grad)
+    _, b = _grads(x, grad)
+    names = ("dq", "dswa", "dsink") + (("dlatent",) if ratio else ())
+    for name in names:
+        assert torch.equal(getattr(a, name), getattr(b, name)), name
+        bar = 2e-3 if name in ("dswa", "dlatent") else 1e-5
+        assert _metrics(getattr(a, name), getattr(atomic, name))["rel_l2"] < bar, name
+
+
+@pytest.mark.parametrize("ratio", [0, 2, 1])
+def test_umma_kernel_matches_mma_kernel(ratio, monkeypatch):
+    """The tcgen05 backward agrees with the mma.sync one up to summation order."""
+    from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
+
+    docs = [0, 700, 701, 2048]
+    x = _inputs(docs[-1], ratio, seed=19, docs=docs)
+    x.swa_kv = x.swa_kv.float()
+    if ratio:
+        x.latent = x.latent.float()
+    grad = _upstream(docs[-1], torch.Generator(device="cuda").manual_seed(19), "dense")
+    monkeypatch.setattr(mega, "BACKWARD_KERNEL", "umma")
+    _, umma = _grads(x, grad)
+    monkeypatch.setattr(mega, "BACKWARD_KERNEL", "mma")
+    _, mma = _grads(x, grad)
+    bars = {"dq": 1e-3, "dswa": 1e-4, "dlatent": 1e-4, "dsink": 1e-5}
+    for name in ("dq", "dswa", "dsink") + (("dlatent",) if ratio else ()):
+        m = _metrics(getattr(umma, name), getattr(mma, name))
+        assert m["rel_l2"] < bars[name], (name, m)
+
+
+def test_deterministic_dkv_matches_fp64_reference(monkeypatch):
+    from megatron.lite.model.deepseek_v41.vllm import mega_attention as mega
+
+    monkeypatch.setattr(mega, "DETERMINISTIC_DKV", True)
+    x = _inputs(8320, 2, seed=3 * 8320 + 2)
+    grad = _upstream(8320, torch.Generator(device="cuda").manual_seed(8320), "dense")
+    _, ours = _grads(x, grad)
+    ref = _reference(x, grad)
+    for name in ("dq", "dswa", "dsink", "dlatent"):
+        m = _metrics(getattr(ours, name), getattr(ref, name))
+        print(f"MEGA_DET {name} {m}")
+        assert m["rel_l2"] <= REL_L2 and m["cos"] >= COSINE, (name, m)
+
+
+@pytest.mark.parametrize("ratio", [0, 2])
+def test_layers_after_the_first_do_not_sync(ratio):
+    """The plan is cached per cu_seqlens tensor: a second layer's forward and
+    backward run without a host sync (CUDA sync debug mode raises on one)."""
+    from megatron.lite.model.deepseek_v41.vllm.mega_attention import mega_attention
+
+    docs = [0, 300, 301, 1500, 1700]
+    x = _inputs(docs[-1], ratio, seed=17, docs=docs)
+    cu = torch.tensor(docs, dtype=torch.int32, device="cuda")
+    latent = None if x.latent is None else x.latent[(x.positions + 1) % ratio == 0]
+    grad = _upstream(docs[-1], torch.Generator(device="cuda").manual_seed(3), "dense")
+
+    def layer():
+        q = x.q.detach().requires_grad_()
+        out = mega_attention(
+            q, x.swa_kv, latent, x.topk, x.positions, x.sink,
+            compress_ratio=ratio, cos_sin_cache=x.cos_sin, cu_seqlens=cu,
+        )
+        torch.autograd.backward(out.grad, grad)
+        return out.data, q.grad
+
+    first = layer()  # builds the plan (one sync) and loads the extension
+    torch.cuda.synchronize()
+    torch.cuda.set_sync_debug_mode("error")
+    try:
+        second = layer()
+    finally:
+        torch.cuda.set_sync_debug_mode("default")
+    assert torch.equal(first[0].view(torch.uint8), second[0].view(torch.uint8))
+    assert torch.equal(first[1], second[1])

@@ -37,6 +37,7 @@ Gradient contract (backward is ``csrc/mega_attention_bwd.cu`` plus torch glue):
   dKV (and the KV input gradients) are not bitwise reproducible run to run.
 """
 import math
+import os
 from pathlib import Path
 from typing import NamedTuple
 
@@ -119,14 +120,18 @@ def rope(x, cos_sin_cache, positions, inverse=False):
 
 
 class _Plan(NamedTuple):
-    starts: list  # global first token of each request (document)
-    seq_lens: list  # KV tokens of each request: up to its last local query row
-    query_start_loc: list  # local query row offsets, len R + 1
+    """Request layout of one rank's rows plus every index tensor the forward and
+    backward need, built once on the host and copied in one non-blocking H2D."""
+
+    requests: int
     n: int  # compressed rows per request in the workspace
     m: int  # workspace rows per request
+    swa_pages: int
+    comp_pages: int
+    t: dict  # device tensors
 
 
-def _plan(cu_seqlens, row_start, row_end, ratio):
+def _host_plan(cu_seqlens, row_start, row_end, ratio):
     starts, seq_lens, qsl = [], [], [0]
     for a, b in zip(cu_seqlens[:-1], cu_seqlens[1:]):
         lo, hi = max(a, row_start), min(b, row_end)
@@ -137,7 +142,83 @@ def _plan(cu_seqlens, row_start, row_end, ratio):
     if qsl[-1] != row_end - row_start:
         raise ValueError("cu_seqlens must cover every local query row")
     n = max(s // ratio for s in seq_lens) if ratio else 0
-    return _Plan(starts, seq_lens, qsl, n, n + max(seq_lens))
+    m = n + max(seq_lens)
+    i32, i64 = torch.int32, torch.int64
+    cat = lambda parts, dtype: torch.cat(parts) if parts else torch.empty(0, dtype=dtype)
+
+    def paged(lengths):
+        pages = [max(-(-length // PAGE), 1) for length in lengths]
+        base = [sum(pages[:r]) for r in range(len(lengths))]
+        width = max(pages)
+        table = torch.tensor(
+            [[b + min(p, k - 1) for p in range(width)] for b, k in zip(base, pages)], dtype=i32
+        )
+        return table, base, sum(pages)
+
+    t = {}
+    t["seq_lens"] = torch.tensor(seq_lens, dtype=i32)
+    t["qsl"] = torch.tensor(qsl, dtype=i32)
+    t["tokens"] = cat([torch.arange(a, a + k) for a, k in zip(starts, seq_lens)], i64)
+    t["token_pos"] = cat([torch.arange(k) for k in seq_lens], i64)
+    t["swa_table"], swa_base, swa_pages = paged(seq_lens)
+    t["swa_slots"] = cat([torch.arange(k) + b * PAGE for b, k in zip(swa_base, seq_lens)], i64)
+    rows = [r * m for r in range(len(starts))]
+    t["swa_rows"] = torch.stack(
+        [
+            cat([torch.arange(k) + row + n for row, k in zip(rows, seq_lens)], i64),
+            t["tokens"],
+            t["token_pos"],
+        ]
+    )
+    comp_pages = 0
+    if ratio:
+        counts = [k // ratio for k in seq_lens]
+        t["counts"] = torch.tensor(counts, dtype=i32)
+        t["comp_table"], comp_base, comp_pages = paged(counts)
+        boundary = [torch.arange(c) * ratio + ratio - 1 for c in counts]
+        t["comp_pos"] = cat(boundary, i64)
+        t["comp_src"] = cat([a + j for a, j in zip(starts, boundary)], i64)
+        t["comp_slots"] = cat([torch.arange(c) + b * PAGE for b, c in zip(comp_base, counts)], i64)
+        t["comp_rows"] = torch.stack(
+            [
+                cat([torch.arange(c) + row for row, c in zip(rows, counts)], i64),
+                t["comp_src"],
+                t["comp_pos"] - (ratio - 1),
+            ]
+        )
+    return len(starts), n, m, swa_pages, comp_pages, t
+
+
+_PLANS = {}
+
+
+def _plan(cu_seqlens, total, rank, local, ratio, device):
+    """Cached per (cu_seqlens object, rank, ratio): every layer of a microbatch
+    shares it, so at most the first layer reads ``cu_seqlens`` on the host."""
+    import weakref
+
+    if cu_seqlens is None or not torch.is_tensor(cu_seqlens):
+        values = (0, total) if cu_seqlens is None else tuple(int(x) for x in cu_seqlens)
+        key, ref = ("values", values), None
+    else:
+        key = ("tensor", id(cu_seqlens), cu_seqlens._version)
+        ref = weakref.ref(cu_seqlens)
+        values = None
+    key = key + (total, rank, local, ratio, str(device))
+    hit = _PLANS.get(key)
+    if hit is not None and (hit[0] is None or hit[0]() is cu_seqlens):
+        return hit[1]
+    if values is None:
+        values = [int(x) for x in cu_seqlens.tolist()]  # the only host sync
+    requests, n, m, swa_pages, comp_pages, host = _host_plan(
+        values, rank * local, (rank + 1) * local, ratio
+    )
+    t = {k: v.pin_memory().to(device, non_blocking=True) for k, v in host.items()}
+    plan = _Plan(requests, n, m, swa_pages, comp_pages, t)
+    if len(_PLANS) > 256:
+        _PLANS.clear()
+    _PLANS[key] = (ref, plan)
+    return plan
 
 
 def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, window, top_k, plan):
@@ -154,62 +235,38 @@ def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, win
     from vllm.models.deepseek_v41.nvidia.flash_mla_mega_attn import alloc_mega_attn_output
 
     device = q.device
-    i32 = dict(dtype=torch.int32, device=device)
-    i64 = dict(dtype=torch.int64, device=device)
-    requests = len(plan.starts)
-    seq_lens = torch.tensor(plan.seq_lens, **i32)
-
-    def paged(lengths, record):
-        pages = [max(-(-length // PAGE), 1) for length in lengths]
-        base = [sum(pages[:r]) for r in range(requests)]
-        width = max(pages)
-        table = torch.tensor(
-            [[b + min(p, n - 1) for p in range(width)] for b, n in zip(base, pages)], **i32
-        )
-        cache = torch.zeros(sum(pages), PAGE, record, dtype=torch.uint8, device=device)
-        return cache, table, base
-
-    tokens = torch.cat(
-        [torch.arange(a, a + s, **i64) for a, s in zip(plan.starts, plan.seq_lens)]
-    )
-    token_pos = torch.cat([torch.arange(s, **i64) for s in plan.seq_lens])
-    swa_cache, swa_table, swa_base = paged(plan.seq_lens, SWA_RECORD)
-    swa_slots = torch.cat(
-        [torch.arange(s, **i64) + b * PAGE for b, s in zip(swa_base, plan.seq_lens)]
-    )
+    t = plan.t
+    seq_lens = t["seq_lens"]
+    swa_cache = torch.zeros(plan.swa_pages, PAGE, SWA_RECORD, dtype=torch.uint8, device=device)
     torch.ops._C.fused_deepseek_v4_kv_rope_insert(
-        swa_kv.index_select(0, tokens).contiguous(),
+        swa_kv.index_select(0, t["tokens"]).contiguous(),
         swa_cache,
-        swa_slots,
-        token_pos,
+        t["swa_slots"],
+        t["token_pos"],
         cos_sin_cache,
         PAGE,
         None,
         True,
     )
-    kv = torch.empty(requests, plan.m, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.empty(plan.requests, plan.m, HEAD_DIM, dtype=torch.bfloat16, device=device)
     if ratio:
-        counts = [s // ratio for s in plan.seq_lens]
-        comp_cache, comp_table, comp_base = paged(counts, COMPRESSED_RECORD)
-        boundary = torch.cat(
-            [torch.arange(c, **i64) * ratio + ratio - 1 for c in counts]
-        )  # within-document boundary positions
-        owners = torch.cat([torch.full((c,), a, **i64) for a, c in zip(plan.starts, counts)])
-        comp_slots = torch.cat([torch.arange(c, **i64) + b * PAGE for b, c in zip(comp_base, counts)])
+        comp_cache = torch.zeros(
+            plan.comp_pages, PAGE, COMPRESSED_RECORD, dtype=torch.uint8, device=device
+        )
         rope_quant_insert(
-            latent.index_select(0, owners + boundary).contiguous(),
-            boundary,
+            latent.index_select(0, t["comp_src"]).contiguous(),
+            t["comp_pos"],
             cos_sin_cache,
             comp_cache,
-            comp_slots,
+            t["comp_slots"],
             ratio,
         )
         dequantize_and_gather_k_cache(
             kv[:, : plan.n],
             comp_cache,
-            seq_lens=torch.tensor(counts, **i32),
+            seq_lens=t["counts"],
             gather_lens=None,
-            block_table=comp_table,
+            block_table=t["comp_table"],
             block_size=PAGE,
             offset=0,
         )
@@ -218,11 +275,11 @@ def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, win
         swa_cache,
         seq_lens=seq_lens,
         gather_lens=seq_lens,
-        block_table=swa_table,
+        block_table=t["swa_table"],
         block_size=PAGE,
         offset=plan.n,
     )
-    qsl = torch.tensor(plan.query_start_loc, **i32)
+    qsl = t["qsl"]
     if ratio:
         from vllm.model_executor.kernels.batch_invariant import combine_swa_first_indices
 
@@ -230,7 +287,7 @@ def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, win
             topk, qsl, seq_lens, seq_lens, window, ratio, top_k, plan.m, plan.n
         )
     else:
-        dummy = torch.full((q.shape[0], top_k), -1, **i32)
+        dummy = torch.full((q.shape[0], top_k), -1, dtype=torch.int32, device=device)
         indices, lens = combine_topk_swa_indices(
             dummy, qsl, seq_lens, seq_lens, window, 0, 0, plan.m, 0
         )
@@ -260,21 +317,6 @@ def _forward(q, swa_kv, latent, topk, positions, sink, cos_sin_cache, ratio, win
     return out.data, out.scale, lse, kv, indices, lens
 
 
-def _kv_rows(plan, ratio, device):
-    """Per workspace row: (global token, RoPE position) for compressed and SWA rows."""
-    i64 = dict(dtype=torch.int64, device=device)
-    comp, swa = [], []
-    for r, (a, s) in enumerate(zip(plan.starts, plan.seq_lens)):
-        row = r * plan.m
-        if ratio:
-            j = torch.arange(s // ratio, **i64)
-            comp.append(torch.stack([row + j, a + j * ratio + ratio - 1, j * ratio]))
-        t = torch.arange(s, **i64)
-        swa.append(torch.stack([row + plan.n + t, a + t, t]))
-    cat = lambda parts: torch.cat(parts, 1) if parts else torch.empty(3, 0, **i64)
-    return cat(comp), cat(swa)
-
-
 _EXTENSION = None
 
 
@@ -285,14 +327,51 @@ def _extension():
 
         _EXTENSION = load(
             name="ds41_mega_attention_bwd",
-            sources=[str(Path(__file__).with_name("csrc") / "mega_attention_bwd.cu")],
+            sources=[
+                str(Path(__file__).with_name("csrc") / name)
+                for name in ("mega_attention_bwd.cu", "mega_attention_bwd_sm100.cu")
+            ],
             extra_cuda_cflags=["-O3", "-gencode=arch=compute_100a,code=sm_100a"],
             verbose=False,
         )
     return _EXTENSION
 
 
-def attention_backward_kernel(q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale):
+# Deterministic dKV: per-(row, slot) partials (FP32 accumulated, stored bf16),
+# summed per KV row in FP32 in a fixed (row-major) order instead of FP32
+# atomics. Partials are bounded by DETERMINISTIC_PARTIAL_BYTES per row chunk.
+DETERMINISTIC_DKV = os.environ.get("DS41_MEGA_ATTN_DETERMINISTIC", "0") == "1"
+DETERMINISTIC_PARTIAL_BYTES = 1 << 30
+# Backward kernel: "umma" (tcgen05 + TMA gather4) or "mma" (mma.sync), same
+# contract; kept selectable for A/B.
+BACKWARD_KERNEL = os.environ.get("DS41_MEGA_ATTN_BWD_KERNEL", "umma")
+
+
+def _segments(indices, lens, kv_rows, chunk_rows):
+    """Stable sort of the valid (row, slot) pairs by (row chunk, KV row).
+
+    Returns the flat ``row * width + slot`` positions in that order and, for
+    every (chunk, KV row), where its run starts (``chunks * kv_rows + 1``).
+    """
+    rows, width = indices.shape
+    slots = torch.arange(width, device=indices.device)
+    valid = (slots < lens[:, None]) & (indices >= 0) & (indices < kv_rows)
+    chunk = torch.arange(rows, device=indices.device) // chunk_rows
+    key = torch.where(
+        valid, chunk[:, None] * kv_rows + indices.long(), torch.iinfo(torch.int64).max
+    ).flatten()
+    keys, order = torch.sort(key, stable=True)
+    chunks = -(-rows // chunk_rows)
+    starts = torch.searchsorted(
+        keys, torch.arange(chunks * kv_rows + 1, device=indices.device, dtype=torch.int64)
+    )
+    return starts, order
+
+
+def attention_backward_kernel(
+    q, grad, positions, cos_sin_cache, kv, indices, lens, lse_full, scale, deterministic=None,
+    kernel=None,
+):
     """Owned VJP of the mega kernel's attention, RoPE and layouts included.
 
     ``q`` bf16 ``[S, 64, 512]`` fused query layout (unrotated); ``grad`` the
@@ -301,22 +380,36 @@ def attention_backward_kernel(q, grad, positions, cos_sin_cache, kv, indices, le
     natural-log LSE including the sink. Returns bf16 ``dq`` (fused layout), FP32
     ``dkv [M, 512]`` w.r.t. the rotated KV, and FP32 ``D [S, 64]``.
     """
+    deterministic = DETERMINISTIC_DKV if deterministic is None else deterministic
     dq = torch.empty(q.shape, dtype=torch.bfloat16, device=q.device)
     dkv = torch.zeros(kv.shape, dtype=torch.float32, device=q.device)
     delta = torch.empty(q.shape[:2], dtype=torch.float32, device=q.device)
-    _extension().backward(
+    indices, lens = indices.contiguous(), lens.contiguous()
+    empty = torch.empty(0, dtype=torch.int64, device=q.device)
+    starts = order = empty
+    chunk_rows = max(1, DETERMINISTIC_PARTIAL_BYTES // (indices.shape[1] * HEAD_DIM * 2))
+    if deterministic and q.shape[0]:
+        starts, order = _segments(indices, lens, kv.shape[0], chunk_rows)
+    kernel = BACKWARD_KERNEL if kernel is None else kernel
+    if kernel not in ("umma", "mma"):
+        raise ValueError(f"unknown mega attention backward kernel {kernel!r}")
+    ext = _extension()
+    (ext.backward_sm100 if kernel == "umma" else ext.backward)(
         q.contiguous(),
         grad.bfloat16().contiguous(),
         positions.to(torch.int32).contiguous(),
         cos_sin_cache.float().contiguous(),
         kv.contiguous(),
-        indices.contiguous(),
-        lens.contiguous(),
+        indices,
+        lens,
         (lse_full * math.log2(math.e)).contiguous(),
         float(scale),
         dq,
         dkv,
         delta,
+        starts,
+        order,
+        chunk_rows,
     )
     return dq, dkv, delta
 
@@ -329,20 +422,19 @@ class _MegaAttention(torch.autograd.Function):
     ):
         rank, size = (group.rank(), group.size()) if group is not None else (0, 1)
         local = q.shape[0]
-        swa_full, latent_full, boundary = swa_kv.detach(), None, None
+        swa_full, latent_full, compact = swa_kv.detach(), None, None
         if latent is not None:
-            # Compact boundary rows -> the per-token latent vLLM's insert reads.
-            boundary = ((positions + 1) % ratio == 0).nonzero().squeeze(1)
-            if boundary.numel() != latent.shape[0]:
-                raise ValueError("comp_latent must hold one row per local group-boundary token")
-            latent_full = latent.new_zeros(local, HEAD_DIM)
-            latent_full[boundary] = latent.detach()
+            # Compact boundary rows -> the per-token latent vLLM's insert reads,
+            # without a host sync: boundary token t holds compact row
+            # cumsum(flag)[t] - 1, every other token the dump row N_local.
+            flag = (positions + 1) % ratio == 0
+            compact = torch.where(flag, flag.long().cumsum(0) - 1, latent.shape[0])
+            padded = torch.cat([latent.detach(), latent.new_zeros(1, HEAD_DIM)])
+            latent_full = padded.index_select(0, compact)
         if size > 1:
             swa_full = _all_gather(swa_full, group)
             latent_full = None if latent_full is None else _all_gather(latent_full, group)
-        total = local * size
-        cu = [0, total] if cu_seqlens is None else [int(x) for x in cu_seqlens]
-        plan = _plan(cu, rank * local, (rank + 1) * local, ratio)
+        plan = _plan(cu_seqlens, local * size, rank, local, ratio, q.device)
         sink32 = sink.detach().float().contiguous()
         data, scale, lse, kv, indices, lens = _forward(
             q.detach().contiguous(), swa_full.bfloat16().contiguous(),
@@ -350,17 +442,17 @@ class _MegaAttention(torch.autograd.Function):
             None if topk is None else topk.to(torch.int32).contiguous(),
             positions, sink32, cos_sin_cache, ratio, window, top_k, plan,
         )
-        ctx.save_for_backward(q, kv, indices, lens, lse, positions, sink32, cos_sin_cache, boundary)
+        ctx.save_for_backward(q, kv, indices, lens, lse, positions, sink32, cos_sin_cache, compact)
         ctx.meta = (plan, ratio, group, rank, size, swa_kv.dtype,
-                    None if latent is None else latent.dtype, sink.dtype)
+                    None if latent is None else (latent.dtype, latent.shape[0]), sink.dtype)
         ctx.mark_non_differentiable(data, scale)
         carrier = torch.zeros((), dtype=torch.bfloat16, device=q.device).expand(data.shape)
         return data, scale, carrier
 
     @staticmethod
     def backward(ctx, _data, _scale, grad):
-        q, kv, indices, lens, lse, positions, sink, cos_sin_cache, boundary = ctx.saved_tensors
-        plan, ratio, group, rank, size, swa_dtype, latent_dtype, sink_dtype = ctx.meta
+        q, kv, indices, lens, lse, positions, sink, cos_sin_cache, compact = ctx.saved_tensors
+        plan, ratio, group, rank, size, swa_dtype, latent_meta, sink_dtype = ctx.meta
         if grad is None:
             grad = torch.zeros(q.shape[0], HEADS // WV_GROUP, WV_GROUP * HEAD_DIM, device=q.device)
         lse_full = torch.logaddexp(lse, sink.unsqueeze(0))
@@ -370,12 +462,13 @@ class _MegaAttention(torch.autograd.Function):
         )
         dq = dq.to(q.dtype)
         dsink = -(torch.exp(sink.unsqueeze(0) - lse_full) * delta).sum(0).to(sink_dtype)
-        comp_rows, swa_rows = _kv_rows(plan, ratio, q.device)
+        swa_rows = plan.t["swa_rows"]
         total = q.shape[0] * size
         dswa = torch.zeros(total, HEAD_DIM, dtype=torch.float32, device=q.device)
         dswa[swa_rows[1]] = rope(dkv[swa_rows[0]], cos_sin_cache, swa_rows[2], inverse=True)
         dlatent = None
-        if latent_dtype is not None:
+        if latent_meta is not None:
+            comp_rows = plan.t["comp_rows"]
             dlatent = torch.zeros(total, HEAD_DIM, dtype=torch.float32, device=q.device)
             dlatent[comp_rows[1]] = rope(
                 dkv[comp_rows[0]], cos_sin_cache, comp_rows[2], inverse=True
@@ -385,7 +478,11 @@ class _MegaAttention(torch.autograd.Function):
             dlatent = None if dlatent is None else _reduce_scatter(dlatent, group)
         dswa = dswa.to(swa_dtype)
         if dlatent is not None:
-            dlatent = dlatent[boundary].to(latent_dtype)
+            dtype, count = latent_meta
+            # The boundary tokens in order: the stable sort puts compact rows
+            # 0..count-1 first (no host sync, deterministic).
+            rows = torch.argsort(compact, stable=True)[:count]
+            dlatent = dlatent.index_select(0, rows).to(dtype)
         return dq, dswa, dlatent, None, None, dsink, None, None, None, None, None, None
 
 
@@ -450,7 +547,7 @@ def mega_attention(
         *_MegaAttention.apply(
             q, swa_kv, comp_latent, topk_local, positions, attn_sink, cos_sin_cache,
             compress_ratio, window, top_k,
-            None if cu_seqlens is None else torch.as_tensor(cu_seqlens).tolist(),
+            cu_seqlens,
             cp_group,
         )
     )
