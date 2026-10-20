@@ -32,13 +32,18 @@ def _reference(hidden, kv, q_weight, k_weight, mask, eps):
 
 class _Gate(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, hidden, kv, q_weight, k_weight, mask, eps):
+    def forward(ctx, hidden, kv, q_master, k_master, mask, eps):
         if not hidden.is_cuda:
             raise RuntimeError("Deployment Engram gate requires CUDA")
         import triton
 
         from vllm.models.deepseek_v41.common.engram import _fused_engram_post_wkv_kernel
 
+        # vLLM holds q/k as BF16 (the release/export RNE of the FP32 masters). The gate sees
+        # those values; their gradient goes to the masters unrounded (identity STE), since it
+        # is a reduction over every token and a BF16 rounding of it costs ~2e-3.
+        q_weight, k_weight = q_master.to(torch.bfloat16), k_master.to(torch.bfloat16)
+        ctx.master_dtypes = (q_master.dtype, k_master.dtype)
         tokens, copies, dim = hidden.shape
         ctx.save_for_backward(hidden, kv, q_weight, k_weight, mask)
         ctx.eps = eps
@@ -82,10 +87,8 @@ class _Gate(torch.autograd.Function):
             wanted = [t for t, n in zip(live, need) if n]
             grads = iter(torch.autograd.grad(out, wanted, grad.float(), allow_unused=True))
         result = [next(grads) if n else None for n in need]
-        result = [
-            None if g is None else g.to(t.dtype)
-            for g, t in zip(result, (hidden, kv, q_weight, k_weight))
-        ]
+        dtypes = (hidden.dtype, kv.dtype, *ctx.master_dtypes)
+        result = [None if g is None else g.to(dt) for g, dt in zip(result, dtypes)]
         return (*result, None, None)
 
 
@@ -95,7 +98,4 @@ def engram(hidden, rows, wkv_weight, q_weight, k_weight, mask=None, *, eps):
     kv = linear(rows, wkv_weight, fp8=True)
     if mask is not None:
         mask = mask.contiguous()
-    # vLLM holds q/k as BF16 (the release/export RNE of the FP32 masters); the cast's
-    # derivative is the identity onto the master.
-    q_weight, k_weight = q_weight.to(torch.bfloat16), k_weight.to(torch.bfloat16)
     return _Gate.apply(hidden.contiguous(), kv.contiguous(), q_weight, k_weight, mask, eps)
