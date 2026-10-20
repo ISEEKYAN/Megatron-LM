@@ -50,8 +50,10 @@ ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
-# Host budget (recipe-v1.md): params stay on GPU; Adam runs on CPU (offload_fraction 1.0);
-# gradient buffers are released (not copied) outside the training phase.
+# Host budget (recipe-v1.md): params stay on GPU; Adam runs on GPU in chunks while masters and
+# moments live in pinned host memory between steps (12 B/param; CPU Adam needs 18 B/param and
+# does not fit at 16 nodes); gradient buffers are released (not copied) outside training.
+OPTIMIZER_STATE_CHUNK_MB="${OPTIMIZER_STATE_CHUNK_MB:-2048}"
 PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
 GRAD_OFFLOAD="${GRAD_OFFLOAD:-True}"
@@ -107,9 +109,8 @@ export VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${OUTPUT_ROOT}/${RUN_NAME
 OPTIM_ARGS=()
 if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
   OPTIM_ARGS=(
-    "+actor_rollout_ref.actor.optim.override_optimizer_config.offload_fraction=1.0"
-    "+actor_rollout_ref.actor.optim.override_optimizer_config.use_precision_aware_optimizer=True"
-    "+actor_rollout_ref.actor.optim.override_optimizer_config.decoupled_weight_decay=True"
+    "+actor_rollout_ref.actor.optim.override_optimizer_config.chunked_optimizer_state_offload=True"
+    "+actor_rollout_ref.actor.optim.override_optimizer_config.optimizer_state_offload_chunk_size_mb=${OPTIMIZER_STATE_CHUNK_MB}"
   )
 fi
 

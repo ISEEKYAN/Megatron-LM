@@ -75,6 +75,14 @@ def _param_sums(params):
     return [tuple(checksum(p)[3:]) for p in params]
 
 
+def _pinned_stats():
+    try:
+        st = torch.cuda.host_memory_stats()
+    except Exception:
+        return None
+    return {k: v for k, v in st.items() if k.split(".")[0] in ("allocated_bytes", "reserved_bytes") and k.endswith(("current", "peak"))}
+
+
 def _host_bytes(optimizer):
     """Bytes of CPU tensors held by the optimizer (params/master, grads, state), by kind and dtype."""
     out, seen = {}, set()
@@ -149,6 +157,7 @@ def optimizer_step(handle, step_fn):
         "params_changed": changed,
         "host_optimizer_bytes": _host_bytes(handle._optimizer),
         "trainable_numel": sum(p.numel() for p in params),
+        "pinned_host_allocator": _pinned_stats(),
         "non_bf16_params": sorted(
             f"{n}:{str(p.dtype)[6:]}"
             for chunk in chunks

@@ -672,6 +672,9 @@ class MegatronLiteEngine(BaseEngine):
         offload_fraction = override.get(
             "offload_fraction", override.get("optimizer_offload_fraction")
         )
+        chunked = bool(override.get("chunked_optimizer_state_offload"))
+        if chunked:
+            offload_fraction = 0.0
         if offload_fraction is None and override.get("optimizer_cpu_offload"):
             offload_fraction = 1.0
         if offload_fraction is None and self.is_optimizer_offload_enabled:
@@ -712,6 +715,8 @@ class MegatronLiteEngine(BaseEngine):
             offload_fraction=offload_fraction,
             use_precision_aware_optimizer=override.get("use_precision_aware_optimizer"),
             decoupled_weight_decay=override.get("decoupled_weight_decay"),
+            chunked_state_offload=chunked or None,
+            state_offload_chunk_size_mb=override.get("optimizer_state_offload_chunk_size_mb"),
         )
 
     @staticmethod
