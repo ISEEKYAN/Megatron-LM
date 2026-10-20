@@ -216,6 +216,7 @@ class DeepseekV41Model(NativeModel):
             layout='mega' if kind == 'mega' else 'flashmla',
             keep=None if token_mask is None else token_mask.reshape(-1).bool(),
             cp=cp,
+            recompute=self.impl.recompute,
         )
         output = {'rows': torch.arange(rows, device=ids.device) + offset}
         if labels is None:

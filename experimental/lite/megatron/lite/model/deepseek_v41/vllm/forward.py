@@ -34,6 +34,66 @@ def _none(*_):
     return None
 
 
+def recompute_modes(recompute):
+    """``impl_cfg.recompute`` (None, True, "full", "attn,moe", list) -> set of modes."""
+    if recompute is True:
+        return {"full"}
+    modes = set(recompute.split(",") if isinstance(recompute, str) else recompute or ())
+    if not modes <= {"full", "attn", "moe"}:
+        raise ValueError("DS4.1 recomputation supports only full, attn and moe")
+    return modes
+
+
+def recomputed(fn, state, *args):
+    """``fn(*args, replay=bool) -> tuple of tensors`` under reentrant recomputation.
+
+    The segment re-executes the same ops in backward. Cross-layer ``state`` crosses it
+    explicitly: every compressor latent present at entry is an input and every latent
+    the segment publishes is an output, so reader gradients reach the owner segment;
+    the no-grad indexer state is replayed from its entry snapshot, so the replay sees
+    what the original forward saw and the live state is left alone. ``state`` None:
+    the segment touches no cross-layer state. RNG-free, so no RNG state is kept.
+    """
+    from megatron.lite.primitive.recompute import CheckpointFunction
+
+    names = [] if state is None else list(state.latent)
+    if state is not None:
+        entry = (dict(state.indexer.keys), state.indexer.candidates, state.indexer.topk)
+    count, published, calls = len(args), [], []
+
+    def segment(*inputs):
+        replay = bool(calls)
+        calls.append(None)
+        if state is None:
+            return tuple(fn(*inputs, replay=replay))
+        live = state.latent, state.indexer
+        state.latent = dict(zip(names, inputs[count:]))
+        if replay:
+            state.indexer = A.IndexerState()
+            state.indexer.keys = dict(entry[0])
+            state.indexer.candidates, state.indexer.topk = entry[1:]
+        try:
+            out = tuple(fn(*inputs[:count], replay=replay))
+            new = [k for k in state.latent if k not in names]
+            if not replay:
+                published.extend(new)
+            elif new != published:
+                raise RuntimeError("Recomputed segment published different compressor latents")
+            return (*out, *(state.latent[k] for k in published))
+        finally:
+            state.latent = live[0]
+            if replay:
+                state.indexer = live[1]
+
+    latents = tuple(state.latent[k] for k in names) if state is not None else ()
+    result = CheckpointFunction.apply(segment, False, *args, *latents)
+    result = (result,) if isinstance(result, torch.Tensor) else tuple(result)
+    if published:
+        state.latent.update(zip(published, result[-len(published) :]))
+        result = result[: -len(published)]
+    return result
+
+
 def attention_layer(
     x, positions, p, layer, cfg, state, core, tap=_none, cu_seqlens=None, layout="mega", cp=None
 ):
@@ -122,9 +182,11 @@ def layer_forward(
     layout="mega",
     keep=None,
     cp=None,
+    modes=(),
 ):
     """One decoder layer. ``carry`` is the embedding for layer 0, else the previous
-    layer's ``(y, stream, post, comb, pre)``; returns this layer's carry."""
+    layer's ``(y, stream, post, comb, pre)``; returns this layer's carry.
+    ``modes``: "attn" / "moe" recompute those sublayers (see :func:`recomputed`)."""
     copies = cfg["hc_mult"]
     if layer == 0:
         if lp.engram is not None:
@@ -153,12 +215,23 @@ def layer_forward(
             stream, pre, lp.attn_norm, lp.attn_mixes, pending=(y, stream, post, comb)
         )
     tap("attn.in", x)
-    o = attention_layer(x, positions, lp.attn, layer, cfg, state, core, tap, cu_seqlens, layout, cp)
+
+    def attn(x, replay=False):
+        t = _none if replay else tap
+        o = attention_layer(
+            x, positions, lp.attn, layer, cfg, state, core, t, cu_seqlens, layout, cp
+        )
+        return (o,)
+
+    def ffn(x, replay=False):
+        return (moe(x, ids, layer),)
+
+    (o,) = recomputed(attn, state, x) if "attn" in modes else attn(x)
     stream, pre, post, comb, x = joint(
         stream, pre, lp.ffn_norm, lp.ffn_mixes, pending=(o, stream, post, comb)
     )
     tap("moe.in", x)
-    y = moe(x, ids, layer)
+    (y,) = recomputed(ffn, None, x) if "moe" in modes else ffn(x)
     tap("moe.out", y)
     carry = (y, stream, post, comb, pre)
     tap("layer.out", carry)
@@ -180,8 +253,12 @@ def model_forward(
     layout="mega",
     keep=None,
     cp=None,
+    recompute=None,
 ):
     """Returns the final normed hidden ``[T, H]`` (input of the head).
+
+    ``recompute``: ``impl_cfg.recompute``; "full" recomputes whole layers, "attn" /
+    "moe" the attention / MoE sublayers. Only with grad enabled.
 
     ``params``: ``embed``, ``norm``, ``layers[i]`` with ``attn_norm``, ``ffn_norm``,
     ``attn_mixes``, ``ffn_mixes``, ``attn``, ``engram`` (or None).
@@ -193,29 +270,35 @@ def model_forward(
     embedding = _EmbeddingAccumulatingIntoMainGrad.apply(params.embed, ids)
     keep = (ids != IMAGE_SENTINEL) if keep is None else keep & (ids != IMAGE_SENTINEL)
     tap("embed.out", embedding)
+    modes = recompute_modes(recompute) if torch.is_grad_enabled() else set()
     carry = embedding
     for layer, lp in enumerate(params.layers):
 
         def ltap(name, value, prefix=f"L{layer}."):
             tap(prefix + name, value)
 
-        carry = layer_forward(
-            layer,
-            lp,
-            carry,
-            ids,
-            positions,
-            cfg,
-            state,
-            core=core,
-            moe=moe,
-            engram_rows=engram_rows,
-            tap=ltap,
-            cu_seqlens=cu_seqlens,
-            layout=layout,
-            keep=keep,
-            cp=cp,
-        )
+        def step(*carry, replay=False, layer=layer, lp=lp, ltap=ltap):
+            return layer_forward(
+                layer,
+                lp,
+                carry[0] if len(carry) == 1 else carry,
+                ids,
+                positions,
+                cfg,
+                state,
+                core=core,
+                moe=moe,
+                engram_rows=engram_rows,
+                tap=_none if replay else ltap,
+                cu_seqlens=cu_seqlens,
+                layout=layout,
+                keep=keep,
+                cp=cp,
+                modes=() if "full" in modes else modes,
+            )
+
+        carry = carry if isinstance(carry, tuple) else (carry,)
+        carry = recomputed(step, state, *carry) if "full" in modes else step(*carry)
     y, stream, post, comb, pre = carry
     stream = post_mix(y, stream, post, comb)
     collapsed = collapse(stream, pre)
