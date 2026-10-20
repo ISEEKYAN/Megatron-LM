@@ -19,7 +19,7 @@ set -euo pipefail
 : "${VAL_FILES:?set VAL_FILES (AIME 2024 parquet)}"
 OUTPUT_ROOT="${OUTPUT_ROOT:-}"
 
-NNODES="${NNODES:-8}"
+NNODES="${NNODES:-16}"
 NGPUS_PER_NODE="${NGPUS_PER_NODE:-4}"
 TOTAL_GPUS=$((NNODES * NGPUS_PER_NODE))
 ACTOR_PP="${ACTOR_PP:-1}"
@@ -42,13 +42,19 @@ ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}"
 # DSpark speculative decoding (drafter frozen at the release; target-only sync).
-ROLLOUT_SPEC="${ROLLOUT_SPEC:-False}"
+ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
+# Level 2: the per-step sync rewrites every trained weight; a level-1 host backup of the full
+# rollout weights pins ~590 GB/node (measured). verl_mlite compat 08f keeps the rest of the
+# weights pool (drafter, untrained params, tensor attributes) across level 2.
+ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
-PARAM_OFFLOAD="${PARAM_OFFLOAD:-True}"
+# Host budget (recipe-v1.md): params stay on GPU; Adam runs on CPU (offload_fraction 1.0);
+# gradient buffers are released (not copied) outside the training phase.
+PARAM_OFFLOAD="${PARAM_OFFLOAD:-False}"
 OPTIMIZER_OFFLOAD="${OPTIMIZER_OFFLOAD:-True}"
-GRAD_OFFLOAD="${GRAD_OFFLOAD:-False}"
+GRAD_OFFLOAD="${GRAD_OFFLOAD:-True}"
 
 TOTAL_EPOCHS="${TOTAL_EPOCHS:-15}"
 TOTAL_TRAINING_STEPS="${TOTAL_TRAINING_STEPS:-null}"
@@ -72,6 +78,7 @@ export PYTHONPATH="${EXAMPLE_ROOT}:${LITE_ROOT}:${REPO_ROOT}:${PYTHONPATH:-}"
 export CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1
 # Transformers has no deepseek_v41 config class; register an opaque one in every process.
 export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v41
+export VERL_MLITE_ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL}"
 export VLLM_BATCH_INVARIANT=1 VERL_FULL_DETERMINISM=1
 export VLLM_BI_MXFP8_GEMM=tensor_core VLLM_BI_MEGA_MHC=1 VLLM_BI_BF16_GEMM=tensor_core
 export VLLM_BI_MEGA_ATTN=1 VLLM_BI_MXFP8_PREQUANT=1 VLLM_BI_MHC_OVERLAP=1

@@ -282,6 +282,10 @@ class MegatronLiteEngine(BaseEngine):
     def is_optimizer_offload_enabled(self) -> bool:
         return self.engine_config.optimizer_offload
 
+    @property
+    def _release_grads(self) -> bool:
+        return bool(getattr(self.engine_config, "grad_offload", False)) and not self.is_param_offload_enabled
+
     def initialize(self):
         if self.engine_config.full_determinism:
             from verl.workers.engine.utils import enable_full_determinism
@@ -308,7 +312,7 @@ class MegatronLiteEngine(BaseEngine):
             device="cpu",
             model=self.is_param_offload_enabled,
             optimizer=self.is_optimizer_offload_enabled,
-            grad=self.is_param_offload_enabled,
+            grad=self.is_param_offload_enabled or self._release_grads,
         )
 
     def train_mode(self, **kwargs):
@@ -436,6 +440,10 @@ class MegatronLiteEngine(BaseEngine):
 
     def to(self, device: str, model: bool = True, optimizer: bool = True, grad: bool = True):
         self._require_initialized()
+        if self._release_grads and not model:
+            # VERL ties gradients to param offload; with params resident, release the gradient
+            # buffers at the training boundary (VERL passes optimizer=True only there).
+            grad = grad or optimizer
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)

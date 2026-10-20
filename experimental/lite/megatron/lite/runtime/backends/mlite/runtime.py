@@ -461,17 +461,21 @@ class MegatronLiteRuntime(RuntimeBase):
             load_optimizer,
             offload_model_to_cpu,
             offload_optimizer,
+            release_grad_buffers,
+            restore_grad_buffers,
         )
 
-        # A model+gradient transfer is the training context boundary.  On its
+        # A gradient transfer (with or without the model) is the training context boundary.  On its
         # CPU side the colocated rollout is about to map its sleeping weights;
         # on its CUDA side training is taking the device back.  Keep the whole
         # release/restore contract here rather than teaching VERL about backend
         # scratch buffers or optimizer residency.
-        training_transfer = model and grad
+        training_transfer = grad
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
+            elif grad:
+                release_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
                 if callable(offload_state):
@@ -492,6 +496,8 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
+            elif grad:
+                restore_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):

@@ -75,6 +75,44 @@ def _param_sums(params):
     return [tuple(checksum(p)[3:]) for p in params]
 
 
+def _host_bytes(optimizer):
+    """Bytes of CPU tensors held by the optimizer (params/master, grads, state), by kind and dtype."""
+    out, seen = {}, set()
+
+    def add(kind, t):
+        if not isinstance(t, torch.Tensor) or t.device.type != "cpu" or id(t) in seen:
+            return
+        seen.add(id(t))
+        key = f"{kind}:{str(t.dtype)[6:]}{':pinned' if t.is_pinned() else ''}"
+        out[key] = out.get(key, 0) + t.untyped_storage().nbytes()
+
+    stack = [optimizer]
+    while stack:
+        opt = stack.pop()
+        if opt is None:
+            continue
+        chained = getattr(opt, "chained_optimizers", None)
+        if chained:
+            stack.extend(chained)
+            continue
+        try:
+            inner = getattr(opt, "optimizer", None)
+        except Exception:
+            inner = None
+        if inner is not None and inner is not opt:
+            stack.append(inner)
+        stack.extend(getattr(opt, "sub_optimizers", []) or [])
+        for group in getattr(opt, "param_groups", []) or []:
+            for p in group.get("params", []):
+                add("param", p)
+                add("grad", getattr(p, "grad", None))
+        for st in (getattr(opt, "state", {}) or {}).values():
+            if isinstance(st, dict):
+                for v in st.values():
+                    add("state", v)
+    return out
+
+
 def optimizer_step(handle, step_fn):
     """Wrap one optimizer step with gradient-coverage and parameter-change evidence."""
     if not enabled():
@@ -109,6 +147,8 @@ def optimizer_step(handle, step_fn):
         "grad_nonzero": nonzero,
         "local_grad_sq": sq,
         "params_changed": changed,
+        "host_optimizer_bytes": _host_bytes(handle._optimizer),
+        "trainable_numel": sum(p.numel() for p in params),
         "non_bf16_params": sorted(
             f"{n}:{str(p.dtype)[6:]}"
             for chunk in chunks
