@@ -85,3 +85,28 @@ def test_recompute_modes_match_native_names():
     assert recompute_modes("attn,moe") == {"attn", "moe"}
     with pytest.raises(ValueError):
         recompute_modes("mlp")
+
+
+def test_param_gather_finisher_runs_only_core_ddp_readiness_hooks():
+    """finish_param_gather selects Core DDP's readiness hook by name (a rename would make it a
+    silent no-op) and leaves every other forward pre-hook alone."""
+    from types import SimpleNamespace
+
+    from megatron.core.distributed import DistributedDataParallel
+
+    from megatron.lite.model.deepseek_v41.vllm.model import finish_param_gather
+
+    seen, other = [], []
+
+    class Owners(dict):
+        def __contains__(self, param):
+            seen.append(param)
+            return False
+
+    ddp = SimpleNamespace(use_forward_hook=True, param_to_bucket_group=Owners())
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
+    for module in model.modules():
+        module.register_forward_pre_hook(DistributedDataParallel._make_forward_pre_hook(ddp))
+        module.register_forward_pre_hook(lambda *_: other.append(1))
+    finish_param_gather(model)
+    assert seen == list(model.parameters()) and other == []

@@ -42,6 +42,24 @@ def doc_positions(prefix, rows):
     return index - starts[owner]
 
 
+def finish_param_gather(model):
+    """Finish an overlapped DistOpt parameter all-gather before parameters are read raw.
+
+    Core DDP finishes the gather of a module's parameters in that module's forward
+    pre-hook. The deployment forward reads most parameters without calling their
+    modules, so after an optimizer step not followed by an export (which syncs) it
+    would read other ranks' stale shards. Run DDP's readiness hook of every submodule,
+    as the native forward does by calling them; once the gather has finished the hooks
+    return immediately.
+    """
+    for module in model.modules():
+        for hook in list(module._forward_pre_hooks.values()):
+            if getattr(hook, '__qualname__', '').startswith(
+                'DistributedDataParallel._make_forward_pre_hook'
+            ):
+                hook(module)
+
+
 class DeepseekV41Model(NativeModel):
     deployment_providers = {
         'attention': 'vLLM BI projections/compressor/indexer/wo_a/wo_b; core per tracks.md (M/F)',
@@ -169,6 +187,7 @@ class DeepseekV41Model(NativeModel):
             raise NotImplementedError('Deployment DS4.1 forward is PP=1')
         if self.ps.tp_size > 1:
             raise NotImplementedError('Deployment DS4.1 forward is TP=1')
+        finish_param_gather(self)
         params = packed_seq_params
         ids = input_ids.reshape(-1)
         rows = ids.shape[0]
