@@ -237,45 +237,50 @@ def _seq_lens(data):
 def pack_ab(engine, data, loss_function, result):
     """Packing A/C check on the old-logprob path (``Y_C8_PACK_AB=1``).
 
-    Recomputes the same batch under (a) one sequence per micro-batch budget and (b) the
-    recipe budget with the document order reversed, and compares every token's log-prob
-    bitwise with the production pass. Called on every DP rank (micro counts are synced).
+    Recomputes the same batch under (a) one sequence per micro-batch, (b) the smallest legal
+    dynamic budget ``ceil(max_len/sp)`` and (c) the recipe budget with the document order
+    reversed, and compares every token's log-prob bits with the production pass. Every rank
+    runs the recomputes (CP ranks share the collectives); only ranks holding outputs compare.
     """
     if not enabled() or os.environ.get("Y_C8_PACK_AB") != "1" or _STATE["suppress"]:
         return
     from verl.utils import tensordict_utils as tu
 
     base = (result or {}).get("model_output", {}).get("log_probs")
-    if base is None:
-        return
     n = len(data)
     sp = tu.get_non_tensor_data(data=data, key="sp_size", default=1)
     budget = int(tu.get_non_tensor_data(data=data, key="max_token_len_per_gpu", default=0))
     lens = _seq_lens(data)
     variants = {
-        "one_seq_budget": (list(range(n)), -(-max(lens) // sp)),
+        "one_seq": (list(range(n)), None),
+        "min_budget": (list(range(n)), -(-max(lens) // sp)),
         "reversed_order": (list(range(n))[::-1], budget),
     }
     rec = {"optim_step": _STATE["optim_steps"], "n_docs": n, "seq_lens": lens, "sp": sp,
            "budget_per_gpu": budget, "variants": {}}
-    base_rows = base.unbind()
+    base_rows = None if base is None else base.unbind()
     _STATE["suppress"] = True
     try:
         for name, (perm, b) in variants.items():
             d2 = tu.index_select_tensor_dict(data, perm)
-            tu.assign_non_tensor(d2, max_token_len_per_gpu=b)
+            if b is None:
+                tu.assign_non_tensor(d2, use_dynamic_bsz=False, micro_batch_size_per_gpu=1)
+            else:
+                tu.assign_non_tensor(d2, max_token_len_per_gpu=b)
             groups = []
             _STATE["groups"] = groups
             out = engine.forward_backward_batch(d2, loss_function, forward_only=True)
+            if base_rows is None:
+                continue
             rows = out["model_output"]["log_probs"].unbind()
             mism, maxd, tok = 0, 0.0, 0
             for i, j in enumerate(perm):
                 a, c = base_rows[j], rows[i]
                 tok += a.numel()
-                if a.shape != c.shape:
+                if a.shape != c.shape or a.dtype != c.dtype:
                     mism += a.numel()
                     continue
-                ne = a.ne(c)
+                ne = a.contiguous().view(torch.int32).ne(c.contiguous().view(torch.int32))
                 mism += int(ne.sum())
                 if ne.any():
                     maxd = max(maxd, float((a.float() - c.float()).abs().max()))
@@ -284,6 +289,8 @@ def pack_ab(engine, data, loss_function, result):
     finally:
         _STATE["suppress"] = False
         _STATE.pop("groups", None)
+    if base_rows is None:
+        return
     _STATE["packab"] += 1
     with open(os.path.join(_dir("packab"), f"{_tag()}_{_STATE['packab']:03d}.json"), "w") as f:
         json.dump(rec, f)
