@@ -134,6 +134,9 @@ fi
 # Trainer MegaMoE processes packed rows in blocks of this many tokens per rank (track P: 2048
 # keeps the 5120-token micro-batch in GPU memory; logprobs unchanged). vLLM does not read it.
 export DSV41_MEGAMOE_MAX_TOKENS="${DSV41_MEGAMOE_MAX_TOKENS:-2048}"
+# Mega-attention dKV with atomics (user decision); logprobs stay bitwise, gradients compared
+# within tolerance. 1 makes dKV run-to-run reproducible for debugging.
+export DS41_MEGA_ATTN_DETERMINISTIC="${DS41_MEGA_ATTN_DETERMINISTIC:-0}"
 RAY_ENV_ARGS=()
 for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS VERL_MLITE_VAL_MAX_TOKENS; do
   # Quoted: Ray requires string env values and Hydra would parse 1 as an int.
