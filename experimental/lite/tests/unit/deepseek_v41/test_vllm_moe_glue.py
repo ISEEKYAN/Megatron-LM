@@ -54,3 +54,14 @@ def test_activation_decode_accepts_empty_chunks(rows):
     assert out.shape == (rows, 128)
     expected = codes.float().reshape(rows, 4, 32) * scale.unsqueeze(-1)
     assert torch.equal(out, expected.reshape(rows, 128))
+
+
+@pytest.mark.parametrize("rows", [0, 2])
+def test_l2_requant_accepts_empty_chunks(rows):
+    from megatron.lite.model.deepseek_v41.vllm.megamoe import _requant_l2
+
+    h = torch.linspace(-600, 600, rows * 64).reshape(rows, 64)
+    out = _requant_l2(h)
+    assert out.shape == h.shape
+    if rows:
+        assert out.abs().max() <= 600 and torch.isfinite(out).all()
