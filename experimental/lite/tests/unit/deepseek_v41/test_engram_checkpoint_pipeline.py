@@ -125,6 +125,11 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
     )
     with pytest.raises(ValueError, match="equal Core row shards"):
         _sharded_state(unequal, "", (), None, {})
+    from megatron.lite.primitive.modules.engram import ShardedFrozenTable
+
+    group = SimpleNamespace(size=lambda: 2, rank=lambda: 0)
+    frozen = ShardedFrozenTable(4, 32, group, initialize=False)
+    assert _sharded_state(frozen, "embed.", (), None, {}) == {}  # resume keeps the release
     unread = stage()
     del unread.embed  # a stage-local release key nobody reads
     with pytest.raises(ValueError, match=r"unread \['embed.weight'\]"):

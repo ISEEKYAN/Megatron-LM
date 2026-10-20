@@ -247,14 +247,17 @@ def _local_tensors(module):
 def _sharded_state(module, prefix, offsets, ps, metadata):
     """Core sharded state for the DS4.1 tree.
 
-    Native Core modules describe themselves (expert offsets, TP axes). A module
-    whose rows are sharded over ``lookup.group`` (frozen Engram table) keeps each
-    rank's rows at their global offset. Other lite modules are replicated.
+    Native Core modules describe themselves (expert offsets, TP axes). Modules marked
+    ``restored_from_release`` (the frozen Engram tables) are left out. A module whose rows
+    are sharded over ``lookup.group`` keeps each rank's rows at their global offset.
+    Other lite modules are replicated.
     """
     from megatron.core.dist_checkpointing.mapping import ShardedTensor
     from megatron.core.transformer.module import MegatronModule
     from megatron.core.transformer.utils import make_sharded_tensors_for_checkpoint
 
+    if getattr(module, "restored_from_release", False):
+        return {}  # frozen Engram table: resume keeps the bytes loaded from the release
     lookup = getattr(module, "lookup", None)
     if getattr(lookup, "group", None) is not None:
         size, rank = lookup.group.size(), lookup.group.rank()
