@@ -23,6 +23,7 @@ def test_masked_lp_entropy_and_logits_over_the_deployment_hidden():
     model.layout = NS(has_embed=True, has_head=True)
     model.ps = NS(tp_size=1, cp_size=1, cp_rank=0)
     model.engrams, model.release = {}, NS()
+    model.impl = NS(recompute=None)
     model.head = NS(weight=torch.randn(6, 4, requires_grad=True))
     hidden = torch.randn(3, 4, requires_grad=True)
     labels, mask = torch.tensor([1, 0, 5]), torch.tensor([1.0, 0.0, 1.0])

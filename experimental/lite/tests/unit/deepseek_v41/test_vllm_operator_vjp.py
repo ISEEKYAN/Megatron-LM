@@ -126,7 +126,7 @@ def test_wo_a_owned_vjp_matches_autograd_on_decoded_operands(fused):
 def test_engram_qk_grads_reach_fp32_masters_unrounded():
     """The gate saves BF16 q/k (what vLLM uses); their gradient is a reduction over every
     token and must reach the FP32 masters without a BF16 rounding."""
-    from megatron.lite.model.deepseek_v41.vllm.engram import _Gate, _reference
+    from megatron.lite.model.deepseek_v41.vllm.engram import _Gate, reference
 
     torch.manual_seed(0)
     tokens, copies, dim = 64, 4, 128
@@ -145,7 +145,7 @@ def test_engram_qk_grads_reach_fp32_masters_unrounded():
     assert not torch.equal(dq, dq.bfloat16().float()) and not torch.equal(dk, dk.bfloat16().float())
 
     leaves = [t.double().requires_grad_() for t in (q, k)]
-    out = _reference(hidden.double(), kv.double(), *leaves, None, 1e-6)
+    out = reference(hidden.double(), kv.double(), *leaves, 1e-6, None)
     ref = torch.autograd.grad(out, leaves, grad.double())
     for got, want in zip((dq, dk), ref):
         error = (got.double() - want).norm() / want.norm()

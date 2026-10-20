@@ -52,9 +52,10 @@ def test_head_projection_vjp_uses_compute_weight_and_master_dtype():
     grad = torch.randn(5, 11)
     compute = weight + (weight.bfloat16().float() - weight).detach()
     output = torch.nn.functional.linear(x.float(), compute)
-    expected = torch.autograd.grad(output, (x, weight), grad)
+    # Backward GEMMs take BF16 operands (tensor cores): the upstream gradient is rounded.
+    expected = torch.autograd.grad(output, (x, weight), grad.bfloat16().float())
     ctx = SimpleNamespace(
-        saved_tensors=(x.detach(), weight.detach().bfloat16()), weight_dtype=weight.dtype
+        saved_tensors=(x.detach(), weight.detach().bfloat16()), owners=(weight,), like=weight
     )
     actual = _BF16Linear.backward(ctx, grad)
     assert all(torch.equal(a, b) for a, b in zip(actual, expected))
