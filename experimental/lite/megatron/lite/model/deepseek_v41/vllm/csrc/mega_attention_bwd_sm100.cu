@@ -31,7 +31,7 @@ constexpr int BK = 128;     // KV slots per block (UMMA M)
 constexpr int TILE = 128;   // dims per ring stage
 constexpr int NS = 2;       // ring stages
 constexpr int ROPE = 64;
-constexpr int THREADS = 384;
+constexpr int THREADS = 512;
 constexpr uint32_t STAGE_BYTES = BK * TILE * 2;
 
 // Tensor memory columns.
@@ -123,37 +123,57 @@ __global__ void __launch_bounds__(THREADS, 1)
   __syncthreads();
   tc_after_sync();
   const uint32_t tmem = s.tmem;
+
   const uint32_t q_addr = smem_u32(s.q), do_addr = smem_u32(s.dout);
   const uint32_t pt_addr = smem_u32(s.pt), ds_addr = smem_u32(s.dst);
 
-  if (warp == 0) {
-    // ---- gather4 producer ----
-    int ks = 0;
-    uint32_t kphase = 0;
-    for (int row = row0 + blockIdx.x; row < row1; row += gridDim.x) {
-      const int next = row + gridDim.x;
-      if (lane == 0 && next < row1) {
-        prefetch_l2(q_fused + (int64_t)next * H * D, H * D * 2);
-        prefetch_l2(grad_fused + (int64_t)next * H * D, H * D * 2);
-      }
-      const int len = lens[row];
-      const int nb = max(1, (len + BK - 1) / BK);
-      for (int pass = 0; pass < 2; ++pass) {
-        for (int b = 0; b < nb; ++b) {
-          const int slot = b * BK + 4 * lane;
-          const int4 rows = make_int4(slot_id(indices, index_stride, row, slot, len, kv_rows),
-                                      slot_id(indices, index_stride, row, slot + 1, len, kv_rows),
-                                      slot_id(indices, index_stride, row, slot + 2, len, kv_rows),
-                                      slot_id(indices, index_stride, row, slot + 3, len, kv_rows));
-          {
+  // Warpgroups 0 and 3 (MMA, gather4 issue) need few registers; 1 and 2
+  // (softmax, dK drain) get the rest.
+  if (warp < 4 || warp >= 12) {
+  asm volatile("setmaxnreg.dec.sync.aligned.u32 56;");
+  if (warp != 1) {
+    // ---- gather4 producers ----
+    // TMA issue throughput scales with issuing warps, not lanes: lanes 0-4
+    // of warps 0, 2, 3, 12-15 each own one group of 4 slots.
+    constexpr int LANES = 5, ISSUERS = 7 * LANES, GROUPS = BK / 4;
+    constexpr int PER = (GROUPS + ISSUERS - 1) / ISSUERS;
+    const int pw = warp == 0 ? 0 : (warp < 4 ? warp - 1 : warp - 9);
+    const int issuer = pw * LANES + lane;
+    if (lane < LANES) {
+      int ks = 0;
+      uint32_t kphase = 0;
+      for (int row = row0 + blockIdx.x; row < row1; row += gridDim.x) {
+        const int next = row + gridDim.x;
+        if (issuer == 0 && next < row1) {
+          prefetch_l2(q_fused + (int64_t)next * H * D, H * D * 2);
+          prefetch_l2(grad_fused + (int64_t)next * H * D, H * D * 2);
+        }
+        const int len = lens[row];
+        const int nb = max(1, (len + BK - 1) / BK);
+        for (int pass = 0; pass < 2; ++pass) {
+          for (int b = 0; b < nb; ++b) {
+            int4 rows[PER];
+#pragma unroll
+            for (int k = 0; k < PER; ++k) {
+              const int slot = b * BK + 4 * (issuer + ISSUERS * k);
+              rows[k] = make_int4(slot_id(indices, index_stride, row, slot, len, kv_rows),
+                                  slot_id(indices, index_stride, row, slot + 1, len, kv_rows),
+                                  slot_id(indices, index_stride, row, slot + 2, len, kv_rows),
+                                  slot_id(indices, index_stride, row, slot + 3, len, kv_rows));
+            }
             for (int st = 0; st < D / TILE; ++st) {
               mbar_wait(&s.kempty[ks], kphase ^ 1);
-              if (lane == 0) mbar_expect_tx(&s.kfull[ks], STAGE_BYTES);
-              __syncwarp();
+              if (issuer == 0) mbar_expect_tx(&s.kfull[ks], STAGE_BYTES);
 #pragma unroll
-              for (int slab = 0; slab < 2; ++slab)
-                tma_gather4(&kv_map, &s.kfull[ks], &s.k[ks][slab * BK * 64 + 4 * lane * 64],
-                            st * TILE + slab * 64, rows);
+              for (int k = 0; k < PER; ++k) {
+                const int g = issuer + ISSUERS * k;
+                if (g < GROUPS) {
+#pragma unroll
+                  for (int slab = 0; slab < 2; ++slab)
+                    tma_gather4(&kv_map, &s.kfull[ks], &s.k[ks][slab * BK * 64 + 4 * g * 64],
+                                st * TILE + slab * 64, rows[k]);
+                }
+              }
               if (++ks == NS) {
                 ks = 0;
                 kphase ^= 1;
@@ -163,7 +183,7 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
       }
     }
-  } else if (warp == 1) {
+  } else {
     // ---- UMMA issuer ----
     if (lane == 0) {
       int ks = 0;
@@ -245,7 +265,9 @@ __global__ void __launch_bounds__(THREADS, 1)
         ++n_row;
       }
     }
-  } else if (warp >= 4) {
+  }
+  } else {
+    asm volatile("setmaxnreg.inc.sync.aligned.u32 200;");
     // ---- warps 4-11 ----
     const int t2 = tid - 128;       // 0..255
     const int t = t2 & 127;         // TMEM lane = KV slot / dim within a tile
@@ -260,21 +282,23 @@ __global__ void __launch_bounds__(THREADS, 1)
       const int nb = max(1, (len + BK - 1) / BK);
       const float* cs = cos_sin + (int64_t)positions[row] * ROPE;
 
-      // Q and dO into the swizzled slabs, RoPE as the forward kernel.
-      {
+      // Q and dO into the swizzled slabs, RoPE as the forward kernel. The
+      // softmax warps own the row boundary (this, and dq below) so the drain
+      // warps' last reductions overlap it.
+      if (softmax) {
         const __nv_bfloat16* qrow = q_fused + (int64_t)row * H * D;
         const __nv_bfloat16* grow = grad_fused + (int64_t)row * H * D;
 #pragma unroll 1
-        for (int c0 = t2; c0 < H * D / 8; c0 += 8 * 256) {
+        for (int c0 = t; c0 < H * D / 8; c0 += 8 * 128) {
           uint4 qbuf[8], gbuf[8];
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
-            qbuf[u] = __ldcs(reinterpret_cast<const uint4*>(qrow) + c0 + 256 * u);
-            gbuf[u] = __ldcs(reinterpret_cast<const uint4*>(grow) + c0 + 256 * u);
+            qbuf[u] = __ldcs(reinterpret_cast<const uint4*>(qrow) + c0 + 128 * u);
+            gbuf[u] = __ldcs(reinterpret_cast<const uint4*>(grow) + c0 + 128 * u);
           }
 #pragma unroll
           for (int u = 0; u < 8; ++u) {
-          const int f = (c0 + 256 * u) * 8;
+          const int f = (c0 + 128 * u) * 8;
           const int qh = (f & 1023) >> 4, qd = (f >> 10) * 16 + (f & 15);
           const int rem = f & 4095;
           const int gh = (f >> 12) * 8 + ((rem & 255) >> 5), gd = (rem >> 8) * 32 + (rem & 31);
@@ -300,10 +324,10 @@ __global__ void __launch_bounds__(THREADS, 1)
           *reinterpret_cast<uint4*>(&s.dout[(gd >> 6) * H * 64 + swz(gh, gd & 63)]) = gv;
           }
         }
-        if (t2 < H) s.lse2[t2] = lse2[(int64_t)row * H + t2];
+        if (t < H) s.lse2[t] = lse2[(int64_t)row * H + t];
         fence_async_smem();
-        named_sync(1, 256);
-        if (t2 == 0) mbar_arrive(&s.q_ready);
+        named_sync(2, 128);
+        if (t == 0) mbar_arrive(&s.q_ready);
       }
 
       if (softmax) {
@@ -462,14 +486,13 @@ __global__ void __launch_bounds__(THREADS, 1)
       }
 
       // ---- dq: inverse RoPE, fused layout, staged in s.q ----
-      mbar_wait(&s.row_done, n_row & 1);
-      tc_after_sync();
-      ++n_row;
-      {
-        const int tile = (softmax ? 0 : 2);
+      if (softmax) {
+        mbar_wait(&s.row_done, n_row & 1);
+        tc_after_sync();
+        ++n_row;
         __nv_bfloat16* stage = s.q;
 #pragma unroll 1
-        for (int tt = tile; tt < tile + 2; ++tt) {
+        for (int tt = 0; tt < D / TILE; ++tt) {
           const int d = tt * TILE + t;
 #pragma unroll
           for (int half = 0; half < 2; ++half) {
@@ -495,13 +518,13 @@ __global__ void __launch_bounds__(THREADS, 1)
         }
         tc_before_sync();
         fence_async_smem();
-        named_sync(1, 256);
-        if (t2 == 0) {
+        named_sync(2, 128);
+        if (t == 0) {
           mbar_arrive(&s.dq_free);
           bulk_store(dq_fused + (int64_t)row * H * D, stage, H * D * 2);
           bulk_commit_wait_read();
         }
-        named_sync(1, 256);
+        named_sync(2, 128);
       }
     }
     if (t2 == 0) bulk_commit_wait();
