@@ -99,3 +99,33 @@ def test_wo_a_owned_vjp_matches_autograd_on_decoded_operands(fused):
     expected_out, expected_weight = torch.autograd.grad(z, (out, master), grad)
     torch.testing.assert_close(d_out, expected_out.bfloat16())
     torch.testing.assert_close(d_weight, expected_weight, rtol=1e-5, atol=1e-4)
+
+
+def test_engram_qk_grads_reach_fp32_masters_unrounded():
+    """The gate saves BF16 q/k (what vLLM uses); their gradient is a reduction over every
+    token and must reach the FP32 masters without a BF16 rounding."""
+    from megatron.lite.model.deepseek_v41.vllm.engram import _Gate, _reference
+
+    torch.manual_seed(0)
+    tokens, copies, dim = 64, 4, 128
+    hidden = torch.randn(tokens, copies, dim).bfloat16()
+    kv = torch.randn(tokens, (copies + 1) * dim).bfloat16()
+    q, k = (torch.randn(dim).bfloat16() for _ in range(2))
+    grad = torch.randn(tokens, copies, dim)
+    ctx = SimpleNamespace(
+        saved_tensors=(hidden, kv, q, k, None),
+        needs_input_grad=(False, False, True, True, False, False),
+        eps=1e-6,
+        master_dtypes=(torch.float32, torch.float32),
+    )
+    _, _, dq, dk, _, _ = _Gate.backward(ctx, grad)
+    assert dq.dtype == dk.dtype == torch.float32
+    assert not torch.equal(dq, dq.bfloat16().float()) and not torch.equal(dk, dk.bfloat16().float())
+
+    leaves = [t.double().requires_grad_() for t in (q, k)]
+    out = _reference(hidden.double(), kv.double(), *leaves, None, 1e-6)
+    ref = torch.autograd.grad(out, leaves, grad.double())
+    for got, want in zip((dq, dk), ref):
+        error = (got.double() - want).norm() / want.norm()
+        rounded = (got.bfloat16().double() - want).norm() / want.norm()
+        assert error < 1e-5 < rounded, (error, rounded)
