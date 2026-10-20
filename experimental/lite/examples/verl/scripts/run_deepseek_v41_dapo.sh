@@ -139,8 +139,14 @@ export DSV41_MEGAMOE_MAX_TOKENS="${DSV41_MEGAMOE_MAX_TOKENS:-2048}"
 # Mega-attention dKV with atomics (user decision); logprobs stay bitwise, gradients compared
 # within tolerance. 1 makes dKV run-to-run reproducible for debugging.
 export DS41_MEGA_ATTN_DETERMINISTIC="${DS41_MEGA_ATTN_DETERMINISTIC:-0}"
+# Checkpoint save host memory: stage GPU tensors one at a time through one pinned buffer
+# (<= 4 GiB) instead of the whole shard, and fsync + drop written pages every 1 GiB so the
+# page cache the cgroup and Ray account stays bounded.
+export MCORE_DIST_CKPT_STREAM_D2H="${MCORE_DIST_CKPT_STREAM_D2H:-1}"
+export MCORE_DIST_CKPT_DROP_CACHE_BYTES="${MCORE_DIST_CKPT_DROP_CACHE_BYTES:-1073741824}"
 RAY_ENV_ARGS=()
-for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS VERL_MLITE_VAL_MAX_TOKENS; do
+for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS \
+  VERL_MLITE_VAL_MAX_TOKENS MCORE_DIST_CKPT_STREAM_D2H MCORE_DIST_CKPT_DROP_CACHE_BYTES; do
   # Quoted: Ray requires string env values and Hydra would parse 1 as an int.
   [[ -n "${!key:-}" ]] && RAY_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${key}='${!key}'")
 done

@@ -3,12 +3,14 @@
 """Storage writer for PyT Distributed format allowing asynchronous save."""
 
 import dataclasses
+import errno
 import inspect
 import logging
 import os
 import pickle
 import queue
 import threading
+import weakref
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -47,6 +49,212 @@ except ImportError:
     HAVE_PSUTIL = False
 
 _results_queue = None
+
+
+_EFAULT_RETRY_ENV = "MCORE_DIST_CKPT_EFAULT_RETRY"
+# Synchronous saves only: keep GPU tensors on the device until each is written, staging them
+# one at a time through one page-locked buffer instead of copying the whole shard to the host.
+_STREAM_D2H_ENV = "MCORE_DIST_CKPT_STREAM_D2H"
+_STAGE_BYTES_ENV = "MCORE_DIST_CKPT_STAGE_BYTES"
+# fsync + POSIX_FADV_DONTNEED after every this many written bytes (0 disables), so written
+# checkpoint pages do not accumulate in the page cache that the job cgroup and Ray account.
+_DROP_CACHE_ENV = "MCORE_DIST_CKPT_DROP_CACHE_BYTES"
+
+
+def _env_int(name: str, default: int) -> int:
+    value = os.environ.get(name, "")
+    return int(value) if value else default
+
+
+def _stream_d2h() -> bool:
+    return os.environ.get(_STREAM_D2H_ENV, "0") == "1"
+
+
+def _pinned_bytes(nbytes: int) -> torch.Tensor:
+    """Exact-size page-locked host buffer (the caching host allocator rounds to powers of two
+    and keeps the block after the save)."""
+    buffer = torch.empty(nbytes, dtype=torch.uint8)
+    cudart = torch.cuda.cudart()
+    try:
+        torch.cuda.check_error(cudart.cudaHostRegister(buffer.data_ptr(), nbytes, 0))
+    except RuntimeError:
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    weakref.finalize(buffer, cudart.cudaHostUnregister, buffer.data_ptr())
+    return buffer
+
+
+class _PinnedStager:
+    """Copies device tensors to the host one at a time through one reused pinned buffer.
+
+    The buffer holds the largest device item up to ``cap`` bytes; a larger item gets its own
+    buffer for the duration of its write. The returned host tensor views a slice of the buffer's
+    storage, so ``torch.save`` serializes only that item, and it is invalid after the next call.
+    """
+
+    def __init__(self, tensors, cap: int):
+        sizes = [t.numel() * t.element_size() for t in tensors if not t.is_cpu]
+        self._nbytes = min(max(sizes, default=0), cap)
+        self._buffer = _pinned_bytes(self._nbytes) if self._nbytes else None
+
+    def stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return a host copy of device ``tensor`` (host tensors are returned unchanged)."""
+        if tensor.is_cpu:
+            return tensor
+        nbytes = tensor.numel() * tensor.element_size()
+        if nbytes == 0:
+            return tensor.cpu()
+        buffer = self._buffer if nbytes <= self._nbytes else _pinned_bytes(nbytes)
+        host = torch.empty(0, dtype=tensor.dtype).set_(
+            buffer.untyped_storage()[:nbytes], 0, tensor.shape
+        )
+        with torch.cuda.device(tensor.device):
+            host.copy_(tensor, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+        return host
+
+
+class _BounceWriter:
+    """Writes through fresh pageable copies in 1 MiB chunks instead of from the source buffer."""
+
+    def __init__(self, stream, chunk_bytes: int = 1 << 20):
+        self._stream = stream
+        self._chunk_bytes = chunk_bytes
+
+    def write(self, data) -> int:
+        """Write ``data`` chunk by chunk; returns its size."""
+        view = memoryview(data).cast("B")
+        for start in range(0, view.nbytes, self._chunk_bytes):
+            self._stream.write(bytes(view[start : start + self._chunk_bytes]))
+        return view.nbytes
+
+    def __getattr__(self, name):
+        return getattr(self._stream, name)
+
+
+class _EfaultRetryStream:
+    """Unbuffered file stream that retries each chunk written when it fails with EFAULT.
+
+    Lustre 2.17 writes from GB200 hosts intermittently fail with EFAULT even from plain
+    heap buffers, so a buffered stream can also fail later in flush() or close().
+    """
+
+    def __init__(self, raw, chunk_bytes: int = 64 << 20, attempts: int = 5):
+        self._raw = raw
+        self._chunk_bytes = chunk_bytes
+        self._attempts = attempts
+        self._drop_bytes = _env_int(_DROP_CACHE_ENV, 0)
+        self._since_drop = 0
+
+    def _drop_page_cache(self) -> None:
+        os.fsync(self._raw.fileno())
+        os.posix_fadvise(self._raw.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        self._since_drop = 0
+
+    def write(self, data) -> int:
+        """Write all of ``data``, retrying a chunk from its start on EFAULT."""
+        view = memoryview(data).cast("B")
+        for start in range(0, view.nbytes, self._chunk_bytes):
+            chunk = view[start : start + self._chunk_bytes]
+            pos = self._raw.tell()
+            for attempt in range(self._attempts):
+                try:
+                    done = 0
+                    while done < chunk.nbytes:
+                        done += self._raw.write(
+                            chunk[done:] if attempt == 0 else bytes(chunk[done:])
+                        )
+                    break
+                except OSError as e:
+                    if e.errno != errno.EFAULT or attempt == self._attempts - 1:
+                        raise
+                    logging.getLogger(__name__).warning(
+                        f"EFAULT writing {getattr(self._raw, 'name', '?')} at {pos},"
+                        f" retry {attempt + 1}"
+                    )
+                    self._raw.seek(pos)
+        self._since_drop += view.nbytes
+        if self._drop_bytes and self._since_drop >= self._drop_bytes:
+            self._drop_page_cache()
+        return view.nbytes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._drop_bytes and exc[0] is None:
+                self._drop_page_cache()
+        finally:
+            self._raw.close()
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
+
+
+def _root_os_error(exc: Optional[BaseException]) -> Optional[OSError]:
+    while exc is not None:
+        if isinstance(exc, OSError):
+            return exc
+        exc = exc.__cause__ or exc.__context__
+    return None
+
+
+def _write_item_checked(*args, **kwargs):
+    """``_write_item`` that reports the real I/O error of a failed item.
+
+    When a ``write()`` inside ``torch.save`` fails, torch's zip writer still writes
+    the end of the archive and raises ``unexpected pos ...`` instead, hiding the
+    original error. Re-raise with file, offset, item and the original error.
+
+    Payload writes to Lustre 2.17 from GB200 hosts intermittently fail with EFAULT,
+    with pinned and pageable staging buffers alike; the cause is not identified.
+    As a logged fallback, such an item is rewritten once from its start through
+    fresh 1 MiB bounce copies; set MCORE_DIST_CKPT_EFAULT_RETRY=0 to disable.
+
+    Args are those of ``_write_item``: optional transforms, then stream, data,
+    write_item and storage_key.
+    """
+    *transforms, stream, data, write_item, storage_key = args
+    start = stream.tell()
+
+    def describe(exc: BaseException) -> str:
+        os_error = _root_os_error(exc)
+        is_tensor = isinstance(data, torch.Tensor)
+        return (
+            f"file={getattr(stream, 'name', '?')} offset={start} item={write_item.index} "
+            f"bytes={data.untyped_storage().nbytes() if is_tensor else '?'} "
+            f"pinned={data.is_pinned() if is_tensor else '?'} "
+            f"error={os_error if os_error is not None else exc!r}"
+        )
+
+    try:
+        return _write_item(*args, **kwargs)
+    except Exception as exc:
+        description = describe(exc)
+        os_error = _root_os_error(exc)
+        retry = (
+            isinstance(data, torch.Tensor)
+            and os_error is not None
+            and os_error.errno == errno.EFAULT
+            and getattr(stream, "seekable", lambda: False)()
+            and os.environ.get(_EFAULT_RETRY_ENV, "1") != "0"
+        )
+        if not retry:
+            raise RuntimeError(f"Checkpoint write failed: {description}") from exc
+        logger.error(f"Checkpoint write failed, retrying through bounce buffers: {description}")
+        try:
+            stream.seek(start)
+            stream.truncate(start)
+            result = _write_item(
+                *transforms, _BounceWriter(stream), data, write_item, storage_key, **kwargs
+            )
+        except Exception as retry_exc:
+            raise RuntimeError(
+                f"Checkpoint write retry failed: {describe(retry_exc)}; "
+                f"first attempt: {description}"
+            ) from retry_exc
+    logger.warning(f"Checkpoint write retry succeeded: item={write_item.index}")
+    return result
 
 
 @_disable_gc()
@@ -233,6 +441,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 save in a checkpoint.
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
         """
+        if _stream_d2h():
+            return write_buckets  # staged per item in write_preloaded_data
         result = []
 
         for bucket in write_buckets:
@@ -400,19 +610,22 @@ class FileSystemWriterAsync(FileSystemWriter):
 
                 open_file = msc.open
             else:
-                open_file = open
+                open_file = lambda name, mode: _EfaultRetryStream(open(name, mode, buffering=0))
             with open_file(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
                     local_results.append(
-                        _write_item(
+                        _write_item_checked(
                             *transform_list, stream, data, write_item, storage_key, **extra_kwargs
                         )
                     )
 
+                stager = _PinnedStager(
+                    [t for _, t in tensor_data], _env_int(_STAGE_BYTES_ENV, 4 << 30)
+                )
                 for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
+                    tensor = stager.stage(tensor)
                     local_results.append(
-                        _write_item(
+                        _write_item_checked(
                             *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
                         )
                     )
