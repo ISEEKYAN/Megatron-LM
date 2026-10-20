@@ -3,6 +3,7 @@
 
 import os
 
+import torch
 from megatron.core.transformer.moe.moe_layer import MoELayer
 
 from .experts import combine  # noqa: F401  (re-exported)
@@ -13,6 +14,16 @@ class MegaMoE(MoELayer):
     over this layer's EP group (see :mod:`.megamoe`)."""
 
     max_tokens = int(os.environ.get("DSV41_MEGAMOE_MAX_TOKENS", "8192"))
+
+    def __init__(self, *args, vision_routing=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if vision_routing:
+            # Frozen release ffn.gate.bias_vl: vLLM routes the image sentinel ids
+            # with it in place of the text bias (sampled ids included).
+            bias = self.router.expert_bias
+            self.router.register_buffer(
+                'bias_vl', torch.zeros(bias.shape, dtype=torch.float32, device=bias.device)
+            )
 
     def forward(self, hidden_states, input_ids=None, **kwargs):
         from .megamoe import mega_moe
@@ -25,12 +36,17 @@ class MegaMoE(MoELayer):
         expected = list(range(rank * self.num_local_experts, (rank + 1) * self.num_local_experts))
         if self.local_expert_indices != expected:
             raise ValueError('MegaMoE requires the Core contiguous global expert ownership map')
+        image_bias = getattr(self.router, 'bias_vl', None)
+        if image_bias is not None and (input_ids is None or image_bias.dtype != torch.float32):
+            raise ValueError("DS4.1 vision routing needs the token IDs and the FP32 bias_vl")
         weights, indices = mega_route(
             x,
             self.router.weight,
             self.router.expert_bias.float(),
             self.router.topk,
             self.config.moe_router_topk_scaling_factor,
+            image_bias=image_bias,
+            tokens=None if image_bias is None else input_ids.reshape(-1),
         )
         fc1 = [
             getattr(self.experts.linear_fc1, f'weight{i}') for i in range(self.num_local_experts)

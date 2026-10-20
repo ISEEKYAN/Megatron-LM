@@ -35,7 +35,7 @@ _FP8_BLOCK_SUFFIXES = (
     ".engram.wkv.weight",
 )
 _MXFP4 = re.compile(r"\.ffn\.experts\.\d+\.w[123]\.weight$")
-_FP32 = re.compile(r"(\.hc_(attn|ffn)_(fn|base|scale)|\.attn\.attn_sink|\.ffn\.gate\.bias)$")
+_FP32 = re.compile(r"(\.hc_(attn|ffn)_(fn|base|scale)|\.attn\.attn_sink|\.ffn\.gate\.bias(_vl)?)$")
 _EXPERT = re.compile(
     r"^layers\.(\d+)\.ffn\.(experts|shared_experts)\.linear_fc([12])\.weight(\d*)$"
 )
@@ -86,12 +86,12 @@ class DeepseekV41WeightSpec:
 
     def load_weight_map(self, base_model, ps, logical_state_keys):
         del base_model, ps
-        # Only persistent buffers consult this map: the router bias is exported,
+        # Only persistent buffers consult this map: the router biases are exported,
         # Engram tables and hash constants are not.
         return {
             name: release_names(name)
             for name in logical_state_keys
-            if name.endswith(".ffn.router.expert_bias")
+            if name.endswith((".ffn.router.expert_bias", ".ffn.router.bias_vl"))
         }
 
     def native_to_hf(self, native_name, tensor):

@@ -108,3 +108,12 @@ def test_verl_connector_defaults_accepted_and_unsupported_values_rejected():
                 {"qat": {"enabled": True}}, {"unknown_knob": 1}):
         with pytest.raises(ValueError):
             protocol.validate_impl_cfg_keys(bad)
+
+
+@pytest.mark.parametrize("layers,expected", [(32, True), (0, False), (None, False)])
+def test_vision_routing_follows_the_release_vision_tower(layers, expected):
+    """vLLM routes image sentinel ids with bias_vl iff vision_config has layers (text-only too)."""
+    hf = {"text_config": {"num_hidden_layers": 4}}
+    if layers is not None:
+        hf["vision_config"] = {"num_hidden_layers": layers}
+    assert DeepseekV41Config._from_hf_dict(hf).vision_routing is expected
