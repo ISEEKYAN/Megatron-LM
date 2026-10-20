@@ -58,9 +58,12 @@ def source_name(name):
         return (
             prefix
             + "ffn.gate."
-            + {"weight": "weight", "expert_bias": "bias", "tid2eid": "tid2eid"}[
-                suffix.removeprefix("ffn.router.")
-            ]
+            + {
+                "weight": "weight",
+                "expert_bias": "bias",
+                "bias_vl": "bias_vl",
+                "tid2eid": "tid2eid",
+            }[suffix.removeprefix("ffn.router.")]
         )
     for group in ("attn", "ffn"):
         key = suffix.removeprefix(group + "_mixes.")
@@ -164,14 +167,15 @@ def _record_reads(reader):
 
 def _stage_keys(index, model, cfg, ps):
     """Release keys this pipeline stage and EP rank must consume."""
+    vision = any(n.endswith(".router.bias_vl") for n, _ in model.named_buffers())
     start, end = model.local_layer_range
     local = cfg.n_routed_experts // ps.ep_size
     top = {"embed.weight"} if model.layout.has_embed else set()
     top |= {"head.weight", "norm.weight"} if model.layout.has_head else set()
     keys = set()
     for key in index:
-        if re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", key):
-            continue  # Release vision-only router bias; text routing uses ffn.gate.bias.
+        if not vision and re.fullmatch(r"layers\.\d+\.ffn\.gate\.bias_vl", key):
+            continue  # Image-sentinel router bias; read only by models that route with it.
         layer = re.match(r"layers\.(\d+)\.(?:ffn\.experts\.(\d+)\.)?", key)
         if layer is None:
             keys |= {key} & top
@@ -192,7 +196,7 @@ def load_hf_weights(chunk, hf_path, model_cfg, ps):
     state += [
         (n, v)
         for n, v in model.named_buffers()
-        if n.endswith("expert_bias")
+        if n.endswith(("expert_bias", ".router.bias_vl"))
         or n.endswith(("embed.embedding.weight", "embed.embedding.scale"))
         or n.endswith("tid2eid")
     ]

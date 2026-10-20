@@ -61,6 +61,7 @@ class DeepseekV41Model(NativeModel):
             layer_number=index + 1,
             pg_collection=self.context.groups,
             hash_moe_layer_threshold=release.num_hash_layers,
+            vision_routing=release.vision_routing,
         )
 
     def _build_head(self, config, release):

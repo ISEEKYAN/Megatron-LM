@@ -143,6 +143,33 @@ def test_release_load_fails_on_unread_stage_keys_or_unloaded_state(tmp_path):
         load_hf_weights(stage(), str(tmp_path), cfg, ps)
 
 
+def test_vision_router_bias_loads_bitwise_and_counts_as_read(tmp_path):
+    """A model that routes image sentinels reads ffn.gate.bias_vl as exact FP32."""
+    bias_vl = torch.tensor([1 + 2**-20, -3.0e-7, 0.125, 7.0], dtype=torch.float32)
+    tensors = {
+        "layers.0.ffn.gate.weight": torch.ones(4, 2, dtype=torch.bfloat16),
+        "layers.0.ffn.gate.bias": torch.full((4,), 0.5),
+        "layers.0.ffn.gate.bias_vl": bias_vl,
+    }
+    save_file(tensors, tmp_path / "a.safetensors")
+    index = {"weight_map": {n: "a.safetensors" for n in tensors}}
+    (tmp_path / "model.safetensors.index.json").write_text(json.dumps(index))
+
+    model, layer = torch.nn.Module(), torch.nn.Module()
+    layer.ffn = torch.nn.Module()
+    layer.ffn.router = torch.nn.Module()
+    layer.ffn.router.weight = torch.nn.Parameter(torch.zeros(4, 2, dtype=torch.bfloat16))
+    layer.ffn.router.register_buffer("expert_bias", torch.zeros(4))
+    layer.ffn.router.register_buffer("bias_vl", torch.zeros(4))
+    model.layers, model.local_layer_range = torch.nn.ModuleDict({"0": layer}), (0, 1)
+    model.layout = SimpleNamespace(has_embed=False, has_head=False)
+    cfg, ps = SimpleNamespace(n_routed_experts=1), SimpleNamespace(ep_size=1, ep_rank=0)
+    load_hf_weights(model, str(tmp_path), cfg, ps)
+    router = model.layers["0"].ffn.router
+    assert torch.equal(router.bias_vl.view(torch.int32), bias_vl.view(torch.int32))
+    assert torch.equal(router.expert_bias, torch.full((4,), 0.5))
+
+
 @pytest.mark.gpus(1)
 def test_native_fp4_fp8_gpu_decode_matches_cpu_bits(tmp_path):
     from megatron.lite.primitive.ckpt.hf_weights import SafeTensorReader
