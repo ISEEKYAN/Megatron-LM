@@ -131,9 +131,13 @@ fi
 
 # Actor numerics switches reach every Ray actor through the job runtime_env, not only through
 # whatever environment the Ray cluster was started with (actors log the values they see).
+# Trainer MegaMoE processes packed rows in blocks of this many tokens per rank (track P: 2048
+# keeps the 5120-token micro-batch in GPU memory; logprobs unchanged). vLLM does not read it.
+export DSV41_MEGAMOE_MAX_TOKENS="${DSV41_MEGAMOE_MAX_TOKENS:-2048}"
 RAY_ENV_ARGS=()
 for key in DS41_MEGA_ATTN_DETERMINISTIC DS41_MEGA_ATTN_BWD_KERNEL DSV41_MEGAMOE_MAX_TOKENS VERL_MLITE_VAL_MAX_TOKENS; do
-  [[ -n "${!key:-}" ]] && RAY_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${key}=${!key}")
+  # Quoted: Ray requires string env values and Hydra would parse 1 as an int.
+  [[ -n "${!key:-}" ]] && RAY_ENV_ARGS+=("++ray_kwargs.ray_init.runtime_env.env_vars.${key}='${!key}'")
 done
 
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
