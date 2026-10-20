@@ -1067,7 +1067,7 @@ def _patch_vllm_rollout_sleep_level() -> bool:
     return True
 
 
-def _weights_pool_gaps(worker):
+def _weights_pool_gaps(worker, exclude_named: bool = False):
     """Byte ranges of the CuMem ``weights`` pool not covered by target-model parameter storage.
 
     Level-2 sleep discards the whole pool, but only the target parameters are rewritten by the
@@ -1081,10 +1081,18 @@ def _weights_pool_gaps(worker):
         for d in CuMemAllocator.get_instance().pointer_to_data.values()
         if d.tag == "weights"
     )
+    model = worker.model_runner.model
+    tensors = [t for n, t in model.named_parameters() if exclude_named or not n.endswith("bias_vl")]
+    if exclude_named:
+        # vLLM itself keeps buffers and sleep_preserve_parameter_names matches (drafter, bias_vl).
+        draft = worker.get_draft_model()
+        tensors += list(model.buffers())
+        if draft is not None:
+            tensors += list(draft.parameters()) + list(draft.buffers())
     synced = []
-    for name, param in worker.model_runner.model.named_parameters():
-        if param.is_cuda and not name.endswith("bias_vl"):
-            st = param.untyped_storage()
+    for t in tensors:
+        if t.is_cuda:
+            st = t.untyped_storage()
             if st.nbytes():
                 synced.append((st.data_ptr(), st.data_ptr() + st.nbytes()))
     synced.sort()
@@ -1111,11 +1119,14 @@ def _patch_vllm_sleep_level2_retention() -> bool:
     vLLM saves only named buffers and ``sleep_preserve_parameter_names`` matches; DS4.1's
     drafter, untrained gate bias and plain tensor attributes came back uninitialized (illegal
     address in the dspark proposer). Copies the gaps to host before suspend, back after the
-    weights wake (before the sync reload). Opt-in fallback (``VERL_MLITE_L2_RETENTION=1``); the
+    weights wake (before the sync reload). Opt-in (``VERL_MLITE_L2_RETENTION=1``); with ``unnamed``
+    only bytes no parameter or buffer owns are kept (vLLM keeps the rest itself); the
     recipe keeps the drafter and untrained parameters with ``sleep_preserve_parameter_names``.
     """
-    if os.environ.get("VERL_MLITE_L2_RETENTION", "0") != "1" or not _vllm_importable():
+    mode = os.environ.get("VERL_MLITE_L2_RETENTION", "0")
+    if mode not in ("1", "unnamed") or not _vllm_importable():
         return False
+    exclude_named = mode == "unnamed"
     try:
         worker_mod = importlib.import_module("vllm.v1.worker.gpu_worker")
     except Exception:
@@ -1138,7 +1149,7 @@ def _patch_vllm_sleep_level2_retention() -> bool:
         if level == 2:
             torch.cuda.synchronize()
             cu, saved, total = _cuda(), [], 0
-            for ptr, size in _weights_pool_gaps(self):
+            for ptr, size in _weights_pool_gaps(self, exclude_named):
                 host = torch.empty(size, dtype=torch.uint8).pin_memory()
                 rc = cu.cuMemcpyDtoH_v2(ctypes.c_void_p(host.data_ptr()), ctypes.c_uint64(ptr), ctypes.c_size_t(size))
                 if rc != 0:
