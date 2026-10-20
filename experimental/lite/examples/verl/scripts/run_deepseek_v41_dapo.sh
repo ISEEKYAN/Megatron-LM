@@ -52,8 +52,9 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. Needs vLLM
 # with 00474aeec6 (mega-attn load permutations on host; the post-sleep reload reads them).
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
-# True gives the n samples of a prompt the same seed (identical siblings).
-ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-True}"
+# True gives the n samples of a prompt the same seed (identical siblings, so val n=8 degenerates
+# to one sample per problem). False needs the bias_vl routing fix (d844ca37b).
+ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-False}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
@@ -118,6 +119,7 @@ RUN_NAME="${RUN_NAME:-ds41_dapo_${TOTAL_GPUS}gpu_ep${ACTOR_EP}_cp${ACTOR_CP}_dep
 CKPT_DIR="${CKPT_DIR:-${OUTPUT_ROOT}/checkpoints/${RUN_NAME}}"
 LOG_FILE="${LOG_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.log}"
 CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
+VAL_DATA_DIR="${VAL_DATA_DIR:-${OUTPUT_ROOT}/val_dump}"
 mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}"
 export VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 
@@ -274,6 +276,7 @@ COMMAND=(
   "trainer.default_local_dir=${CKPT_DIR}"
   "trainer.val_before_train=${VAL_BEFORE_TRAIN}"
   "trainer.log_val_generations=10"
+  "trainer.validation_data_dir=${VAL_DATA_DIR}"
   # reward (DAPO overlong shaping as in the DS4 recipe)
   "+reward.reward_kwargs.overlong_buffer_cfg.enable=True"
   "+reward.reward_kwargs.overlong_buffer_cfg.len=${OVERLONG_BUFFER_LEN}"
