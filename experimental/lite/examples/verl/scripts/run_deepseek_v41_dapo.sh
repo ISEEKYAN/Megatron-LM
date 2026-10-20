@@ -52,6 +52,8 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Buffers are kept by vLLM itself; the Engram tables live in pinned host memory. Needs vLLM
 # with 00474aeec6 (mega-attn load permutations on host; the post-sleep reload reads them).
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
+# True gives the n samples of a prompt the same seed (identical siblings).
+ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-True}"
 # chat: "<User>..<Assistant></think>" (no reasoning); thinking: effort-75 reasoning prefix.
 PROMPT_MODE="${PROMPT_MODE:-chat}"
 
@@ -236,8 +238,7 @@ COMMAND=(
   "actor_rollout_ref.rollout.load_format=auto"
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
-  # True seeds every sibling of a prompt identically (16 distinct of 64 samples, track P).
-  "actor_rollout_ref.rollout.full_determinism=False"
+  "actor_rollout_ref.rollout.full_determinism=${ROLLOUT_FULL_DETERMINISM}"
   "+${VLLM}.compilation_config={cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
   "+${VLLM}.max_cudagraph_capture_size=8190"
   "+${VLLM}.attention_backend=FLASHMLA_MEGA_ATTN_DSV41"
