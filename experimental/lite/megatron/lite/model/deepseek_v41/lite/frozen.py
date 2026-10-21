@@ -12,6 +12,8 @@ def install(module, prefix, model, reader):
 
     for local, parameter in list(module.named_parameters()):
         name = prefix + local
+        if name.endswith(".ape"):
+            continue  # generated position parameter; identical to strict checkpoint loading
         keys = _expert_sources(name, model.release, model.ps)
         if keys is None:
             if name.startswith('engrams.'):
@@ -107,8 +109,24 @@ def install_bf16_hooks(module):
             originals = {n: current._parameters[n] for n in names}
             stack.append(originals)
             try:
-                for name, original in originals.items():
-                    value = torch.nn.Parameter(original.decoded(), requires_grad=False)
+                weights = tuple(originals.values())
+                if len(weights) == 1:
+                    decoded = (weights[0].decoded(),)
+                else:
+                    if len({(w.kind, tuple(w.shape), w.dtype) for w in weights}) != 1:
+                        raise ValueError('Grouped native weights must share shape/kind/dtype')
+                    codes = torch.stack([w.codes for w in weights])
+                    scales = torch.stack([w.scale for w in weights])
+                    batch = FrozenWeight(
+                        codes,
+                        scales,
+                        (len(weights), *weights[0].shape),
+                        weights[0].kind,
+                        weights[0].dtype,
+                    )
+                    decoded = batch.decoded().unbind(0)
+                for (name, original), matrix in zip(originals.items(), decoded):
+                    value = torch.nn.Parameter(matrix, requires_grad=False)
                     for key, item in original.__dict__.items():
                         if key not in ('codes', 'scale', 'kind', '_is_param'):
                             setattr(value, key, item)

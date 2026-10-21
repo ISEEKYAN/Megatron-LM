@@ -170,3 +170,43 @@ def test_lite_leaf_decode_is_replayed_released_and_exception_safe():
     with pytest.raises(RuntimeError):
         layer(torch.zeros(1, 63, dtype=torch.bfloat16))
     assert isinstance(layer.weight, frozen.FrozenWeight)
+
+
+def test_grouped_leaf_decodes_all_experts_in_one_codec_call(monkeypatch):
+    class Grouped(torch.nn.Module):
+        def forward(self, x):
+            assert all(not isinstance(p, frozen.FrozenWeight) for p in self.parameters())
+            return torch.stack([torch.nn.functional.linear(x, p) for p in self.parameters()])
+
+    layer = Grouped()
+    weights = [encoded('mxfp4') for _ in range(3)]
+    for index, w in enumerate(weights):
+        layer.register_parameter(f'weight{index}', torch.nn.Parameter(w, requires_grad=False))
+    original, calls = frozen.FrozenWeight.decoded, []
+
+    def decode(w):
+        calls.append(tuple(w.shape))
+        return original(w)
+
+    monkeypatch.setattr(frozen.FrozenWeight, 'decoded', decode)
+    frozen.install_bf16_hooks(layer)
+    x = torch.randn(2, 64, dtype=torch.bfloat16)
+    y = layer(x)
+    assert calls == [(3, 64, 64)]
+    assert torch.equal(
+        y, torch.stack([torch.nn.functional.linear(x, original(w)) for w in weights])
+    )
+    assert all(isinstance(p, frozen.FrozenWeight) for p in layer.parameters())
+
+
+def test_native_install_leaves_generated_ape_parameter_untouched():
+    layer = torch.nn.Module()
+    layer.attention = torch.nn.Module()
+    layer.attention.core_attention = torch.nn.Module()
+    layer.attention.core_attention.native = torch.nn.Module()
+    layer.attention.core_attention.native.compressor = torch.nn.Module()
+    original = torch.nn.Parameter(torch.zeros(2, 64), requires_grad=False)
+    layer.attention.core_attention.native.compressor.ape = original
+    model = SimpleNamespace(release=SimpleNamespace(), ps=SimpleNamespace())
+    frozen.install(layer, 'layers.2.', model, SimpleNamespace())
+    assert layer.attention.core_attention.native.compressor.ape is original

@@ -133,7 +133,11 @@ def linear_vjp(ctx, grad, activation, weight):
             if needs[0]
             else None
         )
-        dw = tc_mm(flat_grad.T, activation, torch.float32) if needs[1] else None
+        dw = (
+            tc_mm(flat_grad.T, activation.reshape(-1, weight.shape[1]), torch.float32)
+            if needs[1]
+            else None
+        )
     if dw is None:
         return dx, None, None
     owners = getattr(ctx, 'owners', None)
