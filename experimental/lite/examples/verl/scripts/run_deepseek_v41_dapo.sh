@@ -41,7 +41,9 @@ PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
 LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
 # Each Ray worker imports vLLM via the verl_mlite sitecustomize (~50 s); cap the prestarted pool.
 RAY_NUM_CPUS="${RAY_NUM_CPUS:-null}"
-ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.70}"
+# 0.70 left about 1 GiB per GPU at the KV wake and OOMed after a checkpoint save on the full
+# model; at 0.65 the KV cache still holds well above what 64 sequences x 10240 tokens need.
+ROLLOUT_GPU_MEMORY_UTILIZATION="${ROLLOUT_GPU_MEMORY_UTILIZATION:-0.65}"
 ROLLOUT_MAX_NUM_SEQS="${ROLLOUT_MAX_NUM_SEQS:-64}"
 ROLLOUT_MAX_NUM_BATCHED_TOKENS="${ROLLOUT_MAX_NUM_BATCHED_TOKENS:-8192}"
 # DSpark speculative decoding (drafter frozen at the release; target-only sync).

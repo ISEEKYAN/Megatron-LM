@@ -533,6 +533,9 @@ class MegatronLiteEngine(BaseEngine):
         finally:
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+            # Return what the save cached (e.g. dequantized copies) before vLLM wakes on the
+            # same GPUs; the full model otherwise OOMs in the post-save wake by ~1 GiB.
+            aggressive_empty_cache(force_sync=True)
 
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")
