@@ -121,7 +121,12 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
     save_calls = []
     sync_calls = []
     monkeypatch.setattr(engine, "to", lambda **kwargs: to_calls.append(kwargs))
+    empty_calls = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: sync_calls.append(True))
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.aggressive_empty_cache",
+        lambda **kwargs: empty_calls.append(kwargs),
+    )
     monkeypatch.setattr(
         "verl_mlite.engine.mlite_engine.save_training_checkpoint",
         lambda *args, **kwargs: save_calls.append((args, kwargs)),
@@ -134,6 +139,8 @@ def test_save_checkpoint_forwards_contents_scheduler_and_param_offload_reload(
         {"device": "cpu", "model": True, "optimizer": False, "grad": False},
     ]
     assert sync_calls == [True]
+    # The save's cached blocks are returned before the rollout wakes on the same GPUs.
+    assert empty_calls == [{"force_sync": True}]
     assert len(save_calls) == 1
     save_args, save_kwargs = save_calls[0]
     assert save_args == (module, optimizer, 13, str(tmp_path), parallel, parallel_state)
