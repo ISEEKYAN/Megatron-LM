@@ -35,3 +35,28 @@ def tiny_config():
         rotary_scaling_factor=16.0,
         original_max_position_embeddings=32,
     )
+
+
+# Spawned workers import this fixture before constructing the actual model.
+import sys
+
+
+class _NoRolloutImports:
+    """Reject vLLM imports except from the deployment-operator package and its tests."""
+
+    def find_spec(self, name, path=None, target=None):
+        if name == "vllm" or name.startswith("vllm."):
+            frame = sys._getframe(1)
+            while frame is not None:
+                module = frame.f_globals.get("__name__") or ""
+                if module.startswith("megatron.lite.model.deepseek_v41.vllm") or (
+                    module.rpartition(".")[2].startswith(("test_vllm_", "_flashmla_fixture"))
+                ):
+                    return None
+                frame = frame.f_back
+            raise AssertionError(name)
+        return None
+
+
+assert not any(n == "vllm" or n.startswith("vllm.") for n in sys.modules)
+sys.meta_path.insert(0, _NoRolloutImports())

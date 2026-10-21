@@ -18,6 +18,7 @@ import torch
 
 from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
 from megatron.core.tensor_parallel.layers import ColumnParallelLinear
+from megatron.core.utils import ensure_params_ready
 from megatron.lite.model.deepseek_v41.lite.checkpoint import source_name
 from megatron.lite.model.deepseek_v41.lite.components.config import validate_runtime_cp
 from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model as NativeModel
@@ -50,16 +51,10 @@ def finish_param_gather(model):
     Core DDP finishes the gather of a module's parameters in that module's forward
     pre-hook. The deployment forward reads most parameters without calling their
     modules, so after an optimizer step not followed by an export (which syncs) it
-    would read other ranks' stale shards. Run DDP's readiness hook of every submodule,
-    as the native forward does by calling them; once the gather has finished the hooks
-    return immediately.
+    would read other ranks' stale shards. Core's readiness callbacks publish every
+    bucket once; once the gather has finished they return immediately.
     """
-    for module in model.modules():
-        for hook in list(module._forward_pre_hooks.values()):
-            if getattr(hook, '__qualname__', '').startswith(
-                'DistributedDataParallel._make_forward_pre_hook'
-            ):
-                hook(module)
+    ensure_params_ready(model.parameters())
 
 
 class DeepseekV41Model(NativeModel):

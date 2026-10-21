@@ -20,7 +20,6 @@ from megatron.core.transformer.module import MegatronModule
 from megatron.core.transformer.spec_utils import ModuleSpec
 from megatron.lite.model.deepseek_v41.lite.components.assembly import (
     DS41AttentionSources,
-    ModelNorm,
     SourceContext,
 )
 from megatron.lite.model.deepseek_v41.lite.components.attention import DS41SelfAttention
@@ -39,23 +38,20 @@ from megatron.lite.model.deepseek_v41.lite.components.engram import (
 from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
 from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.modules.engram import NgramHash
+from megatron.lite.primitive.modules.projection import ModelNorm
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.source_state import KVSourceState
 
 
 class CoreAttentionSources(DS41AttentionSources):
-    """Core Attention constructs once before Hybrid supplies ratio/RoPE.
-
-    Match native CSA's window-only bootstrap defaults; Hybrid immediately
-    replaces that temporary module using the actual per-layer arguments.
-    """
+    """Core Attention constructs once before Hybrid supplies ratio/RoPE."""
 
     def __init__(self, *, compress_ratio=0, rotary_pos_emb=None, **kwargs):
         super().__init__(compress_ratio=compress_ratio, rotary_pos_emb=rotary_pos_emb, **kwargs)
 
 
 class DeepseekV41Model(MegatronModule):
-    def __init__(self, release, impl, ps, *, token_map):
+    def __init__(self, release, impl, ps, *, token_map, load_reader=None):
         config = core_config(
             release,
             impl.parallel,
@@ -66,6 +62,7 @@ class DeepseekV41Model(MegatronModule):
         config.persist_layer_norm = False
         super().__init__(config=config)
         self.release, self.impl, self.ps = release, impl, ps
+        self._load_reader = load_reader
         self.parallel_state = ps
         self.tp_group = ps.tp_group
         self.source_state = KVSourceState()
@@ -104,6 +101,10 @@ class DeepseekV41Model(MegatronModule):
                 self.engrams[str(index)] = DS41Engram(
                     release, config, index, table_group, frozen=not impl.trainable_engram
                 )
+                if load_reader is not None:
+                    from megatron.lite.model.deepseek_v41.lite.checkpoint import prefetch_engram
+
+                    prefetch_engram(load_reader, self.engrams[str(index)].embed, index)
         if self.engrams:
             self.hash = NgramHash(
                 token_map,
@@ -178,38 +179,6 @@ class DeepseekV41Model(MegatronModule):
         )
         head.weight.is_embedding_or_output_parameter = True
         return norm, head
-
-    def module_inventory(self):
-        rows = []
-        for key, block in self.layers.items():
-            index = int(key)
-            source = block.attention.core_attention
-            policy = self.context.policies[index]
-            ratio = source.ratio
-            kv_owner = ratio > 0 and policy.kv == index
-            index_owner = ratio > 0 and policy.index == index
-            if ratio == 0:
-                assert source.native.compressor is None and source.native.indexer is None
-            elif ratio == 2:
-                assert source.native.compressor is not None and source.native.indexer is not None
-                assert bool(list(source.native.compressor.parameters())) == kv_owner
-                assert (source.native.indexer.linear_wq_b.linear is not None) == index_owner
-            else:
-                assert hasattr(source, "main_projection") == kv_owner
-                assert hasattr(source, "index_key") == kv_owner
-                assert (source.index_q.linear is not None) == index_owner
-            rows.append(
-                dict(
-                    layer=index,
-                    ratio=ratio,
-                    kv_owner=policy.kv,
-                    index_owner=policy.index,
-                    owns_kv=kv_owner,
-                    owns_index=index_owner,
-                    candidate=policy.candidate,
-                )
-            )
-        return rows
 
     def set_input_tensor(self, value):
         self._input_tensor = value[0] if isinstance(value, (tuple, list)) else value

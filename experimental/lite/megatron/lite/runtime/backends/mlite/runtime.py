@@ -208,11 +208,9 @@ def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
     return wrapped_forward_step, wrapped_loss_fn
 
 
-def _has_chunked_state_offload(optimizer) -> bool:
-    if optimizer is None:
-        return False
-    opts = getattr(optimizer, "chained_optimizers", None) or [optimizer]
-    return any(getattr(o, "_optimizer_state_offloader", None) is not None for o in opts)
+def _has_chunked_state_offload(optimizer):
+    owners = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+    return any(getattr(owner, "_optimizer_state_offloader", None) is not None for owner in owners)
 
 
 class MegatronLiteRuntime(RuntimeBase):
@@ -426,16 +424,13 @@ class MegatronLiteRuntime(RuntimeBase):
         proto = handle._extras.get("protocol")
         model_cfg = handle._extras.get("model_cfg")
         ps = handle._parallel_state
-        # With overlapped DistOpt parameter gathering, the last step's updates reach
-        # the other data-parallel replicas only in the next forward's pre-hooks; an
-        # export before that would publish each rank's stale copy of every parameter
-        # shard it does not own. Finish the gather first (as checkpoint save does).
+        # Complete overlapped DistOpt gathers before publishing updated weights: otherwise
+        # each rank exports its stale copy of every parameter shard it does not own.
         wrapped = handle._model if isinstance(handle._model, (list, tuple)) else [handle._model]
-        synced = set()
-        for chunk in [*model_chunks, *wrapped]:
-            if id(chunk) not in synced and callable(getattr(chunk, "start_param_sync", None)):
-                chunk.start_param_sync(force_sync=True)
-                synced.add(id(chunk))
+        for chunk in {id(c): c for c in [*model_chunks, *wrapped]}.values():
+            sync = getattr(chunk, "start_param_sync", None)
+            if callable(sync):
+                sync(force_sync=True)
 
         if proto and hasattr(proto, "export_hf_weights"):
             yield from proto.export_hf_weights(model_chunks, model_cfg, ps, **kwargs)

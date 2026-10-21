@@ -9,7 +9,10 @@ import pytest
 import torch
 import torch.distributed as dist
 
-pytestmark = [pytest.mark.gpus(1), pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA')]
+pytestmark = [
+    pytest.mark.gpus(1, min_architecture="blackwell"),
+    pytest.mark.skipif(not torch.cuda.is_available(), reason='CUDA'),
+]
 
 
 def test_megamoe_module_matches_direct_fused_launch(tmp_path):

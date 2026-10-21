@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Selection/lifecycle identity only; CPU does not execute deployment kernels."""
 import inspect
+from types import SimpleNamespace
+from unittest.mock import patch
 
 import torch
 
@@ -91,25 +93,47 @@ def test_recompute_modes_match_native_names():
         recompute_modes("mlp")
 
 
-def test_param_gather_finisher_runs_only_core_ddp_readiness_hooks():
-    """finish_param_gather selects Core DDP's readiness hook by name (a rename would make it a
-    silent no-op) and leaves every other forward pre-hook alone."""
-    from types import SimpleNamespace
-
-    from megatron.core.distributed import DistributedDataParallel
+def test_param_gather_finisher_publishes_each_bucket_once():
+    """finish_param_gather fires Core's per-bucket readiness callback once per bucket and
+    leaves unmarked parameters alone."""
+    from megatron.core.utils import PARAM_READY_CALLBACK_ATTR
     from megatron.lite.model.deepseek_v41.vllm.model import finish_param_gather
 
-    seen, other = [], []
-
-    class Owners(dict):
-        def __contains__(self, param):
-            seen.append(param)
-            return False
-
-    ddp = SimpleNamespace(use_forward_hook=True, param_to_bucket_group=Owners())
-    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2))
-    for module in model.modules():
-        module.register_forward_pre_hook(DistributedDataParallel._make_forward_pre_hook(ddp))
-        module.register_forward_pre_hook(lambda *_: other.append(1))
+    calls = []
+    model = torch.nn.Sequential(torch.nn.Linear(2, 2), torch.nn.Linear(2, 2, bias=False))
+    first, second = (lambda: calls.append(0)), (lambda: calls.append(1))
+    setattr(model[0].weight, PARAM_READY_CALLBACK_ATTR, first)
+    setattr(model[0].bias, PARAM_READY_CALLBACK_ATTR, first)
+    setattr(model[1].weight, PARAM_READY_CALLBACK_ATTR, second)
     finish_param_gather(model)
-    assert seen == list(model.parameters()) and other == []
+    assert calls == [0, 1]
+
+
+def test_native_hf_construction_recovers_release_token_map(tmp_path):
+    from unittest.mock import Mock
+
+    impl = protocol.ImplConfig(hf_path=str(tmp_path))
+    model_cfg = SimpleNamespace(engram_layer_ids=[1])
+    native_build = Mock(return_value=object())
+    with patch.object(protocol, "release_token_map", return_value=[2, 0, 1]) as recover:
+        with patch.object(native, "build_model", native_build):
+            protocol.build_model(model_cfg, impl_cfg=impl)
+            recovered = native_build.call_args.kwargs["impl_cfg"]
+            assert recovered.token_map == [2, 0, 1]
+            assert impl.token_map is None
+            recover.assert_called_once_with(str(tmp_path))
+            recover.reset_mock()
+            (tmp_path / "token_map.pt").write_bytes(b"existence-only: native loader owns bytes")
+            protocol.build_model(model_cfg, impl_cfg=impl)
+            assert native_build.call_args.kwargs["impl_cfg"] is impl
+            recover.assert_not_called()
+
+
+def test_native_hf_construction_keeps_explicit_token_map(tmp_path):
+    from unittest.mock import Mock
+
+    impl = protocol.ImplConfig(hf_path=str(tmp_path), token_map=[1, 0])
+    with patch.object(protocol, "release_token_map", side_effect=AssertionError("recomputed")):
+        with patch.object(native, "build_model", Mock()) as build:
+            protocol.build_model(SimpleNamespace(engram_layer_ids=[1]), impl_cfg=impl)
+            assert build.call_args.kwargs["impl_cfg"] is impl

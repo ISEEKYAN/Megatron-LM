@@ -29,6 +29,7 @@ class ImplConfig:
     dtype: torch.dtype = torch.bfloat16
     hf_path: str = ""
     initialize_weights: bool = True
+    prefetch_weights: bool = True
     token_map: object = None
     trainable_engram: bool = False
     shard_engram: bool = True
@@ -149,9 +150,6 @@ def _optimizer(chunks, cfg, impl, ps):
         parallel=impl.parallel,
         optimizer=SimpleNamespace(**values),
         deterministic=False,
-        # Runtime permits a variable number of microbatches; finish native
-        # reductions once after accumulation, rather than learning a fixed
-        # per-parameter readiness count from the first batch.
         ddp_config_overrides={"overlap_grad_reduce": False},
     )
     chunks[:], optimizer = build_dist_opt_stack(chunks, model_cfg=cfg, engine_cfg=engine, ps=ps)
@@ -187,12 +185,21 @@ def build_model(model_cfg, *, impl_cfg, _model_class=None):
         if path.is_file():
             token_map = torch.load(path, map_location="cpu", weights_only=True)
     constructor = DeepseekV41Model if _model_class is None else _model_class
-    chunks = [constructor(model_cfg, impl_cfg, ps, token_map=token_map)]
-    chunks[0].ds41_module_inventory = chunks[0].module_inventory()
+    reader = None
+    if impl_cfg.prefetch_weights and not impl_cfg.initialize_weights and impl_cfg.hf_path:
+        from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
+
+        reader = RowSliceReader(impl_cfg.hf_path, device=impl_cfg.device)
+    try:
+        chunks = [constructor(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)]
+    except BaseException:
+        if reader is not None:
+            reader.close()
+        raise
     optimizer, finalize = (None, None)
     if impl_cfg.optimizer is not None:
         optimizer, finalize = _optimizer(chunks, model_cfg, impl_cfg, ps)
-        from megatron.lite.model.deepseek_v41.lite.checkpoint import attach_checkpoint_metadata
+        from megatron.lite.primitive.ckpt.row_state import attach_checkpoint_metadata
 
         attach_checkpoint_metadata(chunks, ps)
     return ModelBundle(
@@ -253,14 +260,12 @@ def forward_step(model, batch):
         roll_loss_mask=True,
     )
     original = packed.packed_seq_params
+    names = (
+        "qkv_format cu_seqlens_q cu_seqlens_kv cu_seqlens_q_padded "
+        "cu_seqlens_kv_padded max_seqlen_q max_seqlen_kv"
+    ).split()
     params = PackedSeqParams(
-        qkv_format="thd",
-        cu_seqlens_q=original.cu_seqlens_q,
-        cu_seqlens_kv=original.cu_seqlens_kv,
-        cu_seqlens_q_padded=original.cu_seqlens_q_padded,
-        cu_seqlens_kv_padded=original.cu_seqlens_kv_padded,
-        max_seqlen_q=original.max_seqlen_q,
-        max_seqlen_kv=original.max_seqlen_kv,
+        **{name: getattr(original, name) for name in names},
         cp_partition_mode="contiguous",
         cp_group=ps.cp_group,
         local_cp_size=ps.cp_size,

@@ -1,23 +1,19 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
-"""Export DS4.1 weights in the release (= vLLM checkpoint) format for online resync.
+"""HF/BF16 and native release export, shared by training and deployment protocols.
 
-Names, dtypes and quantized storage match the release checkpoint, so vLLM's own
-``load_weights`` (layerwise reload) consumes the stream exactly as a cold load:
-
-* block-FP8 linears: E4M3 codes + UE8M0 32x32 scales (``quantize_block_fp8``);
-* routed experts: MXFP4 codes + UE8M0 1x32 scales (``quantize_mxfp4``);
-* everything else in its release dtype (BF16, or FP32 for mHC/sink/router bias).
-
-The quantizers are the ones the deployment forward applies to the BF16 master
-each step, so the resynced vLLM weights are the training fake-quant weights.
-Frozen Engram tables are never trained and are not exported.
+Native targets use block-FP8 32x32 UE8M0 and MXFP4 experts. The paired vLLM
+target keeps official BF16 wo_a unquantized, matching the training forward. Frozen tables
+always retain original row-sharded FP8/E8M0 bytes. With include_frozen=True,
+export streams TensorRowChunk objects for these tables; save_hf_weights drains
+them directly to safetensors. Online sync can set include_frozen=False.
 """
 import re
 
 import torch
 
 from megatron.lite.model.deepseek_v41.lite.checkpoint import source_name
-from megatron.lite.primitive.ckpt.hf_weights import parse_expert_idx
+from megatron.lite.primitive.ckpt.hf_weights import parse_expert_idx, unwrap_model
+from megatron.lite.primitive.ckpt.row_export import iter_row_shards, save_row_shards
 from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
 from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
 
@@ -45,6 +41,8 @@ _ALPHA = ("alpha_pre", "alpha_post", "alpha_res")
 
 def release_format(key):
     """``"mxfp4"``, ``"fp8_block"`` or the release dtype of a release key."""
+    if key.endswith(".tid2eid"):
+        return torch.int64
     if _MXFP4.search(key):
         return "mxfp4"
     if key.endswith(_FP8_BLOCK_SUFFIXES):
@@ -86,12 +84,14 @@ class DeepseekV41WeightSpec:
 
     def load_weight_map(self, base_model, ps, logical_state_keys):
         del base_model, ps
-        # Only persistent buffers consult this map: the router biases are exported,
-        # Engram tables and hash constants are not.
+        # Only persistent buffers consult this map: the router biases and hash map are
+        # exported, Engram tables and hash constants are not.
         return {
             name: release_names(name)
             for name in logical_state_keys
-            if name.endswith((".ffn.router.expert_bias", ".ffn.router.bias_vl"))
+            if name.endswith(
+                (".ffn.router.expert_bias", ".ffn.router.bias_vl", ".ffn.router.tid2eid")
+            )
         }
 
     def native_to_hf(self, native_name, tensor):
@@ -119,24 +119,40 @@ class DeepseekV41WeightSpec:
 def to_release(key, tensor):
     """Serialize one release tensor (+ its scale for quantized storage)."""
     kind = release_format(key)
-    if kind == "mxfp4":
-        codes, scale = quantize_mxfp4(tensor)
-        return [(key, codes), (key[: -len("weight")] + "scale", scale)]
-    if kind == "fp8_block":
-        codes, scale = quantize_block_fp8(tensor, FP8_BLOCK, scale_format="e8m0")
-        return [(key, codes), (key[: -len("weight")] + "scale", scale)]
+    if kind in ("mxfp4", "fp8_block"):
+        from megatron.lite.primitive.ckpt.hf_weights import _dequantize_block_scaled_tensor
+
+        quantize = (
+            quantize_mxfp4
+            if kind == "mxfp4"
+            else lambda x: quantize_block_fp8(x, FP8_BLOCK, scale_format="e8m0")
+        )
+        codes, scale = quantize(tensor)
+        # Canonicalize equivalent scale/code pairs: reloading BF16 then exporting
+        # must not choose a different power-of-two scale at a rounding boundary.
+        for _ in range(3):
+            decoded = _dequantize_block_scaled_tensor(codes, scale, tensor.shape).bfloat16()
+            again, descale = quantize(decoded)
+            if torch.equal(scale.view(torch.uint8), descale.view(torch.uint8)) and torch.equal(
+                codes.view(torch.uint8), again.view(torch.uint8)
+            ):
+                return [(key, codes), (key[: -len("weight")] + "scale", scale)]
+            codes, scale = again, descale
+        raise RuntimeError(f"Non-idempotent release encoding for {key}")
     return [(key, tensor.to(kind).contiguous())]
 
 
 def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as gather
 
-    target = kwargs.pop("target", "release")
-    if target not in ("release", "hf", "vllm"):
-        raise ValueError(f"DS4.1 exports only the release/vLLM checkpoint format, got {target!r}")
+    target = kwargs.pop("target", "hf")
+    if target not in ("release", "hf", "bf16", "vllm"):
+        raise ValueError(f"Unknown DS4.1 export target, got {target!r}")
     if kwargs.pop("resync_config", None) or kwargs.get("export_dtype"):
         raise ValueError("DS4.1 release export owns dtypes and quantization; no overrides")
     kwargs.pop("export_dtype", None)
+    include_frozen = kwargs.pop("include_frozen", True)
+    row_bytes = kwargs.get("buffer_max_size_bytes", 64 * 1024**2)
     scales = {}
     for key, tensor in gather(
         chunks, DeepseekV41WeightSpec(model_cfg), ps, vocab_size=model_cfg.vocab_size, **kwargs
@@ -148,18 +164,56 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
             if any(p is None for p in parts):
                 continue
             tensor = torch.cat(scales.pop(key))
-        yield from to_release(key, tensor)
+        yield from (
+            [
+                (
+                    key,
+                    tensor.to(
+                        release_format(key)
+                        if isinstance(release_format(key), torch.dtype)
+                        else torch.bfloat16
+                    ).contiguous(),
+                )
+            ]
+            if target in ("hf", "bf16") or (target == "vllm" and key.endswith(".attn.wo_a.weight"))
+            else to_release(key, tensor)
+        )
     if scales:
         raise RuntimeError(f"Incomplete mHC scale export: {sorted(scales)[:4]}")
+    if include_frozen:
+        yield from _frozen_rows(chunks, row_bytes, kwargs.get("rank0_only", False))
+
+
+def _frozen_rows(chunks, row_bytes, rank0_only):
+    rows = []
+    for chunk in chunks if isinstance(chunks, (list, torch.nn.ModuleList)) else [chunks]:
+        for layer, module in unwrap_model(chunk).engrams.items():
+            table = module.embed
+            start = table.embedding.lookup.boundaries[table.group.rank()]
+            for kind in ("weight", "scale"):
+                value = getattr(table.embedding, kind)[: max(0, table.rows - start)]
+                rows.append((f"layers.{layer}.engram.embed.{kind}", value, start, table.rows))
+    yield from iter_row_shards(rows, max_bytes=row_bytes, rank0_only=rank0_only)
 
 
 def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import stream_export_to_shards
 
+    for chunk in chunks if isinstance(chunks, (list, torch.nn.ModuleList)) else [chunks]:
+        sync = getattr(chunk, "start_param_sync", None)
+        if callable(sync):
+            sync(force_sync=True)
     kwargs.pop("cpu", None)
+    include_frozen = kwargs.pop("include_frozen", True)
     shard = int(kwargs.pop("shard_size_bytes", 5 * 1024**3))
     stream_export_to_shards(
-        export_hf_weights(chunks, model_cfg, ps, rank0_only=True, cpu=True, **kwargs),
+        export_hf_weights(
+            chunks, model_cfg, ps, rank0_only=True, cpu=True, include_frozen=False, **kwargs
+        ),
         path,
         shard_size_bytes=shard,
     )
+    if include_frozen:
+        save_row_shards(
+            _frozen_rows(chunks, kwargs.get("buffer_max_size_bytes", 64 * 1024**2), True), path
+        )

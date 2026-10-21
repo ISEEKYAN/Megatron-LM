@@ -4,10 +4,8 @@ from megatron.lite.model.deepseek_v41.lite import protocol as native
 from megatron.lite.model.deepseek_v41.lite.protocol import (
     ImplConfig,
     build_model_config,
-    export_hf_weights,
     forward_step,
     load_hf_weights,
-    save_hf_weights,
     unpack_forward_output,
     validate_impl_cfg_keys,
 )
@@ -35,3 +33,18 @@ def build_model(model_cfg, *, impl_cfg):
     ):
         impl_cfg = replace(impl_cfg, token_map=release_token_map(impl_cfg.hf_path))
     return native.build_model(model_cfg, impl_cfg=impl_cfg, _model_class=DeepseekV41Model)
+
+
+def _release_target(kwargs):
+    # The deployment forward quantizes wo_a to FP8 like the release; vLLM syncs those bytes.
+    if kwargs.get("target", "vllm") == "vllm":
+        kwargs["target"] = "release"
+    return kwargs
+
+
+def export_hf_weights(chunks, model_cfg, ps, **kwargs):
+    yield from native.export_hf_weights(chunks, model_cfg, ps, **_release_target(kwargs))
+
+
+def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
+    return native.save_hf_weights(chunks, path, model_cfg, ps, **_release_target(kwargs))

@@ -88,3 +88,20 @@ def test_router_biases_are_the_exported_persistent_buffers():
         "layers.3.ffn.router.expert_bias": ["layers.3.ffn.gate.bias"],
         "layers.3.ffn.router.bias_vl": ["layers.3.ffn.gate.bias_vl"],
     }
+
+
+def test_deployment_publication_uses_the_release_encoding(monkeypatch):
+    """The deployment forward quantizes wo_a to FP8 like the release; vLLM syncs those bytes."""
+    from megatron.lite.model.deepseek_v41.vllm import protocol
+
+    calls = []
+
+    def export(*args, **kwargs):
+        calls.append(kwargs.get("target"))
+        yield ("native-code", torch.zeros(1, dtype=torch.uint8))
+
+    monkeypatch.setattr(protocol.native, "export_hf_weights", export)
+    for target, expected in (("vllm", "release"), (None, "release"), ("hf", "hf")):
+        kwargs = {} if target is None else {"target": target}
+        assert len(list(protocol.export_hf_weights(None, None, None, **kwargs))) == 1
+        assert calls[-1] == expected
