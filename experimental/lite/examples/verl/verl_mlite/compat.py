@@ -1525,30 +1525,53 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
 
 
 def _patch_vllm_rollout_sleep_level() -> bool:
-    """Pin the hybrid rollout sleep level (``VERL_MLITE_ROLLOUT_SLEEP_LEVEL``).
+    """Keep frozen DS4.1 adapter weights resident; release only the KV cache.
 
-    Level 1 backs every GPU weight up to host; level 2 discards them and relies on
-    the actor sync. DS4.1 syncs only the trained tensors (Engram tables are host
-    memory and survive either level), so level 2 needs the dspark drafter kept via
-    vLLM ``sleep_preserve_parameter_names=['draft.*']``.
+    Other rollouts retain VERL's policy, or the explicit legacy level override.
+    Use AsyncLLM utilities, which broadcast to every DP engine, not worker RPCs.
     """
     level = os.environ.get("VERL_MLITE_ROLLOUT_SLEEP_LEVEL", "").strip()
-    if level not in ("1", "2") or not _vllm_importable():
+    if not _vllm_importable():
         return False
     try:
         server = importlib.import_module("verl.workers.rollout.vllm_rollout.vllm_async_server")
     except Exception:
         return False
     cls = getattr(server, "vLLMHttpServer", None)
-    if cls is None or getattr(cls._sleep_hybrid, "_verl_mlite_level", None) == level:
-        return cls is not None
+    if cls is None:
+        return False
+    if getattr(cls._sleep_hybrid, "_verl_mlite_kv_only", False):
+        return True
+    original_sleep = cls._sleep_hybrid
+    original_tags = cls._get_wake_up_tags
+
+    def kv_only(self):
+        return (
+            self.lora_as_adapter
+            and getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v41"
+        )
 
     async def _sleep_hybrid(self):
-        await self.engine.sleep(level=int(level))
-        await self.engine.reset_encoder_cache()
+        if kv_only(self):
+            release = getattr(self.engine, "release_kv_cache_memory", None)
+            if not callable(release):
+                raise RuntimeError("DS4.1 adapter rollout requires vLLM KV-only release API")
+            # sleep(0) pauses scheduling without unmapping or backing up weights.
+            await self.engine.sleep(level=0)
+            await release()
+            await self.engine.reset_encoder_cache()
+        elif level in ("1", "2"):
+            await self.engine.sleep(level=int(level))
+            await self.engine.reset_encoder_cache()
+        else:
+            await original_sleep(self)
 
-    _sleep_hybrid._verl_mlite_level = level
+    def _get_wake_up_tags(self):
+        return ["kv_cache"] if kv_only(self) else original_tags(self)
+
+    _sleep_hybrid._verl_mlite_kv_only = True
     cls._sleep_hybrid = _sleep_hybrid
+    cls._get_wake_up_tags = _get_wake_up_tags
     return True
 
 
