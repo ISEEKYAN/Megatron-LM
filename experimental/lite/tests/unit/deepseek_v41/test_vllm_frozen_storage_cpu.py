@@ -210,3 +210,33 @@ def test_native_install_leaves_generated_ape_parameter_untouched():
     model = SimpleNamespace(release=SimpleNamespace(), ps=SimpleNamespace())
     frozen.install(layer, 'layers.2.', model, SimpleNamespace())
     assert layer.attention.core_attention.native.compressor.ape is original
+
+
+@pytest.mark.parametrize('kind', ['mxfp4', 'fp8_block'])
+def test_module_apply_native_payload_follows_parameter_storage(kind):
+    module = torch.nn.Module()
+    module.weight = torch.nn.Parameter(encoded(kind), requires_grad=False)
+    parameter = module.weight
+    parameter.owner_marker = object()
+    marker = parameter.owner_marker
+    moved = []
+
+    def move(value):
+        result = frozen.FrozenWeight(
+            value.codes.clone(), value.scale.clone(), value.shape, value.kind, torch.float32
+        )
+        moved.append(result)
+        return result
+
+    original_codes = parameter.codes.view(torch.uint8).clone()
+    original_scale = parameter.scale.view(torch.uint8).clone()
+    module._apply(move)  # actual same-backend set_data path, as CPU -> CUDA uses
+    assert module.weight is parameter and parameter.owner_marker is marker
+    assert parameter.dtype == torch.float32 and not parameter.requires_grad
+    assert parameter.codes is moved[0].codes and parameter.scale is moved[0].scale
+    assert torch.equal(parameter.codes.view(torch.uint8), original_codes)
+    assert torch.equal(parameter.scale.view(torch.uint8), original_scale)
+    assert parameter.data.codes is parameter.codes
+    with pytest.raises(ValueError, match='matching native storage'):
+        parameter.data = torch.zeros(parameter.shape)
+    assert parameter.codes is moved[0].codes

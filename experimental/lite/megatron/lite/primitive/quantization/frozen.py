@@ -31,6 +31,23 @@ class FrozenWeight(torch.Tensor):
     def __init__(self, codes, scale, shape, kind, dtype=torch.bfloat16):
         self.codes, self.scale, self.kind = codes, scale, kind
 
+    @property
+    def data(self):
+        return self.detach()
+
+    @data.setter
+    def data(self, value):
+        # Module._apply may keep a Parameter and replace only its TensorImpl.
+        # Its Python-owned native payload must follow that storage transition.
+        if (
+            not isinstance(value, FrozenWeight)
+            or value.shape != self.shape
+            or value.kind != self.kind
+        ):
+            raise ValueError('Immutable native weights require matching native storage')
+        torch.Tensor.data.__set__(self, value)
+        self.codes, self.scale, self.kind = value.codes, value.scale, value.kind
+
     def requires_grad_(self, requires_grad=True):
         if requires_grad:
             raise ValueError('Native release base is immutable; train adapters only')
