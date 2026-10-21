@@ -13,7 +13,7 @@ import sys
 import threading
 from collections.abc import Iterable
 from concurrent.futures import ThreadPoolExecutor
-from contextvars import copy_context
+from contextvars import ContextVar, copy_context
 from functools import wraps
 from pathlib import Path
 from typing import Any
@@ -26,6 +26,95 @@ _VLLM_IMPORTABLE: bool | None = None
 
 
 _BUCKETED_SENDER_MODULE = "verl.workers.rollout.vllm_rollout.bucketed_weight_transfer"
+
+
+_SENDER_RPC_FAILURE = ContextVar("mlite_sender_rpc_failure", default=None)
+
+
+class _RPCFailureSocket:
+    """Keep native wire operations, but do not hide a failed receiver RPC."""
+
+    def __init__(self, socket, failure):
+        self._socket, self._failure = socket, failure
+
+    def __getattr__(self, name):
+        return getattr(self._socket, name)
+
+    def _call(self, method, event, *args, **kwargs):
+        import zmq
+
+        flags = kwargs.get("flags", 0)
+        while True:
+            if self._failure:
+                raise self._failure[0]
+            if flags & zmq.DONTWAIT:
+                return getattr(self._socket, method)(*args, **kwargs)
+            if not self._socket.poll(50, event):
+                continue
+            if self._failure:
+                raise self._failure[0]
+            try:
+                return getattr(self._socket, method)(
+                    *args, **{**kwargs, "flags": flags | zmq.DONTWAIT}
+                )
+            except zmq.Again:
+                continue
+
+    def send_pyobj(self, *args, **kwargs):
+        import zmq
+
+        return self._call("send_pyobj", zmq.POLLOUT, *args, **kwargs)
+
+    def recv(self, *args, **kwargs):
+        import zmq
+
+        return self._call("recv", zmq.POLLIN, *args, **kwargs)
+
+
+def _install_sender_rpc_failure(adapter_cls, sender_cls):
+    if getattr(adapter_cls._execute_method, "_mlite_rpc_failure", False):
+        return False
+    execute, init_socket = adapter_cls._execute_method, sender_cls._init_socket
+
+    @wraps(execute)
+    async def execute_checked(self, method, non_block=False, *args, **kwargs):
+        ref = await execute(self, method, non_block, *args, **kwargs)
+        if method == "update_weights_from_ipc" and non_block:
+            failure = [] if ref is not None else None
+            _SENDER_RPC_FAILURE.set(failure)
+            if ref is not None:
+
+                def completed(future):
+                    try:
+                        future.result()
+                    except BaseException as error:
+                        failure.append(error)
+
+                ref.future().add_done_callback(completed)
+        return ref
+
+    @wraps(init_socket)
+    def init_checked(self, *args, **kwargs):
+        result = init_socket(self, *args, **kwargs)
+        failure = _SENDER_RPC_FAILURE.get()
+        if failure is not None:
+            self.socket = _RPCFailureSocket(self.socket, failure)
+        return result
+
+    execute_checked._mlite_rpc_failure = True
+    adapter_cls._execute_method, sender_cls._init_socket = execute_checked, init_checked
+    return True
+
+
+def _patch_sender_rpc_failure():
+    consumer = sys.modules.get(_VLLM_ROLLOUT_CONSUMER_MODULE)
+    if consumer is not None:
+        sender = importlib.import_module(_BUCKETED_SENDER_MODULE)
+        return _install_sender_rpc_failure(consumer.ServerAdapter, sender.BucketedWeightSender)
+    if any(getattr(finder, "_mlite_weight_sync_probe_finder", False) for finder in sys.meta_path):
+        return False
+    sys.meta_path.insert(0, _SenderPatchFinder())
+    return True
 
 
 def _vllm_importable() -> bool:
@@ -1263,6 +1352,9 @@ class _SenderPatchLoader(importlib.abc.Loader):
 
     def exec_module(self, module) -> None:
         self._loader.exec_module(module)
+        if module.__name__ == _VLLM_ROLLOUT_CONSUMER_MODULE:
+            _patch_sender_rpc_failure()
+            return
         _install_bucketed_sender_prefetch(module.BucketedWeightSender)
         if _weight_sync_probe_enabled() or _weight_sync_fingerprint_enabled():
             _instrument_bucketed_weight_sender(module.BucketedWeightSender)
@@ -1275,7 +1367,7 @@ class _SenderPatchFinder(importlib.abc.MetaPathFinder):
         self._mlite_weight_sync_probe_requested = False
 
     def find_spec(self, fullname, path, target=None):
-        if fullname != _BUCKETED_SENDER_MODULE:
+        if fullname not in (_BUCKETED_SENDER_MODULE, _VLLM_ROLLOUT_CONSUMER_MODULE):
             return None
         spec = importlib.machinery.PathFinder.find_spec(fullname, path, target)
         if spec is not None and spec.loader is not None:
@@ -1843,12 +1935,18 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("07b.transformers_apply_chat_template_return_dict", result)
     result = _patch_bucketed_weight_sender()
     _trace_runtime_patch("08.bucketed_weight_sender", result)
+    result = _patch_sender_rpc_failure()
+    _trace_runtime_patch("08a.sender_rpc_failure", result)
     result = _patch_verl_dsv4_mxfp4_check()
     _trace_runtime_patch("08b.verl_dsv4_mxfp4_check", result)
     result = _patch_verl_dsv4_native_layerwise_reload()
     _trace_runtime_patch("08c.verl_dsv4_native_layerwise_reload", result)
     result = _patch_verl_dsv41_layerwise_reload()
     _trace_runtime_patch("08d.verl_dsv41_layerwise_reload", result)
+    if _vllm_importable():
+        from verl_mlite.rollout.ds41_lora import install
+
+        _trace_runtime_patch('08d1.ds41_adapter_reload', install())
     result = _patch_vllm_rollout_sleep_level()
     _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
     result = _patch_verl_vllm_headless_api_server_count()

@@ -7,6 +7,8 @@ Megatron-style sharded linear surfaces, not arbitrary PEFT injection.
 
 from __future__ import annotations
 
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from typing import Any
 
@@ -30,6 +32,7 @@ class LoraConfig:
     alpha: int | None = None
     dropout: float = 0.0
     target_modules: tuple[str, ...] = field(default_factory=lambda: _DEFAULT_TARGET_MODULES)
+    layers: tuple[int, int] | None = None  # [start, end) decoder layers; model default if None
 
     @property
     def enabled(self) -> bool:
@@ -65,8 +68,9 @@ def normalize_lora_config(config: LoraConfig | dict[str, Any] | None) -> LoraCon
         values["target_modules"] = values.pop("targets")
     else:
         values.pop("targets", None)
-    if "target_modules" in values and not isinstance(values["target_modules"], tuple):
-        values["target_modules"] = tuple(values["target_modules"])
+    for key in ("target_modules", "layers"):
+        if values.get(key) is not None and not isinstance(values[key], tuple):
+            values[key] = tuple(values[key])
     return LoraConfig(**values)
 
 
@@ -367,6 +371,7 @@ class LinearLoRA(nn.Module):
         b_tensor_model_parallel: bool = False,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for LinearLoRA.")
         self.rank = int(rank)
@@ -477,6 +482,7 @@ class GroupedLinearLoRA(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for GroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
@@ -528,6 +534,7 @@ class SharedGroupedLinearLoRA(nn.Module):
         dropout: float = 0.0,
     ):
         super().__init__()
+        self.disabled = False
         if rank <= 0:
             raise ValueError("LoRA rank must be positive for SharedGroupedLinearLoRA.")
         self.num_local_experts = int(num_local_experts)
@@ -563,3 +570,29 @@ __all__ = [
     "normalize_lora_config",
     "trainable_param_stats",
 ]
+
+
+_LORA_MODULE_TYPES = (LinearLoRA, GroupedLinearLoRA, SharedGroupedLinearLoRA)
+
+
+def register_lora_adapter_type(adapter_type):
+    global _LORA_MODULE_TYPES
+    if adapter_type not in _LORA_MODULE_TYPES:
+        _LORA_MODULE_TYPES += (adapter_type,)
+
+
+def lora_active(adapter: nn.Module | None) -> bool:
+    return adapter is not None and not adapter.disabled
+
+
+@contextmanager
+def disable_lora_adapters(model: nn.Module) -> Iterator[int]:
+    adapters = [module for module in model.modules() if isinstance(module, _LORA_MODULE_TYPES)]
+    previous = [adapter.disabled for adapter in adapters]
+    for adapter in adapters:
+        adapter.disabled = True
+    try:
+        yield len(adapters)
+    finally:
+        for adapter, disabled in zip(adapters, previous):
+            adapter.disabled = disabled

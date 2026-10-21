@@ -2,7 +2,10 @@
 """R1's nonfused MegaMoE chain, using shared codecs and native BI activation."""
 import torch
 
-from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4, quantize_mxfp4
+from megatron.lite.primitive.quantization.mxfp4 import dequantize_mxfp4
+
+from .batching import aligned_rows, grouped_mm, packed_weights
+from .lora import activation_input, adapter, add, expert_down, expert_gate_up
 
 
 def packed_scales(scale):
@@ -40,45 +43,28 @@ def quantize_activation(x):
     return per_token_group_quant_fp8(x.contiguous(), 32, eps=1e-4, use_ue8m0=True)
 
 
-def _activation_surrogate(first, scores, limit):
-    gate, up = first.float().chunk(2, -1)
-    if limit is not None:
-        gate, up = gate.clamp(max=limit), up.clamp(-limit, limit)
-    return torch.nn.functional.silu(gate) * up * scores.float().unsqueeze(-1)
-
-
-class _Activation(torch.autograd.Function):
-    @staticmethod
-    def forward(ctx, first, scores, limit):
-        ctx.save_for_backward(first, scores)
-        ctx.limit = limit
-        return _activation_surrogate(first, scores, limit)
-
-    @staticmethod
-    def backward(ctx, grad):
-        first, scores = ctx.saved_tensors
-        with torch.enable_grad():
-            first, scores = first.detach().requires_grad_(), scores.detach().requires_grad_()
-            output = _activation_surrogate(first, scores, ctx.limit)
-            df, ds = torch.autograd.grad(output, (first, scores), grad)
-        return df, ds, None
-
-
-def activation(fc1, scores, limit):
+def activation(fc1, scores, limit, *, native_input=False):
     if not fc1.is_cuda:
         raise RuntimeError("Deployment expert activation requires CUDA")
     from vllm.model_executor.kernels.batch_invariant import swiglu_apply_weight_to_fp8
 
-    hidden = _Activation.apply(fc1, scores, limit)
+    width = fc1.shape[1] // 2
     if not fc1.shape[0]:
+        native = fc1.new_empty(
+            (0, width), dtype=(torch.bfloat16 if native_input else torch.float32)
+        )
+        hidden = activation_input(native, fc1, scores, limit)
         return hidden, (
             hidden.to(torch.float8_e4m3fn),
-            hidden.new_empty((0, hidden.shape[1] // 32)),
+            hidden.new_empty((0, width // 32), dtype=torch.float32),
         )
-    codes, packed = swiglu_apply_weight_to_fp8(
-        fc1.detach(), scores.detach().float(), clamp_limit=limit, fast_math=True
+    values = swiglu_apply_weight_to_fp8(
+        fc1.detach(), scores.detach().float(), clamp_limit=limit, fast_math=True, output_bf16=True
     )
-    return hidden, (codes, unpack_scales(packed, hidden.shape[1] // 32))
+    codes, packed = values[:2]
+    native = values[2] if native_input else values[2].float()
+    hidden = activation_input(native, fc1, scores, limit)
+    return hidden, (codes, unpack_scales(packed, width // 32))
 
 
 def _grouped(codes, scale, weights, weight_scales, counts):
@@ -88,13 +74,7 @@ def _grouped(codes, scale, weights, weight_scales, counts):
     if deep_gemm is None:
         raise RuntimeError("Pinned DeepGEMM is required for MegaMoE numerics")
     alignment = deep_gemm.get_theoretical_mk_alignment_for_contiguous_layout()
-    positions, ends, offset = [], [], 0
-    for count in counts:
-        positions.append(torch.arange(offset, offset + count, device=codes.device))
-        ends.append(offset + count)
-        offset = (offset + count + alignment - 1) // alignment * alignment
-    positions = torch.cat(positions)
-    capacity = max(offset, alignment)
+    positions, _, ends, capacity = aligned_rows(counts, alignment, codes.device)
     padded = torch.zeros((capacity, codes.shape[1]), dtype=torch.uint8, device=codes.device)
     padded.index_copy_(0, positions, codes.view(torch.uint8))
     sf = scale.new_ones((capacity, scale.shape[1])).index_copy_(0, positions, scale)
@@ -113,7 +93,7 @@ def _grouped(codes, scale, weights, weight_scales, counts):
         (padded.view(torch.float8_e4m3fn), packed_scales(sf)),
         (weights, weight_sf),
         output,
-        torch.tensor(ends, dtype=torch.int32, device=codes.device),
+        ends,
         use_psum_layout=True,
         recipe=(1, 1, 32),
     )
@@ -127,10 +107,10 @@ class _Grouped(torch.autograd.Function):
             raise RuntimeError("Deployment grouped experts require CUDA")
         if len(counts) != len(weights) or sum(counts) != x.shape[0]:
             raise ValueError("One contiguous row count is required per native local expert")
+        if len({w.dtype for w in weights}) != 1:
+            raise ValueError("Grouped expert weights must have a common dtype")
         codes, scale = encoded
-        packed = [quantize_mxfp4(weight.detach()) for weight in weights]
-        weight_codes = torch.stack([v[0] for v in packed])
-        weight_scales = torch.stack([v[1] for v in packed])
+        weight_codes, weight_scales = packed_weights(weights)
         ctx.save_for_backward(codes, scale, weight_codes, weight_scales)
         ctx.counts, ctx.dtypes, ctx.input_dtype = counts, [w.dtype for w in weights], x.dtype
         return _grouped(codes, scale, weight_codes, weight_scales, counts)
@@ -138,10 +118,16 @@ class _Grouped(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         codes, scale, weight_codes, weight_scales = ctx.saved_tensors
+        needs = getattr(ctx, 'needs_input_grad', (True, True, True, *([True] * len(ctx.dtypes))))
+        need_w = any(needs[3:])
         x = (
-            _decode_bf16(codes, scale)
-            if codes.is_cuda and codes.numel() and grad.dtype == torch.bfloat16
-            else dequantize_activation(codes, scale).to(grad.dtype)
+            (
+                _decode_bf16(codes, scale)
+                if codes.is_cuda and codes.numel() and grad.dtype == torch.bfloat16
+                else dequantize_activation(codes, scale).to(grad.dtype)
+            )
+            if need_w
+            else None
         )
         ends = torch.tensor(ctx.counts, device=grad.device, dtype=torch.int32).cumsum(
             0, dtype=torch.int32
@@ -153,32 +139,37 @@ class _Grouped(torch.autograd.Function):
                 if grad.is_cuda
                 else torch.cat([g @ w for g, w in zip(grad.split(ctx.counts), weight.unbind(0))])
             )
-            if grad.is_cuda:
-                if not grad.shape[0]:
-                    dw = torch.zeros_like(weight)
+            dw = None
+            if need_w:
+                if grad.is_cuda:
+                    if not grad.shape[0]:
+                        dw = torch.zeros_like(weight)
+                    else:
+                        dw = torch._grouped_mm(grad.contiguous().T, x.contiguous(), offs=ends)
+                        empty = ends == torch.cat((ends.new_zeros(1), ends[:-1]))
+                        dw.masked_fill_(empty[:, None, None], 0)
                 else:
-                    dw = torch._grouped_mm(grad.contiguous().T, x.contiguous(), offs=ends)
-                    empty = ends == torch.cat((ends.new_zeros(1), ends[:-1]))
-                    dw.masked_fill_(empty[:, None, None], 0)
-            else:
-                dw = torch.stack(
-                    [
-                        g.float().T @ a.float()
-                        for g, a in zip(grad.split(ctx.counts), x.split(ctx.counts))
-                    ]
-                )
+                    dw = torch.stack(
+                        [
+                            g.float().T @ a.float()
+                            for g, a in zip(grad.split(ctx.counts), x.split(ctx.counts))
+                        ]
+                    )
         return (
             dx.to(ctx.input_dtype),
             None,
             None,
-            *(value.to(dtype) for value, dtype in zip(dw.unbind(0), ctx.dtypes)),
+            *(dw[index] if needs[3 + index] else None for index, dtype in enumerate(ctx.dtypes)),
         )
 
 
-def expert_rows(x, fc1, fc2, counts, scores, encoded, limit):
+def expert_rows(x, fc1, fc2, counts, scores, encoded, limit, *, lora=None, lora_hidden=None):
     first = _Grouped.apply(x, tuple(counts), encoded, *fc1)
-    hidden, encoded = activation(first, scores, limit)
-    return _Grouped.apply(hidden, tuple(counts), encoded, *fc2)
+    if lora is not None:
+        first = (first + expert_gate_up(lora_hidden, lora, counts)).bfloat16()
+    hidden, encoded = activation(first, scores, limit, native_input=lora is not None)
+    result = _Grouped.apply(hidden, tuple(counts), encoded, *fc2)
+    return result if lora is None else (result + expert_down(hidden, lora, counts)).bfloat16()
 
 
 class _Shared(torch.autograd.Function):
@@ -192,7 +183,14 @@ class _Shared(torch.autograd.Function):
         if deep_gemm is None:
             raise RuntimeError("Pinned DeepGEMM is required for shared MegaMoE numerics")
         a, scale = encoded
-        codes, sf = quantize_block_fp8(weight, (32, 32), scale_format='e8m0')
+        from .frozen import native_payload
+
+        payload = native_payload(weight, 'fp8_block')
+        codes, sf = (
+            payload
+            if payload is not None
+            else quantize_block_fp8(weight, (32, 32), scale_format='e8m0')
+        )
         ctx.save_for_backward(a, scale, codes, sf)
         ctx.weight_dtype, ctx.input_shape, ctx.input_dtype = weight.dtype, x.shape, x.dtype
         output = x.new_empty((x.shape[0], weight.shape[0]), dtype=torch.bfloat16)
@@ -398,3 +396,14 @@ def launch(x, weights, ids, packed, buffer, limit, ep_size):
         shared_l2_weights=shared_l2,
     )
     return y
+
+
+def shared_rows(x, module, encoded, limit):
+    first = _Shared.apply(x, module.linear_fc1.weight, encoded)
+    w1, w3, w2 = (adapter(module, f'{name}_lora') for name in ('w1', 'w3', 'w2'))
+    if w1 is not None or w3 is not None:
+        gate, up = first.chunk(2, -1)
+        first = torch.cat((add(x, gate, w1), add(x, up, w3)), -1)
+    hidden, encoded = activation(first, x.new_ones(x.shape[0]), limit, native_input=w2 is not None)
+    result = _Shared.apply(hidden, module.linear_fc2.weight, encoded)
+    return add(hidden, result, w2)

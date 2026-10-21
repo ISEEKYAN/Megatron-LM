@@ -6,6 +6,8 @@ import torch
 
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8, quantize_block_fp8
 
+from .batching import dense_mm
+
 
 def _row_scales(scale, rows, inner):
     tiles, groups = (rows + 127) // 128, inner // 32
@@ -78,7 +80,14 @@ class _MXFP8Linear(torch.autograd.Function):
                 raise ValueError("Swizzled prequant requires the tensor-core consumer")
             codes, scales = activation.data.reshape(flat.shape), activation.scale
         raw = _row_scales(scales, *flat.shape) if tc else scales
-        packed, weight_scales = quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
+        from .frozen import native_payload
+
+        payload = native_payload(weight, 'fp8_block')
+        packed, weight_scales = (
+            payload
+            if payload is not None
+            else quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
+        )
         row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
         if tc:
             row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
@@ -114,10 +123,19 @@ class _MXFP8Linear(torch.autograd.Function):
 
 
 def linear_vjp(ctx, grad, activation, weight):
+    needs = getattr(ctx, 'needs_input_grad', (True, True))
     flat_grad = grad.reshape(-1, weight.shape[0])
     with torch.autocast(device_type=grad.device.type, enabled=False):
-        dx = tc_mm(flat_grad, weight).reshape(ctx.input_shape).to(activation.dtype)
-        dw = tc_mm(flat_grad.T, activation, torch.float32)
+        dx = (
+            tc_mm(flat_grad, weight)
+            .reshape(getattr(ctx, 'input_shape', activation.shape))
+            .to(activation.dtype)
+            if needs[0]
+            else None
+        )
+        dw = tc_mm(flat_grad.T, activation, torch.float32) if needs[1] else None
+    if dw is None:
+        return dx, None, None
     owners = getattr(ctx, 'owners', None)
     if owners is None:
         return dx, dw.to(ctx.weight_dtype), None
@@ -129,7 +147,7 @@ class _BF16Linear(torch.autograd.Function):
     def forward(ctx, x, weight, owners=None):
         if not x.is_cuda or not weight.is_cuda:
             raise RuntimeError("Deployment BF16 linear requires CUDA")
-        ctx.owners, ctx.like = owners, _like(weight)
+        ctx.owners, ctx.like, ctx.input_shape = owners, _like(weight), x.shape
         from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import bf16_fixed_mm
 
         compute = weight.bfloat16()
@@ -143,14 +161,7 @@ class _BF16Linear(torch.autograd.Function):
     @staticmethod
     def backward(ctx, grad):
         x, compute = ctx.saved_tensors
-        flat_grad = grad.reshape(-1, compute.shape[0])
-        with torch.autocast(device_type=grad.device.type, enabled=False):
-            dx = tc_mm(flat_grad, compute).reshape(x.shape).to(x.dtype)
-            dw = tc_mm(flat_grad.T, x.reshape(-1, compute.shape[1]), torch.float32)
-        owners = getattr(ctx, 'owners', None)
-        if owners is None:
-            return dx, dw.to(ctx.weight_dtype), None
-        return dx, accumulate_wgrad(owners, dw, ctx.like), None
+        return linear_vjp(ctx, grad, x, compute)
 
 
 def linear(x, weight, *, fp8, activation=None):
