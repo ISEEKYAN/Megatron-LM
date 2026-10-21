@@ -240,3 +240,79 @@ def test_module_apply_native_payload_follows_parameter_storage(kind):
     with pytest.raises(ValueError, match='matching native storage'):
         parameter.data = torch.zeros(parameter.shape)
     assert parameter.codes is moved[0].codes
+
+
+@pytest.mark.parametrize('kind', ['mxfp4', 'fp8_block'])
+@pytest.mark.parametrize('mode', ['set_data', 'overwrite', 'swap'])
+def test_native_module_apply_conversion_branches(kind, mode):
+    old_overwrite = torch.__future__.get_overwrite_module_params_on_conversion()
+    old_swap = torch.__future__.get_swap_module_params_on_conversion()
+    try:
+        torch.__future__.set_overwrite_module_params_on_conversion(mode == 'overwrite')
+        torch.__future__.set_swap_module_params_on_conversion(mode == 'swap')
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(encoded(kind), requires_grad=False)
+        original = module.weight
+        marker = original.owner_marker = object()
+        moved = []
+
+        def convert(value):
+            result = frozen.FrozenWeight(
+                value.codes.clone(), value.scale.clone(), value.shape, value.kind, torch.float32
+            )
+            moved.append(result)
+            return result
+
+        module._apply(convert)
+        assert module.weight.codes is moved[0].codes and module.weight.scale is moved[0].scale
+        assert module.weight.dtype == torch.float32
+        assert (module.weight is original) == (mode != 'overwrite')
+        if mode == 'set_data':
+            assert module.weight.owner_marker is marker
+        assert torch.equal(module.weight.codes.view(torch.uint8), moved[0].codes.view(torch.uint8))
+        module.to('meta')
+        assert module.weight.device == module.weight.codes.device == module.weight.scale.device
+    finally:
+        torch.__future__.set_overwrite_module_params_on_conversion(old_overwrite)
+        torch.__future__.set_swap_module_params_on_conversion(old_swap)
+
+
+@pytest.mark.skipif(
+    not torch.cuda._is_compiled(), reason='Requires CUDA-built torch, no GPU allocation'
+)
+@pytest.mark.parametrize('kind', ['mxfp4', 'fp8_block'])
+def test_module_to_cuda_api_with_fake_cuda_allocator(kind, monkeypatch):
+    # Execute Module.to/_apply with CUDA device semantics on CPU-only nodes.
+    # Actual copies and kernels are checked again by the allocated GPU probe.
+    from torch._subclasses.fake_tensor import FakeTensorMode
+    from torch.utils._python_dispatch import TorchDispatchMode
+
+    class NativeStorageMode(TorchDispatchMode):
+        def __torch_dispatch__(self, func, types, args=(), kwargs=None):
+            # Keep the real wrapper's dispatch; fake only its inner allocations.
+            if args and isinstance(args[0], frozen.FrozenWeight):
+                return frozen.FrozenWeight.__torch_dispatch__(func, types, args, kwargs)
+            return func(*args, **(kwargs or {}))
+
+    monkeypatch.setattr(torch.cuda, '_lazy_init', lambda: None)
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    with FakeTensorMode(), NativeStorageMode():
+        if kind == 'mxfp4':
+            codes = torch.empty((32, 16), dtype=torch.int8)
+            scale = torch.empty((32, 1), dtype=torch.float8_e8m0fnu)
+        else:
+            codes = torch.empty((32, 32), dtype=torch.float8_e4m3fn)
+            scale = torch.empty((1, 1), dtype=torch.float8_e8m0fnu)
+        module = torch.nn.Module()
+        module.weight = torch.nn.Parameter(
+            frozen.FrozenWeight(codes, scale, (32, 32), kind), requires_grad=False
+        )
+        module.to('cuda:0')
+        assert module.weight.device == module.weight.codes.device == module.weight.scale.device
+        assert module.weight.device == torch.device('cuda:0')
+        module.cpu()
+        assert module.weight.device == module.weight.codes.device == module.weight.scale.device
+        assert module.weight.device == torch.device('cpu')
+        module.cuda(0)
+        assert module.weight.device == module.weight.codes.device == module.weight.scale.device
+        assert module.weight.device == torch.device('cuda:0')
