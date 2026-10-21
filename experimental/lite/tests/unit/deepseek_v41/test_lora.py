@@ -65,6 +65,7 @@ def test_subset_export_metadata_matches_saved_adapters(tmp_path, monkeypatch, ta
     lora.attach_lora(model, cfg, torch.float32)
     monkeypatch.setattr(dist, "get_world_size", lambda: 1)
     monkeypatch.setattr(dist, "get_rank", lambda: 0)
+    monkeypatch.setattr(dist, "get_backend", lambda: "gloo")
     monkeypatch.setattr(dist, "all_gather_object", lambda parts, local: parts.__setitem__(0, local))
     monkeypatch.setattr(dist, "barrier", lambda: None)
     lora.save_lora_hf([model], tmp_path, cfg)
@@ -76,10 +77,15 @@ def test_subset_export_metadata_matches_saved_adapters(tmp_path, monkeypatch, ta
     monkeypatch.setattr(dist, "get_world_size", lambda: 2)
 
     def gather(parts, local):
-        parts[:] = [local, {k: v.clone() for k, v in local.items()}]
-        next(iter(parts[1].values())).flatten()[0] += 1
+        parts[:] = [local, local]
+
+    def corrupted_tensor_gather(output, local, group=None):
+        output[: local.numel()].copy_(local)
+        output[local.numel() :].copy_(local)
+        output[local.numel()] += 1
 
     monkeypatch.setattr(dist, "all_gather_object", gather)
+    monkeypatch.setattr(dist, "all_gather_into_tensor", corrupted_tensor_gather)
     with pytest.raises(ValueError, match="factors differ before export"):
         lora.save_lora_hf([model], tmp_path, cfg)
 

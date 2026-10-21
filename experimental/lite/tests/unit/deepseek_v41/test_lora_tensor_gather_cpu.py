@@ -16,10 +16,11 @@ def _worker(rank, world, init, mode):
 
     dist.init_process_group('gloo', init_method=init, rank=rank, world_size=world)
     try:
-        shared = torch.tensor([0.0, -0.0, 1.0, -2.0], dtype=torch.bfloat16).reshape(2, 2)
+        dtype = torch.float32 if mode == 'fp32' else torch.bfloat16
+        shared = torch.tensor([0.0, -0.0, 1.0, -2.0], dtype=dtype).reshape(2, 2)
         local = {'shared': shared.clone()}
         if rank == 0:
-            local['owner0'] = torch.arange(6, dtype=torch.bfloat16).reshape(2, 3)
+            local['owner0'] = torch.arange(6, dtype=dtype).reshape(2, 3)
         if mode == 'empty' and rank != 0:
             local = {}
         if mode == 'corrupt' and rank == 1:
@@ -29,10 +30,7 @@ def _worker(rank, world, init, mode):
                 dict(gather_lora_tensors(local))
         else:
             actual = dict(gather_lora_tensors(local))
-            expected = {
-                'shared': shared,
-                'owner0': torch.arange(6, dtype=torch.bfloat16).reshape(2, 3),
-            }
+            expected = {'shared': shared, 'owner0': torch.arange(6, dtype=dtype).reshape(2, 3)}
             assert actual.keys() == expected.keys()
             for key, value in expected.items():
                 assert torch.equal(actual[key].view(torch.uint8), value.view(torch.uint8))
@@ -45,7 +43,7 @@ def _worker(rank, world, init, mode):
         dist.destroy_process_group()
 
 
-@pytest.mark.parametrize('mode', ['ragged', 'empty', 'corrupt'])
+@pytest.mark.parametrize('mode', ['ragged', 'empty', 'corrupt', 'fp32'])
 def test_real_gloo_lora_tensor_gather(tmp_path, mode):
     init = 'file://' + str(Path(tmp_path) / 'gloo')
     world = int(os.environ.get('W10_LORA_TEST_WORLD', '2'))

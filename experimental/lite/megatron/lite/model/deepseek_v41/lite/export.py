@@ -246,40 +246,46 @@ def gather_lora_tensors(local):
     world = dist.get_world_size()
     metadata = [None] * world
     entries = sorted(local.items())
-    if any(v.dtype != torch.bfloat16 for _, v in entries):
-        raise ValueError("LoRA deployment factors must be BF16")
-    dist.all_gather_object(metadata, [(k, tuple(v.shape)) for k, v in entries])
-    lengths = [sum(math.prod(shape) for _, shape in part) for part in metadata]
-    maximum = max(lengths)
-    if not maximum:
-        return
+    dist.all_gather_object(metadata, [(k, tuple(v.shape), str(v.dtype)) for k, v in entries])
     device = (
         torch.device("cuda", torch.cuda.current_device())
         if dist.get_backend() == "nccl"
         else torch.device("cpu")
     )
-    packed = torch.zeros(maximum, device=device, dtype=torch.bfloat16)
-    if entries:
-        views = packed[: lengths[dist.get_rank()]].split([v.numel() for _, v in entries])
-        torch._foreach_copy_(list(views), [v.reshape(-1) for _, v in entries])
-    gathered = bucketed_all_gather_into_tensor(
-        [("adapter", packed)],
-        group=None,
-        group_size=world,
-        buffer_max_size_bytes=maximum * world * packed.element_size(),
-    )[0][2]
     state = {}
-    for part, vector in zip(metadata, gathered):
-        # One D2H copy per rank buffer, never one copy per expert factor.
-        cpu = vector.cpu()
-        offset = 0
-        for key, shape in part:
-            size = math.prod(shape)
-            value = cpu[offset : offset + size].view(shape)
-            offset += size
-            if key in state and not torch.equal(
-                state[key].view(torch.uint8), value.view(torch.uint8)
-            ):
-                raise ValueError(f"Replicated LoRA factors differ before export: {key}")
-            state[key] = value
+    # Real deployment factors are uniformly BF16 (one collective). Keep the HF
+    # exporter lossless for CPU FP32 and mixed floating-point adapter callers.
+    for dtype_name in sorted({dtype for part in metadata for _, _, dtype in part}):
+        dtype = getattr(torch, dtype_name.removeprefix("torch."))
+        parts = [[(k, shape) for k, shape, d in part if d == dtype_name] for part in metadata]
+        selected = [(k, v) for k, v in entries if v.dtype == dtype]
+        lengths = [sum(math.prod(shape) for _, shape in part) for part in parts]
+        maximum = max(lengths)
+        if not maximum:
+            continue
+        packed = torch.zeros(maximum, device=device, dtype=dtype)
+        if selected:
+            views = packed[: lengths[dist.get_rank()]].split([v.numel() for _, v in selected])
+            torch._foreach_copy_(list(views), [v.reshape(-1) for _, v in selected])
+        gathered = bucketed_all_gather_into_tensor(
+            [("adapter", packed)],
+            group=None,
+            group_size=world,
+            buffer_max_size_bytes=maximum * world * packed.element_size(),
+        )[0][2]
+        for part, vector in zip(parts, gathered):
+            # One D2H copy per rank/dtype buffer, never one copy per expert factor.
+            cpu = vector.cpu()
+            offset = 0
+            for key, shape in part:
+                size = math.prod(shape)
+                value = cpu[offset : offset + size].view(shape)
+                offset += size
+                if key in state and (
+                    state[key].dtype != value.dtype
+                    or state[key].shape != value.shape
+                    or not torch.equal(state[key].view(torch.uint8), value.view(torch.uint8))
+                ):
+                    raise ValueError(f"Replicated LoRA factors differ before export: {key}")
+                state[key] = value
     yield from state.items()
