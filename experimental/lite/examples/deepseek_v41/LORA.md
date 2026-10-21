@@ -1,28 +1,33 @@
 # Deployment-aligned DS4.1 LoRA
 
-This example builds `impl="vllm"` on the normal Lite runtime and Core distributed
-Adam optimizer. The base model and Engram tables stay frozen. Attention, shared
+This example builds `impl="vllm"`, runs actual training steps on real tokenized
+text, and writes adapter-only safetensors through the normal Lite runtime and
+Core distributed Adam optimizer. The base model and Engram tables stay frozen. Attention, shared
 experts and routed experts use the same `LoraConfig` and adapter owners as the
 Lite implementation. Deployment forwards call native vLLM LoRA operations with
 explicit adjoints; no vLLM kernel source is copied here.
 
 Use a compatible ISEEKYAN/vllm build at
-`ad140fc150a7216ed3dd4a8d3df4b37e4de6fe33` (branch
-`v3/ds41-lora-dpfix`), including the BI activation op introduced by
-`8a7fa58d768ac5db565470aff8d33e6fcee75484` and FP8 wo_a LoRA support from
-`013286420`. Stock vLLM is insufficient. Use the paired native FP8 wo_a model
-configuration, sparse FlashMLA, MegaMoE, and the BI settings documented for the
-base implementation. Mega attention is outside the validated scope.
+`9681fe824ec4bcfdfa24f6f0e8fd8b3229e8cc3f` (`v62365/lora-clean`), based on
+vllm-project/vllm#62365 with the native LoRA/DP-filler fixes and the BI activation
+op. Stock vLLM is insufficient. Use the native FP8 wo_a model configuration,
+sparse FlashMLA, MegaMoE and the paired BI settings. Mega attention is outside
+the validated scope.
 
 With `experimental/lite` on `PYTHONPATH`, run the example through a distributed
 launcher, for example on a single eight-GPU host:
 
 ```bash
 torchrun --nproc-per-node=8 experimental/lite/examples/deepseek_v41/lora_vllm.py \
-  --model /path/to/native-model --ep 8 --layers 0 4
+  --model /path/to/native-model --ep 8 --layers 20 40 \
+  --token-ids /path/to/real-text-token-ids.json --steps 1 \
+  --output /path/to/adapter.safetensors
 ```
 
-For the 40-layer E16 proxy, pass `--layers 0 40`. Omitting `layers` from a
+The input is a JSON array of token IDs from real text; each step uses shifted
+next-token labels. The example reports the optimizer result and writes the
+post-update adapter factors on rank0, after collective parameter synchronization.
+It is a minimal training/export example, not a DAPO recipe. Omitting `layers` from a
 `LoraConfig` selects the last twenty layers (or all layers of a smaller model).
 The default target set covers `wq_a`, `wq_b`, `wkv`, `wo_a`, `wo_b`, shared experts
 and routed experts. Use `target_modules` for a subset; dropout is unsupported.
@@ -46,4 +51,9 @@ native rollout DEP4 x 2; FP8 wo_a + sparse FlashMLA + MegaMoE. The two-step chec
 compare actual response-token FP32 log-probability bit patterns in rollout,
 old-policy scoring and grad-enabled actor scoring at each of three generations.
 These checks establish update/publication correctness, not convergence, PP/CP
-LoRA parity, multiple concurrent adapters, or full 384-expert 40-layer training.
+LoRA parity or multiple concurrent adapters. The full 40-layer/384-expert release
+was additionally checked
+with rank32 adapters on layers20–39 under KV-only hybrid rollout: three policy
+generations, 384 actual response tokens, 24 receiver ACKs and two finite nonzero
+updates, with identical FP32 response LP bits. Long-response DAPO throughput and
+reward improvement remain separate validations.
