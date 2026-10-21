@@ -88,6 +88,12 @@ class _MXFP8Linear(torch.autograd.Function):
             if payload is not None
             else quantize_block_fp8(weight, (32, 32), scale_format="e8m0")
         )
+        # A contiguous view can still have a byte-offset pointer. CuTe requires
+        # 16-byte operands; clone only that storage, preserving native bits.
+        if codes.data_ptr() % 16:
+            codes = codes.clone()
+        if packed.data_ptr() % 16:
+            packed = packed.clone()
         row_scales = weight_scales.view(torch.uint8).repeat_interleave(32, dim=0)
         if tc:
             row_scales = swizzle_mxfp8_scale(row_scales, *weight.shape)
