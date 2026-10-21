@@ -48,6 +48,8 @@ class DS41Block(nn.Module):
         )
         if modes and torch.is_grad_enabled() and source_state is None:
             raise ValueError("DS4.1 layer recomputation requires explicit source_state")
+        if modes and torch.is_grad_enabled() and any(p.requires_grad for p in self.parameters()):
+            hidden.requires_grad_()
         if "full" in modes and torch.is_grad_enabled():
             return source_state.checkpoint(
                 lambda h, pre: self._forward(

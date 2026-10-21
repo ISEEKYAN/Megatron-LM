@@ -143,6 +143,9 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as gather
 
     target = kwargs.pop("target", "hf")
+    if target == "lora":
+        yield from _lora_weights(chunks)
+        return
     if target not in ("release", "hf", "bf16", "vllm"):
         raise ValueError(f"Unknown DS4.1 export target, got {target!r}")
     if kwargs.pop("resync_config", None) or kwargs.get("export_dtype"):
@@ -214,3 +217,28 @@ def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
         save_row_shards(
             _frozen_rows(chunks, kwargs.get("buffer_max_size_bytes", 64 * 1024**2), True), path
         )
+
+
+def _lora_weights(chunks):
+    """Merge adapter owners only after replicated factors agree byte for byte."""
+    import torch.distributed as dist
+
+    from megatron.lite.model.deepseek_v41.lite.lora import lora_state
+
+    for chunk in chunks:
+        sync = getattr(chunk, "start_param_sync", None)
+        if callable(sync):
+            sync(force_sync=True)
+    parts = [None] * dist.get_world_size()
+    dist.all_gather_object(
+        parts, {k: v.detach().cpu() for c in chunks for k, v in lora_state(c).items()}
+    )
+    state = {}
+    for part in parts:
+        for key, value in part.items():
+            if key in state and not torch.equal(
+                state[key].view(torch.uint8), value.view(torch.uint8)
+            ):
+                raise ValueError(f"Replicated LoRA factors differ before export: {key}")
+            state[key] = value
+    yield from state.items()

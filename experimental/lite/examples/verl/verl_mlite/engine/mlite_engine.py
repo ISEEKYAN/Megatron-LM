@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# fmt: off
 """External VERL engine backed by Megatron Lite runtime primitives."""
 
 from __future__ import annotations
@@ -6,23 +7,14 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
 
 import torch
 import torch.distributed as dist
-from megatron.lite.model import resolve_model_type_from_hf
-from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
-from megatron.lite.primitive.modules import router_replay
-from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
-from megatron.lite.runtime import create_runtime
-from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
-from megatron.lite.runtime.contracts import LossContext, PackedBatch
-from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
-from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 from tensordict import TensorDict
-
 from verl.trainer.config import CheckpointConfig
 from verl.utils import tensordict_utils as tu
 from verl.utils.device import get_device_id, get_device_name
@@ -30,6 +22,17 @@ from verl.utils.memory_utils import aggressive_empty_cache
 from verl.workers.config import HFModelConfig, OptimizerConfig
 from verl_mlite import qat_export
 from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+
+from megatron.lite.model import resolve_model_type_from_hf
+from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
+from megatron.lite.primitive.modules import router_replay
+from megatron.lite.primitive.modules.lora import disable_lora_adapters
+from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
+from megatron.lite.runtime import create_runtime
+from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
+from megatron.lite.runtime.contracts import LossContext, PackedBatch
+from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
+from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -318,6 +321,18 @@ class MegatronLiteEngine(BaseEngine):
     def eval_mode(self, **kwargs):
         self._require_initialized()
         return _MegatronLiteModeCtx(self, mode="eval", **kwargs)
+
+    @contextmanager
+    def disable_adapter(self):
+        """Run forward as the frozen base model, as VERL does for LoRA reference log-probs."""
+        self._require_initialized()
+        with disable_lora_adapters(self.module) as num_adapters:
+            if num_adapters == 0:
+                raise RuntimeError(
+                    "VERL requested the LoRA base model, but this Megatron Lite model has no "
+                    "LoRA adapters; configure engine.impl_cfg.lora to train adapters."
+                )
+            yield
 
     def optimizer_zero_grad(self):
         self._require_initialized()
@@ -1029,3 +1044,5 @@ class MegatronLiteEngine(BaseEngine):
         placement_fn = getattr(proto, "PLACEMENT_FN", default_placement_fn)
         expert_classifier = getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier)
         return placement_fn, expert_classifier
+
+# fmt: on

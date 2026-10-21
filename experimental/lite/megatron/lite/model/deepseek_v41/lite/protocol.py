@@ -37,6 +37,7 @@ class ImplConfig:
     router_aux_loss_coef: float = 0.0
     quantized: bool = False
     w4a8_experts: bool = False
+    lora: object = None  # LoraConfig or dict; adapters only, the base is frozen
 
 
 def validate_impl_cfg_keys(values):
@@ -125,6 +126,21 @@ def _optimizer(chunks, cfg, impl, ps):
     return optimizer, lambda: finalize_dist_opt_grads(chunks, optimizer)
 
 
+def _require_trainable_stages(chunk, impl, ps):
+    """With LoRA on a layer range, every pipeline stage must own at least one adapter."""
+    from megatron.lite.model.deepseek_v41.lite.model import lora_config
+
+    if not lora_config(impl).enabled or impl.optimizer is None:
+        return
+    owned = torch.tensor([any(p.requires_grad for p in chunk.parameters())], device="cuda")
+    torch.distributed.all_reduce(owned, torch.distributed.ReduceOp.MIN, group=ps.pp_group)
+    if not owned.item():
+        raise ValueError(
+            "DS4.1 LoRA: a pipeline stage holds no LoRA layer and would have no trainable "
+            "parameters; choose pipeline_split_layer so every stage keeps one LoRA layer"
+        )
+
+
 def build_model(model_cfg, *, impl_cfg):
     _validate(model_cfg, impl_cfg)
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
@@ -162,6 +178,7 @@ def build_model(model_cfg, *, impl_cfg):
         if reader is not None:
             reader.close()
         raise
+    _require_trainable_stages(chunks[0], impl_cfg, ps)
     optimizer, finalize = (None, None)
     if impl_cfg.optimizer is not None:
         optimizer, finalize = _optimizer(chunks, model_cfg, impl_cfg, ps)

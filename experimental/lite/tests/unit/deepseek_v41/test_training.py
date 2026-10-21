@@ -2,6 +2,7 @@
 """Random small full-model gates; real Core/TE/FHT/FlashMLA, synthetic release-format weights, no downloaded weights."""
 import hashlib
 import json
+from contextlib import ExitStack
 from dataclasses import asdict
 from pathlib import Path
 
@@ -54,7 +55,7 @@ def _initialize(model, ps, root):
         if n.endswith(("expert_bias", "tid2eid", "embed.embedding.weight"))
     ]
     for name, tensor in state:
-        if name.endswith(".ape"):
+        if name.endswith(".ape") or "lora" in name:
             continue
         value = tensor.detach().cpu()
         keys = _expert_sources(name, model.release, ps)
@@ -81,7 +82,17 @@ def _initialize(model, ps, root):
     load_hf_weights(model, str(path), model.release, ps)
 
 
-def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
+def _seed_adapters(model):
+    """Nonzero adapters, identical for a release name (global expert) in every configuration."""
+    from megatron.lite.model.deepseek_v41.lite.lora import lora_state
+
+    for name, parameter in lora_state(model).items():
+        seed = int(hashlib.sha256(name.encode()).hexdigest()[:8], 16)
+        value = torch.randn(parameter.shape, generator=torch.Generator().manual_seed(seed))
+        parameter.data.copy_(value * 0.05)
+
+
+def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False, impl=None):
     from megatron.lite.runtime import create_runtime
     from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
     from megatron.lite.runtime.contracts import ParallelConfig
@@ -98,6 +109,7 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
     if pp > 1:
         options["pipeline_split_layer"] = [9] if pp == 2 else [3, 9]
     options["recompute"] = recompute
+    options.update(impl or {})
     cfg = MegatronLiteConfig(
         model_name="deepseek_v41",
         impl="lite",
@@ -115,14 +127,21 @@ def _build(root, ep=1, cp=1, pp=1, recompute=None, sft=False):
     return rt, handle, model, ps
 
 
-def _worker(rank, root, world, ep, cp, pp, recompute, sft):
+def _worker(rank, root, world, ep, cp, pp, recompute, sft, impl=None, seed=True, bypass=False):
     from megatron.lite.runtime.contracts import LossContext, PackedBatch
 
     torch.cuda.set_device(rank)
     dist.init_process_group("nccl", f"file://{root}/store", rank=rank, world_size=world)
     torch.use_deterministic_algorithms(not sft, warn_only=True)
-    rt, handle, model, ps = _build(root, ep, cp, pp, recompute, sft)
+    rt, handle, model, ps = _build(root, ep, cp, pp, recompute, sft, impl)
     _initialize(model, ps, root)
+    if impl and impl.get("lora") and seed:
+        _seed_adapters(model)
+    stack = ExitStack()
+    if bypass:
+        from megatron.lite.primitive.modules.lora import disable_lora_adapters
+
+        assert stack.enter_context(disable_lora_adapters(model)) > 0
     if sft:
         handle._optimizer.reload_model_params()
     if not sft:
@@ -148,9 +167,9 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
                 handle,
                 iter([(batch, LossContext(return_log_probs=True))]),
                 loss_fn=loss_fn,
-                forward_only=not enabled,
+                forward_only=not enabled or bypass,
             )
-        if enabled:
+        if enabled and not bypass:
             grads = {
                 n: p.main_grad if hasattr(p, "main_grad") else p.grad
                 for n, p in model.named_parameters()
@@ -160,6 +179,9 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
                 n for n, g in grads.items() if g is None
             ]
             names = "linear_kv_proj.weight linear_q_up_proj.weight compressor.linear_wkv.weight main_projection.weight".split()
+            # LoRA: per-expert factors of an idle routed expert rightly stay zero (test_lora G2).
+            lora = ["_lora.lora_b", "fc2_lora_b"]
+            names = lora if impl and (impl.get("lora") or {}).get("rank") else names
             main = [g for n, g in grads.items() if any(k in n for k in names)]
             assert main and all(g.abs().sum() > 0 for g in main)
         if sft:
@@ -171,20 +193,25 @@ def _worker(rank, root, world, ep, cp, pp, recompute, sft):
                 (rows.tolist(), values.float().tolist()) for rows, values in captured
             ]
     if sft:
-        assert sum(losses[-7:]) <= sum(losses[:7]) * 0.8, losses
+        if not (impl and (impl.get("lora") or {}).get("rank")):  # LoRA: test_lora G4
+            assert sum(losses[-7:]) <= sum(losses[:7]) * 0.8, losses
         record["losses"] = losses
     record["peak_bytes"] = torch.cuda.max_memory_allocated()
     (Path(root) / f"rank-{rank}.json").write_text(json.dumps(record))
+    stack.close()
     dist.destroy_process_group()
 
 
-def _run(root, shape, sft=False):
+def _run(root, shape, sft=False, impl=None, seed=True, bypass=False):
     root.mkdir()
     (root / "config.json").write_text(json.dumps(asdict(tiny_config())))
     ep, cp, pp, recompute = shape
     world = max(ep, cp * pp)
     mp.start_processes(
-        _worker, (str(root), world, ep, cp, pp, recompute, sft), nprocs=world, start_method="spawn"
+        _worker,
+        (str(root), world, ep, cp, pp, recompute, sft, impl, seed, bypass),
+        nprocs=world,
+        start_method="spawn",
     )
     records = [json.loads((root / f"rank-{r}.json").read_text()) for r in range(world)]
     if sft:
