@@ -184,3 +184,30 @@ def test_real_engine_method_selects_only_shared_lora_export():
     with pytest.raises(ValueError, match='frozen release base'):
         MegatronLiteEngine.get_per_tensor_param(engine, base_sync_done=False)
     assert len(calls) == 3  # never falls back to a full base publication
+
+
+def test_native_bucket_snapshot_owns_one_shared_storage_before_reuse():
+    buffer = torch.tensor([0.0, -0.0, 1.0, 2.0, 3.0, 4.0], dtype=torch.bfloat16)
+    views = [('a', buffer[:2].view(1, 2)), ('b', buffer[2:].view(2, 2))]
+    actual = sync._snapshot_bucket(iter(views))
+    before = {k: v.clone() for k, v in actual.items()}
+    assert actual['a'].untyped_storage().data_ptr() == actual['b'].untyped_storage().data_ptr()
+    assert actual['a'].untyped_storage().data_ptr() != buffer.untyped_storage().data_ptr()
+    buffer.fill_(99)
+    for key in actual:
+        assert torch.equal(actual[key].view(torch.uint8), before[key].view(torch.uint8))
+
+
+def test_generator_bucket_is_snapshotted_before_transport_reuse(runner):
+    _, tensors, config = payload()
+
+    class GeneratorReceiver(Receiver):
+        def receive_weights(self, on_bucket_received):
+            buffers = [(k, v.clone()) for k, v in self.tensors.items()]
+            on_bucket_received(iter(buffers), True)
+            for _, value in buffers:
+                value.fill_(-99)
+
+    sync.receive_adapter(GeneratorReceiver(tensors), runner, config)
+    for key, value in runner.calls[-2][2].items():
+        assert torch.equal(value.view(torch.uint8), tensors[key].view(torch.uint8))

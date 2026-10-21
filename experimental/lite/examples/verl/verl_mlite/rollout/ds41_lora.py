@@ -39,6 +39,41 @@ def _entries(tensors):
     return result
 
 
+def _snapshot_bucket(weights):
+    """Own a reused native IPC bucket with one device-to-host copy, not one per factor."""
+    items = list(weights)
+    if not items:
+        return {}
+    first = items[0][1].detach()
+    same_storage = all(
+        value.dtype == first.dtype
+        and value.device == first.device
+        and value.is_contiguous()
+        and value.untyped_storage().data_ptr() == first.untyped_storage().data_ptr()
+        for _, value in items
+    )
+    if same_storage:
+        start = min(value.storage_offset() for _, value in items)
+        stop = max(value.storage_offset() + value.numel() for _, value in items)
+        owned = torch.as_strided(first, (stop - start,), (1,), storage_offset=start).to(
+            'cpu', copy=True
+        )
+        return {
+            name: owned[
+                value.storage_offset() - start : value.storage_offset() - start + value.numel()
+            ].view(value.shape)
+            for name, value in items
+        }
+    # Non-native callers may supply separate allocations; a single concatenation
+    # still avoids per-factor CUDA copies/synchronizations.
+    lengths = [value.numel() for _, value in items]
+    owned = torch.cat([value.detach().reshape(-1) for _, value in items]).to('cpu', copy=True)
+    return {
+        name: value.view(original.shape)
+        for (name, original), value in zip(items, owned.split(lengths))
+    }
+
+
 def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256):
     from megatron.lite.model.deepseek_v41.vllm.lora import serving_targets
     from megatron.lite.primitive.modules.lora import normalize_lora_config
@@ -80,6 +115,7 @@ def receive_adapter(receiver, model_runner, config):
 
     def consume(weights, is_last):
         nonlocal terminal
+        weights = list(weights)
         if terminal:
             errors.append('Adapter bucket after terminal marker')
         for name, value in weights:
@@ -90,7 +126,11 @@ def receive_adapter(receiver, model_runner, config):
                 errors.append(f'Base tensor in adapter publication: {name}')
                 continue
             # The transport reuses its IPC buffer after this callback.
-            tensors[name] = value.detach().to('cpu', copy=True).contiguous()
+            tensors[name] = value
+        # Copy before the native transport is allowed to reuse this buffer.
+        tensors.update(
+            _snapshot_bucket([(n, v) for n, v in weights if n in tensors and tensors[n] is v])
+        )
         terminal = bool(is_last)
 
     receiver.receive_weights(on_bucket_received=consume)

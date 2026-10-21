@@ -230,13 +230,53 @@ def _lora_weights(chunks):
         sync = getattr(chunk, "start_param_sync", None)
         if callable(sync):
             sync(force_sync=True)
-    parts = [None] * dist.get_world_size()
-    dist.all_gather_object(
-        parts, {k: v.detach().cpu() for c in chunks for k, v in lora_state(c).items()}
+    yield from gather_lora_tensors(
+        {k: v.detach() for c in chunks for k, v in lora_state(c).items()}
     )
+
+
+def gather_lora_tensors(local):
+    """Exchange only metadata as objects; gather unchanged adapter bytes in one bucket."""
+    import math
+
+    import torch.distributed as dist
+
+    from megatron.lite.primitive.ckpt.hf_weights import bucketed_all_gather_into_tensor
+
+    world = dist.get_world_size()
+    metadata = [None] * world
+    entries = sorted(local.items())
+    if any(v.dtype != torch.bfloat16 for _, v in entries):
+        raise ValueError("LoRA deployment factors must be BF16")
+    dist.all_gather_object(metadata, [(k, tuple(v.shape)) for k, v in entries])
+    lengths = [sum(math.prod(shape) for _, shape in part) for part in metadata]
+    maximum = max(lengths)
+    if not maximum:
+        return
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.get_backend() == "nccl"
+        else torch.device("cpu")
+    )
+    packed = torch.zeros(maximum, device=device, dtype=torch.bfloat16)
+    if entries:
+        views = packed[: lengths[dist.get_rank()]].split([v.numel() for _, v in entries])
+        torch._foreach_copy_(list(views), [v.reshape(-1) for _, v in entries])
+    gathered = bucketed_all_gather_into_tensor(
+        [("adapter", packed)],
+        group=None,
+        group_size=world,
+        buffer_max_size_bytes=maximum * world * packed.element_size(),
+    )[0][2]
     state = {}
-    for part in parts:
-        for key, value in part.items():
+    for part, vector in zip(metadata, gathered):
+        # One D2H copy per rank buffer, never one copy per expert factor.
+        cpu = vector.cpu()
+        offset = 0
+        for key, shape in part:
+            size = math.prod(shape)
+            value = cpu[offset : offset + size].view(shape)
+            offset += size
             if key in state and not torch.equal(
                 state[key].view(torch.uint8), value.view(torch.uint8)
             ):
