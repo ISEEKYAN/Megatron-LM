@@ -6,6 +6,7 @@ import functools
 import torch
 
 from .linear import linear
+from .lora import adapter, add, grouped_add
 
 
 def _rotate(x, positions, cache, inverse=False):
@@ -24,15 +25,18 @@ def _rotate(x, positions, cache, inverse=False):
 
 class _QueryInputs(torch.autograd.Function):
     @staticmethod
-    def forward(ctx, raw, qw, kw, eps):
+    def forward(ctx, raw, qw, kw, eps, emit_orig=False):
         from vllm.model_executor.kernels.batch_invariant import rms_norm_cuda
         from vllm.models.deepseek_v41.common.ops.query_quant import fused_q_kv_rmsnorm_quant
 
         q, kv = raw.split((qw.numel(), kw.numel()), -1)
-        qa, native_kv = fused_q_kv_rmsnorm_quant(q, kv, qw.bfloat16(), kw.bfloat16(), eps)
-        qr = rms_norm_cuda(q.contiguous(), qw.bfloat16(), eps)
+        qa, native_kv = fused_q_kv_rmsnorm_quant(
+            q, kv, qw.bfloat16(), kw.bfloat16(), eps, **({'emit_orig': True} if emit_orig else {})
+        )
+        qr = qa.orig if emit_orig else rms_norm_cuda(q.contiguous(), qw.bfloat16(), eps)
         ctx.save_for_backward(q, kv, qw, kw)
         ctx.eps = eps
+        ctx.argument_count = len(ctx.needs_input_grad)
         ctx.mark_non_differentiable(qa.data, qa.scale)
         return qr, native_kv, qa.data, qa.scale
 
@@ -50,7 +54,8 @@ class _QueryInputs(torch.autograd.Function):
 
         a, b = norm_vjp(q, qw, dq)
         c, d = norm_vjp(kv, kw, dk)
-        return torch.cat((a, c), -1).to(q.dtype), b, d, None
+        result = (torch.cat((a, c), -1).to(q.dtype), b, d, None)
+        return result + (None,) if ctx.argument_count == 5 else result
 
 
 class _SWAInsert(torch.autograd.Function):
@@ -235,8 +240,7 @@ class _InverseRoPE(torch.autograd.Function):
             heads_per_group=x.shape[1] // groups,
             nope_dim=x.shape[-1] - cache.shape[-1],
             rope_dim=cache.shape[-1],
-            quant_group_size=128,
-            tma_aligned_scales=True,
+            quant_group_size=32,
             quantize=False,
         )
         return out
@@ -299,11 +303,18 @@ class _FP8OutputProjection(torch.autograd.Function):
         )
         # Exactly the serialization used for live publication, including its
         # canonicalization. Do not independently requantize each output row.
-        tensors = dict(
-            to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
-        )
-        codes, descale = (tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"])
+        from .frozen import native_payload
+
+        payload = native_payload(weight, 'fp8_block')
+        if payload is None:
+            tensors = dict(
+                to_release("layers.0.attn.wo_a.weight", weight.reshape(groups * rank, inner))
+            )
+            payload = tensors["layers.0.attn.wo_a.weight"], tensors["layers.0.attn.wo_a.scale"]
+        codes, descale = payload
         saved_codes, saved_scale = codes.clone(), descale.clone()
+        if native_payload(weight, 'fp8_block') is not None:
+            codes, descale = codes.clone(), descale.clone()
         codes, native_scale = deepgemm_post_process_fp8_weight_block(
             codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
         )
@@ -366,13 +377,20 @@ class _FP8OutputProjection(torch.autograd.Function):
                 )
 
             dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
-            dw = bmm(g.transpose(1, 2), a).reshape(ctx.weight_shape)
+            need_w = getattr(ctx, 'needs_input_grad', (True, True))[1]
+            dw = bmm(g.transpose(1, 2), a).reshape(ctx.weight_shape) if need_w else None
         like = getattr(ctx, 'like', None)
         from .linear import accumulate_wgrad
 
         return (
             _rotate(dx.reshape(ctx.shape), positions, cache),
-            dw.to(ctx.weight_dtype) if like is None else accumulate_wgrad((like,), dw, like),
+            (
+                None
+                if dw is None
+                else (
+                    dw.to(ctx.weight_dtype) if like is None else accumulate_wgrad((like,), dw, like)
+                )
+            ),
             None,
             None,
             None,
@@ -383,6 +401,16 @@ def _projections(attention, x, row_perm=None):
     raw = linear(
         x, (attention.linear_q_down_proj.weight, attention.linear_kv_proj.weight), fp8=True
     )
+    wqa, wkv = adapter(attention, 'wq_a_lora'), adapter(attention, 'wkv_lora')
+    if wqa is not None or wkv is not None:
+        qraw, kvraw = raw.split(
+            (
+                attention.linear_q_down_proj.weight.shape[0],
+                attention.linear_kv_proj.weight.shape[0],
+            ),
+            -1,
+        )
+        raw = torch.cat((add(x, qraw, wqa), add(x, kvraw, wkv)), -1)
     from vllm.model_executor.layers.fusion.quant_activation import QuantizedActivation
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
 
@@ -391,11 +419,13 @@ def _projections(attention, x, row_perm=None):
         attention.q_layernorm.weight,
         attention.kv_layernorm.weight,
         attention.config.layernorm_epsilon,
+        adapter(attention, 'wq_b_lora') is not None,
     )
     qa = QuantizedActivation(codes, scales, qr.dtype, qr.shape, kMxfp8Dynamic)
     q = linear(
         qr, (attention.linear_q_up_proj.weight,), fp8=True, activation=qa, row_perm=row_perm
     ).bfloat16()
+    q = add(qr, q, adapter(attention, 'wq_b_lora'))
     q = q.reshape(-1, attention.num_attention_heads_per_partition, attention.q_head_dim)
     from .linear import _row_scales
 
@@ -726,8 +756,12 @@ def output_projection(attention, out, positions, rope_cache, emit=None):
     weight = attention.linear_o_group_proj
     groups = attention.config.o_groups
     z = _FP8OutputProjection.apply(out, weight, positions, rope_cache, groups)
+    wo_a = adapter(attention, 'wo_a_lora')
+    if wo_a is not None:
+        z = grouped_add(inverse_rope_bf16(out, positions, rope_cache, groups), z, wo_a)
     emit('wo_a', z)
     result = linear(z.flatten(1), (attention.linear_proj.weight,), fp8=True).bfloat16()
+    result = add(z.flatten(1), result, adapter(attention, 'wo_b_lora'))
     emit('wo_b', result)
     return result
 

@@ -1,4 +1,5 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
+# fmt: off
 """External VERL engine backed by Megatron Lite runtime primitives."""
 
 from __future__ import annotations
@@ -6,6 +7,7 @@ from __future__ import annotations
 import math
 import os
 import weakref
+from contextlib import contextmanager
 from enum import Enum
 from types import SimpleNamespace
 from typing import Any
@@ -24,6 +26,7 @@ from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_ap
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.modules import router_replay
+from megatron.lite.primitive.modules.lora import disable_lora_adapters
 from megatron.lite.primitive.protocols import default_expert_classifier, default_placement_fn
 from megatron.lite.runtime import create_runtime
 from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
@@ -326,6 +329,18 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
         return _MegatronLiteModeCtx(self, mode="eval", **kwargs)
 
+    @contextmanager
+    def disable_adapter(self):
+        """Run forward as the frozen base model, as VERL does for LoRA reference log-probs."""
+        self._require_initialized()
+        with disable_lora_adapters(self.module) as num_adapters:
+            if num_adapters == 0:
+                raise RuntimeError(
+                    "VERL requested the LoRA base model, but this Megatron Lite model has no "
+                    "LoRA adapters; configure engine.impl_cfg.lora to train adapters."
+                )
+            yield
+
     def optimizer_zero_grad(self):
         self._require_initialized()
         self.runtime.zero_grad(self.handle)
@@ -387,6 +402,24 @@ class MegatronLiteEngine(BaseEngine):
         if not getattr(self, "_initial_sync_cache_cleared", False):
             aggressive_empty_cache(force_sync=True)
             self._initial_sync_cache_cleared = True
+        if self._resolve_model_name() == 'deepseek_v41':
+            from megatron.lite.primitive.modules.lora import normalize_lora_config
+
+            lora = normalize_lora_config(self.engine_config.impl_cfg.get('lora'))
+            if lora.enabled:
+                from verl_mlite.rollout.ds41_lora import prepare_adapter_sync
+
+                if kwargs.get('base_sync_done') is False:
+                    raise ValueError('DS4.1 LoRA rollout must load the frozen release base first')
+                version = kwargs.get('policy_version', getattr(self, '_ds41_lora_version', -1) + 1)
+                cfg = self.handle._extras['model_cfg']
+                base = getattr(self.model_config.hf_config, 'mlite_base_manifest_sha256', '')
+                result = prepare_adapter_sync(
+                    self.runtime.export_weights(self.handle, target='lora'),
+                    lora, cfg.num_hidden_layers, version, base,
+                )
+                self._ds41_lora_version = version
+                return result
         export_kwargs = {
             key: kwargs[key]
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
@@ -1054,3 +1087,5 @@ class MegatronLiteEngine(BaseEngine):
         placement_fn = getattr(proto, "PLACEMENT_FN", default_placement_fn)
         expert_classifier = getattr(proto, "EXPERT_CLASSIFIER", default_expert_classifier)
         return placement_fn, expert_classifier
+
+# fmt: on

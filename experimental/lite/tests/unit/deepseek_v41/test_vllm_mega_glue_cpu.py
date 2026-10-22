@@ -60,9 +60,10 @@ def test_attention_core_option_selects_flashmla_or_mega(monkeypatch):
 
     assert protocol.ImplConfig().attention_core == 'flashmla'
     protocol.validate_impl_cfg_keys({'attention_core': 'mega'})
-    monkeypatch.setattr(protocol.native, 'build_model', lambda *a, **k: 'built')
+    bundle = SimpleNamespace(chunks=[], optimizer=None)
+    monkeypatch.setattr(protocol.native, 'build_model', lambda *a, **k: bundle)
     impl = protocol.ImplConfig(attention_core='mega', token_map=torch.zeros(1))
-    assert protocol.build_model(SimpleNamespace(engram_layer_ids=()), impl_cfg=impl) == 'built'
+    assert protocol.build_model(SimpleNamespace(engram_layer_ids=()), impl_cfg=impl) is bundle
     with pytest.raises(ValueError, match="'flashmla' or 'mega'"):
         protocol.build_model(
             SimpleNamespace(engram_layer_ids=()),
