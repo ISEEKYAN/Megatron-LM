@@ -6,7 +6,11 @@ adjoint recomputes the older BF16 base-plus-delta graph because the hook exports
 post-SwiGLU activations, not its FP32 L1 accumulator. This is not an exact VJP of
 that accumulator. No vLLM or DeepGEMM kernel is copied here.
 """
+from contextlib import nullcontext
+
 import torch
+
+from megatron.lite.primitive.modules.lora import disable_lora_adapters
 
 from . import experts
 from .batching import metadata
@@ -171,7 +175,8 @@ class _Hooks(torch.autograd.Function):
     def forward(ctx, x, scores, ids, owner, *parameters):
         ctx.owner = owner
         ctx.save_for_backward(x, scores, ids, *parameters)
-        gu, *_ = factors(owner)
+        ctx.base_only = not parameters
+        rank = 0 if ctx.base_only else factors(owner)[0].rank
         capacity = 8192
         buffer = experts.symm_buffer(
             owner.ep_group,
@@ -180,7 +185,7 @@ class _Hooks(torch.autograd.Function):
             ids.shape[1],
             x.shape[1],
             owner.experts.linear_fc1.weight0.shape[0] // 2,
-            lora_rank=gu.rank,
+            lora_rank=rank,
         )
         max_rows = torch.tensor(x.shape[0], device=x.device)
         torch.distributed.all_reduce(max_rows, torch.distributed.ReduceOp.MAX, group=owner.ep_group)
@@ -192,7 +197,20 @@ class _Hooks(torch.autograd.Function):
             # Empty input ranks can own remote expert rows. Bound the down grid
             # by the largest source, never this rank's local token count.
             bound = min(capacity, max_rows - i * capacity)
-            outputs.append(_launch(owner, x[sl], scores[sl], ids[sl], packed, buffer, bound))
+            if ctx.base_only:
+                outputs.append(
+                    experts.launch(
+                        x[sl],
+                        scores[sl],
+                        ids[sl],
+                        packed,
+                        buffer,
+                        owner.config.activation_func_clamp_value,
+                        owner.ep_group.size(),
+                    )
+                )
+            else:
+                outputs.append(_launch(owner, x[sl], scores[sl], ids[sl], packed, buffer, bound))
         return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
 
     @staticmethod
@@ -204,7 +222,10 @@ class _Hooks(torch.autograd.Function):
         active = [p for p in inputs if p.requires_grad]
         # Native hooks expose no pre-SwiGLU L1. Recompute the old BF16 graph,
         # retaining its grouped TE backward, explicitly an approximate adjoint.
-        with torch.enable_grad():
+        # A disabled forward must stay disabled during backward even when the
+        # caller has already exited its temporary disable context.
+        replay = disable_lora_adapters(ctx.owner) if ctx.base_only else nullcontext()
+        with torch.enable_grad(), replay:
             result = ctx.owner._lora_rows(x, scores, ids)
         values = iter(torch.autograd.grad(result, active, grad, allow_unused=True))
         grads = tuple(next(values) if p.requires_grad else None for p in inputs)
@@ -215,3 +236,8 @@ def forward(owner, x, scores, ids):
     gu, *shared = factors(owner)
     parameters = tuple(gu.parameters()) + tuple(p for m in shared for p in m.parameters())
     return _Hooks.apply(x, scores, ids, owner, *parameters)
+
+
+def base_forward(owner, x, scores, ids):
+    """Frozen base uses the same native fused MegaMoE launch as the baseline."""
+    return _Hooks.apply(x, scores, ids, owner)

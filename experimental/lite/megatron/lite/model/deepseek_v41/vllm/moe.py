@@ -512,7 +512,16 @@ class MegaMoE(MoELayer):
             raise ValueError('MegaMoE requires contiguous global expert ownership')
         logits = linear(x, self.router.weight, fp8=False)
         scores, indices = route(logits, self.router, input_ids)
-        if getattr(self, 'fused_moe_lora', False) and adapter(self.experts, 'lora') is not None:
+        shared = self.shared_experts
+        active = adapter(self.experts, 'lora') is not None or (
+            shared is not None
+            and any(adapter(shared, n + '_lora') is not None for n in ('w1', 'w3', 'w2'))
+        )
+        if not active and shared is not None:
+            from .fused_lora import base_forward
+
+            out = base_forward(self, x, scores, indices)
+        elif getattr(self, 'fused_moe_lora', False) and adapter(self.experts, 'lora') is not None:
             from .fused_lora import forward
 
             out = forward(self, x, scores, indices)

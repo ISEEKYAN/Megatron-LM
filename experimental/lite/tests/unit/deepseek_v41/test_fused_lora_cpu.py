@@ -152,3 +152,82 @@ def test_native_gate_up_shrink_is_one_call_with_three_slices(monkeypatch, rows):
     assert len(calls) == (1 if rows else 0)
     if rows:
         assert torch.equal(got, torch.stack([x.float() @ w.float().T for w in weights]))
+
+
+@pytest.mark.parametrize('rows', [0, 3])
+def test_disabled_base_uses_native_launch_and_replay_stays_disabled(monkeypatch, rows):
+    from megatron.lite.primitive.modules.lora import LinearLoRA, disable_lora_adapters
+
+    class Owner(torch.nn.Module):
+        def __init__(self):
+            super().__init__()
+            self.lora = LinearLoRA(2, 2, rank=1, alpha=1)
+            self.ep_group = SimpleNamespace(size=lambda: 1)
+            self.num_local_experts = 1
+            self.experts = SimpleNamespace(linear_fc1=SimpleNamespace(weight0=torch.empty(4, 2)))
+            self.config = SimpleNamespace(activation_func_clamp_value=10)
+
+        def _lora_rows(self, x, scores, ids):
+            assert self.lora.disabled
+            return x * 3 + scores.sum(-1, keepdim=True)
+
+    owner = Owner()
+    calls = []
+
+    def buffer(*args, **kwargs):
+        assert kwargs == {'lora_rank': 0}
+        return 'native-buffer'
+
+    def launch(x, scores, ids, packed, buf, limit, ep_size):
+        calls.append((packed, buf, limit, ep_size))
+        return x * 7 + scores.sum(-1, keepdim=True)
+
+    monkeypatch.setattr(fused_lora.experts, 'symm_buffer', buffer)
+    monkeypatch.setattr(fused_lora.experts, 'launch', launch)
+    monkeypatch.setattr(fused_lora, 'frozen_weights', lambda _: 'native-packed')
+    monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
+    monkeypatch.setattr(
+        fused_lora, 'factors', lambda _: pytest.fail('disabled adapter factors read')
+    )
+    monkeypatch.setattr(fused_lora, '_launch', lambda *a: pytest.fail('LoRA hook called'))
+    x = torch.ones(rows, 2, requires_grad=True)
+    scores = torch.ones(rows, 1, requires_grad=True)
+    ids = torch.zeros(rows, 1, dtype=torch.int64)
+    with disable_lora_adapters(owner):
+        result = fused_lora.base_forward(owner, x, scores, ids)
+    assert not owner.lora.disabled
+    assert torch.equal(result, x * 7 + scores)
+    result.sum().backward()
+    assert calls == [('native-packed', 'native-buffer', 10, 1)]
+    assert torch.equal(x.grad, torch.full_like(x, 3))
+    assert torch.equal(scores.grad, torch.full_like(scores, 2))
+    assert all(p.grad is None for p in owner.lora.parameters())
+    assert not owner.lora.disabled
+
+
+@pytest.mark.parametrize('enabled', [False, True])
+@pytest.mark.parametrize('fused', [False, True])
+def test_moe_dispatch_disabled_keeps_fused_base(monkeypatch, enabled, fused):
+    from megatron.lite.model.deepseek_v41.vllm import moe
+
+    routed = object() if enabled else None
+    owner = SimpleNamespace(
+        ep_group=SimpleNamespace(size=lambda: 1, rank=lambda: 0),
+        num_local_experts=1,
+        local_expert_indices=[0],
+        experts=object(),
+        shared_experts=object(),
+        router=SimpleNamespace(weight=None),
+        fused_moe_lora=fused,
+        _lora_rows=lambda *a: torch.full((2, 3), 30.0),
+    )
+    monkeypatch.setattr(moe, 'adapter', lambda obj, name: routed if obj is owner.experts else None)
+    monkeypatch.setattr(moe, 'linear', lambda x, *a, **kw: x)
+    monkeypatch.setattr(
+        moe, 'route', lambda *a: (torch.ones(2, 1), torch.zeros(2, 1, dtype=torch.long))
+    )
+    monkeypatch.setattr(fused_lora, 'base_forward', lambda *a: torch.full((2, 3), 10.0))
+    monkeypatch.setattr(fused_lora, 'forward', lambda *a: torch.full((2, 3), 20.0))
+    out, bias = moe.MegaMoE._lora_forward(owner, torch.ones(2, 3), None)
+    assert bias is None
+    assert torch.equal(out, torch.full_like(out, 10.0 if not enabled else 20.0 if fused else 30.0))
