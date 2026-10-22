@@ -33,6 +33,13 @@ def _decode_bf16(codes, scale):
     return dequantize_activation(codes, scale).bfloat16()
 
 
+@torch.compile(fullgraph=True, dynamic=True)
+def _decode_weight(codes, scale, dtype):
+    # Fuse the shared codec + final cast; do not allocate model-sized FP32
+    # LUT-index, expanded-scale and decoded-weight intermediates.
+    return dequantize_mxfp4(codes, scale).to(dtype)
+
+
 def quantize_activation(x):
     if not x.is_cuda:
         raise RuntimeError("Deployment experts require CUDA")
@@ -132,7 +139,11 @@ class _Grouped(torch.autograd.Function):
         ends = torch.tensor(ctx.counts, device=grad.device, dtype=torch.int32).cumsum(
             0, dtype=torch.int32
         )
-        weight = dequantize_mxfp4(weight_codes, weight_scales).to(grad.dtype)
+        weight = (
+            _decode_weight(weight_codes, weight_scales, grad.dtype)
+            if weight_codes.is_cuda
+            else dequantize_mxfp4(weight_codes, weight_scales).to(grad.dtype)
+        )
         with torch.autocast(device_type=grad.device.type, enabled=False):
             dx = (
                 torch._grouped_mm(grad.contiguous(), weight, offs=ends)
