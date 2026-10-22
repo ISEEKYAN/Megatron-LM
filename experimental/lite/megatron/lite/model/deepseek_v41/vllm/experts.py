@@ -342,11 +342,23 @@ def kernel_weights(fc1, fc2, shared_fc1, shared_fc2):
     return (w13, s13), (w2, s2), (l1, l1s), (l2, l2s)
 
 
-def symm_buffer(group, num_experts, max_tokens, top_k, hidden, inter, shared_experts=1):
+def symm_buffer(
+    group, num_experts, max_tokens, top_k, hidden, inter, shared_experts=1, *, lora_rank=0
+):
     from vllm.utils.deep_gemm import _import_deep_gemm
 
     deep_gemm = _import_deep_gemm()
-    key = (id(group), torch.cuda.current_device(), num_experts, max_tokens, top_k, hidden, inter)
+    key = (
+        id(group),
+        torch.cuda.current_device(),
+        num_experts,
+        max_tokens,
+        top_k,
+        hidden,
+        inter,
+        shared_experts,
+        lora_rank,
+    )
     if key not in _BUFFERS:
         torch.cuda.empty_cache()
         _BUFFERS[key] = deep_gemm.get_symm_buffer_for_mega_moe(
@@ -359,13 +371,14 @@ def symm_buffer(group, num_experts, max_tokens, top_k, hidden, inter, shared_exp
             num_shared_experts=shared_experts,
             mma_type="fp8xfp4",
             activation="swiglu",
+            **(dict(lora_rank=lora_rank, shared_lora_rank=lora_rank) if lora_rank else {}),
         )
         torch.cuda.synchronize()
         torch.distributed.barrier(group=group)
     return _BUFFERS[key]
 
 
-def launch(x, weights, ids, packed, buffer, limit, ep_size):
+def launch(x, weights, ids, packed, buffer, limit, ep_size, **kernel_kwargs):
     """The inference launch over prepacked kernel weights. Returns bf16 [T, H]."""
     from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs
     from vllm.model_executor.layers.quantization.utils.quant_utils import kMxfp8Dynamic
@@ -405,6 +418,7 @@ def launch(x, weights, ids, packed, buffer, limit, ep_size):
         activation_clamp=limit,
         shared_l1_weights=shared_l1,
         shared_l2_weights=shared_l2,
+        **kernel_kwargs,
     )
     return y
 

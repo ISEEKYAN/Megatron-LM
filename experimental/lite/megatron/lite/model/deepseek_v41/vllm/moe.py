@@ -406,6 +406,16 @@ class MegaMoE(MoELayer):
             raise ValueError('MegaMoE requires contiguous global expert ownership')
         logits = linear(x, self.router.weight, fp8=False)
         scores, indices = route(logits, self.router, input_ids)
+        if getattr(self, 'fused_moe_lora', False) and adapter(self.experts, 'lora') is not None:
+            from .fused_lora import forward
+
+            out = forward(self, x, scores, indices)
+        else:
+            out = self._lora_rows(x, scores, indices)
+        return out.reshape_as(hidden_states), None
+
+    def _lora_rows(self, x, scores, indices):
+        group = self.ep_group
         encoded = experts.quantize_activation(x)
         limit = self.config.activation_func_clamp_value
         shared = (
@@ -436,9 +446,4 @@ class MegaMoE(MoELayer):
             lora=lora,
             lora_hidden=dispatched[5] if extra is not None else None,
         )
-        return (
-            combine(return_rows(rows, indices, state, group), indices, shared).reshape_as(
-                hidden_states
-            ),
-            None,
-        )
+        return combine(return_rows(rows, indices, state, group), indices, shared)

@@ -115,13 +115,15 @@ class DeepseekV41Model(NativeModel):
         spec = get_mlp_module_spec(
             use_te=True, num_experts=release.n_routed_experts, moe_grouped_gemm=True
         )
-        return MegaMoE(
+        mlp = MegaMoE(
             config=config,
             submodules=spec.keywords['submodules'],
             layer_number=index + 1,
             pg_collection=self.context.groups,
             hash_moe_layer_threshold=release.num_hash_layers,
         )
+        mlp.fused_moe_lora = getattr(self.impl, "fused_moe_lora", False)
+        return mlp
 
     def _build_block(self, config, index, attention, mlp):
         return Block(config, index + 1, attention, mlp)
