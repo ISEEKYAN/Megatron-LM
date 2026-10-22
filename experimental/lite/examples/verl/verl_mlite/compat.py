@@ -1513,6 +1513,11 @@ def _patch_vllm_dp_pin_by_session() -> bool:
     original = cls.generate
 
     async def generate(self, prompt, sampling_params, request_id, *args, **kwargs):
+        if not getattr(cls, "_verl_mlite_env_logged", False):
+            # Run-log evidence of the rollout's BI mode (arms may differ only here).
+            cls._verl_mlite_env_logged = True
+            print(f"[verl_mlite] rollout VLLM_BATCH_INVARIANT={os.environ.get('VLLM_BATCH_INVARIANT')}",
+                  file=sys.stderr, flush=True)
         if kwargs.get("data_parallel_rank") is None:
             key = (getattr(sampling_params, "extra_args", None) or {}).get("verl_dp_pin")
             dp_size = self.vllm_config.parallel_config.data_parallel_size
