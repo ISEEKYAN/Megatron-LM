@@ -170,11 +170,24 @@ class _ExpertShardExchange:
         match = _RELEASE_EXPERT.fullmatch(key)
         layer, expert, proj = int(match[1]), int(match[2]), match[3]
         unit = self.pending.setdefault((layer, proj), {})
-        unit[expert] = to_release(key, tensor)
+        unit[expert] = (key, tensor)
         if len(unit) < self.n_local:
             return
         del self.pending[(layer, proj)]
-        yield from self._exchange(layer, proj, unit)
+        yield from self._exchange(layer, proj, self._encode(unit))
+
+    @staticmethod
+    def _encode(unit):
+        """to_release of every local expert in one call: MXFP4 blocks never span experts,
+        and a slice that is canonical stays byte-identical through further iterations."""
+        owned = sorted(unit)
+        key = unit[owned[0]][0]
+        parts = to_release(key, torch.stack([unit[e][1] for e in owned]))
+        base = len(key) - len("weight")
+        return {
+            e: [(unit[e][0][:base] + k[base:], t[i]) for k, t in parts]
+            for i, e in enumerate(owned)
+        }
 
     def _exchange(self, layer, proj, unit):
         owned = sorted(unit)
