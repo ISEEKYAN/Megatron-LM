@@ -412,6 +412,10 @@ class MegatronLiteEngine(BaseEngine):
             if target not in ("release", "vllm"):
                 raise ValueError("DS4.1 rollout resync requires native release weights")
             export_kwargs["include_frozen"] = False
+            rollout_ep = int(os.environ.get("VERL_MLITE_SYNC_ROLLOUT_EP", "0") or 0)
+            if rollout_ep > 1:
+                # Send each colocated rollout rank only the routed experts it holds.
+                export_kwargs["rollout_ep_size"] = rollout_ep
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
             weights = qat_export.export_qat_weights(weights, self.engine_config.qat)

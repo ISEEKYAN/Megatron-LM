@@ -9,6 +9,7 @@ import importlib.machinery
 import importlib.util
 import os
 import queue
+import re
 import sys
 import threading
 from collections.abc import Iterable
@@ -1321,6 +1322,71 @@ def _is_deepseek_v41(model: Any) -> bool:
     return type(model).__name__.startswith("DeepseekV41")
 
 
+_RELEASE_ROUTED_EXPERT = re.compile(r"layers\.(\d+)\.ffn\.experts\.(\d+)\.w[123]\.(weight|scale)$")
+
+
+def _local_experts(model) -> dict[int, range | Any]:
+    """Target-model layer index -> container of the routed experts this rank holds."""
+    local = getattr(model, "_verl_mlite_local_experts", None)
+    if local is None:
+        local = {}
+        for name, module in model.named_modules():
+            match = re.search(r"(?:^|\.)layers\.(\d+)\.", name)
+            if match is None or "draft" in name or "mtp" in name:
+                continue
+            count = getattr(module, "num_local_experts", None)
+            if count is None:
+                count = getattr(module, "n_local_experts", None)
+            if hasattr(module, "experts_start_idx") and count is not None:
+                start = module.experts_start_idx
+                local.setdefault(int(match[1]), range(start, start + count))
+            elif getattr(module, "expert_map_manager", None) is not None:
+                manager = module.expert_map_manager
+                local.setdefault(
+                    int(match[1]),
+                    [e for e in range(manager.expert_map.numel()) if manager.is_local_expert(e)]
+                    if manager.expert_map is not None
+                    else range(manager.local_num_experts),
+                )
+        model._verl_mlite_local_experts = local
+    return local
+
+
+def _count_rollout_expert_shard(model, weights) -> None:
+    """With trainer-side expert sharding, every routed expert received must be local."""
+    if not os.environ.get("VERL_MLITE_SYNC_ROLLOUT_EP"):
+        return
+    local = _local_experts(model)
+    counts = model._verl_mlite_expert_counts
+    for name, _ in weights:
+        match = _RELEASE_ROUTED_EXPERT.search(name)
+        if match is None:
+            continue
+        layer, expert = int(match[1]), int(match[2])
+        if layer in local and expert not in local[layer]:
+            raise RuntimeError(f"rollout expert shard: {name} is not local to this rank")
+        counts[layer] = counts.get(layer, 0) + 1
+
+
+def _check_rollout_expert_shard(model) -> None:
+    """Each MoE layer received exactly its local experts' codes and scales (w1/w2/w3)."""
+    if not os.environ.get("VERL_MLITE_SYNC_ROLLOUT_EP"):
+        return
+    counts = getattr(model, "_verl_mlite_expert_counts", {})
+    local = _local_experts(model)
+    wrong = {
+        layer: (counts.get(layer, 0), 6 * len(experts))
+        for layer, experts in local.items()
+        if counts.get(layer, 0) != 6 * len(experts)
+    }
+    if wrong or not local:
+        raise RuntimeError(f"rollout expert shard: (received, expected) per layer {wrong}")
+    sys.stderr.write(
+        f"VERL_MLITE_SYNC_ROLLOUT_EP ok: {len(local)} layers, "
+        f"{sum(counts.values())} routed-expert tensors, all local\n"
+    )
+
+
 def _patch_verl_dsv41_layerwise_reload() -> bool:
     """DS4.1 resync = vLLM's own checkpoint-format reload, nothing else.
 
@@ -1363,6 +1429,7 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         with set_current_vllm_config(_vllm_config(model)):
             initialize_layerwise_reload(model)
         model._verl_mlite_dsv41_reload_active = True
+        model._verl_mlite_expert_counts = {}
         # DS4.1 ``load_weights`` derives the mHC broadcast weight from layer
         # ``start_layer``'s ``hc_attn_fn`` at the end of every call. VERL streams
         # buckets, so a call can end while that layer is still staged (meta);
@@ -1383,6 +1450,7 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         from vllm.model_executor.model_loader.reload import finalize_layerwise_processing
 
         config = _vllm_config(model)
+        _check_rollout_expert_shard(model)
         try:
             with set_current_vllm_config(config):
                 finalize_layerwise_processing(model, config.model_config)
@@ -1407,6 +1475,7 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
         # The receiver reuses its bucket buffer after this callback, while the
         # layerwise loader may hold tensors until their layer is complete.
         weights = [(name, tensor.clone()) for name, tensor in weights]
+        _count_rollout_expert_shard(model, weights)
         try:
             from vllm.model_executor.model_loader.mtp_validation import (
                 disable_mtp_completeness_check,
