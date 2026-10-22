@@ -106,7 +106,10 @@ esac
 [[ "$ROLLOUT_SLEEP_LEVEL" =~ ^[12]$ ]] || { echo "ROLLOUT_SLEEP_LEVEL must be 1 or 2" >&2; exit 2; }
 export VLLM_USE_V2_MODEL_RUNNER=1
 export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
-export MCORE_DIST_CKPT_STREAM_D2H=0  # Use the unmodified Core checkpoint writer.
+# Checkpoint save host memory: stage device tensors one at a time instead of the whole shard,
+# and fsync + drop written pages every 1 GiB.
+export MCORE_DIST_CKPT_STREAM_D2H="${MCORE_DIST_CKPT_STREAM_D2H:-1}"
+export MCORE_DIST_CKPT_DROP_CACHE_BYTES="${MCORE_DIST_CKPT_DROP_CACHE_BYTES:-1073741824}"
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
 export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}" NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export VERL_MLITE_SKIP_RUNTIME_PATCHES=0
@@ -160,6 +163,7 @@ names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
          'DS41_MEGA_ATTN_DETERMINISTIC', 'DS41_MEGA_ATTN_BWD_KERNEL',
          'VERL_MLITE_VAL_MAX_TOKENS', 'VERL_MLITE_L2_RETENTION', 'VERL_MLITE_SLEEP_FP_DIR',
          'MLITE_DISTOPT_SHARDING_TYPE', 'MCORE_DIST_CKPT_STREAM_D2H',
+         'MCORE_DIST_CKPT_DROP_CACHE_BYTES',
          )
 for name in names:
     if name in os.environ:
