@@ -211,6 +211,8 @@ class PostProcessNode(ScheduleNode):
             extra_block_kwargs=self.chunk_state.extra_block_kwargs,
             output_processor=self.chunk_state.output_processor,
             output_processor_context=self.chunk_state.output_processor_context,
+            compute_mtp_loss=self.chunk_state.compute_mtp_loss,
+            mtp_loss_normalization_factor=self.chunk_state.mtp_loss_normalization_factor,
         )
 
         # combined-1F1B currently expects fp32 loss output.

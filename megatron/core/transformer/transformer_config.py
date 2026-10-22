@@ -95,6 +95,11 @@ class TransformerConfig(ModelParallelConfig):
     keep_mtp_in_bf16: bool = False
     """Keep MTP layers out of FP8 and FP4 quantization contexts."""
 
+    mtp_detach_output_weight: bool = False
+    """Detach the shared or untied output weight for MTP loss only.
+    Unlike ``mtp_detach_heads``, this preserves gradients into the backbone.
+    """
+
     mtp_detach_heads: bool = False
     """If True, detach MTP head inputs from the main model graph.
     This prevents MTP loss gradients from flowing back to the main model,

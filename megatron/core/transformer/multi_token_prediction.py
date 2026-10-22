@@ -22,7 +22,7 @@ from megatron.core.fp4_utils import get_fp4_context
 from megatron.core.fp8_utils import get_fp8_context
 from megatron.core.inference.utils import InferenceMode
 from megatron.core.models.backends import BackendSpecProvider, get_backend
-from megatron.core.packed_seq_params import PackedSeqParams
+from megatron.core.packed_seq_params import PackedSeqParams, resolve_cp_group
 from megatron.core.pipeline_parallel.utils import is_vp_last_stage
 from megatron.core.process_groups_config import ProcessGroupCollection
 from megatron.core.tensor_observation import is_observing_tensor, observe_tensor
@@ -1111,6 +1111,7 @@ def process_mtp_loss(
     mtp_input_mask: Optional[Tensor] = None,
     metric_avg_group: Optional[torch.distributed.ProcessGroup] = None,
     main_hidden_states: Optional[Tensor] = None,
+    loss_normalization_factor: float = 1.0,
 ) -> Tensor:
     """Process Multi-Token Prediction (MTP) loss computation.
 
@@ -1139,12 +1140,19 @@ def process_mtp_loss(
             additional MTP conditioning inputs. The mask accumulates across prediction
             steps so a path stays masked after it reaches an invalid token.
         metric_avg_group (Optional[ProcessGroup]): Group used to average MTP logging metrics.
+        loss_normalization_factor (float): Per-microbatch correction when the schedule
+            normalizes gradients against routed rather than objective tokens.
         main_hidden_states (Optional[Tensor]): Hidden states returned to the main model.
             Defaults to the first chunk of ``hidden_states``.
 
     Returns:
         Tensor: Main-model hidden states with the MTP loss attached.
     """
+    if loss_normalization_factor <= 0:
+        raise ValueError("MTP loss normalization factor must be positive.")
+    if packed_seq_params is not None and packed_seq_params.cp_group is not None:
+        cp_group = packed_seq_params.cp_group
+
     hidden_states_list = torch.chunk(hidden_states, 1 + config.mtp_num_layers, dim=0)
     hidden_states = hidden_states_list[0] if main_hidden_states is None else main_hidden_states
 
@@ -1165,7 +1173,7 @@ def process_mtp_loss(
         )
         derived_labels_from_input_ids = True
 
-    if config.mtp_detach_heads:
+    if config.mtp_detach_heads or config.mtp_detach_output_weight:
         if output_weight is not None:
             output_weight = output_weight.detach()
         else:
@@ -1311,7 +1319,9 @@ def process_mtp_loss(
                 config.mtp_num_layers,
                 avg_group=metric_avg_group,
             )
-        mtp_loss_scale = config.mtp_loss_scaling_factor / config.mtp_num_layers
+        mtp_loss_scale = (
+            config.mtp_loss_scaling_factor * loss_normalization_factor / config.mtp_num_layers
+        )
         if config.calculate_per_token_loss:
             # This uses local counts; exact parity for packed or uneven valid-token
             # distributions across DP/CP ranks would require all-reduced counts.
@@ -1617,6 +1627,8 @@ class MultiTokenPredictionLayer(MegatronModule):
             mtp_input_mask (torch.Tensor, optional): Mask of conditioning tokens backed by
                 regular token embeddings. Shape: [b, s].
         """
+        cp_group = resolve_cp_group(self.cp_group, packed_seq_params)
+
         if mtp_input_mask is not None:
             assert mtp_input_mask.shape == input_ids.shape, (
                 f"mtp_input_mask shape {mtp_input_mask.shape} must match "
@@ -1633,7 +1645,7 @@ class MultiTokenPredictionLayer(MegatronModule):
         if self.config.attention_cp_layout == "contiguous":
             input_ids, position_ids, padding_mask, mtp_input_mask = roll_contiguous_fields(
                 (input_ids, position_ids, padding_mask, mtp_input_mask),
-                self.cp_group,
+                cp_group,
                 packed_seq_params,
                 fill_values=(0, 0, True, False),
             )
@@ -1645,7 +1657,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     input_ids,
                     shifts=-1,
                     dims=-1,
-                    cp_group=self.cp_group,
+                    cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
@@ -1658,7 +1670,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     token_metadata,
                     shifts=-1,
                     dims=-1,
-                    cp_group=self.cp_group,
+                    cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
@@ -1668,7 +1680,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                 position_ids,
                 shifts=-1,
                 dims=-1,
-                cp_group=self.cp_group,
+                cp_group=cp_group,
                 packed_seq_params=packed_seq_params,
                 return_sum=False,
             )
@@ -1678,7 +1690,7 @@ class MultiTokenPredictionLayer(MegatronModule):
                     ~padding_mask,
                     shifts=-1,
                     dims=-1,
-                    cp_group=self.cp_group,
+                    cp_group=cp_group,
                     packed_seq_params=packed_seq_params,
                     return_sum=False,
                 )
