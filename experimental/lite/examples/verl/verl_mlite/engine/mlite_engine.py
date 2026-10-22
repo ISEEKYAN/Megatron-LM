@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import weakref
@@ -317,6 +318,13 @@ class MegatronLiteEngine(BaseEngine):
             optimizer=self.is_optimizer_offload_enabled,
             grad=self.is_param_offload_enabled or self._release_grads,
         )
+        if os.environ.get("VERL_MLITE_GC_FREEZE", "1") == "1":
+            # Model and optimizer construction leaves millions of long-lived Python
+            # objects; VERL's weight sync runs up to six full gc.collect() passes per
+            # step (aggressive_empty_cache), each ~1 s over them. Move them out of the
+            # collector's generations; later garbage is still collected.
+            gc.collect()
+            gc.freeze()
 
     def train_mode(self, **kwargs):
         self._require_initialized()
