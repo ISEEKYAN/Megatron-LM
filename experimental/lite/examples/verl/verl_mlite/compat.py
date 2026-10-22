@@ -1490,6 +1490,43 @@ def _patch_verl_rollout_env_overrides() -> bool:
     return True
 
 
+def _patch_vllm_dp_pin_by_session() -> bool:
+    """Pin a request to one DP rank of its replica when it carries a session key.
+
+    Multi-turn agent loops tag every turn of a session with
+    ``SamplingParams.extra_args["verl_dp_pin"]``; the replica is already sticky
+    by request id, and this keeps the session on one DP engine core so its
+    prefix cache is reused (vLLM otherwise load-balances each turn across DP
+    ranks). Opt-in via ``VERL_MLITE_DP_PIN=1``.
+    """
+    if os.environ.get("VERL_MLITE_DP_PIN") != "1" or not _vllm_importable():
+        return False
+    try:
+        module = importlib.import_module("vllm.v1.engine.async_llm")
+    except Exception:
+        return False
+    cls = module.AsyncLLM
+    if getattr(cls.generate, "_verl_mlite_dp_pin", False):
+        return True
+    import hashlib
+
+    original = cls.generate
+
+    async def generate(self, prompt, sampling_params, request_id, *args, **kwargs):
+        if kwargs.get("data_parallel_rank") is None:
+            key = (getattr(sampling_params, "extra_args", None) or {}).get("verl_dp_pin")
+            dp_size = self.vllm_config.parallel_config.data_parallel_size
+            if key is not None and dp_size > 1:
+                digest = hashlib.sha1(str(key).encode()).hexdigest()
+                kwargs["data_parallel_rank"] = int(digest, 16) % dp_size
+        async for output in original(self, prompt, sampling_params, request_id, *args, **kwargs):
+            yield output
+
+    generate._verl_mlite_dp_pin = True
+    cls.generate = generate
+    return True
+
+
 def _patch_verl_padding_helpers() -> bool:
     """Reuse VERL's pure-Torch padding helpers when FlashAttention is absent."""
     try:
@@ -1893,6 +1930,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08i.verl_val_max_tokens", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
+    result = _patch_vllm_dp_pin_by_session()
+    _trace_runtime_patch("09b.vllm_dp_pin_by_session", result)
     result = _patch_verl_rollout_env_overrides()
     _trace_runtime_patch("09c.verl_rollout_env_overrides", result)
     _trace_runtime_patch("10.end")
