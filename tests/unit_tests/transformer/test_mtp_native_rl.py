@@ -77,7 +77,7 @@ def test_output_weight_detach_and_microbatch_normalization(tied, detach_output, 
 def test_mtp_embedding_roll_uses_runtime_cp_group(monkeypatch):
     from megatron.core.transformer import multi_token_prediction as mtp
 
-    runtime_group = object()
+    runtime_group = SimpleNamespace(size=lambda: 1)
     seen = []
 
     def roll(value, *, cp_group=None, **kwargs):
