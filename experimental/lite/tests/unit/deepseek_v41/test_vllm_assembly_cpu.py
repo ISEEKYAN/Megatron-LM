@@ -72,7 +72,7 @@ def test_native_hf_construction_recovers_release_token_map(tmp_path):
 
     impl = protocol.ImplConfig(hf_path=str(tmp_path))
     model_cfg = SimpleNamespace(engram_layer_ids=[1])
-    native_build = Mock(return_value=object())
+    native_build = Mock(return_value=SimpleNamespace(chunks=[], optimizer=None))
     with patch.object(protocol, "release_token_map", return_value=[2, 0, 1]) as recover:
         with patch.object(native, "build_model", native_build):
             protocol.build_model(model_cfg, impl_cfg=impl)
@@ -92,7 +92,9 @@ def test_native_hf_construction_keeps_explicit_token_map(tmp_path):
 
     impl = protocol.ImplConfig(hf_path=str(tmp_path), token_map=[1, 0])
     with patch.object(protocol, "release_token_map", side_effect=AssertionError("recomputed")):
-        with patch.object(native, "build_model", Mock()) as build:
+        with patch.object(
+            native, "build_model", Mock(return_value=SimpleNamespace(chunks=[], optimizer=None))
+        ) as build:
             protocol.build_model(SimpleNamespace(engram_layer_ids=[1]), impl_cfg=impl)
             assert build.call_args.kwargs["impl_cfg"] is impl
 
@@ -107,7 +109,9 @@ def test_recipe_options_are_explicit_and_future_modes_fail_before_build(monkeypa
     default = protocol.ImplConfig()
     assert (default.attention_core, default.head_dtype) == ("flashmla", "float32")
     protocol.validate_impl_cfg_keys({"attention_core": "mega", "head_dtype": "bfloat16"})
-    with patch.object(native, "build_model", Mock()) as build:
+    with patch.object(
+        native, "build_model", Mock(return_value=SimpleNamespace(chunks=[], optimizer=None))
+    ) as build:
         with pytest.raises(NotImplementedError):
             protocol.build_model(
                 SimpleNamespace(), impl_cfg=protocol.ImplConfig(attention_core="mega")

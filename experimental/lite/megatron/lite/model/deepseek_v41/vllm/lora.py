@@ -60,7 +60,9 @@ class _Shrink(torch.autograd.Function):
         ctx.save_for_backward(x, a)
         result = torch.zeros((1, x.shape[0], a.shape[0]), dtype=torch.float32, device=x.device)
         if x.shape[0]:
-            lora_shrink(x.contiguous(), [a[None, None].contiguous()], result, *_metadata(x), 1.0)
+            lora_shrink(
+                x.contiguous(), [a.detach()[None, None].contiguous()], result, *_metadata(x), 1.0
+            )
         return result[0]
 
     @staticmethod
@@ -80,7 +82,7 @@ class _Expand(torch.autograd.Function):
         if base.shape[0]:
             lora_expand(
                 hidden.contiguous(),
-                [b[None, None].contiguous() for b in weights],
+                [b.detach()[None, None].contiguous() for b in weights],
                 result,
                 *_metadata(base),
                 add_inputs=True,
@@ -113,7 +115,9 @@ class _GroupShrink(torch.autograd.Function):
         if rows:
             # Treat groups as independent native adapter IDs, retaining the BI
             # split-K/reduction kernel rather than substituting a torch GEMM.
-            lora_shrink(flat, [a[:, None].contiguous()], output, *metadata(flat, groups), 1.0)
+            lora_shrink(
+                flat, [a.detach()[:, None].contiguous()], output, *metadata(flat, groups), 1.0
+            )
         return output.reshape(groups, rows, a.shape[1])
 
     @staticmethod
@@ -130,13 +134,108 @@ def shrink(x, a):
     return _Shrink.apply(x, a)
 
 
+class _ScaledB(torch.autograd.Function):
+    @staticmethod
+    def forward(ctx, original, cached, scale):
+        ctx.scale = scale
+        return cached.view_as(cached)
+
+    @staticmethod
+    def backward(ctx, grad):
+        return grad * ctx.scale, None, None
+
+
+def _forget_native_pointers(owner, value):
+    # Storage construction/migration only; normal optimizer steps keep keys fixed.
+    import sys
+
+    utils = sys.modules.get('vllm.lora.ops.triton_ops.utils')
+    if utils is not None and not value.is_meta:
+        key = (value.data_ptr(),) if value.ndim == 2 else tuple(b.data_ptr() for b in value)
+        utils._LORA_B_PTR_DICT.pop(key, None)
+        utils._LORA_A_PTR_DICT.pop((owner.lora_a.data_ptr(),), None)
+
+
+def prepare_scaled_b(root):
+    """Persistent per-module serving operands, excluded from HF/checkpoint state."""
+    owners = root.modules() if isinstance(root, torch.nn.Module) else (root,)
+    for owner in owners:
+        if hasattr(owner, 'lora_b') and getattr(owner, '_native_scaled_b', None) is None:
+            owner._native_scaled_b = torch.empty_like(
+                owner.lora_b, memory_format=torch.contiguous_format
+            )
+            owner._native_scaled_b_stamp = owner._native_scaled_b_ready = None
+            _forget_native_pointers(owner, owner._native_scaled_b)
+
+
+def invalidate_scaled_b(root, *, release=False):
+    """Mark post-step data dirty; release pointer metadata only for model migration."""
+    owners = root.modules() if isinstance(root, torch.nn.Module) else (root,)
+    for owner in owners:
+        value = getattr(owner, '_native_scaled_b', None)
+        if value is None:
+            continue
+        owner._native_scaled_b_stamp = None
+        if release:
+            _forget_native_pointers(owner, value)
+            owner._native_scaled_b = owner._native_scaled_b_ready = None
+
+
+def scaled_b(module):
+    """Refresh once after each step, after Core's parameter-ready boundary.
+
+    The detached persistent payload has one address/geometry for the model's
+    lifetime. Each use gets a fresh scaling VJP, not a reused multiplication graph.
+    """
+    prepare_scaled_b(module)
+    b, value, scale = module.lora_b, module._native_scaled_b, module.scale
+    if value.shape != b.shape or value.dtype != b.dtype or value.device != b.device:
+        raise ValueError('LoRA geometry changed: rebuild or migrate the owning model')
+    stamp = (id(b), b.data_ptr(), b._version, b.dtype, b.device, scale)
+    if module._native_scaled_b_stamp != stamp:
+        torch.mul(b.detach(), scale, out=value)
+        ready = module._native_scaled_b_ready
+        if b.is_cuda:
+            if ready is None:
+                ready = module._native_scaled_b_ready = torch.cuda.Event()
+            ready.record()
+        module._native_scaled_b_stamp = stamp
+    elif module._native_scaled_b_ready is not None:
+        torch.cuda.current_stream(b.device).wait_event(module._native_scaled_b_ready)
+    return _ScaledB.apply(b, value, scale)
+
+
+def release_scaled_b_after_step(chunks, optimizer):
+    """DistOpt writes need not bump versions; mark dirty after native Adam updates.
+
+    Copying here would read the old model views, before Core's master-to-model
+    copy/gather. The first use after ensure_params_ready refreshes the same buffer.
+    """
+    import weakref
+
+    if optimizer is None or not any(
+        getattr(m, '_native_scaled_b', None) is not None for c in chunks for m in c.modules()
+    ):
+        return
+    refs = tuple(weakref.ref(c) for c in chunks)
+
+    def dirty(*_):
+        for ref in refs:
+            chunk = ref()
+            if chunk is not None:
+                invalidate_scaled_b(chunk)
+
+    for inner in optimizer.optimizers:
+        inner.register_step_post_hook(dirty)
+
+
 def add(x, base, module):
     if module is None:
         return base
     shape = base.shape
     x = x.reshape(-1, x.shape[-1])
     # R1's loader folds alpha/r into B in BF16 once; export keeps raw factors.
-    b = (module.lora_b * module.scale).to(module.lora_b.dtype)
+    b = scaled_b(module)
     return _Expand.apply(base.reshape(-1, shape[-1]), shrink(x, module.lora_a)[None], b).reshape(
         shape
     )
@@ -146,7 +245,7 @@ def grouped_add(x, base, module):
     if module is None:
         return base
     hidden = _GroupShrink.apply(x, module.lora_a)
-    weights = (module.lora_b * module.scale).to(module.lora_b.dtype)
+    weights = scaled_b(module)
     return _Expand.apply(base.flatten(1), hidden, *weights.unbind(0)).reshape_as(base)
 
 

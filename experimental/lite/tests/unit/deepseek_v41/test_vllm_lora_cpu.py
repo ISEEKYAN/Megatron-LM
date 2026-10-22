@@ -13,8 +13,11 @@ from megatron.lite.model.deepseek_v41.vllm import lora
 def calls(monkeypatch):
     events = []
     ops = ModuleType('vllm.lora.ops.triton_ops')
+    utils = ModuleType('vllm.lora.ops.triton_ops.utils')
+    utils._LORA_A_PTR_DICT, utils._LORA_B_PTR_DICT = {}, {}
 
     def shrink(x, weights, output, *args):
+        utils._LORA_A_PTR_DICT.setdefault(tuple(w.data_ptr() for w in weights), weights[0])
         assert x.dtype == weights[0].dtype == torch.bfloat16
         if len(args) == 1:
             assert args == (1.0,)
@@ -27,6 +30,8 @@ def calls(monkeypatch):
         events.append(('shrink', x.clone(), weights[0].clone()))
 
     def expand(hidden, weights, output, *args, add_inputs):
+        assert all(not w.requires_grad and w.grad_fn is None for w in weights)
+        utils._LORA_B_PTR_DICT.setdefault(tuple(w.data_ptr() for w in weights), weights[0])
         assert add_inputs and not args
         start = 0
         for index, b in enumerate(weights):
@@ -38,6 +43,7 @@ def calls(monkeypatch):
 
     ops.lora_shrink, ops.lora_expand = shrink, expand
     monkeypatch.setitem(sys.modules, ops.__name__, ops)
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
     monkeypatch.setattr(lora, '_metadata', lambda x: ())
     monkeypatch.setattr(lora, 'metadata', lambda x, groups=1: (groups,))
     return events
@@ -213,3 +219,143 @@ def test_fp8_wo_a_delta_uses_native_prequant_rotation_contract(monkeypatch):
             quantize=False,
         )
     ]
+
+
+@pytest.fixture
+def pointer_cache(monkeypatch):
+    utils = ModuleType('vllm.lora.ops.triton_ops.utils')
+    utils._LORA_B_PTR_DICT = {(12345,): object()}
+    utils._LORA_A_PTR_DICT = {}
+    monkeypatch.setitem(sys.modules, utils.__name__, utils)
+    return utils._LORA_B_PTR_DICT
+
+
+@pytest.mark.parametrize('groups', [None, 2])
+def test_scaled_b_reuses_storage_but_not_a_freed_autograd_graph(groups, pointer_cache):
+    shape = (4, 2) if groups is None else (groups, 4, 2)
+    owner = SimpleNamespace(
+        lora_a=torch.nn.Parameter(torch.randn(2, 2)),
+        lora_b=torch.nn.Parameter(torch.randn(shape)),
+        scale=0.3,
+    )
+    outputs = []
+    for _ in range(3):
+        value = lora.scaled_b(owner)
+        outputs.append(value)
+        expected = owner.lora_b.detach() * owner.scale
+        assert torch.equal(value, expected)
+        value.sum().backward()  # independent microbatch backward, no retain_graph
+    assert len({v.data_ptr() for v in outputs}) == 1
+    assert not owner._native_scaled_b.requires_grad
+    assert owner._native_scaled_b.grad_fn is None
+    torch.testing.assert_close(owner.lora_b.grad, torch.full(shape, 0.9))
+    value = outputs[0]
+    key = (value.data_ptr(),) if groups is None else tuple(v.data_ptr() for v in value)
+    pointer_cache[key] = value
+    lora.invalidate_scaled_b(owner)
+    assert owner._native_scaled_b_stamp is None
+    assert owner._native_scaled_b.data_ptr() == value.data_ptr()
+    assert set(pointer_cache) == {(12345,), key}
+    lora.invalidate_scaled_b(owner, release=True)
+    assert owner._native_scaled_b is None
+    assert set(pointer_cache) == {(12345,)}
+
+
+def test_native_optimizer_step_invalidates_even_when_model_version_does_not(pointer_cache):
+    model = torch.nn.Module()
+    model.lora_a = torch.nn.Parameter(torch.randn(2, 2))
+    model.lora_b = torch.nn.Parameter(torch.randn(4, 2))
+    model.scale = 0.5
+    master = torch.nn.Parameter(model.lora_b.detach().clone())
+    inner = torch.optim.Adam([master])
+    lora.prepare_scaled_b(model)
+    lora.release_scaled_b_after_step([model], SimpleNamespace(optimizers=[inner]))
+    before = lora.scaled_b(model)
+    old_value = before.detach().clone()
+    version = model.lora_b._version
+    inner.zero_grad()
+    master.grad = torch.ones_like(master)
+    inner.step()
+    assert model._native_scaled_b_stamp is None
+    model.lora_b.data.copy_(master.data)  # Core's buffer-copy model update
+    assert model.lora_b._version == version
+    after = lora.scaled_b(model)
+    assert after.data_ptr() == before.data_ptr()
+    assert torch.equal(after, model.lora_b.detach() * model.scale)
+    assert not torch.equal(after, old_value)
+    with torch.no_grad():
+        model.lora_b.add_(1)
+    after = lora.scaled_b(model)
+    assert after.data_ptr() == before.data_ptr()
+    assert torch.equal(after, model.lora_b.detach() * model.scale)
+
+
+def test_persistent_buffer_rejects_changed_geometry_at_same_parameter_address(pointer_cache):
+    b = torch.nn.Parameter(torch.randn(4, 8))
+    owner = SimpleNamespace(lora_a=torch.nn.Parameter(torch.randn(2, 8)), lora_b=b, scale=1.0)
+    lora.scaled_b(owner)
+    old_address = b.data_ptr()
+    owner.lora_b = torch.nn.Parameter(b.detach().reshape(8, 4))
+    assert owner.lora_b.data_ptr() == old_address
+    with pytest.raises(ValueError, match='geometry changed'):
+        lora.scaled_b(owner)
+
+
+def test_model_migration_releases_pointer_metadata_before_reallocating(pointer_cache):
+    from megatron.lite.model.deepseek_v41.vllm.model import DeepseekV41Model
+
+    model = DeepseekV41Model.__new__(DeepseekV41Model)
+    torch.nn.Module.__init__(model)
+    model.lora_a = torch.nn.Parameter(torch.randn(2, 8))
+    model.lora_b = torch.nn.Parameter(torch.randn(4, 2))
+    model.scale = 0.5
+    value = lora.scaled_b(model)
+    pointer_cache[(value.data_ptr(),)] = value.detach()
+    model.to('meta')
+    assert model.lora_b.is_meta and model._native_scaled_b.is_meta
+    assert model._native_scaled_b_stamp is None
+    assert set(pointer_cache) == {(12345,)}
+
+
+@pytest.mark.parametrize('groups', [None, 2])
+def test_fifty_native_call_steps_keep_a_and_b_pointer_keys_constant(calls, groups):
+    model = torch.nn.Module()
+    prefix = () if groups is None else (groups,)
+    model.lora_a = torch.nn.Parameter(torch.randn(*prefix, 4, 8, dtype=torch.bfloat16))
+    model.lora_b = torch.nn.Parameter(torch.randn(*prefix, 6, 4, dtype=torch.bfloat16))
+    model.scale = 0.3
+    lora.prepare_scaled_b(model)
+    optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
+    lora.release_scaled_b_after_step([model], SimpleNamespace(optimizers=[optimizer]))
+    native = sys.modules['vllm.lora.ops.triton_ops.utils']
+    address = model._native_scaled_b.data_ptr()
+    for _ in range(50):
+        optimizer.zero_grad()
+        x = torch.randn(3, 8 * (groups or 1), dtype=torch.bfloat16)
+        base = torch.zeros(3, 6 * (groups or 1), dtype=torch.bfloat16)
+        fn = lora.add if groups is None else lora.grouped_add
+        for microbatch in range(2):
+            fn(x, base, model).float().sum().backward()
+        assert model._native_scaled_b.data_ptr() == address
+        assert torch.equal(model._native_scaled_b, model.lora_b.detach() * model.scale)
+        assert (len(native._LORA_A_PTR_DICT), len(native._LORA_B_PTR_DICT)) == (1, 1)
+        optimizer.step()
+        assert model._native_scaled_b_stamp is None
+
+
+def test_initial_allocation_drops_stale_multi_slice_metadata_at_reused_address(
+    pointer_cache, monkeypatch
+):
+    storage = torch.empty(2, 32)
+    old_views = storage.reshape(2, 4, 8)
+    key = tuple(v.data_ptr() for v in old_views)
+    pointer_cache[key] = ('old geometry', (4, 8))
+    owner = SimpleNamespace(
+        lora_a=torch.nn.Parameter(torch.randn(2, 8, 3)),
+        lora_b=torch.nn.Parameter(torch.randn(2, 8, 4)),
+        scale=0.5,
+    )
+    monkeypatch.setattr(torch, 'empty_like', lambda *a, **kw: storage.reshape(2, 8, 4))
+    lora.prepare_scaled_b(owner)
+    assert tuple(v.data_ptr() for v in owner._native_scaled_b) == key
+    assert key not in pointer_cache  # do not reuse the other module's cached geometry

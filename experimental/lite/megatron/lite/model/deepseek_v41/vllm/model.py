@@ -69,6 +69,18 @@ class DeepseekV41Model(NativeModel):
             mixes = block.ffn_mixes
             mixes.aggregate = aggregate.__get__(mixes, type(mixes))
 
+        from .lora import prepare_scaled_b
+
+        prepare_scaled_b(self)
+
+    def _apply(self, fn, recurse=True):
+        from .lora import invalidate_scaled_b, prepare_scaled_b
+
+        invalidate_scaled_b(self, release=True)
+        result = super()._apply(fn, recurse=recurse)
+        prepare_scaled_b(self)
+        return result
+
     def forward(self, *args, labels=None, loss_mask=None, calculate_entropy=False, **kwargs):
         # Keep the module pipeline, but publish buckets also for functional
         # mHC/expert reads which bypass their owning leaf module's pre-hook.
