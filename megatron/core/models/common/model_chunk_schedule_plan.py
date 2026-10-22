@@ -344,6 +344,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        compute_mtp_loss: bool = True,
+        mtp_loss_normalization_factor: float = 1.0,
     ):
         """Initialize the schedule plan of all Transformer layers' sub-modules.
 
@@ -401,6 +403,8 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         self._model_chunk_state.runtime_gather_output = runtime_gather_output
         self._model_chunk_state.output_processor = output_processor
         self._model_chunk_state.output_processor_context = output_processor_context
+        self._model_chunk_state.compute_mtp_loss = compute_mtp_loss
+        self._model_chunk_state.mtp_loss_normalization_factor = mtp_loss_normalization_factor
         self._model_chunk_state.model = model
         self._model_chunk_state.context = None
         self._model_chunk_state.context_mask = None
@@ -416,7 +420,9 @@ class TransformerModelChunkSchedulePlan(AbstractSchedulePlan):
         # MTP. Also, this can help annotate MTP layer so that it can know where MTP is.
         self._build_layer_schedule_plan(model.decoder, get_comp_stream, get_comm_stream)
         self._build_layer_schedule_plan(
-            getattr(model, "mtp", None), get_comp_stream, get_comm_stream
+            getattr(model, "mtp", None) if compute_mtp_loss else None,
+            get_comp_stream,
+            get_comm_stream,
         )
 
         # build post process
