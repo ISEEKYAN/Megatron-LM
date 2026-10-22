@@ -1,6 +1,8 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Fused inference MegaMoE with an owned decoded-operand backward; the shared-first,
 fixed-slot nonfused chain over routed Core A2A rows serves layers without shared experts."""
+import os
+
 import torch
 
 from megatron.core.tensor_parallel.mappings import all_to_all
@@ -353,7 +355,7 @@ class MegaMoE(MoELayer):
                 self.shared_experts.linear_fc2.weight,
             )
             packed = experts.kernel_weights(fc1, fc2, *masters[-2:])
-            capacity = 8192
+            capacity = int(os.environ.get('DSV41_MEGAMOE_MAX_TOKENS', '8192'))
             buffer = experts.symm_buffer(
                 group,
                 len(fc1) * group.size(),

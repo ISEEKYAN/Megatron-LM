@@ -15,21 +15,13 @@ pytestmark = [
 ]
 
 
-def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
-    from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs
-    from vllm.utils.deep_gemm import _import_deep_gemm
-
+def _megamoe(tmp_path, h, i, e, k):
     from megatron.core.models.gpt.gpt_layer_specs import get_mlp_module_spec
     from megatron.core.tensor_parallel.random import model_parallel_cuda_manual_seed
     from megatron.core.transformer.transformer_config import TransformerConfig
     from megatron.lite.model.deepseek_v41.lite.components.config import core_groups
-    from megatron.lite.model.deepseek_v41.vllm.experts import packed_scales, quantize_activation
-    from megatron.lite.model.deepseek_v41.vllm.linear import linear
     from megatron.lite.model.deepseek_v41.vllm.moe import MegaMoE
-    from megatron.lite.model.deepseek_v41.vllm.routing import route
     from megatron.lite.primitive.parallel import init_parallel
-    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
-    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
     from megatron.lite.runtime.contracts import ParallelConfig
 
     dist.init_process_group(
@@ -46,7 +38,6 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
         gtp_remat_world_size=1,
         egtp_remat_world_size=1,
     )
-    h, i, e, k, n = 1024, 512, 16, 6, 7
     cfg = TransformerConfig(
         num_layers=1,
         hidden_size=h,
@@ -77,11 +68,26 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
         layer_number=1,
         pg_collection=core_groups(ps, SimpleNamespace(cp_size=1)),
         hash_moe_layer_threshold=0,
-    )
+    ).cuda()
     torch.manual_seed(73)
     with torch.no_grad():
         for parameter in model.parameters():
             parameter.copy_((torch.randn_like(parameter.float()) * 0.02).to(parameter.dtype))
+    return model
+
+
+def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
+    from vllm.model_executor.layers.fused_moe.prepare_megamoe import prepare_megamoe_inputs
+    from vllm.utils.deep_gemm import _import_deep_gemm
+
+    from megatron.lite.model.deepseek_v41.vllm.experts import packed_scales, quantize_activation
+    from megatron.lite.model.deepseek_v41.vllm.linear import linear
+    from megatron.lite.model.deepseek_v41.vllm.routing import route
+    from megatron.lite.primitive.quantization.block_fp8 import quantize_block_fp8
+    from megatron.lite.primitive.quantization.mxfp4 import quantize_mxfp4
+
+    h, i, e, k, n = 1024, 512, 16, 6, 7
+    model = _megamoe(tmp_path, h, i, e, k)
     x = torch.randn(n, 1, h, device='cuda', dtype=torch.bfloat16) * 0.3
     dg = _import_deep_gemm()
     dg.use_deterministic_algorithms(True)
@@ -174,4 +180,28 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
             assert bias is None and not different.numel(), receipt
     finally:
         buffer.destroy()
+        dist.destroy_process_group()
+
+
+def test_megamoe_block_size_env_keeps_rows_bitwise(tmp_path, monkeypatch):
+    """DSV41_MEGAMOE_MAX_TOKENS bounds the per-chunk symm buffer without changing any row."""
+    from megatron.lite.model.deepseek_v41.vllm import experts
+
+    model = _megamoe(tmp_path, 1024, 512, 16, 6)
+    x = torch.randn(300, 1, 1024, device='cuda', dtype=torch.bfloat16) * 0.3
+    try:
+        outputs = {}
+        for block in ('8192', '128'):
+            monkeypatch.setenv('DSV41_MEGAMOE_MAX_TOKENS', block)
+            x_ = x.clone().requires_grad_()
+            out, _ = model(x_)
+            out.float().square().sum().backward()
+            outputs[block] = (out, x_.grad)
+        assert sorted(key[3] for key in experts._BUFFERS) == [128, 8192]
+        for full, chunked in zip(outputs['8192'], outputs['128']):
+            assert torch.equal(full.view(torch.int16), chunked.view(torch.int16))
+    finally:
+        for buffer in experts._BUFFERS.values():
+            buffer.destroy()
+        experts._BUFFERS.clear()
         dist.destroy_process_group()
