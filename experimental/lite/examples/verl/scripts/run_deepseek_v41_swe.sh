@@ -6,10 +6,11 @@
 # e.g. Verda E2B; reward = FAIL_TO_PASS + PASS_TO_PASS on the final repo), token in/out on
 # the resident vLLM rollout with prefix caching and one DP rank per session.
 #
-# BATCH_INVARIANT=1 (default) is the DAPO recipe's train/inference contract below.
-# BATCH_INVARIANT=0 is the baseline arm: vLLM default kernels (no VLLM_BATCH_INVARIANT /
-# VLLM_BI_*, attention backend and head dtype left to vLLM) and the training-side default
-# actor (impl=lite). Everything else (data, agent, sampling, topology, engine sizes) is shared.
+# The actor is the DAPO recipe's deployment-operator actor (impl=vllm, BI env) in both arms.
+# BATCH_INVARIANT=1 (default): the rollout runs the BI=1 contract (bitwise vs the actor).
+# BATCH_INVARIANT=0: only the rollout changes -- its server actors get VLLM_BATCH_INVARIANT=0
+# (VERL_MLITE_ROLLOUT_ENV; every VLLM_BI_* is gated by it) and no attention-backend /
+# head-dtype pins, i.e. vLLM's default kernels. Everything else is shared.
 #
 # Train/inference consistency contract (BI=1):
 #   * actor forward calls the rollout's own ops (megatron.lite.model.deepseek_v41.vllm);
@@ -107,23 +108,21 @@ export CUDA_DEVICE_MAX_CONNECTIONS=1 VLLM_USE_V1=1
 export VERL_MLITE_HF_CONFIG_MODEL_TYPE=deepseek_v41
 export VERL_MLITE_ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL}"
 export VERL_MLITE_VAL_MAX_TOKENS="${VAL_MAX_TOKENS}"
-if [[ "$BATCH_INVARIANT" == 1 ]]; then
-  export VLLM_BATCH_INVARIANT=1 VERL_FULL_DETERMINISM=1
-  export VLLM_BI_MXFP8_GEMM=tensor_core VLLM_BI_BF16_GEMM=tensor_core
-  export VLLM_BI_MXFP8_PREQUANT=1 VLLM_BI_MHC_OVERLAP=1
-  case "$DSV41_ATTENTION_CORE" in
-    flashmla) ATTENTION_BACKEND=FLASHMLA_SPARSE_DSV41; export VLLM_BI_MEGA_ATTN=0 ;;
-    mega) ATTENTION_BACKEND=FLASHMLA_MEGA_ATTN_DSV41; export VLLM_BI_MEGA_ATTN=1 ;;
-    *) echo "DSV41_ATTENTION_CORE must be flashmla or mega" >&2; exit 2 ;;
-  esac
-  export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
-  export VLLM_BI_REPLAY_STAGE_LAYERS=2
-  ACTOR_IMPL=vllm ACTOR_DETERMINISTIC=True
+export VLLM_BATCH_INVARIANT=1 VERL_FULL_DETERMINISM=1
+export VLLM_BI_MXFP8_GEMM=tensor_core VLLM_BI_BF16_GEMM=tensor_core
+export VLLM_BI_MXFP8_PREQUANT=1 VLLM_BI_MHC_OVERLAP=1
+case "$DSV41_ATTENTION_CORE" in
+  flashmla) ATTENTION_BACKEND=FLASHMLA_SPARSE_DSV41; export VLLM_BI_MEGA_ATTN=0 ;;
+  mega) ATTENTION_BACKEND=FLASHMLA_MEGA_ATTN_DSV41; export VLLM_BI_MEGA_ATTN=1 ;;
+  *) echo "DSV41_ATTENTION_CORE must be flashmla or mega" >&2; exit 2 ;;
+esac
+export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
+export VLLM_BI_REPLAY_STAGE_LAYERS=2
+ACTOR_IMPL=vllm ACTOR_DETERMINISTIC=True
+if [[ "$BATCH_INVARIANT" == 0 ]]; then
+  export VERL_MLITE_ROLLOUT_ENV=VLLM_BATCH_INVARIANT=0
 else
-  # Baseline: nothing batch-invariant anywhere (the BI kernel gates read VLLM_BATCH_INVARIANT).
-  for name in $(compgen -e | grep -E '^VLLM_BI_'); do unset "$name"; done
-  export VLLM_BATCH_INVARIANT=0
-  ACTOR_IMPL=lite ACTOR_DETERMINISTIC=False
+  unset VERL_MLITE_ROLLOUT_ENV
 fi
 case "$DSV41_HEAD_DTYPE" in
   float32|bfloat16) ;;
@@ -165,13 +164,12 @@ mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}"
 export DS41_SWE_TRACE_DIR="${DS41_SWE_TRACE_DIR:-${OUTPUT_ROOT}/swe_trace}"
 export VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 
-BI_ACTOR_ARGS=()
+BI_ACTOR_ARGS=(
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
+  "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
+)
 BI_ROLLOUT_ARGS=()
 if [[ "$BATCH_INVARIANT" == 1 ]]; then
-  BI_ACTOR_ARGS=(
-    "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
-    "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
-  )
   BI_ROLLOUT_ARGS=(
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=${ATTENTION_BACKEND}"
     "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype:${DSV41_HEAD_DTYPE}}"
@@ -203,9 +201,9 @@ names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
          'DSV41_ATTENTION_CORE', 'DSV41_HEAD_DTYPE', 'DSV41_MEGAMOE_MAX_TOKENS',
          'VERL_MLITE_VAL_MAX_TOKENS', 'VERL_MLITE_L2_RETENTION', 'VERL_MLITE_SLEEP_FP_DIR',
          'MLITE_DISTOPT_SHARDING_TYPE', 'MCORE_DIST_CKPT_STREAM_D2H',
-         'MCORE_DIST_CKPT_DROP_CACHE_BYTES', 'VERL_MLITE_DP_PIN', 'DS41_SWE_TASK_CONFIG',
+         'MCORE_DIST_CKPT_DROP_CACHE_BYTES', 'VERL_MLITE_DP_PIN', 'VERL_MLITE_ROLLOUT_ENV', 'DS41_SWE_TASK_CONFIG',
          'DS41_SWE_THINKING', 'DS41_SWE_REASONING_EFFORT', 'DS41_SWE_TRACE_DIR',
-         'DS41_SWE_SESSION_TIMEOUT', 'SANDBOX_STARTUP_TIMEOUT', 'E2B_CAPACITY_WAIT',
+         'DS41_SWE_SESSION_TIMEOUT', 'DS41_SWE_IGNORE_EOS', 'SANDBOX_STARTUP_TIMEOUT', 'E2B_CAPACITY_WAIT',
          'E2B_EXEC_HARD_TIMEOUT',
          )
 for name in names:

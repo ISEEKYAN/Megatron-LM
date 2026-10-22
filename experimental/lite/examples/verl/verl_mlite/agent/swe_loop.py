@@ -19,6 +19,7 @@ Env (all optional except the task config):
   DS41_SWE_REASONING_EFFORT  V4.1 effort (thinking mode only)
   DS41_SWE_TRACE_DIR     per-episode JSON trace (turn timings, token counts)
   DS41_SWE_SESSION_TIMEOUT  wall deadline of one episode incl. eval (default 3600 s)
+  DS41_SWE_IGNORE_EOS    1 = memory check only: every turn fills the remaining response budget
 """
 
 from __future__ import annotations
@@ -111,6 +112,8 @@ class _TokenSession:
         params = dict(self.sampling_params)
         params["max_tokens"] = self._room()
         params["extra_args"] = {"verl_dp_pin": self.key}
+        if self.loop.ignore_eos:
+            params["ignore_eos"] = True
         t0 = time.time()
         out = await self.loop.server_manager.generate(request_id=self.key, prompt_ids=context, sampling_params=params)
         t1 = time.time()
@@ -184,6 +187,7 @@ class DS41SWEAgentLoop(AgentLoopBase):
         self.codec = DS41Codec(self.tokenizer, thinking=thinking, reasoning_effort=effort)
         self.resolver = TaskConfigResolver.from_file(os.environ["DS41_SWE_TASK_CONFIG"])
         self.session_timeout = float(os.environ.get("DS41_SWE_SESSION_TIMEOUT", "3600"))
+        self.ignore_eos = os.environ.get("DS41_SWE_IGNORE_EOS") == "1"
         trace_dir = os.environ.get("DS41_SWE_TRACE_DIR")
         self.trace_dir = Path(trace_dir) if trace_dir else None
 
