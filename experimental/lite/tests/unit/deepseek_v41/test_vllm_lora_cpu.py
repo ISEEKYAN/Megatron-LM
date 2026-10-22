@@ -333,8 +333,8 @@ def test_fifty_native_call_steps_keep_a_and_b_pointer_keys_constant(calls, group
     address = model._native_scaled_b.data_ptr()
     for _ in range(50):
         optimizer.zero_grad()
-        x = torch.randn(3, 8 * (groups or 1), dtype=torch.bfloat16)
-        base = torch.zeros(3, 6 * (groups or 1), dtype=torch.bfloat16)
+        x = torch.randn(3, *prefix, 8, dtype=torch.bfloat16)
+        base = torch.zeros(3, *prefix, 6, dtype=torch.bfloat16)
         fn = lora.add if groups is None else lora.grouped_add
         for microbatch in range(2):
             fn(x, base, model).float().sum().backward()
