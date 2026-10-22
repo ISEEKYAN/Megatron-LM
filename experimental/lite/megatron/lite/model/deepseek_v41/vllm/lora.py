@@ -225,8 +225,8 @@ def release_scaled_b_after_step(chunks, optimizer):
             if chunk is not None:
                 invalidate_scaled_b(chunk)
 
-    for inner in optimizer.optimizers:
-        inner.register_step_post_hook(dirty)
+    for owner in getattr(optimizer, 'chained_optimizers', (optimizer,)):
+        owner.optimizer.register_step_post_hook(dirty)
 
 
 def add(x, base, module):

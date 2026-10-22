@@ -269,7 +269,9 @@ def test_native_optimizer_step_invalidates_even_when_model_version_does_not(poin
     master = torch.nn.Parameter(model.lora_b.detach().clone())
     inner = torch.optim.Adam([master])
     lora.prepare_scaled_b(model)
-    lora.release_scaled_b_after_step([model], SimpleNamespace(optimizers=[inner]))
+    lora.release_scaled_b_after_step(
+        [model], SimpleNamespace(chained_optimizers=[SimpleNamespace(optimizer=inner)])
+    )
     before = lora.scaled_b(model)
     old_value = before.detach().clone()
     version = model.lora_b._version
@@ -326,7 +328,7 @@ def test_fifty_native_call_steps_keep_a_and_b_pointer_keys_constant(calls, group
     model.scale = 0.3
     lora.prepare_scaled_b(model)
     optimizer = torch.optim.Adam(model.parameters(), lr=1e-3)
-    lora.release_scaled_b_after_step([model], SimpleNamespace(optimizers=[optimizer]))
+    lora.release_scaled_b_after_step([model], SimpleNamespace(optimizer=optimizer))
     native = sys.modules['vllm.lora.ops.triton_ops.utils']
     address = model._native_scaled_b.data_ptr()
     for _ in range(50):
