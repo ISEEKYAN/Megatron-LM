@@ -3,6 +3,11 @@
 
 import sys
 import types
+from pathlib import Path
+
+VERL_EXAMPLE_ROOT = Path(__file__).resolve().parents[3] / "examples" / "verl"
+if str(VERL_EXAMPLE_ROOT) not in sys.path:
+    sys.path.insert(0, str(VERL_EXAMPLE_ROOT))
 
 from verl_mlite import compat
 
