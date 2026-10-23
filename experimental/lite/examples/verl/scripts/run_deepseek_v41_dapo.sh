@@ -165,8 +165,6 @@ if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
 fi
 
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
-CAPTURE="${CAPTURE_SIZES:-[1,2,4,8,16]}"
-REPLAY="${REPLAY_SIZES:-[1,2,4,8,16]}"
 
 # A pre-existing Ray cluster inherits its service environment, not this shell.
 # Forward the paired kernel/compatibility contract explicitly, without secrets.
@@ -293,8 +291,9 @@ COMMAND=(
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
   "actor_rollout_ref.rollout.full_determinism=${ROLLOUT_FULL_DETERMINISM}"
-  "+${VLLM}.compilation_config={mode:0,cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
-  "+${VLLM}.max_cudagraph_capture_size=${MAX_CAPTURE_SIZE:-16}"
+  # Graph mode and capture sizes are vLLM's defaults (DS4.1: breakable FULL_AND_PIECEWISE,
+  # capture up to min(2 x max_num_seqs x (1 + spec tokens), 1024) = 768 here).
+  "+${VLLM}.compilation_config={mode:0}"
   "+${VLLM}.attention_config={indexer_kv_dtype:${INDEXER_KV_DTYPE},indexer_sparse_logits:${INDEXER_SPARSE_LOGITS}}"
   "+${VLLM}.kv_cache_dtype=nvfp4_ds_mla"
   "+${VLLM}.all2all_backend=allgather_reducescatter"
