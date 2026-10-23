@@ -17,6 +17,24 @@ from verl_mlite import compat
 pytestmark = pytest.mark.optional
 
 
+class _InPlaceExperts(torch.nn.Module):
+    reload_in_place = True
+
+
+def _ds4_model() -> torch.nn.Module:
+    """Layer 0 routed experts reload in place; layer 1 ones are staged."""
+    model = torch.nn.Module()
+    model.is_ds4 = True
+    model.layers = torch.nn.ModuleList(
+        torch.nn.Module() for _ in range(2)
+    )
+    model.layers[0].ffn = torch.nn.Module()
+    model.layers[0].ffn.experts = _InPlaceExperts()
+    model.layers[1].ffn = torch.nn.Module()
+    model.layers[1].ffn.experts = torch.nn.Module()
+    return model
+
+
 def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     events = []
     fp8_utils = ModuleType("verl.utils.vllm.vllm_fp8_utils")
@@ -72,15 +90,23 @@ def test_ds4_uses_native_vllm_layerwise_reload(monkeypatch) -> None:
     monkeypatch.setattr(
         torch.cuda, "empty_cache", lambda: events.append("empty-device-cache")
     )
-    model = SimpleNamespace(is_ds4=True)
+    model = _ds4_model()
     config = SimpleNamespace(model_config=object())
     runner = SimpleNamespace(model=model, vllm_config=config)
     assert compat._patch_verl_dsv4_native_layerwise_reload()
     state = fp8_utils.prepare_quanted_weights_for_loading(runner)
     assert state is compat._DSV4_LAYERWISE_RELOAD_STATE
-    source = torch.arange(4)
-    assert rollout_utils.load_quanted_weights([("weight", source)], runner) == "loaded"
-    assert captured_weights[0][1].data_ptr() != source.data_ptr()
+    names = (
+        "weight",
+        "layers.0.ffn.experts.3.w1.weight",
+        "layers.1.ffn.experts.3.w1.weight",
+        "layers.0.ffn.shared_experts.w1.weight",
+    )
+    sources = [torch.arange(4) for _ in names]
+    assert rollout_utils.load_quanted_weights(list(zip(names, sources)), runner) == "loaded"
+    # Only routed experts that vLLM writes in place during the call skip the copy.
+    copied = [loaded.data_ptr() != src.data_ptr() for (_, loaded), src in zip(captured_weights, sources)]
+    assert copied == [True, False, True, True]
     assert model._verl_mlite_ds4_layerwise_reload_active is True
     fp8_utils.process_quanted_weights_after_loading(runner, state)
     assert model._verl_mlite_ds4_layerwise_reload_active is False

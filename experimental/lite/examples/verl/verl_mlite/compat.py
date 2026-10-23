@@ -760,6 +760,29 @@ def _patch_verl_dsv4_fp8_prepare_state() -> bool:
 _DSV4_LAYERWISE_RELOAD_STATE = object()
 
 
+_ROUTED_EXPERT_LAYER = re.compile(r"layers\.(\d+)\.ffn\.experts\.\d+\.w[123]\.")
+_IN_PLACE_EXPERTS = re.compile(r"layers\.(\d+)\.ffn\.experts$")
+
+
+def _routed_expert_layer(name: str) -> int | None:
+    match = _ROUTED_EXPERT_LAYER.search(name)
+    return None if match is None else int(match[1])
+
+
+def _in_place_expert_layers(model: Any) -> frozenset[int]:
+    """Layers whose routed experts vLLM layerwise reload writes in place."""
+    layers = getattr(model, "_verl_mlite_in_place_expert_layers", None)
+    if layers is None:
+        layers = frozenset(
+            int(match[1])
+            for name, module in getattr(model, "named_modules", tuple)()
+            if getattr(module, "reload_in_place", False)
+            and (match := _IN_PLACE_EXPERTS.search(name)) is not None
+        )
+        model._verl_mlite_in_place_expert_layers = layers
+    return layers
+
+
 def _patch_verl_dsv4_native_layerwise_reload() -> bool:
     """Use vLLM's native layerwise reload lifecycle for DS4 FP8 resync.
 
@@ -869,7 +892,13 @@ def _patch_verl_dsv4_native_layerwise_reload() -> bool:
             # callbacks.  The receiver reuses its communication buffer after
             # each callback, so persist every tensor until its logical layer is
             # finalized instead of retaining a view into overwritten storage.
-            weights = [(name, tensor.clone()) for name, tensor in weights]
+            # Routed experts of layers vLLM reloads in place are written during
+            # the call and never retained: no copy.
+            in_place = _in_place_expert_layers(model)
+            weights = [
+                (name, tensor if _routed_expert_layer(name) in in_place else tensor.clone())
+                for name, tensor in weights
+            ]
         return original_load(weights, model_runner, *args, **kwargs)
 
     prepare_quanted_weights_for_loading._verl_mlite_ds4_layerwise = True
