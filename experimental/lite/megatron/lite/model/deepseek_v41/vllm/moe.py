@@ -439,13 +439,12 @@ class MegaMoE(MoELayer):
         super().__init__(*args, **kwargs)
         if vision_routing:
             # Frozen release ffn.gate.bias_vl (FP32): vLLM routes the image ids with it in place
-            # of the text bias, sampled ids included. Loaded from the release, never exported:
-            # the rollout keeps its own copy across sleep (sleep_preserve '*.bias_vl').
+            # of the text bias, sampled ids included. Exported on every resync: the rollout's
+            # level-2 layerwise reload does not keep the value it loaded.
             weight = self.router.weight
             self.router.register_buffer(
                 "bias_vl",
                 torch.zeros(weight.shape[0], dtype=torch.float32, device=weight.device),
-                persistent=False,
             )
 
     def forward(self, hidden_states, input_ids=None, **kwargs):

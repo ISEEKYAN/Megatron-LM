@@ -203,3 +203,16 @@ def test_live_bf16_wo_a_keeps_updates_which_release_fp8_would_round(monkeypatch)
         offline[key], offline['layers.0.attn.wo_a.scale'], weight.shape
     ).bfloat16()
     assert not torch.equal(_bits(decoded), _bits(weight)), 'FP8 roundtrip negative control'
+
+
+def test_router_bias_vl_is_exported_as_exact_fp32():
+    """The rollout's level-2 layerwise reload keeps only what the resync sends."""
+    from megatron.lite.model.deepseek_v41.lite.export import DeepseekV41WeightSpec
+
+    spec = object.__new__(DeepseekV41WeightSpec)
+    name = 'layers.3.ffn.router.bias_vl'
+    assert spec.load_weight_map(None, None, [name]) == {name: ['layers.3.ffn.gate.bias_vl']}
+    value = torch.tensor([1 + 2**-20, -3.0e-7], dtype=torch.float32)
+    [(key, exported)] = list(spec.native_to_hf(name, value))
+    assert key == 'layers.3.ffn.gate.bias_vl' and exported.dtype == torch.float32
+    assert torch.equal(exported.view(torch.int32), value.view(torch.int32))
