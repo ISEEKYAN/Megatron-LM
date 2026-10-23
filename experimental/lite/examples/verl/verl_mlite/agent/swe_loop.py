@@ -24,7 +24,9 @@ Env (all optional except the task config):
 
 Tool calls are guarded like uni-agent's tool errors: an unexpected tool exception is
 returned to the model as a tool error while the sandbox is alive, and fails the episode
-as ``SandboxLost`` (counted as ``infra``) once it is gone.
+as ``SandboxLost`` (counted as ``infra``) once it is gone. A dead tmux shell session in a
+live sandbox is recreated once per episode; a second loss (or a failed recreate) fails the
+episode as ``ShellLost`` (``infra``).
 """
 
 from __future__ import annotations
@@ -71,8 +73,16 @@ class SandboxLost(RuntimeError):
     """The episode's sandbox is gone; the episode fails as an infrastructure failure."""
 
 
+class ShellLost(RuntimeError):
+    """The shell session died again after one recreate (or could not be recreated)."""
+
+
+_SHELL_DEAD = "no server running on"
+
+
 _INFRA_MARKERS = (
     "SandboxLost",
+    "ShellLost",
     "EvalInfraError",
     "SandboxChannelError",
     "RemoteProtocolError",
@@ -110,6 +120,21 @@ async def _renew_lease(sandbox: Any, min_interval: float) -> None:
         logger.warning("sandbox %s lease renewal failed: %r", getattr(sandbox, "sandbox_id", "?"), exc)
 
 
+async def _recreate_shell(tool: Any, detail: str) -> None:
+    if getattr(tool, "_ds41_shell_recreated", False):
+        raise ShellLost(f"shell session died again after a recreate: {detail}")
+    tool._ds41_shell_recreated = True
+    try:
+        await tool.close()
+    except Exception:  # noqa: BLE001 -- the session is already gone
+        tool._shell = None
+    try:
+        await tool._ensure_shell()
+    except Exception as exc:  # noqa: BLE001
+        raise ShellLost(f"shell session could not be recreated ({exc!r}) after: {detail}") from exc
+    logger.warning("recreated dead shell session for sandbox %s", getattr(tool.sandbox, "sandbox_id", "?"))
+
+
 def _install_tool_guard(min_interval: float) -> None:
     from uni_agent.tools import base
 
@@ -129,6 +154,14 @@ def _install_tool_guard(min_interval: float) -> None:
             detail = f"{type(exc).__name__}: {str(exc)[:2000]}"
             if sandbox is not None and not await sandbox.is_alive():
                 raise SandboxLost(f"sandbox gone during {name!r}: {detail}") from exc
+            tool = self._tools.get(name)
+            if _SHELL_DEAD in str(exc) and hasattr(tool, "_ensure_shell"):
+                await _recreate_shell(tool, detail)
+                return base.ToolResult(
+                    text="Error: the shell session died and was restarted; the command was not run. "
+                    "The working directory and shell state were reset.",
+                    status="error",
+                )
             return base.ToolResult(text=f"Error: {detail}", status="error")
 
     base.Toolbox.call = call
