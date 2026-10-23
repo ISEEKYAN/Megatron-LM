@@ -20,6 +20,11 @@ Env (all optional except the task config):
   DS41_SWE_TRACE_DIR     per-episode JSON trace (turn timings, token counts)
   DS41_SWE_SESSION_TIMEOUT  wall deadline of one episode incl. eval (default 3600 s)
   DS41_SWE_IGNORE_EOS    1 = memory check only: every turn fills the remaining response budget
+  DS41_SWE_LEASE_RENEW_S  min seconds between sandbox lease renewals before tool calls (default 60)
+
+Tool calls are guarded like uni-agent's tool errors: an unexpected tool exception is
+returned to the model as a tool error while the sandbox is alive, and fails the episode
+as ``SandboxLost`` (counted as ``infra``) once it is gone.
 """
 
 from __future__ import annotations
@@ -60,6 +65,74 @@ def _canon(message: dict[str, Any]) -> dict[str, Any]:
 
 class _ContextFull(Exception):
     pass
+
+
+class SandboxLost(RuntimeError):
+    """The episode's sandbox is gone; the episode fails as an infrastructure failure."""
+
+
+_INFRA_MARKERS = (
+    "SandboxLost",
+    "EvalInfraError",
+    "SandboxChannelError",
+    "RemoteProtocolError",
+    "TimeoutException",
+    "ConnectError",
+    "E2BSandbox not started",
+)
+
+
+def failure_kind(error: str | None) -> str | None:
+    """``infra`` (sandbox/eval infrastructure), ``timeout`` (episode deadline) or ``other``."""
+    if error is None:
+        return None
+    if any(m in error for m in _INFRA_MARKERS):
+        return "infra"
+    if error.startswith("TimeoutError"):
+        return "timeout"
+    return "other"
+
+
+async def _renew_lease(sandbox: Any, min_interval: float) -> None:
+    lease = getattr(sandbox, "lease_seconds", None)
+    handle = getattr(sandbox, "_sandbox", None)
+    if not lease or handle is None:
+        return
+    now = time.monotonic()
+    if now - getattr(sandbox, "_ds41_renewed", -1e9) < min_interval:
+        return
+    sandbox._ds41_renewed = now
+    try:
+        await asyncio.wait_for(handle.set_timeout(int(lease)), timeout=30)
+    except asyncio.CancelledError:
+        raise
+    except Exception as exc:  # noqa: BLE001 -- the keepalive task still renews
+        logger.warning("sandbox %s lease renewal failed: %r", getattr(sandbox, "sandbox_id", "?"), exc)
+
+
+def _install_tool_guard(min_interval: float) -> None:
+    from uni_agent.tools import base
+
+    if getattr(base.Toolbox, "_ds41_guard", False):
+        return
+    original = base.Toolbox.call
+
+    async def call(self, name, args=None, *, timeout=None):
+        sandbox = getattr(self._tools.get(name), "sandbox", None)
+        if sandbox is not None:
+            await _renew_lease(sandbox, min_interval)
+        try:
+            return await original(self, name, args, timeout=timeout)
+        except asyncio.CancelledError:
+            raise
+        except Exception as exc:  # noqa: BLE001
+            detail = f"{type(exc).__name__}: {str(exc)[:2000]}"
+            if sandbox is not None and not await sandbox.is_alive():
+                raise SandboxLost(f"sandbox gone during {name!r}: {detail}") from exc
+            return base.ToolResult(text=f"Error: {detail}", status="error")
+
+    base.Toolbox.call = call
+    base.Toolbox._ds41_guard = True
 
 
 class _TokenSession:
@@ -178,6 +251,7 @@ class DS41SWEAgentLoop(AgentLoopBase):
         from uni_agent.tasks import TaskConfigResolver
 
         _install_inproc_model()
+        _install_tool_guard(float(os.environ.get("DS41_SWE_LEASE_RENEW_S", "60")))
         self.prompt_length = self.rollout_config.prompt_length
         self.response_length = self.rollout_config.response_length
         thinking = os.environ.get("DS41_SWE_THINKING", "0") == "1"
@@ -215,6 +289,7 @@ class DS41SWEAgentLoop(AgentLoopBase):
         finally:
             _SESSIONS.pop(key, None)
         wall = time.time() - t0
+        kind = failure_kind(error)
         gen_s = sum(t["t_gen1"] - t["t_gen0"] for t in session.turns)
         response_mask = session.response_mask if error is None else [0] * len(session.response_ids)
         if not session.prompt_ids:
@@ -226,6 +301,7 @@ class DS41SWEAgentLoop(AgentLoopBase):
             "instance_id": task_cfg.get("metadata", {}).get("instance_id"),
             "reward": reward,
             "error": error,
+            "failure_kind": kind,
             "truncated": session.truncated,
             "turns": session.turns,
             "wall_s": wall,
@@ -249,6 +325,7 @@ class DS41SWEAgentLoop(AgentLoopBase):
             metrics=AgentLoopMetrics(generate_sequences=gen_s, tool_calls=max(0.0, wall - gen_s)),
             extra_fields={
                 "swe_failed": error is not None,
+                "swe_infra_failed": kind == "infra",
                 "swe_truncated": session.truncated,
                 "swe_turns": len(session.turns),
                 "swe_wall_s": wall,
