@@ -435,6 +435,19 @@ class _FusedMoE(torch.autograd.Function):
 
 
 class MegaMoE(MoELayer):
+    def __init__(self, *args, vision_routing=False, **kwargs):
+        super().__init__(*args, **kwargs)
+        if vision_routing:
+            # Frozen release ffn.gate.bias_vl (FP32): vLLM routes the image ids with it in place
+            # of the text bias, sampled ids included. Loaded from the release, never exported:
+            # the rollout keeps its own copy across sleep (sleep_preserve '*.bias_vl').
+            weight = self.router.weight
+            self.router.register_buffer(
+                "bias_vl",
+                torch.zeros(weight.shape[0], dtype=torch.float32, device=weight.device),
+                persistent=False,
+            )
+
     def forward(self, hidden_states, input_ids=None, **kwargs):
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         group, rank = self.ep_group, self.ep_group.rank()
