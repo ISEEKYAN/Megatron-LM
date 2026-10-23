@@ -42,6 +42,10 @@ from megatron.lite.primitive.modules.projection import ModelNorm
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.source_state import KVSourceState
 
+# vLLM deepseek_v41 image_sentinel_mask: Engram treats this id as dead (it breaks n-grams and
+# its gate is zeroed), sampled ids included.
+ENGRAM_DEAD_TOKEN_ID = 129264
+
 
 class CoreAttentionSources(DS41AttentionSources):
     def __init__(self, *, compress_ratio=0, rotary_pos_emb=None, **kwargs):
@@ -216,7 +220,8 @@ class DeepseekV41Model(MegatronModule):
                 if self.ps.cp_size > 1:
                     raise ValueError("DS4.1 Engram CP requires full packed IDs from the protocol")
                 full_input_ids = ids
-            hashes = self.hash(full_input_ids.reshape(1, -1), cu_seqlens=prefix)
+            full = full_input_ids.reshape(1, -1)
+            hashes = self.hash(full, full != ENGRAM_DEAD_TOKEN_ID, cu_seqlens=prefix)
             hashes = hashes[:, self.ps.cp_rank * rows : (self.ps.cp_rank + 1) * rows].transpose(
                 0, 1
             )
@@ -226,7 +231,9 @@ class DeepseekV41Model(MegatronModule):
             for key, block in self.layers.items():
                 if key in self.engrams:
                     module = self.engrams[key]
-                    mask = None if token_mask is None else token_mask.reshape(rows, 1)
+                    mask = (ids != ENGRAM_DEAD_TOKEN_ID).reshape(rows, 1)
+                    if token_mask is not None:
+                        mask = mask & token_mask.reshape(rows, 1).bool()
                     hidden = module(hidden, hashes[:, :, module.layer_hash_index], mask)
                 hidden, pre = block(
                     hidden,
