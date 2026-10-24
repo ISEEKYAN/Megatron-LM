@@ -1460,6 +1460,36 @@ def _patch_vllm_rollout_sleep_level() -> bool:
     return True
 
 
+def _patch_verl_rollout_env_overrides() -> bool:
+    """Give the vLLM rollout server actors their own env (``VERL_MLITE_ROLLOUT_ENV=K=V[,K=V]``).
+
+    The rollout runs in separate Ray actors (vLLMHttpServer + its mp engine workers);
+    verl launches them with ``platform.rollout_env_vars()``, which overrides the job
+    runtime env. This lets one arm run the trainer under the BI=1 actor contract while
+    the rollout runs with e.g. ``VLLM_BATCH_INVARIANT=0``.
+    """
+    raw = os.environ.get("VERL_MLITE_ROLLOUT_ENV", "").strip()
+    if not raw:
+        return False
+    overrides = dict(item.split("=", 1) for item in raw.split(",") if item)
+    try:
+        manager = importlib.import_module("verl.plugin.platform.platform_manager")
+        cls = type(manager.get_platform())
+    except Exception:
+        return False
+    if getattr(cls.rollout_env_vars, "_verl_mlite_overrides", None) == overrides:
+        return True
+    original = getattr(cls.rollout_env_vars, "_verl_mlite_original", cls.rollout_env_vars)
+
+    def rollout_env_vars(self):
+        return {**original(self), **overrides}
+
+    rollout_env_vars._verl_mlite_overrides = overrides
+    rollout_env_vars._verl_mlite_original = original
+    cls.rollout_env_vars = rollout_env_vars
+    return True
+
+
 def _patch_verl_padding_helpers() -> bool:
     """Reuse VERL's pure-Torch padding helpers when FlashAttention is absent."""
     try:
@@ -1863,6 +1893,8 @@ def apply_runtime_patches() -> None:
     _trace_runtime_patch("08i.verl_val_max_tokens", result)
     result = _patch_vllm_server_profile()
     _trace_runtime_patch("09.vllm_server_profile", result)
+    result = _patch_verl_rollout_env_overrides()
+    _trace_runtime_patch("09c.verl_rollout_env_overrides", result)
     _trace_runtime_patch("10.end")
 
 
