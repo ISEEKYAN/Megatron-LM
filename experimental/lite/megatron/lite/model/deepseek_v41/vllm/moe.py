@@ -7,7 +7,9 @@ from megatron.core.tensor_parallel.mappings import all_to_all
 from megatron.core.transformer.moe.moe_layer import MoELayer
 
 from . import experts
+from .batching import owned_slots
 from .linear import linear
+from .lora import adapter, shrink
 from .routing import route
 
 
@@ -20,7 +22,7 @@ def combine(slots, indices, shared):
     return result.bfloat16()
 
 
-def dispatch_rows(x, scores, indices, encoded, local_experts, group):
+def dispatch_rows(x, scores, indices, encoded, local_experts, group, extra=None):
     # Stable global expert order also makes contiguous expert ownership peer-major.
     valid = (indices.flatten() >= 0).nonzero().flatten()
     position = valid[torch.argsort(indices.flatten()[valid], stable=True)]
@@ -39,7 +41,12 @@ def dispatch_rows(x, scores, indices, encoded, local_experts, group):
     codes = all_to_all(group, encoded[0].view(torch.uint8)[token], receives, sends)[order]
     scale = all_to_all(group, encoded[1][token], receives, sends)[order]
     state = position, torch.argsort(order), sends, receives
-    return live, weights, (codes.view(torch.float8_e4m3fn), scale), counts, state
+    result = live, weights, (codes.view(torch.float8_e4m3fn), scale), counts, state
+    return (
+        result
+        if extra is None
+        else (*result, all_to_all(group, extra[token], receives, sends)[order])
+    )
 
 
 def return_rows(rows, indices, state, group):
@@ -436,6 +443,18 @@ class _FusedMoE(torch.autograd.Function):
 
 class MegaMoE(MoELayer):
     def forward(self, hidden_states, input_ids=None, **kwargs):
+        from .frozen import FrozenWeight
+
+        shared = self.shared_experts
+        if (
+            isinstance(self.experts.linear_fc1.weight0, FrozenWeight)
+            or adapter(self.experts, 'lora') is not None
+            or (
+                shared is not None
+                and any(adapter(shared, n + '_lora') is not None for n in ('w1', 'w3', 'w2'))
+            )
+        ):
+            return self._lora_forward(hidden_states, input_ids)
         x = hidden_states.reshape(-1, hidden_states.shape[-1])
         group, rank = self.ep_group, self.ep_group.rank()
         expected = list(range(rank * self.num_local_experts, (rank + 1) * self.num_local_experts))
@@ -484,3 +503,62 @@ class MegaMoE(MoELayer):
                 )
             out = outputs[0] if len(outputs) == 1 else torch.cat(outputs)
         return out.reshape_as(hidden_states), None
+
+    def _lora_forward(self, hidden_states, input_ids):
+        x = hidden_states.reshape(-1, hidden_states.shape[-1])
+        group, rank = self.ep_group, self.ep_group.rank()
+        expected = list(range(rank * self.num_local_experts, (rank + 1) * self.num_local_experts))
+        if self.local_expert_indices != expected:
+            raise ValueError('MegaMoE requires contiguous global expert ownership')
+        logits = linear(x, self.router.weight, fp8=False)
+        scores, indices = route(logits, self.router, input_ids)
+        shared = self.shared_experts
+        active = adapter(self.experts, 'lora') is not None or (
+            shared is not None
+            and any(adapter(shared, n + '_lora') is not None for n in ('w1', 'w3', 'w2'))
+        )
+        if not active and shared is not None:
+            from .fused_lora import base_forward
+
+            out = base_forward(self, x, scores, indices)
+        elif getattr(self, 'fused_moe_lora', False) and adapter(self.experts, 'lora') is not None:
+            from .fused_lora import forward
+
+            out = forward(self, x, scores, indices)
+        else:
+            out = self._lora_rows(x, scores, indices)
+        return out.reshape_as(hidden_states), None
+
+    def _lora_rows(self, x, scores, indices):
+        group = self.ep_group
+        encoded = experts.quantize_activation(x)
+        limit = self.config.activation_func_clamp_value
+        shared = (
+            experts.shared_rows(x, self.shared_experts, encoded, limit)
+            if self.shared_experts is not None
+            else x * 0
+        )
+        lora = adapter(self.experts, 'lora')
+        extra = shrink(x, lora.fc1_lora_a) if lora is not None else None
+        dispatched = dispatch_rows(
+            x, scores, indices, encoded, self.num_local_experts, group, extra
+        )
+        live, weights, encoded, counts, state = dispatched[:5]
+        fc1 = [
+            getattr(self.experts.linear_fc1, f'weight{i}') for i in range(self.num_local_experts)
+        ]
+        fc2 = [
+            getattr(self.experts.linear_fc2, f'weight{i}') for i in range(self.num_local_experts)
+        ]
+        rows = experts.expert_rows(
+            live,
+            fc1,
+            fc2,
+            counts,
+            weights,
+            encoded,
+            limit,
+            lora=lora,
+            lora_hidden=dispatched[5] if extra is not None else None,
+        )
+        return combine(return_rows(rows, indices, state, group), indices, shared)

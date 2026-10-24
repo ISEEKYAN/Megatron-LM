@@ -144,6 +144,9 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
     from megatron.lite.primitive.ckpt.hf_weights import export_hf_weights as gather
 
     target = kwargs.pop("target", "hf")
+    if target == "lora":
+        yield from _lora_weights(chunks)
+        return
     if target not in ("release", "hf", "bf16", "vllm"):
         raise ValueError(f"Unknown DS4.1 export target, got {target!r}")
     if kwargs.pop("resync_config", None) or kwargs.get("export_dtype"):
@@ -215,3 +218,74 @@ def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
         save_row_shards(
             _frozen_rows(chunks, kwargs.get("buffer_max_size_bytes", 64 * 1024**2), True), path
         )
+
+
+def _lora_weights(chunks):
+    """Merge adapter owners only after replicated factors agree byte for byte."""
+    import torch.distributed as dist
+
+    from megatron.lite.model.deepseek_v41.lite.lora import lora_state
+
+    for chunk in chunks:
+        sync = getattr(chunk, "start_param_sync", None)
+        if callable(sync):
+            sync(force_sync=True)
+    yield from gather_lora_tensors(
+        {k: v.detach() for c in chunks for k, v in lora_state(c).items()}
+    )
+
+
+def gather_lora_tensors(local):
+    """Exchange only metadata as objects; gather unchanged adapter bytes in one bucket."""
+    import math
+
+    import torch.distributed as dist
+
+    from megatron.lite.primitive.ckpt.hf_weights import bucketed_all_gather_into_tensor
+
+    world = dist.get_world_size()
+    metadata = [None] * world
+    entries = sorted(local.items())
+    dist.all_gather_object(metadata, [(k, tuple(v.shape), str(v.dtype)) for k, v in entries])
+    device = (
+        torch.device("cuda", torch.cuda.current_device())
+        if dist.get_backend() == "nccl"
+        else torch.device("cpu")
+    )
+    state = {}
+    # Real deployment factors are uniformly BF16 (one collective). Keep the HF
+    # exporter lossless for CPU FP32 and mixed floating-point adapter callers.
+    for dtype_name in sorted({dtype for part in metadata for _, _, dtype in part}):
+        dtype = getattr(torch, dtype_name.removeprefix("torch."))
+        parts = [[(k, shape) for k, shape, d in part if d == dtype_name] for part in metadata]
+        selected = [(k, v) for k, v in entries if v.dtype == dtype]
+        lengths = [sum(math.prod(shape) for _, shape in part) for part in parts]
+        maximum = max(lengths)
+        if not maximum:
+            continue
+        packed = torch.zeros(maximum, device=device, dtype=dtype)
+        if selected:
+            views = packed[: lengths[dist.get_rank()]].split([v.numel() for _, v in selected])
+            torch._foreach_copy_(list(views), [v.reshape(-1) for _, v in selected])
+        gathered = bucketed_all_gather_into_tensor(
+            [("adapter", packed)],
+            group=None,
+            group_size=world,
+            buffer_max_size_bytes=maximum * world * packed.element_size(),
+        )[0][2]
+        for part, vector in zip(parts, gathered):
+            # One D2H copy per rank/dtype buffer, never one copy per expert factor.
+            cpu = vector.cpu()
+            offset = 0
+            for key, shape in part:
+                size = math.prod(shape)
+                value = cpu[offset : offset + size].view(shape)
+                offset += size
+                if key in state and (
+                    state[key].dtype != value.dtype
+                    or state[key].shape != value.shape
+                    or not torch.equal(state[key].view(torch.uint8), value.view(torch.uint8))
+                ):
+                    raise ValueError(f"Replicated LoRA factors differ before export: {key}")
+                state[key] = value
+    yield from state.items()

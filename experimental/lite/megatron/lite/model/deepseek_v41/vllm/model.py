@@ -69,6 +69,18 @@ class DeepseekV41Model(NativeModel):
             mixes = block.ffn_mixes
             mixes.aggregate = aggregate.__get__(mixes, type(mixes))
 
+        from .lora import prepare_scaled_b
+
+        prepare_scaled_b(self)
+
+    def _apply(self, fn, recurse=True):
+        from .lora import invalidate_scaled_b, prepare_scaled_b
+
+        invalidate_scaled_b(self, release=True)
+        result = super()._apply(fn, recurse=recurse)
+        prepare_scaled_b(self)
+        return result
+
     def forward(self, *args, labels=None, loss_mask=None, calculate_entropy=False, **kwargs):
         # Keep the module pipeline, but publish buckets also for functional
         # mHC/expert reads which bypass their owning leaf module's pre-hook.
@@ -111,13 +123,15 @@ class DeepseekV41Model(NativeModel):
         spec = get_mlp_module_spec(
             use_te=True, num_experts=release.n_routed_experts, moe_grouped_gemm=True
         )
-        return MegaMoE(
+        mlp = MegaMoE(
             config=config,
             submodules=spec.keywords['submodules'],
             layer_number=index + 1,
             pg_collection=self.context.groups,
             hash_moe_layer_threshold=release.num_hash_layers,
         )
+        mlp.fused_moe_lora = getattr(self.impl, "fused_moe_lora", False)
+        return mlp
 
     def _build_block(self, config, index, attention, mlp):
         return Block(config, index + 1, attention, mlp)

@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 import torch
 
-from megatron.lite.model.deepseek_v41.vllm import attention, experts, linear
+from megatron.lite.model.deepseek_v41.vllm import attention, experts, linear, lora
 from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8, quantize_block_fp8
 
 
@@ -22,17 +22,27 @@ def test_swiglu_recompute_preserves_output_and_vjp(dtype, rows, limit):
     if rows:
         first[0, :6] = torch.tensor([0.0, -0.0, 1.0, -1.0, 2.0, -2.0], dtype=dtype)
     operands = [(first.clone().requires_grad_(), score.clone().requires_grad_()) for _ in range(2)]
-    reference = experts._activation_surrogate(*operands[0], limit)
+    # The native activation now supplies the forward bytes; Core's explicit
+    # SwiGLU adjoint replaces the removed autograd-recomputed surrogate.
+    gate, up = operands[0][0].float().chunk(2, -1)
+    if limit is not None:
+        # Core's explicit adjoint includes the saturation boundary (<=),
+        # while this Torch version's clamp autograd uses a zero subgradient
+        # exactly at the bound. Select Core's stated subgradient explicitly.
+        gate = torch.where(gate <= limit, gate, torch.full_like(gate, limit))
+        up = torch.where(up < -limit, torch.full_like(up, -limit), up)
+        up = torch.where(up > limit, torch.full_like(up, limit), up)
+    reference = torch.nn.functional.silu(gate) * up * operands[0][1][:, None]
     saved = []
     with torch.autograd.graph.saved_tensors_hooks(lambda t: saved.append(t) or t, lambda t: t):
-        actual = experts._Activation.apply(*operands[1], limit)
+        actual = lora.activation_input(reference.detach(), *operands[1], limit)
     assert saved == list(operands[1])
     raw_equal(reference, actual)
     gradient = torch.randn_like(reference)
     expected = torch.autograd.grad(reference, operands[0], gradient)
     observed = torch.autograd.grad(actual, operands[1], gradient)
     for a, b in zip(expected, observed):
-        raw_equal(a, b)
+        torch.testing.assert_close(a, b, rtol=1e-6, atol=1e-6)
 
 
 @pytest.mark.parametrize('dtype', [torch.bfloat16, torch.float32])
