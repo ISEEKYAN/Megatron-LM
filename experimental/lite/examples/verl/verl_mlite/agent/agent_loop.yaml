@@ -1,0 +1,3 @@
+# verl agent loops provided by verl_mlite (actor_rollout_ref.rollout.agent.agent_loop_config_path).
+- name: ds41_swe
+  _target_: verl_mlite.agent.swe_loop.DS41SWEAgentLoop

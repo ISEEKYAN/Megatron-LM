@@ -25,6 +25,13 @@ TOTAL_GPUS=$((NNODES * NGPUS_PER_NODE))
 ACTOR_PP="${ACTOR_PP:-1}"
 ACTOR_CP="${ACTOR_CP:-1}"
 ACTOR_EP="${ACTOR_EP:-${TOTAL_GPUS}}"
+# Sparse-attention backward determinism (impl_cfg.attention_deterministic_backward). cuDNN's
+# deterministic adjoint needs a workspace that grows with sequence length (26.55 GiB at 32K
+# context, OOM); backward need not be bitwise, so it is off by default. Forward recomputation,
+# indexer scoring and the BI=1 rollout parity do not depend on it.
+ACTOR_ATTN_DETERMINISTIC_BWD="${ACTOR_ATTN_DETERMINISTIC_BWD:-False}"
+# Actor determinism (engine full_determinism + impl_cfg.deterministic), unchanged by default.
+ACTOR_DETERMINISTIC="${ACTOR_DETERMINISTIC:-True}"
 # One rollout replica per node: DP=EP=4 over the node's GPUs (DEP4).
 ROLLOUT_DP="${ROLLOUT_DP:-${NGPUS_PER_NODE}}"
 ROLLOUT_EP="${ROLLOUT_EP:-${NGPUS_PER_NODE}}"
@@ -46,7 +53,16 @@ ROLLOUT_SPEC="${ROLLOUT_SPEC:-True}"
 # Level 2 uses native vLLM preservation for frozen drafter/router state; requires
 # vLLM 00474aeec6 or newer (reload permutations stay on host).
 ROLLOUT_SLEEP_LEVEL="${ROLLOUT_SLEEP_LEVEL:-2}"
-ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-True}"
+# BATCH_INVARIANT=0: only the rollout changes -- its server actors get
+# VLLM_BATCH_INVARIANT=0 (VERL_MLITE_ROLLOUT_ENV; every VLLM_BI_* is gated by it) and no
+# attention-backend / head-dtype pins, i.e. vLLM's default kernels. The actor is unchanged.
+BATCH_INVARIANT="${BATCH_INVARIANT:-1}"
+[[ "$BATCH_INVARIANT" =~ ^[01]$ ]] || { echo "BATCH_INVARIANT must be 0 or 1" >&2; exit 2; }
+# verl's rollout full_determinism sets VLLM_BATCH_INVARIANT=1 in the server: BI=1 only.
+ROLLOUT_FULL_DETERMINISM="${ROLLOUT_FULL_DETERMINISM:-$([[ $BATCH_INVARIANT == 1 ]] && echo True || echo False)}"
+if [[ "$BATCH_INVARIANT" == 0 && "${ROLLOUT_FULL_DETERMINISM,,}" =~ ^(true|1)$ ]]; then
+  echo "BATCH_INVARIANT=0 needs ROLLOUT_FULL_DETERMINISM=False" >&2; exit 2
+fi
 PPO_MAX_TOKEN_LEN="${PPO_MAX_TOKEN_LEN:-5120}"
 LOG_PROB_MAX_TOKEN_LEN="${LOG_PROB_MAX_TOKEN_LEN:-${MAX_SEQ_LEN}}"
 export DSV41_ATTENTION_CORE="${DSV41_ATTENTION_CORE:-flashmla}"
@@ -105,6 +121,11 @@ case "$DSV41_HEAD_DTYPE" in
 esac
 [[ "$ROLLOUT_SLEEP_LEVEL" =~ ^[12]$ ]] || { echo "ROLLOUT_SLEEP_LEVEL must be 1 or 2" >&2; exit 2; }
 export VLLM_USE_V2_MODEL_RUNNER=1
+if [[ "$BATCH_INVARIANT" == 0 ]]; then
+  export VERL_MLITE_ROLLOUT_ENV=VLLM_BATCH_INVARIANT=0
+else
+  unset VERL_MLITE_ROLLOUT_ENV
+fi
 export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
 export MCORE_DIST_CKPT_STREAM_D2H=0  # Use the unmodified Core checkpoint writer.
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
@@ -134,6 +155,14 @@ CMD_FILE="${CMD_FILE:-${OUTPUT_ROOT}/${RUN_NAME}.cmd.sh}"
 mkdir -p "${OUTPUT_ROOT}" "${CKPT_DIR}"
 export VERL_FILE_LOGGER_PATH="${VERL_FILE_LOGGER_PATH:-${OUTPUT_ROOT}/${RUN_NAME}.jsonl}"
 
+BI_ROLLOUT_ARGS=()
+if [[ "$BATCH_INVARIANT" == 1 ]]; then
+  BI_ROLLOUT_ARGS=(
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.attention_backend=${ATTENTION_BACKEND}"
+    "+actor_rollout_ref.rollout.engine_kwargs.vllm.hf_overrides={head_dtype:${DSV41_HEAD_DTYPE}}"
+  )
+fi
+
 OPTIM_ARGS=()
 if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
   OPTIM_ARGS=(
@@ -143,8 +172,6 @@ if [[ "${OPTIMIZER_OFFLOAD}" =~ ^(True|true|1)$ ]]; then
 fi
 
 VLLM="actor_rollout_ref.rollout.engine_kwargs.vllm"
-CAPTURE="${CAPTURE_SIZES:-[1,2,4,8,16]}"
-REPLAY="${REPLAY_SIZES:-[1,2,4,8,16]}"
 
 # A pre-existing Ray cluster inherits its service environment, not this shell.
 # Forward the paired kernel/compatibility contract explicitly, without secrets.
@@ -159,6 +186,7 @@ names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
          'DSV41_ATTENTION_CORE', 'DSV41_HEAD_DTYPE', 'DSV41_MEGAMOE_MAX_TOKENS',
          'VERL_MLITE_VAL_MAX_TOKENS', 'VERL_MLITE_L2_RETENTION', 'VERL_MLITE_SLEEP_FP_DIR',
          'MLITE_DISTOPT_SHARDING_TYPE', 'MCORE_DIST_CKPT_STREAM_D2H',
+         'VERL_MLITE_ROLLOUT_ENV',
          )
 for name in names:
     if name in os.environ:
@@ -231,11 +259,12 @@ COMMAND=(
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
   "actor_rollout_ref.actor.engine.export_dtype=null"
   "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
-  "+actor_rollout_ref.actor.engine.full_determinism=True"
+  "+actor_rollout_ref.actor.engine.full_determinism=${ACTOR_DETERMINISTIC}"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=adam"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=${RECOMPUTE:-full}"
-  "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True"
+  "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=${ACTOR_DETERMINISTIC}"
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_deterministic_backward=${ACTOR_ATTN_DETERMINISTIC_BWD}"
   "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
   "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
   # rollout: resident vLLM, BI=1 sparse arm, DEP per node
@@ -270,11 +299,10 @@ COMMAND=(
   "actor_rollout_ref.rollout.enable_rollout_routing_replay=False"
   "actor_rollout_ref.rollout.enforce_eager=False"
   "actor_rollout_ref.rollout.full_determinism=${ROLLOUT_FULL_DETERMINISM}"
-  "+${VLLM}.compilation_config={mode:0,cudagraph_mode:FULL_AND_PIECEWISE,cudagraph_capture_sizes:${CAPTURE},decoder_replay_cudagraph_capture_sizes:${REPLAY}}"
-  "+${VLLM}.max_cudagraph_capture_size=${MAX_CAPTURE_SIZE:-16}"
-  "+${VLLM}.attention_backend=${ATTENTION_BACKEND}"
+  # Graph mode and capture sizes are vLLM's defaults (DS4.1: breakable FULL_AND_PIECEWISE,
+  # capture up to min(2 x max_num_seqs x (1 + spec tokens), 1024) = 768 here).
+  "+${VLLM}.compilation_config={mode:0}"
   "+${VLLM}.attention_config={indexer_kv_dtype:${INDEXER_KV_DTYPE},indexer_sparse_logits:${INDEXER_SPARSE_LOGITS}}"
-  "+${VLLM}.hf_overrides={head_dtype:${DSV41_HEAD_DTYPE}}"
   "+${VLLM}.kv_cache_dtype=nvfp4_ds_mla"
   "+${VLLM}.all2all_backend=allgather_reducescatter"
   "+${VLLM}.kernel_config={enable_flashinfer_autotune:true,moe_backend:deep_gemm_mega_moe}"
@@ -282,6 +310,7 @@ COMMAND=(
   "+${VLLM}.language_model_only=True"
   "+${VLLM}.worker_extension_cls=verl.workers.rollout.vllm_rollout.utils.vLLMColocateWorkerExtension"
   "${SPEC_ARGS[@]}"
+  "${BI_ROLLOUT_ARGS[@]}"
   # trainer
   "ray_kwargs.ray_init.num_cpus=${RAY_NUM_CPUS}"
   "critic.enable=False"
@@ -323,7 +352,7 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-echo "[ds41-dapo] nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} prompt=${PROMPT_MODE}"
+echo "[ds41-dapo] nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} actor_det=${ACTOR_DETERMINISTIC} attn_det_bwd=${ACTOR_ATTN_DETERMINISTIC_BWD} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} prompt=${PROMPT_MODE}"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"
 cmd_rc="${PIPESTATUS[0]}"
