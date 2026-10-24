@@ -3,12 +3,14 @@
 """Storage writer for PyT Distributed format allowing asynchronous save."""
 
 import dataclasses
+import errno
 import inspect
 import logging
 import os
 import pickle
 import queue
 import threading
+import weakref
 from functools import partial
 from heapq import heappop, heappush
 from itertools import chain
@@ -47,6 +49,105 @@ except ImportError:
     HAVE_PSUTIL = False
 
 _results_queue = None
+
+# Synchronous saves only: keep device tensors on the GPU until each is written, staging them
+# one at a time through one exact-size page-locked buffer instead of copying the whole shard.
+_STREAM_D2H_ENV = "MCORE_DIST_CKPT_STREAM_D2H"
+# fsync + POSIX_FADV_DONTNEED every this many written bytes and at close (0 disables), so written
+# pages do not pile up in the page cache that the job cgroup accounts.
+_DROP_CACHE_ENV = "MCORE_DIST_CKPT_DROP_CACHE_BYTES"
+
+
+def _pinned_bytes(nbytes: int) -> torch.Tensor:
+    """Page-locked host bytes of exactly ``nbytes``; the caching host allocator rounds up to a
+    power of two and keeps the block after the save."""
+    buffer = torch.empty(nbytes, dtype=torch.uint8)
+    cudart = torch.cuda.cudart()
+    try:
+        torch.cuda.check_error(cudart.cudaHostRegister(buffer.data_ptr(), nbytes, 0))
+    except RuntimeError:
+        return torch.empty(nbytes, dtype=torch.uint8, pin_memory=True)
+    weakref.finalize(buffer, cudart.cudaHostUnregister, buffer.data_ptr())
+    return buffer
+
+
+class _PinnedStager:
+    """Copies device tensors to the host one at a time through one buffer sized for the largest.
+
+    A staged tensor views the buffer and is invalid after the next ``stage`` call.
+    """
+
+    def __init__(self, tensors):
+        nbytes = max((t.numel() * t.element_size() for t in tensors if not t.is_cpu), default=0)
+        self._buffer = _pinned_bytes(nbytes) if nbytes else None
+
+    def stage(self, tensor: torch.Tensor) -> torch.Tensor:
+        """Return a host copy of ``tensor`` (host tensors are returned unchanged)."""
+        if tensor.is_cpu or tensor.numel() == 0:
+            return tensor.cpu()
+        storage = self._buffer.untyped_storage()[: tensor.numel() * tensor.element_size()]
+        host = torch.empty(0, dtype=tensor.dtype).set_(storage, 0, tensor.shape)
+        with torch.cuda.device(tensor.device):
+            host.copy_(tensor, non_blocking=True)
+            torch.cuda.current_stream().synchronize()
+        return host
+
+
+class _EfaultRetryStream:
+    """Unbuffered file stream that rewrites a chunk from its start when it fails with EFAULT.
+
+    Lustre writes from GB200 hosts intermittently fail with EFAULT, even from plain heap buffers.
+    Also drops written pages from the page cache every ``MCORE_DIST_CKPT_DROP_CACHE_BYTES``.
+    """
+
+    def __init__(self, raw, chunk_bytes: int = 64 << 20, attempts: int = 5):
+        self._raw = raw
+        self._chunk_bytes = chunk_bytes
+        self._attempts = attempts
+        self._drop_bytes = int(os.environ.get(_DROP_CACHE_ENV) or 0)
+        self._since_drop = 0
+
+    def _drop_page_cache(self) -> None:
+        os.fsync(self._raw.fileno())
+        os.posix_fadvise(self._raw.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        self._since_drop = 0
+
+    def write(self, data) -> int:
+        """Write all of ``data``; returns its size."""
+        view = memoryview(data).cast("B")
+        for start in range(0, view.nbytes, self._chunk_bytes):
+            chunk = view[start : start + self._chunk_bytes]
+            pos = self._raw.tell()
+            for attempt in range(self._attempts):
+                try:
+                    done = 0
+                    while done < chunk.nbytes:
+                        # Retries write from a fresh copy of the chunk.
+                        rest = chunk[done:] if attempt == 0 else bytes(chunk[done:])
+                        done += self._raw.write(rest)
+                    break
+                except OSError as e:
+                    if e.errno != errno.EFAULT or attempt == self._attempts - 1:
+                        raise
+                    logger.warning(f"EFAULT writing {self._raw.name} at {pos}, retry {attempt + 1}")
+                    self._raw.seek(pos)
+        self._since_drop += view.nbytes
+        if self._drop_bytes and self._since_drop >= self._drop_bytes:
+            self._drop_page_cache()
+        return view.nbytes
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *exc):
+        try:
+            if self._drop_bytes and exc[0] is None:
+                self._drop_page_cache()
+        finally:
+            self._raw.close()
+
+    def __getattr__(self, name):
+        return getattr(self._raw, name)
 
 
 @_disable_gc()
@@ -233,6 +334,8 @@ class FileSystemWriterAsync(FileSystemWriter):
                 save in a checkpoint.
             non_blocking (bool, optional): knob to enable pinned D2H memcpy. Default is True.
         """
+        if os.environ.get(_STREAM_D2H_ENV) == "1":
+            return write_buckets  # staged one item at a time by write_preloaded_data
         result = []
 
         for bucket in write_buckets:
@@ -400,7 +503,7 @@ class FileSystemWriterAsync(FileSystemWriter):
 
                 open_file = msc.open
             else:
-                open_file = open
+                open_file = lambda name, mode: _EfaultRetryStream(open(name, mode, buffering=0))
             with open_file(file_name, "wb") as stream:
                 for write_item, data in bytes_data:
                     local_results.append(
@@ -409,8 +512,9 @@ class FileSystemWriterAsync(FileSystemWriter):
                         )
                     )
 
+                stager = _PinnedStager([tensor for _, tensor in tensor_data])
                 for write_item, tensor in tensor_data:
-                    assert tensor.is_cpu
+                    tensor = stager.stage(tensor)
                     local_results.append(
                         _write_item(
                             *transform_list, stream, tensor, write_item, storage_key, **extra_kwargs
