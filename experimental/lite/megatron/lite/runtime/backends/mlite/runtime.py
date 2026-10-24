@@ -208,6 +208,11 @@ def _pipeline_callbacks(forward_step: Callable, loss_fn: Callable | None):
     return wrapped_forward_step, wrapped_loss_fn
 
 
+def _has_chunked_state_offload(optimizer):
+    owners = getattr(optimizer, "chained_optimizers", None) or [optimizer]
+    return any(getattr(owner, "_optimizer_state_offloader", None) is not None for owner in owners)
+
+
 class MegatronLiteRuntime(RuntimeBase):
     """Megatron Lite default training backend (Megatron-style 5D parallel)."""
 
@@ -458,20 +463,29 @@ class MegatronLiteRuntime(RuntimeBase):
             load_optimizer,
             offload_model_to_cpu,
             offload_optimizer,
+            release_grad_buffers,
+            restore_grad_buffers,
         )
 
-        # A model+gradient transfer is the training context boundary.  On its
+        # A gradient transfer (with or without the model) is the training context boundary.  On its
         # CPU side the colocated rollout is about to map its sleeping weights;
         # on its CUDA side training is taking the device back.  Keep the whole
         # release/restore contract here rather than teaching VERL about backend
         # scratch buffers or optimizer residency.
-        training_transfer = model and grad
+        training_transfer = grad
+        chunked = _has_chunked_state_offload(handle._optimizer)
         if device == "cpu":
             if model:
                 offload_model_to_cpu(model_chunks)
+            elif grad:
+                release_grad_buffers(model_chunks)
             if (optimizer or training_transfer) and handle._optimizer is not None:
                 offload_state = getattr(handle._optimizer, "offload_state_to_cpu", None)
-                if callable(offload_state):
+                if chunked:
+                    # The step left masters and moments on GPU; park them in their pinned
+                    # host copies. The next prepare_grads prefetches them back.
+                    handle._optimizer.offload_optimizer_state_for_forward(offload_master=True)
+                elif callable(offload_state):
                     offload_state()
                 else:
                     offload_optimizer(handle._optimizer)
@@ -489,7 +503,9 @@ class MegatronLiteRuntime(RuntimeBase):
         elif device == "cuda":
             if model:
                 load_model_to_gpu(model_chunks, load_grad=grad)
-            if (optimizer or training_transfer) and handle._optimizer is not None:
+            elif grad:
+                restore_grad_buffers(model_chunks)
+            if (optimizer or training_transfer) and handle._optimizer is not None and not chunked:
                 load_state = getattr(handle._optimizer, "load_state_to_device", None)
                 if callable(load_state):
                     load_state()
