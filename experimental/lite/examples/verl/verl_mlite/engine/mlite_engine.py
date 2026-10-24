@@ -3,6 +3,7 @@
 
 from __future__ import annotations
 
+import gc
 import math
 import os
 import weakref
@@ -317,6 +318,13 @@ class MegatronLiteEngine(BaseEngine):
             optimizer=self.is_optimizer_offload_enabled,
             grad=self.is_param_offload_enabled or self._release_grads,
         )
+        if os.environ.get("VERL_MLITE_GC_FREEZE", "1") == "1":
+            # Model and optimizer construction leaves millions of long-lived Python
+            # objects; VERL's weight sync runs up to six full gc.collect() passes per
+            # step (aggressive_empty_cache), each ~1 s over them. Move them out of the
+            # collector's generations; later garbage is still collected.
+            gc.collect()
+            gc.freeze()
 
     def train_mode(self, **kwargs):
         self._require_initialized()
@@ -412,6 +420,10 @@ class MegatronLiteEngine(BaseEngine):
             if target not in ("release", "vllm"):
                 raise ValueError("DS4.1 rollout resync requires native release weights")
             export_kwargs["include_frozen"] = False
+            rollout_ep = int(os.environ.get("VERL_MLITE_SYNC_ROLLOUT_EP", "0") or 0)
+            if rollout_ep > 1:
+                # Send each colocated rollout rank only the routed experts it holds.
+                export_kwargs["rollout_ep_size"] = rollout_ep
         weights = self.runtime.export_weights(self.handle, **export_kwargs)
         if self.engine_config.qat.get("enable", False):
             weights = qat_export.export_qat_weights(weights, self.engine_config.qat)
