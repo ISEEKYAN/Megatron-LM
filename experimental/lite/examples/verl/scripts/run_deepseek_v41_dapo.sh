@@ -25,6 +25,13 @@ TOTAL_GPUS=$((NNODES * NGPUS_PER_NODE))
 ACTOR_PP="${ACTOR_PP:-1}"
 ACTOR_CP="${ACTOR_CP:-1}"
 ACTOR_EP="${ACTOR_EP:-${TOTAL_GPUS}}"
+# Sparse-attention backward determinism (impl_cfg.attention_deterministic_backward). cuDNN's
+# deterministic adjoint needs a workspace that grows with sequence length (26.55 GiB at 32K
+# context, OOM); backward need not be bitwise, so it is off by default. Forward recomputation,
+# indexer scoring and the BI=1 rollout parity do not depend on it.
+ACTOR_ATTN_DETERMINISTIC_BWD="${ACTOR_ATTN_DETERMINISTIC_BWD:-False}"
+# Actor determinism (engine full_determinism + impl_cfg.deterministic), unchanged by default.
+ACTOR_DETERMINISTIC="${ACTOR_DETERMINISTIC:-True}"
 # One rollout replica per node: DP=EP=4 over the node's GPUs (DEP4).
 ROLLOUT_DP="${ROLLOUT_DP:-${NGPUS_PER_NODE}}"
 ROLLOUT_EP="${ROLLOUT_EP:-${NGPUS_PER_NODE}}"
@@ -252,11 +259,12 @@ COMMAND=(
   "actor_rollout_ref.actor.engine.load_hf_weights=True"
   "actor_rollout_ref.actor.engine.export_dtype=null"
   "actor_rollout_ref.actor.engine.router_replay_mode=disabled"
-  "+actor_rollout_ref.actor.engine.full_determinism=True"
+  "+actor_rollout_ref.actor.engine.full_determinism=${ACTOR_DETERMINISTIC}"
   "actor_rollout_ref.actor.engine.impl_cfg.use_thd=True"
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=adam"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=${RECOMPUTE:-full}"
-  "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=True"
+  "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=${ACTOR_DETERMINISTIC}"
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_deterministic_backward=${ACTOR_ATTN_DETERMINISTIC_BWD}"
   "+actor_rollout_ref.actor.engine.impl_cfg.attention_core=${DSV41_ATTENTION_CORE}"
   "+actor_rollout_ref.actor.engine.impl_cfg.head_dtype=${DSV41_HEAD_DTYPE}"
   # rollout: resident vLLM, BI=1 sparse arm, DEP per node
@@ -344,7 +352,7 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-echo "[ds41-dapo] nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} prompt=${PROMPT_MODE}"
+echo "[ds41-dapo] nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} actor_det=${ACTOR_DETERMINISTIC} attn_det_bwd=${ACTOR_ATTN_DETERMINISTIC_BWD} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} prompt=${PROMPT_MODE}"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"
 cmd_rc="${PIPESTATUS[0]}"
