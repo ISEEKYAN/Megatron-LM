@@ -118,7 +118,11 @@ case "$DSV41_ATTENTION_CORE" in
 esac
 export VLLM_BI_MEGA_GATE="${VLLM_BI_MEGA_GATE:-0}" VLLM_BI_MEGA_MHC="${VLLM_BI_MEGA_MHC:-0}"
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
-ACTOR_IMPL=vllm ACTOR_DETERMINISTIC=True
+# Actor determinism (engine full_determinism + impl_cfg.deterministic), on by default.
+# Sparse-attention backward determinism is separate and off by default: cuDNN's deterministic
+# adjoint workspace grows with sequence length and OOMs at 32K context (see the DAPO recipe).
+ACTOR_IMPL=vllm ACTOR_DETERMINISTIC="${ACTOR_DETERMINISTIC:-True}"
+ACTOR_ATTN_DETERMINISTIC_BWD="${ACTOR_ATTN_DETERMINISTIC_BWD:-False}"
 if [[ "$BATCH_INVARIANT" == 0 ]]; then
   export VERL_MLITE_ROLLOUT_ENV=VLLM_BATCH_INVARIANT=0
 else
@@ -282,6 +286,7 @@ COMMAND=(
   "+actor_rollout_ref.actor.engine.impl_cfg.optimizer=adam"
   "+actor_rollout_ref.actor.engine.impl_cfg.recompute=${RECOMPUTE:-full}"
   "++actor_rollout_ref.actor.engine.impl_cfg.deterministic=${ACTOR_DETERMINISTIC}"
+  "+actor_rollout_ref.actor.engine.impl_cfg.attention_deterministic_backward=${ACTOR_ATTN_DETERMINISTIC_BWD}"
   "${BI_ACTOR_ARGS[@]}"
   # rollout: resident vLLM, BI=1 sparse arm, DEP per node
   "actor_rollout_ref.rollout.name=vllm"
@@ -366,7 +371,7 @@ if [[ "${COMPOSE_ONLY:-0}" == "1" ]]; then
   exit 0
 fi
 
-echo "[ds41-swe] bi=${BATCH_INVARIANT} impl=${ACTOR_IMPL} nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} bs=${TRAIN_BATCH_SIZE}x${ROLLOUT_N} ctx=${MAX_SEQ_LEN} thinking=${DS41_SWE_THINKING}"
+echo "[ds41-swe] bi=${BATCH_INVARIANT} impl=${ACTOR_IMPL} actor_det=${ACTOR_DETERMINISTIC} attn_det_bwd=${ACTOR_ATTN_DETERMINISTIC_BWD} nodes=${NNODES} ep=${ACTOR_EP} cp=${ACTOR_CP} dep=${ROLLOUT_DP} spec=${ROLLOUT_SPEC} bs=${TRAIN_BATCH_SIZE}x${ROLLOUT_N} ctx=${MAX_SEQ_LEN} thinking=${DS41_SWE_THINKING}"
 set +e
 "${COMMAND[@]}" 2>&1 | tee "${LOG_FILE}"
 cmd_rc="${PIPESTATUS[0]}"
