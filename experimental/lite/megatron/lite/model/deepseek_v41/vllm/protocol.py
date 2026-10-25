@@ -17,6 +17,7 @@ class ImplConfig(native.ImplConfig):
     head_dtype: str = "float32"
     head_chunk_size: int = 1024
     attention_deterministic_backward: bool = True
+    fused_moe_lora: bool = False
 
 
 def validate_impl_cfg_keys(values):
@@ -30,6 +31,7 @@ def validate_impl_cfg_keys(values):
                 "head_dtype",
                 "head_chunk_size",
                 "attention_deterministic_backward",
+                "fused_moe_lora",
             )
         }
     )
@@ -54,6 +56,11 @@ def build_model(model_cfg, *, impl_cfg):
     if getattr(impl_cfg, "attention_core", "flashmla") not in ("flashmla", "mega"):
         raise ValueError("attention_core must be 'flashmla' or 'mega'")
 
+    from megatron.lite.primitive.modules.lora import normalize_lora_config
+
+    if impl_cfg.attention_core == "mega" and normalize_lora_config(impl_cfg.lora).enabled:
+        raise NotImplementedError("LoRA currently requires attention_core='flashmla'")
+
     if (
         impl_cfg.token_map is None
         and impl_cfg.hf_path
@@ -61,7 +68,11 @@ def build_model(model_cfg, *, impl_cfg):
         and not (Path(impl_cfg.hf_path) / "token_map.pt").is_file()
     ):
         impl_cfg = replace(impl_cfg, token_map=release_token_map(impl_cfg.hf_path))
-    return native.build_model(model_cfg, impl_cfg=impl_cfg, _model_class=DeepseekV41Model)
+    from .lora import release_scaled_b_after_step
+
+    bundle = native.build_model(model_cfg, impl_cfg=impl_cfg, _model_class=DeepseekV41Model)
+    release_scaled_b_after_step(bundle.chunks, bundle.optimizer)
+    return bundle
 
 
 def export_hf_weights(chunks, model_cfg, ps, **kwargs):

@@ -35,12 +35,18 @@ from megatron.lite.model.deepseek_v41.lite.components.engram import (
     hash_multipliers,
     prime_buckets,
 )
+from megatron.lite.model.deepseek_v41.lite.lora import attach_lora
 from megatron.lite.model.deepseek_v41.lite.moe import bind_sorted_selection
 from megatron.lite.model.deepseek_v41.topology import validate_build
 from megatron.lite.primitive.modules.engram import NgramHash
+from megatron.lite.primitive.modules.lora import freeze_non_lora_params, normalize_lora_config
 from megatron.lite.primitive.modules.projection import ModelNorm
 from megatron.lite.primitive.parallel import build_pipeline_chunk_layout
 from megatron.lite.primitive.parallel.source_state import KVSourceState
+
+
+def lora_config(impl):
+    return normalize_lora_config(getattr(impl, "lora", None))
 
 
 class CoreAttentionSources(DS41AttentionSources):
@@ -60,6 +66,14 @@ class DeepseekV41Model(MegatronModule):
         config.persist_layer_norm = False
         super().__init__(config=config)
         self.release, self.impl, self.ps = release, impl, ps
+        self._native_frozen_base = bool(lora_config(impl).enabled and impl.hf_path)
+        if self._native_frozen_base:
+            from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
+
+            from .frozen import prepare_reader
+
+            load_reader = load_reader or RowSliceReader(impl.hf_path, device=impl.device)
+            prepare_reader(load_reader)
         self._load_reader = load_reader
         self.parallel_state = ps
         self.tp_group = ps.tp_group
@@ -89,7 +103,13 @@ class DeepseekV41Model(MegatronModule):
         for index in indices:
             attention = self._build_attention(config, index)
             mlp = self._build_mlp(config, release, index)
-            self.layers[str(index)] = self._build_block(config, index, attention, mlp)
+            block = self._build_block(config, index, attention, mlp)
+            self.layers[str(index)] = block
+            if self._native_frozen_base:
+                from .frozen import install, install_bf16_hooks
+
+                install(block, f'layers.{index}.', self, load_reader)
+                install_bf16_hooks(block)
             if index in release.engram_layer_ids:
                 if token_map is None:
                     raise ValueError("DS4.1 Engram requires the release compressed token_map")
@@ -99,6 +119,9 @@ class DeepseekV41Model(MegatronModule):
                 self.engrams[str(index)] = DS41Engram(
                     release, config, index, table_group, frozen=not impl.trainable_engram
                 )
+                if self._native_frozen_base:
+                    install(self.engrams[str(index)], f'engrams.{index}.', self, load_reader)
+                    install_bf16_hooks(self.engrams[str(index)])
                 if load_reader is not None:
                     from megatron.lite.model.deepseek_v41.lite.checkpoint import prefetch_engram
 
@@ -125,6 +148,10 @@ class DeepseekV41Model(MegatronModule):
             if isinstance(module, MegatronModule) and getattr(module, "tp_group", None) is None:
                 groups = getattr(module, "pg_collection", None)
                 module.tp_group = getattr(groups, "tp", None) or ps.tp_group
+        if lora_config(impl).enabled:
+            attach_lora(self, lora_config(impl), config.params_dtype)
+            freeze_non_lora_params(self)
+            config.moe_router_bias_update_rate = 0.0  # the router expert bias is base state too
         self.to(device=impl.device)
         self.ds41_frozen_parameters = tuple(
             name for name, parameter in self.named_parameters() if not parameter.requires_grad

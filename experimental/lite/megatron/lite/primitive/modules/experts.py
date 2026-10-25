@@ -16,6 +16,7 @@ from megatron.lite.primitive import transformer_engine as te
 from megatron.lite.primitive.modules.lora import (
     LoraConfig,
     SharedGroupedLinearLoRA,
+    lora_active,
     normalize_lora_config,
 )
 from megatron.lite.primitive.parallel import ParallelState
@@ -178,20 +179,20 @@ class Experts(nn.Module):
             if self.moe_act_recompute and probs is not None:
                 act_ckpt = CheckpointWithoutOutput(preserve_rng_state=True)
                 fc1_out = self.fc1(x, m_splits)
-                if self.fc1_lora is not None:
+                if lora_active(self.fc1_lora):
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = act_ckpt.checkpoint(swiglu_with_probs, fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
+                if lora_active(self.fc2_lora):
                     out = out + self.fc2_lora(h, m_splits)
                 act_ckpt.discard_output_and_register_recompute(out)
             else:
                 fc1_out = self.fc1(x, m_splits)
-                if self.fc1_lora is not None:
+                if lora_active(self.fc1_lora):
                     fc1_out = fc1_out + self.fc1_lora(x, m_splits)
                 h = swiglu_with_probs(fc1_out, probs, self.swiglu_limit)
                 out = self.fc2(h, m_splits)
-                if self.fc2_lora is not None:
+                if lora_active(self.fc2_lora):
                     out = out + self.fc2_lora(h, m_splits)
 
         if self.etp_group is not None:
