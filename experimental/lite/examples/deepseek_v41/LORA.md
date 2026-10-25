@@ -59,3 +59,12 @@ updates, with identical FP32 response LP bits. Long-response DAPO throughput and
 reward improvement remain separate validations.
 
 Deployment LoRA currently requires `attention_core="flashmla"`; the optional MegaAttention core remains available without LoRA.
+
+
+For long-context jobs that cannot keep both bases on GPU, set VERL's
+`actor_rollout_ref.rollout.custom.ds41_lora_sleep_mode=weights_cpu` explicitly.
+This selects vLLM's native level-1 sleep, which backs up and releases base weights,
+and restores both `weights` and `kv_cache` before generation. The default remains
+`kv_only`. Account for the native CPU backup in the per-node host-memory budget;
+this setting does not offload the actor or bypass memory-admission checks. Never
+use level 2 to discard the frozen base for adapter-only publication.

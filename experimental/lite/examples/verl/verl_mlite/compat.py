@@ -1525,7 +1525,7 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
 
 
 def _patch_vllm_rollout_sleep_level() -> bool:
-    """Keep frozen DS4.1 adapter weights resident; release only the KV cache.
+    """Keep DS4.1 adapter bases resident by default; optionally use native CPU backup.
 
     Other rollouts retain VERL's policy, or the explicit legacy level override.
     Use AsyncLLM utilities, which broadcast to every DP engine, not worker RPCs.
@@ -1545,20 +1545,30 @@ def _patch_vllm_rollout_sleep_level() -> bool:
     original_sleep = cls._sleep_hybrid
     original_tags = cls._get_wake_up_tags
 
-    def kv_only(self):
-        return (
+    def adapter_mode(self):
+        if not (
             self.lora_as_adapter
             and getattr(self.model_config.hf_config, "model_type", None) == "deepseek_v41"
-        )
+        ):
+            return None
+        custom = getattr(getattr(self, "config", None), "custom", None) or {}
+        mode = custom.get("ds41_lora_sleep_mode", "kv_only")
+        if mode not in ("kv_only", "weights_cpu"):
+            raise ValueError("DS4.1 LoRA sleep mode must be kv_only or weights_cpu")
+        return mode
 
     async def _sleep_hybrid(self):
-        if kv_only(self):
+        mode = adapter_mode(self)
+        if mode == "kv_only":
             release = getattr(self.engine, "release_kv_cache_memory", None)
             if not callable(release):
                 raise RuntimeError("DS4.1 adapter rollout requires vLLM KV-only release API")
             # sleep(0) pauses scheduling without unmapping or backing up weights.
             await self.engine.sleep(level=0)
             await release()
+            await self.engine.reset_encoder_cache()
+        elif mode == "weights_cpu":
+            await self.engine.sleep(level=1)
             await self.engine.reset_encoder_cache()
         elif level in ("1", "2"):
             await self.engine.sleep(level=int(level))
@@ -1567,7 +1577,10 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             await original_sleep(self)
 
     def _get_wake_up_tags(self):
-        return ["kv_cache"] if kv_only(self) else original_tags(self)
+        mode = adapter_mode(self)
+        if mode == "weights_cpu":
+            return ["weights", "kv_cache"]
+        return ["kv_cache"] if mode == "kv_only" else original_tags(self)
 
     _sleep_hybrid._verl_mlite_kv_only = True
     cls._sleep_hybrid = _sleep_hybrid

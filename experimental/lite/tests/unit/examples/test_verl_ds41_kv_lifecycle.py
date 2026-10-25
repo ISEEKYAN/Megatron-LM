@@ -93,3 +93,45 @@ def test_foreign_or_full_parameter_rollouts_keep_original_policy(
     asyncio.run(server._sleep_hybrid())
     assert server.events == [('sleep', int(override or '2')), ('reset',)]
     assert server._get_wake_up_tags() == ['kv_cache', 'weights']
+
+
+@pytest.mark.parametrize('legacy', [None, '1', '2'])
+def test_explicit_weight_offload_keeps_base_and_restores_both_tags(server, monkeypatch, legacy):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'weights_cpu'})
+    if legacy:
+        monkeypatch.setenv('VERL_MLITE_ROLLOUT_SLEEP_LEVEL', legacy)
+    assert compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    assert server.events == [('sleep', 1), ('reset',)]
+    assert server._get_wake_up_tags() == ['weights', 'kv_cache']
+
+
+def test_unknown_adapter_mode_fails_before_engine_calls(server):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'discard'})
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(ValueError, match='sleep mode'):
+        asyncio.run(server._sleep_hybrid())
+    with pytest.raises(ValueError, match='sleep mode'):
+        server._get_wake_up_tags()
+    assert server.events == []
+
+
+def test_weight_offload_preserves_original_engine_exception(server):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'weights_cpu'})
+    error = RuntimeError('native-sleep-error')
+    server.engine.sleep = AsyncMock(side_effect=error)
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(RuntimeError) as exc:
+        asyncio.run(server._sleep_hybrid())
+    assert exc.value is error and ('reset',) not in server.events
+
+
+@pytest.mark.parametrize('adapter,model', [(False, 'deepseek_v41'), (True, 'other')])
+def test_adapter_offload_option_does_not_change_foreign_rollouts(server, adapter, model):
+    server.lora_as_adapter = adapter
+    server.model_config.hf_config.model_type = model
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'weights_cpu'})
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    assert server.events == [('sleep', 2), ('reset',)]
+    assert server._get_wake_up_tags() == ['kv_cache', 'weights']
