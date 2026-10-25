@@ -59,3 +59,12 @@ updates, with identical FP32 response LP bits. Long-response DAPO throughput and
 reward improvement remain separate validations.
 
 Deployment LoRA currently requires `attention_core="flashmla"`; the optional MegaAttention core remains available without LoRA.
+
+
+Post-microbatch allocator release defaults to disabled. For colocated CUDA DS4.1
+vLLM training with PP=1, set
+`actor_rollout_ref.actor.engine.post_backward_cache_policy=threshold` to release
+inactive blocks only when driver free memory is below
+`actor_rollout_ref.actor.engine.post_backward_cache_free_gib=4.0` GiB.
+`always` restores unconditional post-backward release for comparison. These
+policies do not change microbatches, head chunking, or live tensors.
