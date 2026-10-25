@@ -26,6 +26,9 @@ def server(monkeypatch):
         def _get_wake_up_tags(self):
             return ['kv_cache', 'weights']
 
+        async def wake_up(self, tags=None):
+            self.events.append(('wake', tags or self._get_wake_up_tags()))
+
     module.vLLMHttpServer = Server
     monkeypatch.setitem(sys.modules, module.__name__, module)
     monkeypatch.setattr(compat, '_vllm_importable', lambda: True)
@@ -135,3 +138,82 @@ def test_adapter_offload_option_does_not_change_foreign_rollouts(server, adapter
     asyncio.run(server._sleep_hybrid())
     assert server.events == [('sleep', 2), ('reset',)]
     assert server._get_wake_up_tags() == ['kv_cache', 'weights']
+
+
+def reload_server(server):
+    server.config = SimpleNamespace(
+        custom={'ds41_lora_sleep_mode': 'weights_reload'},
+        data_parallel_size=4,
+        tensor_model_parallel_size=1,
+    )
+
+    async def utility(*args):
+        server.events.append(('reload', args))
+        return [[None] for _ in range(4)]
+
+    server.engine.engine_core = SimpleNamespace(call_utility_all_async=utility)
+    return server
+
+
+def test_l2_reload_all_engines_once_before_adapter_republish(server):
+    reload_server(server)
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def cycle():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(cycle())
+    assert server.events == [
+        ('sleep', 2),
+        ('reset',),
+        ('wake', ['weights']),
+        ('reload', ('collective_rpc', 'reload_weights', None, (), {})),
+        ('publish_current_adapter_all_ack',),
+        ('wake', ['kv_cache']),
+    ]
+    assert server._verl_mlite_reload_receipt['engines'] == 4
+    assert not server._verl_mlite_reload_pending
+
+
+@pytest.mark.parametrize('replies', [[], [[None]] * 3, [None] * 4, [[None, None]] * 4])
+def test_l2_missing_engine_fails_closed_and_remains_pending(server, replies):
+    reload_server(server)
+    server.engine.engine_core.call_utility_all_async = AsyncMock(return_value=replies)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    with pytest.raises(RuntimeError, match='engine census'):
+        asyncio.run(server.wake_up())
+    assert server._verl_mlite_reload_pending
+
+
+def test_l2_native_loader_failure_is_not_hidden(server):
+    reload_server(server)
+    error = RuntimeError('native-loader-error')
+    server.engine.engine_core.call_utility_all_async = AsyncMock(side_effect=error)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    with pytest.raises(RuntimeError) as caught:
+        asyncio.run(server.wake_up())
+    assert caught.value is error
+    assert server._verl_mlite_reload_pending
+
+
+def test_l2_requires_all_dp_api_before_discard(server):
+    reload_server(server)
+    del server.engine.engine_core.call_utility_all_async
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(RuntimeError, match='all-DP'):
+        asyncio.run(server._sleep_hybrid())
+    assert server.events == []
+
+
+def test_l2_kv_only_wake_first_also_restores_weights(server):
+    reload_server(server)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    asyncio.run(server.wake_up(['kv_cache']))
+    assert server.events[2] == ('wake', ['weights', 'kv_cache'])
+    assert server._get_wake_up_tags() == ['weights', 'kv_cache']

@@ -1525,7 +1525,7 @@ def _patch_verl_dsv41_layerwise_reload() -> bool:
 
 
 def _patch_vllm_rollout_sleep_level() -> bool:
-    """Keep DS4.1 adapter bases resident by default; optionally use native CPU backup.
+    """Keep DS4.1 adapter bases resident by default; optionally back up or reload native weights.
 
     Other rollouts retain VERL's policy, or the explicit legacy level override.
     Use AsyncLLM utilities, which broadcast to every DP engine, not worker RPCs.
@@ -1544,6 +1544,7 @@ def _patch_vllm_rollout_sleep_level() -> bool:
         return True
     original_sleep = cls._sleep_hybrid
     original_tags = cls._get_wake_up_tags
+    original_wake = getattr(cls, "wake_up", None)
 
     def adapter_mode(self):
         if not (
@@ -1553,8 +1554,8 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             return None
         custom = getattr(getattr(self, "config", None), "custom", None) or {}
         mode = custom.get("ds41_lora_sleep_mode", "kv_only")
-        if mode not in ("kv_only", "weights_cpu"):
-            raise ValueError("DS4.1 LoRA sleep mode must be kv_only or weights_cpu")
+        if mode not in ("kv_only", "weights_cpu", "weights_reload"):
+            raise ValueError("DS4.1 LoRA sleep mode must be kv_only, weights_cpu or weights_reload")
         return mode
 
     async def _sleep_hybrid(self):
@@ -1570,6 +1571,12 @@ def _patch_vllm_rollout_sleep_level() -> bool:
         elif mode == "weights_cpu":
             await self.engine.sleep(level=1)
             await self.engine.reset_encoder_cache()
+        elif mode == "weights_reload":
+            if not callable(getattr(self.engine.engine_core, "call_utility_all_async", None)):
+                raise RuntimeError("DS4.1 L2 reload requires all-DP native utilities")
+            await self.engine.sleep(level=2)
+            self._verl_mlite_reload_pending = True
+            await self.engine.reset_encoder_cache()
         elif level in ("1", "2"):
             await self.engine.sleep(level=int(level))
             await self.engine.reset_encoder_cache()
@@ -1578,13 +1585,46 @@ def _patch_vllm_rollout_sleep_level() -> bool:
 
     def _get_wake_up_tags(self):
         mode = adapter_mode(self)
-        if mode == "weights_cpu":
+        if mode in ("weights_cpu", "weights_reload"):
             return ["weights", "kv_cache"]
         return ["kv_cache"] if mode == "kv_only" else original_tags(self)
+
+    async def wake_up(self, tags=None):
+        pending = getattr(self, "_verl_mlite_reload_pending", False)
+        if pending:
+            # L2 discarded the base. Restore its allocations before reading the
+            # same checkpoint with vLLM's own loader (no export/codec conversion).
+            tags = list(dict.fromkeys(["weights", *(tags or self._get_wake_up_tags())]))
+        result = await original_wake(self, tags=tags)
+        if pending:
+            import time
+
+            started = time.monotonic()
+            replies = await self.engine.engine_core.call_utility_all_async(
+                "collective_rpc", "reload_weights", None, (), {}
+            )
+            expected = self.config.data_parallel_size
+            if len(replies) != expected or any(
+                not isinstance(reply, list) or len(reply) != self.config.tensor_model_parallel_size
+                for reply in replies
+            ):
+                raise RuntimeError(f"DS4.1 reload engine census differs: {replies!r}")
+            # Native reload clears LoRA state. The normal awaited adapter publish
+            # must follow this wake, before the trainer resumes generation.
+            self._verl_mlite_reload_receipt = {
+                "engines": len(replies),
+                "seconds": time.monotonic() - started,
+                "source": "unchanged_vllm_config",
+                "adapter_reinstall_required": True,
+            }
+            self._verl_mlite_reload_pending = False
+        return result
 
     _sleep_hybrid._verl_mlite_kv_only = True
     cls._sleep_hybrid = _sleep_hybrid
     cls._get_wake_up_tags = _get_wake_up_tags
+    if original_wake is not None:
+        cls.wake_up = wake_up
     return True
 
 
