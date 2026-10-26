@@ -48,7 +48,7 @@ def record(engine, phase):
             return value.untyped_storage().nbytes()
 
         assert not any(resident(p) for p in engine.module.parameters())
-        assert not any(resident(b) for b in engine.module.buffers())
+        assert not any(resident(b) for _, b in engine.module.named_buffers())
 
 
 def extra_storage(engine, device):
@@ -113,11 +113,17 @@ def install():
         engine = self.actor.engine
         if not getattr(engine.engine_config, 'exclusive_rollout', False):
             return await original(self, global_steps=global_steps, mode=mode)
-        effective = mode if mode != 'auto' else self.config.rollout.checkpoint_engine.backend
+        effective = (
+            mode if mode != 'auto' else self.config.rollout.checkpoint_engine.backend
+        )
         if effective != 'naive' or not self.base_sync_done:
-            raise ValueError('Exclusive actor requires native colocated adapter-only sync')
+            raise ValueError(
+                'Exclusive actor requires native colocated adapter-only sync'
+            )
         if engine.is_param_offload_enabled:
-            raise ValueError('Exclusive actor uses explicit boundaries, not auto param_offload')
+            raise ValueError(
+                'Exclusive actor uses explicit boundaries, not auto param_offload'
+            )
         if getattr(engine, '_exclusive_adapter_snapshot', None) is not None:
             raise RuntimeError('Unconsumed exclusive adapter snapshot')
         weights, peft = engine.get_per_tensor_param(
@@ -127,7 +133,9 @@ def install():
             raise ValueError('Exclusive actor supports adapter-only publication')
         owned = list(weights)
         if not owned or any(value.device.type != 'cpu' for _, value in owned):
-            raise ValueError('Adapter snapshot must own host storage before actor offload')
+            raise ValueError(
+                'Adapter snapshot must own host storage before actor offload'
+            )
         engine._exclusive_adapter_snapshot = (owned, peft)
         try:
             record(engine, 'actor_before_offload')
