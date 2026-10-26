@@ -186,7 +186,11 @@ def load_model_to_gpu(model_list: list, load_grad: bool = True) -> None:
                         buffer.param_data.copy_(buffer.param_data.cpu_data, non_blocking=True)
 
             for param in model_chunk.module.parameters():
-                if not param.requires_grad and param.device.type == "cpu":
+                if (
+                    not param.requires_grad
+                    and param.device.type == "cpu"
+                    and not getattr(param, "_mlite_keep_on_cpu", False)
+                ):
                     param.data = param.data.to("cuda", non_blocking=True)
         else:
             model_chunk.to("cuda")

@@ -5,6 +5,8 @@ custom_backend_module: verl_mlite.engine.mlite_engine
 param_offload: false
 optimizer_offload: false
 grad_offload: false
+# KA adapter-only hybrid mode parks actor storage before rollout wakes.
+exclusive_rollout: false
 # Post-microbatch allocator reclamation is opt-in; threshold reads driver free bytes.
 post_backward_cache_policy: "off"
 post_backward_cache_free_gib: 4.0

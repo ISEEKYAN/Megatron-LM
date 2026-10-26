@@ -39,6 +39,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     post_backward_cache_policy: str = "off"
     post_backward_cache_free_gib: float = 4.0
     grad_offload: bool = False
+    exclusive_rollout: bool = False
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 

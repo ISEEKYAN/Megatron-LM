@@ -240,3 +240,11 @@ def test_post_backward_cache_policy_defaults_off_and_explicit_threshold():
 def test_post_backward_cache_policy_rejects_bad_configuration(values):
     with pytest.raises(ValueError, match="post_backward_cache"):
         _engine_config(**values)
+
+
+@pytest.mark.parametrize("enabled", [False, True])
+def test_exclusive_rollout_is_explicit_boolean_config(enabled):
+    config = _engine_config(exclusive_rollout=enabled)
+    assert config.exclusive_rollout is enabled
+    assert _engine_config().exclusive_rollout is False
+    assert config.post_backward_cache_policy == "off"

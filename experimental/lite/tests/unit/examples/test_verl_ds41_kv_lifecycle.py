@@ -50,18 +50,19 @@ def server(monkeypatch):
     return obj
 
 
-def test_kv_only_is_ds41_adapter_default_and_idempotent(server, monkeypatch):
+def test_weights_cpu_is_ds41_adapter_default_and_idempotent(server, monkeypatch):
     monkeypatch.setenv('VERL_MLITE_ROLLOUT_SLEEP_LEVEL', '1')
     assert compat._patch_vllm_rollout_sleep_level()
     patched = type(server)._sleep_hybrid
     assert compat._patch_vllm_rollout_sleep_level()
     assert patched is type(server)._sleep_hybrid
     asyncio.run(server._sleep_hybrid())
-    assert server.events == [('sleep', 0), ('release',), ('reset',)]
-    assert server._get_wake_up_tags() == ['kv_cache']
+    assert server.events == [('sleep', 1), ('reset',)]
+    assert server._get_wake_up_tags() == ['weights', 'kv_cache']
 
 
 def test_missing_api_fails_before_pause(server):
+    server.config = SimpleNamespace(custom={"ds41_lora_sleep_mode": "kv_only"})
     del server.engine.release_kv_cache_memory
     assert compat._patch_vllm_rollout_sleep_level()
     with pytest.raises(RuntimeError, match='KV-only release API'):
@@ -71,6 +72,7 @@ def test_missing_api_fails_before_pause(server):
 
 @pytest.mark.parametrize('failure', ['sleep', 'release_kv_cache_memory'])
 def test_original_exception_is_not_hidden(server, failure):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'kv_only'})
     error = RuntimeError('original-engine-error')
     setattr(server.engine, failure, AsyncMock(side_effect=error))
     compat._patch_vllm_rollout_sleep_level()
@@ -93,3 +95,29 @@ def test_foreign_or_full_parameter_rollouts_keep_original_policy(
     asyncio.run(server._sleep_hybrid())
     assert server.events == [('sleep', int(override or '2')), ('reset',)]
     assert server._get_wake_up_tags() == ['kv_cache', 'weights']
+
+
+@pytest.mark.parametrize('legacy_level', ['1', '2'])
+def test_explicit_kv_only_remains_available(server, monkeypatch, legacy_level):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'kv_only'})
+    monkeypatch.setenv('VERL_MLITE_ROLLOUT_SLEEP_LEVEL', legacy_level)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    assert server.events == [('sleep', 0), ('release',), ('reset',)]
+    assert server._get_wake_up_tags() == ['kv_cache']
+
+
+def test_cpu_backup_does_not_require_kv_only_api(server):
+    del server.engine.release_kv_cache_memory
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'weights_cpu'})
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    assert server.events == [('sleep', 1), ('reset',)]
+
+
+def test_bad_mode_fails_before_sleep(server):
+    server.config = SimpleNamespace(custom={'ds41_lora_sleep_mode': 'typo'})
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(ValueError, match='sleep mode'):
+        asyncio.run(server._sleep_hybrid())
+    assert server.events == []

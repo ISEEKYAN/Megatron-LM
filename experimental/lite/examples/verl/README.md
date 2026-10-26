@@ -336,3 +336,32 @@ Sleep diagnostics are opt-in: `VERL_MLITE_SLEEP_FP_DIR` records state fingerprin
 bisection. The default is `0`, using vLLM's named preservation. Fingerprints are
 diagnostics: large host tables use head/tail samples, so they do not replace
 full token-logprob bit comparisons.
+
+
+### DS4.1 adapter-only L1 lifecycle
+
+For KA hybrid LoRA, set
+`actor_rollout_ref.rollout.custom.ds41_lora_sleep_mode=weights_cpu` (the
+DS4.1 adapter default) and `actor_rollout_ref.actor.engine.exclusive_rollout=True`.
+Keep automatic `param_offload=False`; the exclusive boundary moves model,
+gradients and optimizer via the existing runtime. Other engines keep the default
+`exclusive_rollout=False`. Explicit `ds41_lora_sleep_mode=kv_only` retains the
+previous resident-base policy with `exclusive_rollout=False`; combining it with
+exclusive L1 raises before offload.
+
+After each update, snapshot the adapter to host, offload the actor, release its
+scratch caches and synchronize all actor ranks. Native VERL then wakes inference
+weights, publishes the adapter and waits for receiver ACKs, and wakes KV. Rollout
+sleep uses native vLLM L1 weight backup; wake copies those same bytes back from
+host, without a new codec or a disk reload. The next actor train/eval context
+restores actor storage; frozen CPU Engram tables remain on CPU. A generation
+wrapper must not independently wake inference before this boundary.
+
+Budget approximately 305 GiB per node for inference weight backups alone on the
+full-model DEP4 x 2 recipe. vLLM uses `pin_memory=PIN_MEMORY` for each weight-tagged
+backup; with CUDA pinning enabled these are pinned host allocations. Include
+actor CPU state, both Engram instances, Ray and other buffers in the complete
+host budget. `--exclusive` alone does not reserve all host memory: request
+`--mem=0` for the node's allocatable memory. The 305 GiB figure is an estimate,
+not a new measurement. This L1 preparation has CPU controls only; no GPU
+validation was requested or performed for the new lifecycle.

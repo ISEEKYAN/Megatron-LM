@@ -238,6 +238,11 @@ class _MegatronLiteModeCtx(BaseEngineCtx):
         self._runtime_ctx = None
 
     def __enter__(self):
+        if getattr(self.engine, "_exclusive_actor_offloaded", False):
+            # Restore all model/gradient buffers before Core can use them.
+            # Keep chunked Adam's existing per-step state prefetch unchanged.
+            self.engine.to("cuda", model=True, optimizer=False, grad=True)
+            self.engine._exclusive_actor_offloaded = False
         super().__enter__()
         assert self.engine.runtime is not None and self.engine.handle is not None
         if self.mode == "train":
@@ -279,6 +284,10 @@ class MegatronLiteEngine(BaseEngine):
         self.module = None
         self._mlite_config = None
         self._rank = dist.get_rank() if dist.is_initialized() else 0
+        if getattr(engine_config, "exclusive_rollout", False):
+            from verl_mlite.rollout.exclusive import install
+
+            install()
 
     @property
     def is_param_offload_enabled(self) -> bool:
@@ -325,12 +334,25 @@ class MegatronLiteEngine(BaseEngine):
                 self.handle._optimizer, torch.device("cuda", torch.cuda.current_device())
             )
 
+        exclusive = getattr(self.engine_config, "exclusive_rollout", False)
+        if exclusive:
+            # Capture theta0 before rollout is constructed, avoiding an initial
+            # actor onload next to the just-loaded inference base.
+            weights, peft = self.get_per_tensor_param(base_sync_done=True)
+            self._exclusive_initial_adapter = (list(weights), peft)
         self.to(
             device="cpu",
-            model=self.is_param_offload_enabled,
-            optimizer=self.is_optimizer_offload_enabled,
-            grad=self.is_param_offload_enabled or self._release_grads,
+            model=self.is_param_offload_enabled or exclusive,
+            optimizer=self.is_optimizer_offload_enabled or exclusive,
+            grad=self.is_param_offload_enabled or self._release_grads or exclusive,
         )
+        if exclusive:
+            from verl_mlite.rollout.exclusive import record
+
+            self._exclusive_actor_offloaded = True
+            record(self, "before_rollout_wake")
+            if dist.is_initialized():
+                dist.barrier()
 
     def train_mode(self, **kwargs):
         self._require_initialized()
@@ -410,6 +432,15 @@ class MegatronLiteEngine(BaseEngine):
 
     def get_per_tensor_param(self, **kwargs):
         self._require_initialized()
+        if getattr(self.engine_config, "exclusive_rollout", False):
+            from verl_mlite.rollout.exclusive import consume_host_snapshot
+
+            cached = consume_host_snapshot(self)
+            if cached is not None:
+                return cached
+        if getattr(self, "_exclusive_actor_offloaded", False):
+            self.to("cuda", model=True, optimizer=False, grad=False)
+            self._exclusive_actor_offloaded = False
         if self.is_param_offload_enabled:
             self.to("cuda", model=True, optimizer=False, grad=False)
         if not getattr(self, "_initial_sync_cache_cleared", False):
@@ -497,7 +528,23 @@ class MegatronLiteEngine(BaseEngine):
             grad = grad or optimizer
         if model or not (optimizer or grad):
             super().to(device=device, model=model, optimizer=optimizer, grad=grad)
+        exclusive = getattr(self.engine_config, "exclusive_rollout", False) and model
+        if exclusive and device == "cpu":
+            from verl_mlite.rollout.exclusive import clear_deployment_scratch
+
+            if not getattr(self, "_exclusive_placement_recorded", False):
+                for parameter in self.module.parameters():
+                    if not parameter.requires_grad:
+                        parameter._mlite_keep_on_cpu = parameter.device.type == "cpu"
+                self._exclusive_placement_recorded = True
+            clear_deployment_scratch(self)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
+        if exclusive:
+            from verl_mlite.rollout.exclusive import extra_storage
+
+            extra_storage(self, device)
+            if device == "cpu" and self.device_name == "cuda":
+                _release_inactive_cuda_cache()
 
     def save_checkpoint(
         self,
