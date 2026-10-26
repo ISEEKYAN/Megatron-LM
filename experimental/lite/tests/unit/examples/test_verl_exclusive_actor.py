@@ -152,3 +152,18 @@ def test_ddp_onload_preserves_original_host_parameter():
         module.load_model_to_gpu([owner])
     assert calls == [model.base.data_ptr()]
     assert model.host.device.type == 'cpu' and torch.equal(model.host, torch.ones(3))
+
+
+def test_all_actor_ranks_park_before_shared_server_wake():
+    m = product()
+    cls, trace = fixture()
+    install(m, cls)
+    with (
+        patch.object(torch.cuda, 'is_available', return_value=False),
+        patch.object(torch.distributed, 'is_initialized', return_value=True),
+        patch.object(
+            torch.distributed, 'barrier', side_effect=lambda: trace.append('all_actors_parked')
+        ),
+    ):
+        asyncio.run(cls().update_weights())
+    assert trace.index('offload') < trace.index('all_actors_parked') < trace.index('wake')

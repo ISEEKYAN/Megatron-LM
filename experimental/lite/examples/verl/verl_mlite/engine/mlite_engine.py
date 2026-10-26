@@ -346,7 +346,12 @@ class MegatronLiteEngine(BaseEngine):
             grad=self.is_param_offload_enabled or self._release_grads or exclusive,
         )
         if exclusive:
+            from verl_mlite.rollout.exclusive import record
+
             self._exclusive_actor_offloaded = True
+            record(self, "before_rollout_wake")
+            if dist.is_initialized():
+                dist.barrier()
 
     def train_mode(self, **kwargs):
         self._require_initialized()

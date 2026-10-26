@@ -18,6 +18,8 @@ def record(engine, phase):
         phase=phase,
         pid=os.getpid(),
         allocated_bytes=allocated,
+        max_allocated_bytes=torch.cuda.max_memory_allocated(),
+        max_reserved_bytes=torch.cuda.max_memory_reserved(),
         reserved_bytes=torch.cuda.memory_reserved(),
         free_bytes=torch.cuda.mem_get_info()[0],
     )
@@ -73,6 +75,8 @@ def extra_storage(engine, device):
 
 
 def clear_deployment_scratch(engine):
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
     prefix = 'megatron.lite.model.deepseek_v41.vllm.'
     lora = sys.modules.get(prefix + 'lora')
     if lora is not None:
@@ -134,6 +138,10 @@ def install():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             record(engine, 'before_rollout_wake')
+            # One server wake restores all DEP workers. Every actor rank
+            # must be parked before the first caller wakes that shared server.
+            if torch.distributed.is_initialized():
+                torch.distributed.barrier()
             # Original native RPC order/IPC/ACK remains authoritative. Its
             # get_per_tensor_param consumes the host snapshot without onload.
             return await original(self, global_steps=global_steps, mode=mode)
