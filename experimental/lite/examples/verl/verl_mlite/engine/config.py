@@ -36,6 +36,7 @@ class MegatronLiteEngineConfig(EngineConfig):
     resync_config: dict[str, Any] = field(default_factory=dict)
     router_replay_mode: str = "disabled"
     grad_offload: bool = False
+    exclusive_rollout: bool = False
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
