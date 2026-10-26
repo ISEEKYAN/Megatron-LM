@@ -21,9 +21,7 @@ def product():
 
 def fixture(exclusive=True, adapter=True, host=True):
     trace = []
-    values = [
-        ('layers.20.lora_a.weight', torch.tensor([-0.0, 1.0], dtype=torch.bfloat16))
-    ]
+    values = [('layers.20.lora_a.weight', torch.tensor([-0.0, 1.0], dtype=torch.bfloat16))]
     peft = {'manifest': 'unchanged'} if adapter else None
 
     class Engine:
@@ -42,9 +40,7 @@ def fixture(exclusive=True, adapter=True, host=True):
             return iter(values), peft
 
         def to(self, device, **kwargs):
-            assert device == 'cpu' and kwargs == dict(
-                model=True, optimizer=True, grad=True
-            )
+            assert device == 'cpu' and kwargs == dict(model=True, optimizer=True, grad=True)
             trace.append('offload')
 
     class Worker:
@@ -62,9 +58,7 @@ def fixture(exclusive=True, adapter=True, host=True):
                 assert trace.index('offload') < trace.index('wake')
             assert cfg is peft
             received = list(ws)
-            assert torch.equal(
-                received[0][1].view(torch.uint8), values[0][1].view(torch.uint8)
-            )
+            assert torch.equal(received[0][1].view(torch.uint8), values[0][1].view(torch.uint8))
             trace.extend(['native_publish', 'all_ACK'])
             return global_steps
 
@@ -118,18 +112,14 @@ def test_invalid_state_stops_before_wake(case):
 def test_repeat_cpu_transfer_does_not_drop_restore_paths():
     m = product()
     owner = torch.nn.Linear(2, 2)
-    engine = SimpleNamespace(
-        module=owner, _exclusive_extra_storage=[(owner, 'weight', False)]
-    )
+    engine = SimpleNamespace(module=owner, _exclusive_extra_storage=[(owner, 'weight', False)])
     m.extra_storage(engine, 'cpu')
     assert engine._exclusive_extra_storage == [(owner, 'weight', False)]
 
 
 def test_host_snapshot_consumed_once_without_onload():
     m = product()
-    values = [
-        ('layers.20.lora_b.weight', torch.tensor([-0.0, 2.0], dtype=torch.bfloat16))
-    ]
+    values = [('layers.20.lora_b.weight', torch.tensor([-0.0, 2.0], dtype=torch.bfloat16))]
     engine = SimpleNamespace(_exclusive_initial_adapter=(values, {'policy_version': 0}))
     got, config = m.consume_host_snapshot(engine)
     assert config == {'policy_version': 0}
@@ -172,9 +162,7 @@ def test_all_actor_ranks_park_before_shared_server_wake():
         patch.object(torch.cuda, 'is_available', return_value=False),
         patch.object(torch.distributed, 'is_initialized', return_value=True),
         patch.object(
-            torch.distributed,
-            'barrier',
-            side_effect=lambda: trace.append('all_actors_parked'),
+            torch.distributed, 'barrier', side_effect=lambda: trace.append('all_actors_parked')
         ),
     ):
         asyncio.run(cls().update_weights())
@@ -195,9 +183,48 @@ def test_residency_check_handles_core_ddp_buffers_list():
         patch.object(torch.cuda, 'memory_reserved', return_value=0),
         patch.object(torch.cuda, 'max_memory_allocated', return_value=0),
         patch.object(torch.cuda, 'max_memory_reserved', return_value=0),
-        patch.object(torch.cuda, 'mem_get_info', return_value=(16 * 2**30, 16 * 2**30)),
+        patch.object(torch.cuda, 'mem_get_info', return_value=(170 * 2**30, 186 * 2**30)),
     ):
         m.record(SimpleNamespace(module=owner), 'before_rollout_wake')
         with patch.object(torch.cuda, 'memory_allocated', return_value=5 * 2**30):
             with pytest.raises(AssertionError, match='ACTOR_GPU_RESIDENCY_ABOVE_4GIB'):
                 m.record(SimpleNamespace(module=owner), 'before_rollout_wake')
+
+
+@pytest.mark.parametrize(
+    ('process_gib', 'free_gib', 'total_gib', 'error'),
+    [
+        (12, 159, 186, None),
+        (17, 159, 186, 'ABOVE_16GIB'),
+        (12, 143, 186, 'WAKE_FREE_MARGIN'),
+        (12, 159, 150, 'CAPACITY_BUDGET'),
+    ],
+)
+def test_native_process_residency_and_rollout_headroom(process_gib, free_gib, total_gib, error):
+    m = product()
+    owner = torch.nn.Module()
+    nvml = SimpleNamespace(
+        nvmlInit=lambda: None,
+        nvmlDeviceGetCount=lambda: 1,
+        nvmlDeviceGetHandleByIndex=lambda i: i,
+        nvmlDeviceGetComputeRunningProcesses=lambda h: [
+            SimpleNamespace(pid=m.os.getpid(), usedGpuMemory=process_gib * 2**30)
+        ],
+    )
+    with (
+        patch.dict(sys.modules, {'pynvml': nvml}),
+        patch.object(torch.cuda, 'is_available', return_value=True),
+        patch.object(torch.cuda, 'synchronize'),
+        patch.object(torch.cuda, 'memory_allocated', return_value=2**30),
+        patch.object(torch.cuda, 'memory_reserved', return_value=2 * 2**30),
+        patch.object(torch.cuda, 'max_memory_allocated', return_value=130 * 2**30),
+        patch.object(torch.cuda, 'max_memory_reserved', return_value=140 * 2**30),
+        patch.object(
+            torch.cuda, 'mem_get_info', return_value=(free_gib * 2**30, total_gib * 2**30)
+        ),
+    ):
+        if error:
+            with pytest.raises(AssertionError, match=error):
+                m.record(SimpleNamespace(module=owner), 'before_rollout_wake')
+        else:
+            m.record(SimpleNamespace(module=owner), 'before_rollout_wake')

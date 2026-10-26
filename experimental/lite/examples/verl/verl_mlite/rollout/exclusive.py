@@ -22,6 +22,7 @@ def record(engine, phase):
         max_reserved_bytes=torch.cuda.max_memory_reserved(),
         reserved_bytes=torch.cuda.memory_reserved(),
         free_bytes=torch.cuda.mem_get_info()[0],
+        total_bytes=torch.cuda.mem_get_info()[1],
     )
     import pynvml
 
@@ -33,10 +34,25 @@ def record(engine, phase):
             if process.pid == os.getpid():
                 process_bytes += process.usedGpuMemory
     report['process_GPU_bytes'] = process_bytes
+    # NVML includes native communication/runtime allocations outside Torch's
+    # allocator. Do not claim an unsupported split between individual libraries.
+    report['non_torch_unclassified_bytes'] = max(0, process_bytes - report['reserved_bytes'])
+    report['torch_inactive_reserved_bytes'] = report['reserved_bytes'] - allocated
+    # Full-model rollout measured ~117 GiB; conservatively reserve 128 GiB.
+    # Keep 16 GiB genuinely free even with actor's native process buffers.
+    rollout_budget = 128 * 2**30
+    margin = 16 * 2**30
+    report['rollout_peak_budget_bytes'] = rollout_budget
+    report['required_free_margin_bytes'] = margin
     print('MLITE_EXCLUSIVE_ACTOR ' + json.dumps(report), flush=True)
     if phase == 'before_rollout_wake':
-        assert process_bytes <= 8 * 2**30, ('ACTOR_PROCESS_RESIDENCY_ABOVE_8GIB', report)
+        assert process_bytes <= 16 * 2**30, ('ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
         assert allocated <= 4 * 2**30, ('ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
+        assert process_bytes + rollout_budget + margin <= report['total_bytes'], (
+            'ACTOR_ROLLOUT_CAPACITY_BUDGET',
+            report,
+        )
+        assert report['free_bytes'] >= rollout_budget + margin, ('ROLLOUT_WAKE_FREE_MARGIN', report)
 
         # Core DDP keeps CUDA parameter views with zero-sized storage while
         # their actual bytes live in pinned CPU buffer copies.
@@ -113,17 +129,11 @@ def install():
         engine = self.actor.engine
         if not getattr(engine.engine_config, 'exclusive_rollout', False):
             return await original(self, global_steps=global_steps, mode=mode)
-        effective = (
-            mode if mode != 'auto' else self.config.rollout.checkpoint_engine.backend
-        )
+        effective = mode if mode != 'auto' else self.config.rollout.checkpoint_engine.backend
         if effective != 'naive' or not self.base_sync_done:
-            raise ValueError(
-                'Exclusive actor requires native colocated adapter-only sync'
-            )
+            raise ValueError('Exclusive actor requires native colocated adapter-only sync')
         if engine.is_param_offload_enabled:
-            raise ValueError(
-                'Exclusive actor uses explicit boundaries, not auto param_offload'
-            )
+            raise ValueError('Exclusive actor uses explicit boundaries, not auto param_offload')
         if getattr(engine, '_exclusive_adapter_snapshot', None) is not None:
             raise RuntimeError('Unconsumed exclusive adapter snapshot')
         weights, peft = engine.get_per_tensor_param(
@@ -133,9 +143,7 @@ def install():
             raise ValueError('Exclusive actor supports adapter-only publication')
         owned = list(weights)
         if not owned or any(value.device.type != 'cpu' for _, value in owned):
-            raise ValueError(
-                'Adapter snapshot must own host storage before actor offload'
-            )
+            raise ValueError('Adapter snapshot must own host storage before actor offload')
         engine._exclusive_adapter_snapshot = (owned, peft)
         try:
             record(engine, 'actor_before_offload')
