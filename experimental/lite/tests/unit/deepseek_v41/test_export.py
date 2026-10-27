@@ -45,14 +45,14 @@ def _put(module, name, shape, dtype=torch.bfloat16, buffer=False):
         module.register_parameter(parts[-1], torch.nn.Parameter(value))
 
 
-def _model(ps):
+def _model(ps, n_experts=2):
     model = torch.nn.Module()
     model.local_layer_range = (ps.pp_rank, ps.pp_rank + 1) if ps.pp_size > 1 else (0, 2)
     model.layout = SimpleNamespace(has_embed=ps.pp_is_first, has_head=ps.pp_is_last)
     model.engrams = torch.nn.ModuleDict()
     for layer in range(*model.local_layer_range):
         prefix = f'layers.{layer}.'
-        for expert in range(2 // ps.ep_size):
+        for expert in range(n_experts // ps.ep_size):
             for fc, shape in [(1, (128, 64)), (2, (64, 64))]:
                 name = f'ffn.experts.linear_fc{fc}.weight{expert}'
                 _put(model, prefix + name, shape)
@@ -61,8 +61,8 @@ def _model(ps):
                 param.data.add_(ps.ep_rank * 0.01)
         for name in ['attention.linear_q_down_proj.weight', 'ffn.shared_experts.linear_fc2.weight']:
             _put(model, prefix + name, (64, 64))
-        _put(model, prefix + 'ffn.router.weight', (2, 64))
-        _put(model, prefix + 'ffn.router.expert_bias', (2,), torch.float32, True)
+        _put(model, prefix + 'ffn.router.weight', (n_experts, 64))
+        _put(model, prefix + 'ffn.router.expert_bias', (n_experts,), torch.float32, True)
         for name in ['mapping_proj.weight', 'bias', 'alpha_pre', 'alpha_post', 'alpha_res']:
             _put(
                 model,
@@ -135,6 +135,43 @@ def _owner_worker(rank, root, ep, pp):
 @pytest.mark.parametrize('ep,pp', [(2, 1), (1, 2)])
 def test_owner_export_matches_single_rank_and_is_idempotent(tmp_path, ep, pp):
     mp.spawn(_owner_worker, args=(str(tmp_path), ep, pp), nprocs=2, join=True)
+
+
+def _shard_worker(rank, root, rollout_ep):
+    from megatron.lite.model.deepseek_v41.lite.export import (
+        export_hf_weights,
+        rollout_expert_range,
+    )
+
+    torch.set_num_threads(1)
+    dist.init_process_group('gloo', init_method=f'file://{root}/store', rank=rank, world_size=4)
+    ps = init_parallel(ParallelConfig(ep=4))
+    cfg = SimpleNamespace(n_routed_experts=8, vocab_size=64)
+    model = _model(ps, n_experts=8)
+    model.start_param_sync = lambda **kw: None
+    options = dict(target='release', include_frozen=False, buffer_max_size_bytes=16384)
+    full = list(export_hf_weights(model, cfg, ps, **options))
+    shard = list(export_hf_weights(model, cfg, ps, rollout_ep_size=rollout_ep, **options))
+    held = rollout_expert_range(8, rollout_ep, rank % rollout_ep)
+
+    def keep(key):
+        parts = key.split('.')
+        return '.ffn.experts.' not in key or int(parts[parts.index('experts') + 1]) in held
+
+    expected = {k: v for k, v in full if keep(k)}
+    actual = dict(shard)
+    assert len(actual) == len(shard) and actual.keys() == expected.keys()
+    assert sum('.ffn.experts.' in k for k in actual) == len(held) * 2 * 6
+    for key, value in actual.items():
+        assert value.dtype == expected[key].dtype and value.shape == expected[key].shape, key
+        assert torch.equal(_bits(value), _bits(expected[key])), key
+    dist.destroy_process_group()
+
+
+@pytest.mark.parametrize('rollout_ep', [2, 4])
+def test_rollout_expert_shard_matches_filtered_full_export(tmp_path, rollout_ep):
+    """Owner-side quantization + all_to_all yields the full export's bytes for held experts."""
+    mp.spawn(_shard_worker, args=(str(tmp_path), rollout_ep), nprocs=4, join=True)
 
 
 @pytest.mark.parametrize('key', ['layers.0.attn.wq_a.weight', 'layers.0.ffn.experts.0.w1.weight'])

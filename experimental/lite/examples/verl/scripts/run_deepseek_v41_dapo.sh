@@ -110,6 +110,12 @@ export MCORE_DIST_CKPT_STREAM_D2H=0  # Use the unmodified Core checkpoint writer
 export VLLM_BI_REPLAY_STAGE_LAYERS=2
 export NCCL_MNNVL_ENABLE="${NCCL_MNNVL_ENABLE:-0}" NCCL_CUMEM_ENABLE="${NCCL_CUMEM_ENABLE:-0}"
 export VERL_MLITE_SKIP_RUNTIME_PATCHES=0
+# Online sync sends each rollout rank only its routed experts (owner-side quantization).
+case "${SYNC_LOCAL_EXPERTS:-False}" in
+  true|True|1) export VERL_MLITE_SYNC_ROLLOUT_EP="${ROLLOUT_EP}" ;;
+  false|False|0) unset VERL_MLITE_SYNC_ROLLOUT_EP ;;
+  *) echo "SYNC_LOCAL_EXPERTS must be True or False" >&2; exit 2 ;;
+esac
 
 case "${PROMPT_MODE}" in
   chat|thinking) ;;
@@ -159,6 +165,7 @@ names = ('VLLM_BATCH_INVARIANT', 'VLLM_BI_MXFP8_GEMM', 'VLLM_BI_BF16_GEMM',
          'DSV41_ATTENTION_CORE', 'DSV41_HEAD_DTYPE', 'DSV41_MEGAMOE_MAX_TOKENS',
          'VERL_MLITE_VAL_MAX_TOKENS', 'VERL_MLITE_L2_RETENTION', 'VERL_MLITE_SLEEP_FP_DIR',
          'MLITE_DISTOPT_SHARDING_TYPE', 'MCORE_DIST_CKPT_STREAM_D2H',
+         'VERL_MLITE_SYNC_ROLLOUT_EP',
          )
 for name in names:
     if name in os.environ:
