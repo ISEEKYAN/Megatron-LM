@@ -12,7 +12,12 @@ from megatron.lite.model.deepseek_v41.lite.components.config import core_config
 from megatron.lite.model.protocol_utils import nested_from_packed
 from megatron.lite.primitive.bundle import ModelBundle
 from megatron.lite.primitive.parallel import init_parallel
-from megatron.lite.primitive.parallel.thd import pack_nested_thd, parallel_state_from_model
+from megatron.lite.primitive.parallel.thd import (
+    pack_nested_thd,
+    parallel_state_from_model,
+    thd_pack_meta,
+    unpack_thd_to_nested,
+)
 from megatron.lite.runtime.contracts import ParallelConfig
 from megatron.lite.runtime.contracts.loss import get_loss_context
 
@@ -37,12 +42,40 @@ class ImplConfig:
     router_aux_loss_coef: float = 0.0
     quantized: bool = False
     w4a8_experts: bool = False
+    # VERL connector knobs (verl_mlite always injects them).
+    use_thd: bool = True
+    cross_entropy_fusion: bool = False
+    mtp_enable: bool = False
+    mtp_enable_train: bool = False
+    mtp_detach_encoder: bool = False
+    mtp_loss_scaling_factor: float = 0.1
+    deterministic: bool = False
+    # Generic MLite QAT schema; DS4.1 fake-quant is part of the deployment forward.
+    qat: object = None
+
+    def __post_init__(self):
+        if self.deterministic:
+            object.__setattr__(self, "deterministic_mode", True)
+
+
+_CONNECTOR_REQUIRED = {
+    'use_thd': True,
+    'cross_entropy_fusion': False,
+    'mtp_enable': False,
+    'mtp_enable_train': False,
+}
 
 
 def validate_impl_cfg_keys(values):
     extra = set(values) - {f.name for f in fields(ImplConfig)}
     if extra:
         raise ValueError(f"Unsupported DS4.1 implementation options: {sorted(extra)}")
+    qat = values.get("qat") or {}
+    if qat.get("enabled") or qat.get("enable"):
+        raise ValueError("DS4.1 applies deployment fake-quant itself; MLite QAT must stay off")
+    for key, required in _CONNECTOR_REQUIRED.items():
+        if key in values and bool(values[key]) != required:
+            raise ValueError(f"DS4.1 requires {key}={required}, got {values[key]!r}")
 
 
 def build_model_config(source, **overrides):
@@ -125,7 +158,7 @@ def _optimizer(chunks, cfg, impl, ps):
     return optimizer, lambda: finalize_dist_opt_grads(chunks, optimizer)
 
 
-def build_model(model_cfg, *, impl_cfg):
+def build_model(model_cfg, *, impl_cfg, _model_class=None):
     _validate(model_cfg, impl_cfg)
     from megatron.lite.model.deepseek_v41.lite.model import DeepseekV41Model
 
@@ -149,15 +182,14 @@ def build_model(model_cfg, *, impl_cfg):
         path = Path(impl_cfg.hf_path) / "token_map.pt"
         if path.is_file():
             token_map = torch.load(path, map_location="cpu", weights_only=True)
+    constructor = DeepseekV41Model if _model_class is None else _model_class
     reader = None
     if impl_cfg.prefetch_weights and not impl_cfg.initialize_weights and impl_cfg.hf_path:
         from megatron.lite.primitive.ckpt.row_reader import RowSliceReader
 
         reader = RowSliceReader(impl_cfg.hf_path, device=impl_cfg.device)
     try:
-        chunks = [
-            DeepseekV41Model(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)
-        ]
+        chunks = [constructor(model_cfg, impl_cfg, ps, token_map=token_map, load_reader=reader)]
     except BaseException:
         if reader is not None:
             reader.close()
@@ -262,3 +294,19 @@ def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
     from megatron.lite.model.deepseek_v41.lite.export import save_hf_weights as save
 
     save(chunks, path, model_cfg, ps, **kwargs)
+
+
+def unpack_forward_output(model, batch, output):
+    """Reverse ``forward_step`` token outputs to jagged per-sequence form.
+
+    ``forward_step`` pads each sequence to ``pack_nested_thd``'s alignment and
+    gives each CP rank one contiguous slice of the packed row.
+    """
+    ps = parallel_state_from_model(model)
+    meta = thd_pack_meta(
+        batch.sizes(),
+        tp_size=ps.tp_size,
+        cp_size=ps.cp_size,
+        cp_group=ps.cp_group if ps.cp_size > 1 else None,
+    )
+    return unpack_thd_to_nested(output, meta, contiguous=True)

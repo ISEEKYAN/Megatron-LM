@@ -87,34 +87,9 @@ class DeepseekV41Model(MegatronModule):
             )
             self.embed.weight.is_embedding_or_output_parameter = True
         for index in indices:
-            attention = DS41SelfAttention(
-                config,
-                DSv4HybridSelfAttentionSubmodules(
-                    q_layernorm=ModelNorm,
-                    kv_layernorm=ModelNorm,
-                    linear_q_down_proj=TELinear,
-                    linear_q_up_proj=TEColumnParallelLinear,
-                    linear_kv_proj=TEColumnParallelLinear,
-                    core_attention=ModuleSpec(
-                        CoreAttentionSources, params={"context": self.context}
-                    ),
-                    linear_proj=TERowParallelLinear,
-                ),
-                index + 1,
-                attn_mask_type=AttnMaskType.causal,
-                pg_collection=self.context.groups,
-                compress_ratio=config.csa_compress_ratios[index],
-            )
-            mlp = get_mlp_module_spec(
-                use_te=True, num_experts=release.n_routed_experts, moe_grouped_gemm=True
-            )(
-                config=config,
-                layer_number=index + 1,
-                pg_collection=self.context.groups,
-                hash_moe_layer_threshold=release.num_hash_layers,
-            )
-            bind_sorted_selection(mlp.router)
-            self.layers[str(index)] = DS41Block(config, index + 1, attention, mlp)
+            attention = self._build_attention(config, index)
+            mlp = self._build_mlp(config, release, index)
+            self.layers[str(index)] = self._build_block(config, index, attention, mlp)
             if index in release.engram_layer_ids:
                 if token_map is None:
                     raise ValueError("DS4.1 Engram requires the release compressed token_map")
@@ -145,22 +120,63 @@ class DeepseekV41Model(MegatronModule):
                 ),
             )
         if self.layout.has_head:
-            self.norm = ModelNorm(config, release.hidden_size, release.rms_norm_eps)
-            self.head = ColumnParallelLinear(
-                release.hidden_size,
-                release.vocab_size,
-                config=config,
-                init_method=config.init_method,
-                bias=False,
-                gather_output=False,
-                tp_group=ps.tp_group,
-            )
-            self.head.weight.is_embedding_or_output_parameter = True
+            self.norm, self.head = self._build_head(config, release)
         for module in self.modules():
             if isinstance(module, MegatronModule) and getattr(module, "tp_group", None) is None:
                 groups = getattr(module, "pg_collection", None)
                 module.tp_group = getattr(groups, "tp", None) or ps.tp_group
         self.to(device=impl.device)
+        self.ds41_frozen_parameters = tuple(
+            name for name, parameter in self.named_parameters() if not parameter.requires_grad
+        )
+
+    def _build_attention(self, config, index):
+        attention = DS41SelfAttention(
+            config,
+            DSv4HybridSelfAttentionSubmodules(
+                q_layernorm=ModelNorm,
+                kv_layernorm=ModelNorm,
+                linear_q_down_proj=TELinear,
+                linear_q_up_proj=TEColumnParallelLinear,
+                linear_kv_proj=TEColumnParallelLinear,
+                core_attention=ModuleSpec(CoreAttentionSources, params={"context": self.context}),
+                linear_proj=TERowParallelLinear,
+            ),
+            index + 1,
+            attn_mask_type=AttnMaskType.causal,
+            pg_collection=self.context.groups,
+            compress_ratio=config.csa_compress_ratios[index],
+        )
+        return attention
+
+    def _build_mlp(self, config, release, index):
+        mlp = get_mlp_module_spec(
+            use_te=True, num_experts=release.n_routed_experts, moe_grouped_gemm=True
+        )(
+            config=config,
+            layer_number=index + 1,
+            pg_collection=self.context.groups,
+            hash_moe_layer_threshold=release.num_hash_layers,
+        )
+        bind_sorted_selection(mlp.router)
+        return mlp
+
+    def _build_block(self, config, index, attention, mlp):
+        return DS41Block(config, index + 1, attention, mlp)
+
+    def _build_head(self, config, release):
+        norm = ModelNorm(config, release.hidden_size, release.rms_norm_eps)
+        head = ColumnParallelLinear(
+            release.hidden_size,
+            release.vocab_size,
+            config=config,
+            init_method=config.init_method,
+            bias=False,
+            gather_output=False,
+            tp_group=self.ps.tp_group,
+        )
+        head.weight.is_embedding_or_output_parameter = True
+        return norm, head
 
     def set_input_tensor(self, value):
         self._input_tensor = value[0] if isinstance(value, (tuple, list)) else value
@@ -231,27 +247,32 @@ class DeepseekV41Model(MegatronModule):
                 hidden.dtype
             )
             collapsed = self.norm(collapsed)
-            logits = self.head(collapsed)[0]
-            if float(temperature) != 1:
-                logits = logits / float(temperature)
-            output = {"rows": torch.arange(rows, device=ids.device) + self.ps.cp_rank * rows}
-            if labels is None:
-                output["logits"] = logits.squeeze(1)
-                return output
-            token_loss = vocab_parallel_cross_entropy(
-                logits.float(), labels.reshape(rows, 1), tp_group=self.ps.tp_group
-            ).squeeze(1)
-            mask = (
-                torch.ones_like(token_loss)
-                if loss_mask is None
-                else loss_mask.reshape(-1).to(token_loss.dtype)
+            return self._head_output(
+                collapsed, rows, labels, loss_mask, temperature, calculate_entropy
             )
-            output.update(
-                log_probs=-token_loss,
-                loss=(token_loss * mask).sum() / mask.sum().clamp_min(1),
-                valid_mask=mask.bool(),
-            )
-            if calculate_entropy:
-                logp = logits.float().log_softmax(-1)
-                output["entropy"] = -(logp.exp() * logp).sum(-1).squeeze(1)
+
+    def _head_output(self, collapsed, rows, labels, loss_mask, temperature, calculate_entropy):
+        logits = self.head(collapsed)[0]
+        if float(temperature) != 1:
+            logits = logits / float(temperature)
+        output = {"rows": torch.arange(rows, device=collapsed.device) + self.ps.cp_rank * rows}
+        if labels is None:
+            output["logits"] = logits.squeeze(1)
             return output
+        token_loss = vocab_parallel_cross_entropy(
+            logits.float(), labels.reshape(rows, 1), tp_group=self.ps.tp_group
+        ).squeeze(1)
+        mask = (
+            torch.ones_like(token_loss)
+            if loss_mask is None
+            else loss_mask.reshape(-1).to(token_loss.dtype)
+        )
+        output.update(
+            log_probs=-token_loss,
+            loss=(token_loss * mask).sum() / mask.sum().clamp_min(1),
+            valid_mask=mask.bool(),
+        )
+        if calculate_entropy:
+            logp = logits.float().log_softmax(-1)
+            output["entropy"] = -(logp.exp() * logp).sum(-1).squeeze(1)
+        return output
