@@ -34,11 +34,17 @@ class DeepseekV41Config(DeepseekV4Config):
     engram_head_dim: int = 256
     engram_pad_token_id: int = 2
     engram_compressed_vocab_size: int = 99092
+    # A vision release routes the image ids with ffn.gate.bias_vl (vLLM: vision_n_layers > 0),
+    # whether or not the vision tower is instantiated.
+    vision_routing: bool = False
 
     @classmethod
     def _from_hf_dict(cls, hf, **overrides):
         text = hf.get("text_config", hf)
         config = super()._from_hf_dict(text, **overrides)
+        if "vision_routing" not in overrides:
+            vision = hf.get("vision_config") or {}
+            config.vision_routing = int(vision.get("num_hidden_layers") or 0) > 0
         if not config.compress_ratios:
             config.compress_ratios = list(DEFAULT_RATIOS)
         for item in fields(cls):
