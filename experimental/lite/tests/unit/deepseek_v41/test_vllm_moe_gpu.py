@@ -175,3 +175,53 @@ def test_core_owned_nonfused_moe_matches_native_fused(tmp_path):
     finally:
         buffer.destroy()
         dist.destroy_process_group()
+
+
+@pytest.mark.parametrize("batch_invariant", ["1", "0"])
+def test_route_matches_vllm_for_image_ids(monkeypatch, batch_invariant):
+    """Training routing == vLLM fused_topk_bias bitwise, image ids [129264, 129269) included.
+
+    vLLM DS4.1 routes those ids with ffn.gate.bias_vl (sampled ids too); routing them with the
+    text bias made every later rollout logprob differ (bug swe-bi1-late-divergence).
+    """
+    from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
+        fused_topk_bias,
+    )
+
+    from megatron.lite.model.deepseek_v41.vllm.routing import IMAGE_SENTINEL_LO, route
+
+    monkeypatch.setenv("VLLM_BATCH_INVARIANT", batch_invariant)
+    torch.manual_seed(7)
+    e, k, factor = 16, 6, 2.5
+    tokens = torch.tensor([129263, 129264, 129266, 129267, 129268, 129269, 129259, 5], device="cuda")
+    logits = torch.randn(tokens.numel(), e, device="cuda")
+    router = SimpleNamespace(
+        is_hash_layer=False,
+        tid2eid=None,
+        topk=k,
+        expert_bias=torch.randn(e, device="cuda"),
+        # Far from the text bias: image rows must land on experts 0..k-1.
+        bias_vl=-100 * torch.arange(e, device="cuda", dtype=torch.float32),
+        config=SimpleNamespace(moe_router_topk_scaling_factor=factor),
+    )
+    weights, ids = route(logits, router, tokens)
+    ref_w, ref_ids = fused_topk_bias(
+        hidden_states=logits,
+        gating_output=logits,
+        scoring_func="sqrtsoftplus",
+        e_score_correction_bias=router.expert_bias,
+        topk=k,
+        renormalize=True,
+        indices_type=torch.int32,
+        input_tokens=tokens,
+        routed_scaling_factor=factor,
+        bias_vl=router.bias_vl,
+        image_sentinel_lo=IMAGE_SENTINEL_LO,
+    )
+    assert torch.equal(ids, ref_ids)
+    assert torch.equal(weights.view(torch.int32), ref_w.view(torch.int32))
+    image = (tokens >= 129264) & (tokens < 129269)
+    assert torch.equal(ids[image].sort(-1).values.cpu(), torch.arange(k, dtype=ids.dtype).expand(4, k))
+    text_w, text_ids = route(logits, SimpleNamespace(**{**vars(router), "bias_vl": None}), tokens)
+    assert torch.equal(text_ids[~image], ids[~image])
+    assert not torch.equal(text_ids[image], ids[image])
