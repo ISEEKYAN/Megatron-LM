@@ -3,10 +3,13 @@
 
 from __future__ import annotations
 
+import math
+import weakref
 from dataclasses import dataclass, fields
 from types import SimpleNamespace
 from typing import Any
 
+import numpy as np
 import torch  # pyright: ignore[reportMissingImports]
 import torch.nn as nn  # pyright: ignore[reportMissingImports]
 
@@ -104,7 +107,31 @@ def build_dist_opt_optimizer_config(
         args["decoupled_weight_decay"] = opt.decoupled_weight_decay
     if override_optimizer_config:
         args.update(override_optimizer_config)
+    if args.get("chunked_optimizer_state_offload"):
+        from megatron.core.optimizer.cpu_offloading.chunked_optimizer_state_offload import (
+            ChunkedOptimizerStateOffloader,
+        )
+
+        ChunkedOptimizerStateOffloader._new_cpu_buffer = staticmethod(_exact_pinned_like)
     return CoreOptimizerConfig(**args)
+
+
+def _exact_pinned_like(tensor: torch.Tensor) -> torch.Tensor:
+    """Host copy target pinned at its exact size.
+
+    ``pin_memory=True`` goes through the caching host allocator, which rounds every block up to a
+    power of two (41% extra for DS4.1 optimizer state); registering a numpy-owned allocation pins
+    only the requested bytes until the storage dies.
+    """
+    nbytes = math.prod(tensor.shape) * tensor.dtype.itemsize
+    owner = np.empty(max(nbytes, 1), dtype=np.uint8)
+    cudart = torch.cuda.cudart()
+    if nbytes and int(cudart.cudaHostRegister(owner.ctypes.data, nbytes, 0)) != 0:
+        cudart.cudaGetLastError()
+        return torch.empty(tensor.shape, dtype=tensor.dtype, device="cpu", pin_memory=True)
+    if nbytes:
+        weakref.finalize(owner, cudart.cudaHostUnregister, owner.ctypes.data)
+    return torch.from_numpy(owner)[:nbytes].view(tensor.dtype).view(tensor.shape)
 
 
 def _enable_wgrad_accumulation_fusion(chunks: list[nn.Module]) -> int:
