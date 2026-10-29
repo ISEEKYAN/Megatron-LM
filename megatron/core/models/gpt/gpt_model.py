@@ -624,6 +624,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         padding_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        compute_mtp_loss: bool = True,
+        mtp_loss_normalization_factor: float = 1.0,
     ) -> Any:
         """Forward function of the GPT Model This function passes the input tensors
         through the embedding layer, and then the decoder and finally into the post
@@ -713,6 +715,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             inference_context=inference_context,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            compute_mtp_loss=compute_mtp_loss,
+            mtp_loss_normalization_factor=mtp_loss_normalization_factor,
         )
 
     def _postprocess(
@@ -738,6 +742,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         inference_context=None,
         output_processor=None,
         output_processor_context=None,
+        compute_mtp_loss=True,
+        mtp_loss_normalization_factor=1.0,
     ):
         """Postprocesses decoder hidden states to generate logits or compute loss.
 
@@ -762,7 +768,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         output_weight = None
         if self.share_embeddings_and_output_weights:
             output_weight = self.shared_embedding_or_output_weight()
-        if mtp_in_postprocess and not (in_inference_mode or is_spec_decode):
+        if mtp_in_postprocess and compute_mtp_loss and not (in_inference_mode or is_spec_decode):
             hidden_states = self.mtp(
                 input_ids=input_ids,
                 position_ids=position_ids,
@@ -796,7 +802,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     )
                 else:
                     inference_context.mtp_decoder_hidden_states = hidden_states
-            elif not in_inference_mode:
+            elif not in_inference_mode and compute_mtp_loss:
                 # In training/eval, use the utility function for processing MTP loss/scaling.
                 hidden_states = process_mtp_loss(
                     hidden_states=hidden_states,
@@ -811,6 +817,7 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
                     tp_group=self.tp_group,
                     packed_seq_params=packed_seq_params,
                     scale_logits_fn=self._scale_logits if self.config.use_mup else None,
+                    loss_normalization_factor=mtp_loss_normalization_factor,
                     input_ids=input_ids,
                     mtp_input_mask=mtp_input_mask,
                     metric_avg_group=(
@@ -931,6 +938,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
         mtp_input_mask: Optional[Tensor] = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
+        compute_mtp_loss: bool = True,
+        mtp_loss_normalization_factor: float = 1.0,
     ):
         """Builds a computation schedule plan for the model.
 
@@ -989,6 +998,8 @@ class GPTModel(LanguageModule, GraphableMegatronModule):
             mtp_input_mask=mtp_input_mask,
             output_processor=output_processor,
             output_processor_context=output_processor_context,
+            compute_mtp_loss=compute_mtp_loss,
+            mtp_loss_normalization_factor=mtp_loss_normalization_factor,
         )
 
     def sharded_state_dict(

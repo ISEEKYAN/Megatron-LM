@@ -556,6 +556,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
         packed_seq_params: Optional[PackedSeqParams] = None,
         padding_mask: Optional[Tensor] = None,
         compute_mtp_loss: bool = True,
+        mtp_loss_normalization_factor: float = 1.0,
         cp_batch: ContextParallelBatch | None = None,
         output_processor: Optional[Callable[..., Any]] = None,
         output_processor_context: Optional[Any] = None,
@@ -572,6 +573,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                 loaded. This does not control speculative decoding. On post-process stages,
                 ``labels`` still determine whether the model returns loss or logits.
                 Defaults to True.
+            mtp_loss_normalization_factor: Per-microbatch auxiliary-loss correction.
             cp_batch: Input tensors and packed metadata keyed by CP layout.
             output_processor (Callable, optional): Caller-provided post-decoder hook. When set,
                 it receives the decoder output and output-layer/loss helpers, and its return
@@ -849,6 +851,7 @@ class HybridModel(LanguageModule, GraphableMegatronModule):
                         or self.pg_collection.dp_cp
                     ),
                     main_hidden_states=hidden_states,
+                    loss_normalization_factor=mtp_loss_normalization_factor,
                 )
         # Give callers a post-decoder hook before the default output projection and loss path.
         if output_processor is not None:
