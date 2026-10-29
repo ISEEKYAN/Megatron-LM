@@ -29,7 +29,7 @@ def test_masked_router_replay_is_bit_exact(device):
     try:
         for _ in range(8):
             replay = RouterReplay()
-            scores = source.to(device).requires_grad_()
+            scores = source.to(device).clone().requires_grad_()
             replay.set_target_indices(
                 torch.tensor([[0, 2], [0, 3], [2, 3]], device=device),
                 torch.tensor([True, False, True], device=device),
