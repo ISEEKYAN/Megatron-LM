@@ -8,6 +8,7 @@ and reads the image back through a few pinned bounce buffers. The adapter publis
 the wake rewrites the LoRA slots, as it does after a native reload.
 """
 import ctypes
+import gc
 import json
 import os
 import socket
@@ -72,6 +73,9 @@ def _cuda():
 def dump(worker, directory, chunk_bytes):
     """Write this rank's weights pool to ``directory``; returns a receipt."""
     started = time.monotonic()
+    # Native sleep empties the allocator cache; snapshot the same set of segments it keeps.
+    gc.collect()
+    torch.cuda.empty_cache()
     pool = _pool()
     sums = _sums(pool)
     image, manifest = _paths(worker, directory)

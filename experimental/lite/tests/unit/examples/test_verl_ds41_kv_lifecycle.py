@@ -298,3 +298,25 @@ def test_image_requires_explicit_settings_before_discard(server):
     with pytest.raises(KeyError):
         asyncio.run(server._sleep_hybrid())
     assert server.events == []
+
+
+def test_image_verify_flag_must_be_boolean(server):
+    image_server(server)
+    server.config.custom['ds41_weights_image_verify'] = 'false'
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(TypeError, match='boolean'):
+        asyncio.run(server._sleep_hybrid())
+    assert server.events == []
+
+
+def test_image_restore_rejects_changed_pool(tmp_path, monkeypatch):
+    from verl_mlite.rollout import weights_image
+
+    worker = SimpleNamespace(
+        vllm_config=SimpleNamespace(parallel_config=SimpleNamespace(data_parallel_rank=0))
+    )
+    _, manifest = weights_image._paths(worker, str(tmp_path))
+    Path(manifest).write_text('{"pool": [[4096, 8192], [16384, 4096]], "sums": [0, 0]}')
+    monkeypatch.setattr(weights_image, '_pool', lambda: [(4096, 8192)])
+    with pytest.raises(RuntimeError, match='layout changed'):
+        weights_image.restore(worker, str(tmp_path), 4096, 1, True)

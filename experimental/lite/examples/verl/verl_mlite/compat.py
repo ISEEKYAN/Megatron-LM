@@ -1563,11 +1563,14 @@ def _patch_vllm_rollout_sleep_level() -> bool:
     def image_args(self):
         # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum.
         custom = self.config.custom
+        verify = custom["ds41_weights_image_verify"]
+        if not isinstance(verify, bool):
+            raise TypeError("ds41_weights_image_verify must be a boolean")
         return (
             custom["ds41_weights_image_dir"],
             int(custom["ds41_weights_image_chunk_mib"]) << 20,
             int(custom["ds41_weights_image_readers"]),
-            bool(custom["ds41_weights_image_verify"]),
+            verify,
         )
 
     async def all_workers(self, method, *args):
