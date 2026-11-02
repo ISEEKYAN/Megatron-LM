@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU lifecycle controls; GPU residency and numerical parity require RL gates."""
 import asyncio
+import json
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -240,7 +241,7 @@ def image_server(server):
     return server
 
 
-def test_image_dumps_once_and_restores_before_kv_and_publish(server):
+def test_image_dumps_once_and_restores_before_kv_and_publish(server, capsys):
     image_server(server)
     compat._patch_vllm_rollout_sleep_level()
 
@@ -265,6 +266,10 @@ def test_image_dumps_once_and_restores_before_kv_and_publish(server):
     assert server.events == [dump] + cycle + cycle
     receipt = server._verl_mlite_image_receipt
     assert receipt['engines'] == 4 and receipt['adapter_reinstall_required']
+    lines = [
+        l for l in capsys.readouterr().out.splitlines() if l.startswith('MLITE_WEIGHTS_IMAGE ')
+    ]
+    assert len(lines) == 2 and json.loads(lines[-1].split(' ', 1)[1]) == receipt
     assert not server._verl_mlite_image_pending
 
 

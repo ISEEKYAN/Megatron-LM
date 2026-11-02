@@ -1645,6 +1645,9 @@ def _patch_vllm_rollout_sleep_level() -> bool:
                 "dump": self._verl_mlite_image_dump,
                 "adapter_reinstall_required": True,
             }
+            import json
+
+            print("MLITE_WEIGHTS_IMAGE " + json.dumps(self._verl_mlite_image_receipt), flush=True)
             self._verl_mlite_image_pending = False
             return result
         pending = getattr(self, "_verl_mlite_reload_pending", False)
