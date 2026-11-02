@@ -663,8 +663,14 @@ class MegatronLiteEngine(BaseEngine):
         self._require_initialized()
 
         placement_fn, expert_classifier = self._checkpoint_hooks()
-        reload_params_for_load = self.is_param_offload_enabled
-        if reload_params_for_load:
+        # An exclusive-rollout actor is parked on the host right after init (model, optimizer
+        # and grads); loading into its released device storage segfaulted in the H2D copy.
+        parked = getattr(self, "_exclusive_actor_offloaded", False)
+        reload_params_for_load = self.is_param_offload_enabled and not parked
+        if parked:
+            self.to(device="cuda", model=True, optimizer=True, grad=True)
+            torch.cuda.synchronize()
+        elif reload_params_for_load:
             self.to(device="cuda", model=True, optimizer=False, grad=False)
             torch.cuda.synchronize()
         try:
@@ -686,7 +692,10 @@ class MegatronLiteEngine(BaseEngine):
             if dist.is_initialized():
                 dist.barrier()
         finally:
-            if reload_params_for_load:
+            if parked:
+                self.to(device="cpu", model=True, optimizer=True, grad=True)
+                torch.cuda.synchronize()
+            elif reload_params_for_load:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
 
     def is_mp_src_rank_with_outputs(self):
