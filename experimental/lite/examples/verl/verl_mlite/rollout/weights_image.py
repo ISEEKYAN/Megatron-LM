@@ -2,7 +2,8 @@
 """Byte image of the vLLM ``weights`` pool on node-local storage, for adapter-mode level-2 sleep.
 
 With LoRA served as an adapter the rollout base never changes, so a level-2 wake does not need
-the checkpoint loader: it can copy the same pool bytes back. The first sleep writes one image per
+the checkpoint loader: it can copy the same pool bytes back, minus the ranges vLLM restores itself
+(preserved parameters such as the drafter, and buffers). The first sleep writes one image per
 rank with O_DIRECT (no page cache, nothing kept in host memory); every later wake maps the pool
 and reads the image back through a few pinned bounce buffers. The adapter publish that follows
 the wake rewrites the LoRA slots, as it does after a native reload.
@@ -14,6 +15,7 @@ import os
 import socket
 import time
 from concurrent.futures import ThreadPoolExecutor
+from fnmatch import filter as matching
 
 import torch
 
@@ -53,6 +55,49 @@ def _sums(pool):
     return [checksum(torch.as_tensor(_Raw(ptr, size), device="cuda")) for ptr, size in pool]
 
 
+def _native_ranges(worker):
+    """Device byte ranges that vLLM's own level-2 wake restores (preserved params, buffers)."""
+    model = worker.model_runner.model
+    draft = worker.get_draft_model()
+    parameters = worker._get_sleep_parameters(model)
+    names = set()
+    for pattern in worker.model_config.sleep_preserve_parameter_names or ():
+        names.update(matching(parameters, pattern))
+    tensors = [parameters[name] for name in names] + list(model.buffers())
+    if draft is not None:
+        tensors += list(draft.buffers())
+    ranges = []
+    for t in tensors:
+        if t.is_cuda and t.untyped_storage().nbytes():
+            lo = t.untyped_storage().data_ptr()
+            ranges.append((lo, lo + t.untyped_storage().nbytes()))
+    return sorted(ranges)
+
+
+def _segments(pool, skip):
+    """[(ptr, size)] of the pool minus page-aligned interiors of ``skip`` ranges."""
+    inner = sorted(
+        (-(-lo // _ALIGN) * _ALIGN, hi // _ALIGN * _ALIGN)
+        for lo, hi in skip
+        if hi // _ALIGN * _ALIGN > -(-lo // _ALIGN) * _ALIGN
+    )
+    out, i = [], 0
+    for base, size in pool:
+        cur, end = base, base + size
+        while i < len(inner) and inner[i][1] <= cur:
+            i += 1
+        j = i
+        while j < len(inner) and inner[j][0] < end:
+            lo, hi = inner[j]
+            if lo > cur:
+                out.append((cur, lo - cur))
+            cur = max(cur, hi)
+            j += 1
+        if cur < end:
+            out.append((cur, end - cur))
+    return out
+
+
 def _paths(worker, directory):
     rank = worker.vllm_config.parallel_config.data_parallel_rank
     stem = os.path.join(directory, f"{socket.gethostname()}_dp{rank}")
@@ -78,13 +123,14 @@ def dump(worker, directory, chunk_bytes):
     torch.cuda.empty_cache()
     pool = _pool()
     sums = _sums(pool)
+    segments = _segments(pool, _native_ranges(worker))
     image, manifest = _paths(worker, directory)
     os.makedirs(directory, exist_ok=True)
     cu, (buf,) = _cuda(), _bounce(1, chunk_bytes)
     view = memoryview(buf.numpy())
     fd = os.open(image, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600)
     try:
-        for ptr, size in pool:
+        for ptr, size in segments:
             for off in range(0, size, chunk_bytes):
                 n = min(chunk_bytes, size - off)
                 rc = cu.cuMemcpyDtoH_v2(
@@ -97,10 +143,15 @@ def dump(worker, directory, chunk_bytes):
         os.fsync(fd)
     finally:
         os.close(fd)
-    total = sum(size for _, size in pool)
+    total = sum(size for _, size in segments)
     with open(manifest, "w") as f:
-        json.dump({"pool": pool, "sums": sums}, f)
-    return {"image": image, "bytes": total, "seconds": time.monotonic() - started}
+        json.dump({"pool": pool, "segments": segments, "sums": sums}, f)
+    return {
+        "image": image,
+        "bytes": total,
+        "native_bytes": sum(size for _, size in pool) - total,
+        "seconds": time.monotonic() - started,
+    }
 
 
 def restore(worker, directory, chunk_bytes, readers, verify):
@@ -113,7 +164,7 @@ def restore(worker, directory, chunk_bytes, readers, verify):
     if [list(p) for p in pool] != expected["pool"]:
         raise RuntimeError("weights pool layout changed since the image was written")
     jobs, offset = [], 0
-    for ptr, size in pool:
+    for ptr, size in expected["segments"]:
         for off in range(0, size, chunk_bytes):
             n = min(chunk_bytes, size - off)
             jobs.append((offset, ptr + off, n))

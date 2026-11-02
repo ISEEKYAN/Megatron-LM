@@ -325,3 +325,23 @@ def test_image_restore_rejects_changed_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(weights_image, '_pool', lambda: [(4096, 8192)])
     with pytest.raises(RuntimeError, match='layout changed'):
         weights_image.restore(worker, str(tmp_path), 4096, 1, True)
+
+
+def test_image_segments_skip_page_aligned_native_ranges():
+    from verl_mlite.rollout.weights_image import _segments
+
+    page = 4096
+    pool = [(0, 8 * page), (16 * page, 4 * page)]
+    skip = [
+        (page + 100, 3 * page),  # unaligned start: only the interior page [2p, 3p) is skipped
+        (5 * page, 7 * page),
+        (18 * page, 30 * page),  # runs past the allocation end
+        (10, 20),  # smaller than a page: kept
+    ]
+    assert _segments(pool, skip) == [
+        (0, 2 * page),
+        (3 * page, 2 * page),
+        (7 * page, page),
+        (16 * page, 2 * page),
+    ]
+    assert _segments(pool, []) == pool
