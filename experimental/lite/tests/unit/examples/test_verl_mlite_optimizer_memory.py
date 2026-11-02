@@ -23,8 +23,49 @@ def memory_module():
 
 
 @pytest.fixture
-def engine_module():
-    return pytest.importorskip("verl_mlite.engine.mlite_engine")
+def engine_module(memory_module):
+    """Execute unchanged engine hot-path methods without importing serving extras.
+
+    This is a method contract, not a full VERL/container integration test.
+    """
+    import ast
+
+    from megatron.lite.runtime.contracts.config import RuntimeConfig
+
+    source = VERL_ROOT / "verl_mlite" / "engine" / "mlite_engine.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MegatronLiteEngine"
+    )
+    keep = {
+        "initialize",
+        "optimizer_step",
+        "_require_initialized",
+        "is_param_offload_enabled",
+        "is_optimizer_offload_enabled",
+        "_release_grads",
+    }
+    cls.body = [n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name in keep]
+    cls.bases = []
+    cls.decorator_list = []
+    namespace = dict(
+        torch=torch,
+        RuntimeConfig=RuntimeConfig,
+        create_runtime=None,
+        _release_inactive_cuda_cache=memory_module.release_inactive_cuda_cache,
+        _prewarm_grad_stats_groups=memory_module.prewarm_grad_stats_groups,
+    )
+    exec(compile(ast.Module(body=[cls], type_ignores=[]), str(source), "exec"), namespace)
+
+    # Patch the executed methods' actual globals rather than a copied namespace.
+    class Globals:
+        def __getattr__(self, name):
+            return namespace[name]
+
+        def __setattr__(self, name, value):
+            namespace[name] = value
+
+    return Globals()
 
 
 def test_real_gloo_prewarm_deduplicates_groups_and_preserves_training_state(
@@ -87,7 +128,7 @@ def test_prewarm_rejects_corrupted_scratch_and_propagates_collective_error(
         memory_module.prewarm_grad_stats_groups(owner, "cpu")
 
 
-def test_initialize_warms_before_offload_and_optimizer_releases_before_step(
+def test_initialize_warms_before_offload_and_optimizer_keeps_allocator_cache(
     engine_module, monkeypatch
 ):
     engine = object.__new__(engine_module.MegatronLiteEngine)
@@ -123,7 +164,7 @@ def test_initialize_warms_before_offload_and_optimizer_releases_before_step(
     ]
     calls.clear()
     assert engine.optimizer_step() == 3.25
-    assert calls == ["release", ("step", handle)]
+    assert calls == [("step", handle)]
     assert engine.module is model and engine.handle is handle and handle._optimizer is optimizer
 
 
@@ -135,42 +176,17 @@ def test_release_only_synchronizes_and_returns_unused_allocator_blocks(memory_mo
     assert calls == ["synchronize", "empty_cache"]
 
 
-@pytest.mark.parametrize(
-    "forward_only,pp,impl,device,enabled",
-    [
-        (False, 1, "vllm", "cuda", True),
-        (True, 1, "vllm", "cuda", False),
-        (False, 2, "vllm", "cuda", False),
-        (False, 1, "lite", "cuda", False),
-        (False, 1, "vllm", "cpu", False),
-    ],
-)
+@pytest.mark.parametrize("forward_only", [False, True])
 @pytest.mark.parametrize("external_loss", [False, True])
 @pytest.mark.parametrize("existing_hook", [False, True])
-def test_real_runtime_releases_after_each_backward_including_tail_without_extra_sync(
-    engine_module,
-    memory_module,
-    monkeypatch,
-    forward_only,
-    pp,
-    impl,
-    device,
-    enabled,
-    external_loss,
-    existing_hook,
+def test_real_runtime_does_not_release_allocator_blocks_between_microbatches(
+    monkeypatch, forward_only, external_loss, existing_hook
 ):
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
-    engine = object.__new__(engine_module.MegatronLiteEngine)
-    engine.engine_config = SimpleNamespace(pp=pp, impl=impl)
-    engine.device_name = device
-    engine._resolve_model_name = lambda: "deepseek_v41"
     calls = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("sync"))
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
-    monkeypatch.setattr(
-        engine_module, "_release_inactive_cuda_cache", memory_module.release_inactive_cuda_cache
-    )
     parameter = torch.nn.Parameter(torch.tensor([1.25, -0.0]))
     parameter.register_hook(lambda grad: calls.append("backward"))
 
@@ -188,25 +204,21 @@ def test_real_runtime_releases_after_each_backward_including_tail_without_extra_
         _optimizer=None,
         _parallel_state=SimpleNamespace(pp_size=1),
     )
-    engine.handle = handle
     runtime = object.__new__(MegatronLiteRuntime)
     batches = [torch.tensor(0.5), torch.tensor(1.0), torch.tensor(2.0)]
     loss_fn = (lambda out, batch: (out["loss"], {})) if external_loss else None
     rng = torch.get_rng_state()
-    with engine._runtime_cache_boundaries(forward_only=forward_only):
-        actual = runtime.forward_backward(
-            handle, iter(batches), loss_fn, num_microbatches=3, forward_only=forward_only
-        )
-    expected = ["sync", "empty_cache"] if enabled else []
+    actual = runtime.forward_backward(
+        handle, iter(batches), loss_fn, num_microbatches=3, forward_only=forward_only
+    )
+    expected = []
     for _ in batches:
         expected.append("forward")
         if not forward_only:
             expected.append("backward")
-            if enabled:
-                expected.append("empty_cache")
             if existing_hook:
                 expected.append("previous")
-    assert calls == expected  # tail release precedes runtime return, no next(iterator).
+    assert calls == expected  # No cache release on successful or tail micro-batches.
     assert extras.get("post_backward_hook") is (previous if existing_hook else None)
     assert ("post_backward_hook" in extras) == existing_hook
     assert torch.equal(rng, torch.get_rng_state())
@@ -228,32 +240,25 @@ def test_real_runtime_releases_after_each_backward_including_tail_without_extra_
 
 
 @pytest.mark.parametrize("existing_hook", [False, True])
-def test_backward_error_restores_prior_hook_without_releasing_failed_microbatch(
-    engine_module, monkeypatch, existing_hook
+def test_backward_error_keeps_prior_hook_without_releasing_allocator_blocks(
+    monkeypatch, existing_hook
 ):
     from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
 
-    engine = object.__new__(engine_module.MegatronLiteEngine)
-    engine.engine_config = SimpleNamespace(pp=1, impl="vllm")
-    engine.device_name = "cuda"
-    engine._resolve_model_name = lambda: "deepseek_v41"
     calls = []
-    monkeypatch.setattr(
-        engine_module, "_release_inactive_cuda_cache", lambda **kw: calls.append(kw)
-    )
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     previous = lambda: None
     extras = {"forward_step": lambda m, b: {"loss": torch.tensor(1.0)}}
     if existing_hook:
         extras["post_backward_hook"] = previous
-    engine.handle = SimpleNamespace(
+    handle = SimpleNamespace(
         _extras=extras, _model=None, _optimizer=None, _parallel_state=SimpleNamespace(pp_size=1)
     )
     with pytest.raises(RuntimeError, match="does not require grad"):
-        with engine._runtime_cache_boundaries(forward_only=False):
-            object.__new__(MegatronLiteRuntime).forward_backward(
-                engine.handle, iter([None]), None, num_microbatches=1
-            )
-    assert calls == [{}]  # admission only; failed backward is not a successful boundary.
+        object.__new__(MegatronLiteRuntime).forward_backward(
+            handle, iter([None]), None, num_microbatches=1
+        )
+    assert calls == []
     assert extras.get("post_backward_hook") is (previous if existing_hook else None)
     assert ("post_backward_hook" in extras) == existing_hook
 
@@ -264,3 +269,55 @@ def test_post_backward_empty_cache_does_not_add_explicit_synchronize(memory_modu
     monkeypatch.setattr(torch.cuda, "empty_cache", lambda: calls.append("empty_cache"))
     memory_module.release_inactive_cuda_cache(synchronize=False)
     assert calls == ["empty_cache"]
+
+
+def test_engine_hot_paths_do_not_inject_cache_release():
+    import ast
+
+    source = VERL_ROOT / "verl_mlite" / "engine" / "mlite_engine.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MegatronLiteEngine"
+    )
+    methods = {
+        n.name: n for n in cls.body if isinstance(n, (ast.FunctionDef, ast.AsyncFunctionDef))
+    }
+    for name in ("optimizer_step", "_forward_backward_batch_with_runtime"):
+        calls = [n.func for n in ast.walk(methods[name]) if isinstance(n, ast.Call)]
+        assert not any(
+            isinstance(fn, ast.Name) and fn.id == "_release_inactive_cuda_cache" for fn in calls
+        )
+        assert not any(
+            isinstance(fn, ast.Attribute)
+            and fn.attr in {"empty_cache", "_runtime_cache_boundaries"}
+            for fn in calls
+        )
+    assert "_runtime_cache_boundaries" not in methods
+
+
+def test_production_optimizer_step_has_no_allocator_side_effect(monkeypatch):
+    """Execute the exact production method without optional serving dependencies."""
+    import ast
+
+    source = VERL_ROOT / "verl_mlite" / "engine" / "mlite_engine.py"
+    tree = ast.parse(source.read_text())
+    cls = next(
+        n for n in tree.body if isinstance(n, ast.ClassDef) and n.name == "MegatronLiteEngine"
+    )
+    method = next(
+        n for n in cls.body if isinstance(n, ast.FunctionDef) and n.name == "optimizer_step"
+    )
+    namespace = {}
+    exec(compile(ast.Module(body=[method], type_ignores=[]), str(source), "exec"), namespace)
+    calls = []
+    monkeypatch.setattr(torch.cuda, "empty_cache", lambda: pytest.fail("hot-path cache release"))
+    monkeypatch.setattr(torch.cuda, "synchronize", lambda: pytest.fail("hot-path synchronize"))
+    handle = object()
+    engine = SimpleNamespace(
+        _require_initialized=lambda: calls.append("initialized"),
+        runtime=SimpleNamespace(optimizer_step=lambda h: calls.append(h) or (True, 2.5, 0)),
+        handle=handle,
+        device_name="cuda",
+    )
+    assert namespace["optimizer_step"](engine) == 2.5
+    assert calls == ["initialized", handle]
