@@ -217,3 +217,84 @@ def test_l2_kv_only_wake_first_also_restores_weights(server):
     asyncio.run(server.wake_up(['kv_cache']))
     assert server.events[2] == ('wake', ['weights', 'kv_cache'])
     assert server._get_wake_up_tags() == ['weights', 'kv_cache']
+
+
+def image_server(server):
+    server.config = SimpleNamespace(
+        custom={
+            'ds41_lora_sleep_mode': 'weights_image',
+            'ds41_weights_image_dir': '/raid/scratch/job',
+            'ds41_weights_image_chunk_mib': 64,
+            'ds41_weights_image_readers': 8,
+            'ds41_weights_image_verify': True,
+        },
+        data_parallel_size=4,
+        tensor_model_parallel_size=1,
+    )
+
+    async def utility(*args):
+        server.events.append(('rpc', args[1], args[3]))
+        return [[{'rank': rank}] for rank in range(4)]
+
+    server.engine.engine_core = SimpleNamespace(call_utility_all_async=utility)
+    return server
+
+
+def test_image_dumps_once_and_restores_before_kv_and_publish(server):
+    image_server(server)
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def step():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(step())
+    asyncio.run(step())
+    dump = ('rpc', 'mlite_weights_image_dump', ('/raid/scratch/job', 64 << 20))
+    restore = ('rpc', 'mlite_weights_image_restore', ('/raid/scratch/job', 64 << 20, 8, True))
+    cycle = [
+        ('sleep', 2),
+        ('reset',),
+        ('wake', ['weights']),
+        restore,
+        ('publish_current_adapter_all_ack',),
+        ('wake', ['kv_cache']),
+    ]
+    assert server.events == [dump] + cycle + cycle
+    receipt = server._verl_mlite_image_receipt
+    assert receipt['engines'] == 4 and receipt['adapter_reinstall_required']
+    assert not server._verl_mlite_image_pending
+
+
+def test_image_kv_first_wake_restores_weights_first(server):
+    image_server(server)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    asyncio.run(server.wake_up(['kv_cache']))
+    assert [e[0:2] for e in server.events[-3:]] == [
+        ('wake', ['weights']),
+        ('rpc', 'mlite_weights_image_restore'),
+        ('wake', ['kv_cache']),
+    ]
+
+
+@pytest.mark.parametrize('replies', [[], [[None]] * 3, [None] * 4, [[None, None]] * 4])
+def test_image_missing_engine_fails_closed_and_remains_pending(server, replies):
+    image_server(server)
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    server.engine.engine_core.call_utility_all_async = AsyncMock(return_value=replies)
+    with pytest.raises(RuntimeError, match='engine census'):
+        asyncio.run(server.wake_up())
+    assert server._verl_mlite_image_pending
+
+
+def test_image_requires_explicit_settings_before_discard(server):
+    image_server(server)
+    del server.config.custom['ds41_weights_image_dir']
+    compat._patch_vllm_rollout_sleep_level()
+    with pytest.raises(KeyError):
+        asyncio.run(server._sleep_hybrid())
+    assert server.events == []

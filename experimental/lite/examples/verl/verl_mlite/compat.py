@@ -1554,9 +1554,34 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             return None
         custom = getattr(getattr(self, "config", None), "custom", None) or {}
         mode = custom.get("ds41_lora_sleep_mode", "kv_only")
-        if mode not in ("kv_only", "weights_cpu", "weights_reload"):
-            raise ValueError("DS4.1 LoRA sleep mode must be kv_only, weights_cpu or weights_reload")
+        if mode not in ("kv_only", "weights_cpu", "weights_reload", "weights_image"):
+            raise ValueError(
+                "DS4.1 LoRA sleep mode must be kv_only, weights_cpu, weights_reload or weights_image"
+            )
         return mode
+
+    def image_args(self):
+        # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum.
+        custom = self.config.custom
+        return (
+            custom["ds41_weights_image_dir"],
+            int(custom["ds41_weights_image_chunk_mib"]) << 20,
+            int(custom["ds41_weights_image_readers"]),
+            bool(custom["ds41_weights_image_verify"]),
+        )
+
+    async def all_workers(self, method, *args):
+        if not callable(getattr(self.engine.engine_core, "call_utility_all_async", None)):
+            raise RuntimeError("DS4.1 weights image requires all-DP native utilities")
+        replies = await self.engine.engine_core.call_utility_all_async(
+            "collective_rpc", method, None, args, {}
+        )
+        if len(replies) != self.config.data_parallel_size or any(
+            not isinstance(reply, list) or len(reply) != self.config.tensor_model_parallel_size
+            for reply in replies
+        ):
+            raise RuntimeError(f"DS4.1 {method} engine census differs: {replies!r}")
+        return [receipt for reply in replies for receipt in reply]
 
     async def _sleep_hybrid(self):
         mode = adapter_mode(self)
@@ -1570,6 +1595,17 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             await self.engine.reset_encoder_cache()
         elif mode == "weights_cpu":
             await self.engine.sleep(level=1)
+            await self.engine.reset_encoder_cache()
+        elif mode == "weights_image":
+            if not getattr(self, "_verl_mlite_image_written", False):
+                directory, chunk, _, _ = image_args(self)
+                # The base is frozen in adapter mode: one image serves every later wake.
+                self._verl_mlite_image_dump = await all_workers(
+                    self, "mlite_weights_image_dump", directory, chunk
+                )
+                self._verl_mlite_image_written = True
+            await self.engine.sleep(level=2)
+            self._verl_mlite_image_pending = True
             await self.engine.reset_encoder_cache()
         elif mode == "weights_reload":
             if not callable(getattr(self.engine.engine_core, "call_utility_all_async", None)):
@@ -1585,11 +1621,29 @@ def _patch_vllm_rollout_sleep_level() -> bool:
 
     def _get_wake_up_tags(self):
         mode = adapter_mode(self)
-        if mode in ("weights_cpu", "weights_reload"):
+        if mode in ("weights_cpu", "weights_reload", "weights_image"):
             return ["weights", "kv_cache"]
         return ["kv_cache"] if mode == "kv_only" else original_tags(self)
 
     async def wake_up(self, tags=None):
+        if getattr(self, "_verl_mlite_image_pending", False):
+            import time
+
+            # Map and fill the weights before the KV cache claims memory.
+            started = time.monotonic()
+            rest = [tag for tag in (tags or self._get_wake_up_tags()) if tag != "weights"]
+            await original_wake(self, tags=["weights"])
+            restored = await all_workers(self, "mlite_weights_image_restore", *image_args(self))
+            result = await original_wake(self, tags=rest) if rest else None
+            self._verl_mlite_image_receipt = {
+                "engines": len(restored),
+                "seconds": time.monotonic() - started,
+                "restore": restored,
+                "dump": self._verl_mlite_image_dump,
+                "adapter_reinstall_required": True,
+            }
+            self._verl_mlite_image_pending = False
+            return result
         pending = getattr(self, "_verl_mlite_reload_pending", False)
         if pending:
             # L2 discarded the base. Restore its allocations before reading the
@@ -2023,6 +2077,9 @@ def apply_runtime_patches() -> None:
         from verl_mlite.rollout.ds41_lora import install
 
         _trace_runtime_patch('08d1.ds41_adapter_reload', install())
+        from verl_mlite.rollout.weights_image import install as install_weights_image
+
+        _trace_runtime_patch('08d2.ds41_weights_image', install_weights_image())
     result = _patch_vllm_rollout_sleep_level()
     _trace_runtime_patch("08e.vllm_rollout_sleep_level", result)
     result = _patch_verl_vllm_headless_api_server_count()
