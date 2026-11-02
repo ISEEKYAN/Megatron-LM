@@ -271,7 +271,6 @@ class _FP8OutputProjection(torch.autograd.Function):
         from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import (
             fused_inv_rope_fp8_quant,
         )
-        from vllm.models.deepseek_v4.nvidia.ops.o_proj import _compile_einsum_configs
         from vllm.utils.deep_gemm import fp8_einsum
 
         from megatron.lite.model.deepseek_v41.lite.export import to_release
@@ -318,19 +317,9 @@ class _FP8OutputProjection(torch.autograd.Function):
         codes, native_scale = deepgemm_post_process_fp8_weight_block(
             codes, descale, (32, 32), True, is_bmm=True, bmm_batch_size=groups
         )
-        _compile_einsum_configs(
-            x.shape[0],
-            SimpleNamespace(weight=codes),
-            native_scale,
-            cache,
-            n_groups=groups,
-            heads_per_group=heads // groups,
-            nope_dim=dim - cache.shape[-1],
-            rope_dim=cache.shape[-1],
-            o_lora_rank=rank,
-            einsum_recipe=(1, 1, 32),
-            tma_aligned_scales=True,
-        )
+        # No vLLM serving warm-up here: _compile_einsum_configs runs the einsum once for every
+        # M up to the batch's token count, which training's large, varying M turns into
+        # tens of thousands of launches per layer. DeepGEMM JITs only the configs it uses.
         result = x.new_empty((x.shape[0], groups, rank))
         fp8_einsum(
             "bhr,hdr->bhd", (encoded, scale), (codes, native_scale), result, recipe=(1, 1, 32)

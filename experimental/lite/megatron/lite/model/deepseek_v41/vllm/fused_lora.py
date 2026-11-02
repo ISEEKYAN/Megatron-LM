@@ -14,6 +14,7 @@ from megatron.lite.primitive.modules.lora import disable_lora_adapters
 
 from . import experts
 from .batching import metadata
+from .linear import _bf16_fixed_mm
 from .lora import adapter, scaled_b, shrink
 
 
@@ -91,7 +92,6 @@ def shrink_slices(x, weights):
 
 
 def _launch(owner, x, scores, ids, packed, buffer, max_tokens):
-    from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import bf16_fixed_mm
     from vllm.model_executor.layers.fused_moe.deep_gemm_mega_moe_lora import (
         _add_delta_kernel,
         _down_inputs_kernel,
@@ -164,7 +164,7 @@ def _launch(owner, x, scores, ids, packed, buffer, max_tokens):
     b = x.new_zeros((x.shape[1], 128))
     b[:, :rank].copy_((gu.fc2_lora_b * gu.scale).bfloat16())
     b[:, rank : 2 * rank].copy_(scaled_b(w2))
-    delta = bf16_fixed_mm(inputs, b)
+    delta = _bf16_fixed_mm(inputs, b)
     if y.numel():
         _add_delta_kernel[(triton.cdiv(y.numel(), 1024),)](y, delta, y.numel(), BLOCK=1024)
     return y

@@ -206,20 +206,36 @@ def linear_vjp(ctx, grad, activation, weight):
     return dx, accumulate_wgrad(owners, dw, ctx.like), None
 
 
+def _bf16_fixed_mm(a, weight):
+    """vLLM's ``bf16_fixed_mm`` kernels without its serving warm-up.
+
+    On the tensor-core path vLLM first runs DeepGEMM for every M below a new largest batch
+    (``_compile_tensor_core_configs``) to avoid serving stalls; with training's large and
+    varying M that is tens of thousands of launches per weight. Same kernel and arguments,
+    so the same bits; DeepGEMM JITs only the configs actually used.
+    """
+    from vllm.model_executor.kernels.linear.cute_dsl import batch_invariant as bi
+
+    a, weight = a.contiguous(), weight.contiguous()
+    if not bi._uses_tensor_core(weight):
+        return bi.bf16_fixed_mm(a, weight)
+    out = torch.empty((a.shape[0], weight.shape[0]), device=a.device, dtype=torch.float32)
+    bi._deterministic_deep_gemm().bf16_gemm_nt(a, weight, out)
+    return out
+
+
 class _BF16Linear(torch.autograd.Function):
     @staticmethod
     def forward(ctx, x, weight, owners=None):
         if not x.is_cuda or not weight.is_cuda:
             raise RuntimeError("Deployment BF16 linear requires CUDA")
         ctx.owners, ctx.like, ctx.input_shape = owners, _like(weight), x.shape
-        from vllm.model_executor.kernels.linear.cute_dsl.batch_invariant import bf16_fixed_mm
-
         compute = weight.bfloat16()
         ctx.save_for_backward(x, compute)
         ctx.weight_dtype = weight.dtype
         if not x.reshape(-1, x.shape[-1]).shape[0]:
             return x.new_empty((*x.shape[:-1], weight.shape[0]), dtype=torch.float32)
-        out = bf16_fixed_mm(x.reshape(-1, x.shape[-1]).bfloat16(), compute)
+        out = _bf16_fixed_mm(x.reshape(-1, x.shape[-1]).bfloat16(), compute)
         return out.reshape(*x.shape[:-1], weight.shape[0])
 
     @staticmethod
