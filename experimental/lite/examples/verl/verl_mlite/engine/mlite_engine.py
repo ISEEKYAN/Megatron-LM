@@ -976,16 +976,51 @@ class MegatronLiteEngine(BaseEngine):
                 "R3 routed_experts must use VERL's jagged no-padding layout; "
                 f"got shape {tuple(routed_experts.shape)}."
             )
+        tokens = input_ids.values().contiguous()
+        mask = None if loss_mask is None else loss_mask.values().contiguous().float()
+        seq_lens = input_ids.offsets().diff().to(dtype=torch.int64)
+        tokens, mask, seq_lens = self._pad_to_token_bucket(
+            tokens, mask, seq_lens, routed_experts, r3_replay_mask
+        )
         return PackedBatch(
-            input_ids=input_ids.values().contiguous(),
-            labels=input_ids.values().contiguous(),
-            loss_mask=(None if loss_mask is None else loss_mask.values().contiguous().float()),
-            seq_lens=input_ids.offsets().diff().to(dtype=torch.int64),
+            input_ids=tokens,
+            labels=tokens,
+            loss_mask=mask,
+            seq_lens=seq_lens,
             routed_experts=routed_experts,
             r3_replay_mask=(
                 None if r3_replay_mask is None else r3_replay_mask.values().contiguous()
             ),
         )
+
+    def _pad_to_token_bucket(self, tokens, mask, seq_lens, routed_experts, r3_replay_mask):
+        """Optionally append one loss-masked dummy sequence so the packed micro-batch's
+        CP-aligned token count is a multiple of ``MLITE_PACK_BUCKET_TOKENS``.
+
+        Batch-invariant kernels compile per token count; with dynamic batching every packed
+        micro-batch is a new shape (one KA job spent 35+ min compiling). Buckets bound the set
+        of shapes. The dummy sequence is its own document (no attention to real tokens), has no
+        loss, and its outputs are dropped in ``_build_verl_model_output``.
+        """
+        self._bucket_pad_row = False
+        bucket = int(os.environ.get("MLITE_PACK_BUCKET_TOKENS", "0"))
+        if bucket <= 0:
+            return tokens, mask, seq_lens
+        if routed_experts is not None or r3_replay_mask is not None:
+            raise NotImplementedError("token buckets are not implemented with R3 routing replay")
+        align = max(int(self.engine_config.tp), 1) * max(int(self.engine_config.cp), 1)
+        if bucket % align:
+            raise ValueError(f"MLITE_PACK_BUCKET_TOKENS={bucket} must be a multiple of tp*cp={align}")
+        aligned = int(((seq_lens + align - 1) // align * align).sum())
+        pad = (-aligned) % bucket
+        if pad == 0:
+            return tokens, mask, seq_lens
+        tokens = torch.cat([tokens, tokens.new_zeros(pad)])
+        if mask is not None:
+            mask = torch.cat([mask, mask.new_zeros(pad)])
+        seq_lens = torch.cat([seq_lens, seq_lens.new_tensor([pad])])
+        self._bucket_pad_row = True
+        return tokens, mask, seq_lens
 
     def _make_runtime_loss_context(
         self, micro_batch: TensorDict, *, loss_scale: float
@@ -1075,10 +1110,16 @@ class MegatronLiteEngine(BaseEngine):
             raise ValueError(
                 "Model protocol must expose unpack_forward_output to reverse THD outputs."
             )
-        output = {"log_probs": unpack(self.module, runtime_batch, log_probs)}
+        def real_rows(value):
+            value = unpack(self.module, runtime_batch, value)
+            if not getattr(self, "_bucket_pad_row", False):
+                return value
+            return torch.nested.as_nested_tensor(list(value.unbind())[:-1], layout=torch.jagged)
+
+        output = {"log_probs": real_rows(log_probs)}
         entropy = raw_output.get("entropy")
         if entropy is not None:
-            output["entropy"] = unpack(self.module, runtime_batch, entropy)
+            output["entropy"] = real_rows(entropy)
         return output
 
     def _make_runtime_loss_fn(self, loss_function, num_microbatches: int, output_lst=None):
