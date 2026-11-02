@@ -263,8 +263,6 @@ class _FP8OutputProjection(torch.autograd.Function):
     def forward(ctx, x, weight, positions, cache, groups):
         if not x.is_cuda or not weight.is_cuda:
             raise RuntimeError("Deployment FP8 wo_a requires CUDA")
-        from types import SimpleNamespace
-
         from vllm.model_executor.layers.quantization.utils.fp8_utils import (
             deepgemm_post_process_fp8_weight_block,
         )
