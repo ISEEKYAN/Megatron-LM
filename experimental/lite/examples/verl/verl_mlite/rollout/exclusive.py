@@ -9,6 +9,18 @@ from functools import wraps
 import torch
 
 
+def guard(ok, name, report):
+    """Memory guards warn by default; ``MLITE_EXCLUSIVE_GUARD=raise`` makes them fatal."""
+    if ok:
+        return
+    mode = os.environ.get('MLITE_EXCLUSIVE_GUARD', 'warn')
+    if mode == 'raise':
+        raise AssertionError(name, report)
+    if mode != 'warn':
+        raise ValueError(f'MLITE_EXCLUSIVE_GUARD must be warn or raise, got {mode!r}')
+    print('MLITE_EXCLUSIVE_GUARD_WARN ' + json.dumps(dict(guard=name, **report)), flush=True)
+
+
 def record(engine, phase):
     if not torch.cuda.is_available():
         return
@@ -46,13 +58,14 @@ def record(engine, phase):
     report['required_free_margin_bytes'] = margin
     print('MLITE_EXCLUSIVE_ACTOR ' + json.dumps(report), flush=True)
     if phase == 'before_rollout_wake':
-        assert process_bytes <= 16 * 2**30, ('ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
-        assert allocated <= 4 * 2**30, ('ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
-        assert process_bytes + rollout_budget + margin <= report['total_bytes'], (
+        guard(process_bytes <= 16 * 2**30, 'ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
+        guard(allocated <= 4 * 2**30, 'ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
+        guard(
+            process_bytes + rollout_budget + margin <= report['total_bytes'],
             'ACTOR_ROLLOUT_CAPACITY_BUDGET',
             report,
         )
-        assert report['free_bytes'] >= rollout_budget + margin, ('ROLLOUT_WAKE_FREE_MARGIN', report)
+        guard(report['free_bytes'] >= rollout_budget + margin, 'ROLLOUT_WAKE_FREE_MARGIN', report)
 
         # Core DDP keeps CUDA parameter views with zero-sized storage while
         # their actual bytes live in pinned CPU buffer copies.
@@ -63,8 +76,16 @@ def record(engine, phase):
                 return resident(value.codes) + resident(value.scale)
             return value.untyped_storage().nbytes()
 
-        assert not any(resident(p) for p in engine.module.parameters())
-        assert not any(resident(b) for _, b in engine.module.named_buffers())
+        guard(
+            not any(resident(p) for p in engine.module.parameters()),
+            'ACTOR_PARAMETER_RESIDENT',
+            report,
+        )
+        guard(
+            not any(resident(b) for _, b in engine.module.named_buffers()),
+            'ACTOR_BUFFER_RESIDENT',
+            report,
+        )
 
 
 def extra_storage(engine, device):

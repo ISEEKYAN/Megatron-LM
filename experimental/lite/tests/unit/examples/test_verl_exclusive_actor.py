@@ -169,7 +169,8 @@ def test_all_actor_ranks_park_before_shared_server_wake():
     assert trace.index('offload') < trace.index('all_actors_parked') < trace.index('wake')
 
 
-def test_residency_check_handles_core_ddp_buffers_list():
+def test_residency_check_handles_core_ddp_buffers_list(monkeypatch):
+    monkeypatch.setenv('MLITE_EXCLUSIVE_GUARD', 'raise')
     m = product()
     owner = torch.nn.Module()
     owner.buffers = []  # Core DDP shadows nn.Module.buffers with buffer groups.
@@ -200,7 +201,14 @@ def test_residency_check_handles_core_ddp_buffers_list():
         (12, 159, 150, 'CAPACITY_BUDGET'),
     ],
 )
-def test_native_process_residency_and_rollout_headroom(process_gib, free_gib, total_gib, error):
+@pytest.mark.parametrize('mode', ['raise', 'warn', None])
+def test_native_process_residency_and_rollout_headroom(
+    process_gib, free_gib, total_gib, error, mode, monkeypatch, capsys
+):
+    if mode is None:
+        monkeypatch.delenv('MLITE_EXCLUSIVE_GUARD', raising=False)
+    else:
+        monkeypatch.setenv('MLITE_EXCLUSIVE_GUARD', mode)
     m = product()
     owner = torch.nn.Module()
     nvml = SimpleNamespace(
@@ -223,8 +231,12 @@ def test_native_process_residency_and_rollout_headroom(process_gib, free_gib, to
             torch.cuda, 'mem_get_info', return_value=(free_gib * 2**30, total_gib * 2**30)
         ),
     ):
-        if error:
+        if error and mode == 'raise':
             with pytest.raises(AssertionError, match=error):
                 m.record(SimpleNamespace(module=owner), 'before_rollout_wake')
         else:
             m.record(SimpleNamespace(module=owner), 'before_rollout_wake')
+    warned = [line for line in capsys.readouterr().out.splitlines() if 'GUARD_WARN' in line]
+    assert len(warned) == (1 if error and mode != 'raise' else 0)
+    if warned:
+        assert error in warned[0]
