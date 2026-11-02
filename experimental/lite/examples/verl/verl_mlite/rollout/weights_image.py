@@ -98,6 +98,20 @@ def _segments(pool, skip):
     return out
 
 
+def _split(segments, host_bytes):
+    """Move the first ``host_bytes`` (page aligned) of ``segments`` into a host-resident part."""
+    host_bytes = host_bytes // _ALIGN * _ALIGN
+    host, disk = [], []
+    for ptr, size in segments:
+        take = min(size, host_bytes)
+        if take:
+            host.append((ptr, take))
+            host_bytes -= take
+        if take < size:
+            disk.append((ptr + take, size - take))
+    return host, disk
+
+
 def _paths(worker, directory):
     rank = worker.vllm_config.parallel_config.data_parallel_rank
     stem = os.path.join(directory, f"{socket.gethostname()}_dp{rank}")
@@ -115,18 +129,31 @@ def _cuda():
     return ctypes.CDLL("libcuda.so.1")
 
 
-def dump(worker, directory, chunk_bytes):
-    """Write this rank's weights pool to ``directory``; returns a receipt."""
+def dump(worker, directory, chunk_bytes, host_bytes):
+    """Write this rank's weights pool to ``directory``, keeping ``host_bytes`` in pinned host
+    memory (restored in parallel with the disk read); returns a receipt."""
     started = time.monotonic()
     # Native sleep empties the allocator cache; snapshot the same set of segments it keeps.
     gc.collect()
     torch.cuda.empty_cache()
     pool = _pool()
     sums = _sums(pool)
-    segments = _segments(pool, _native_ranges(worker))
+    host_segments, segments = _split(_segments(pool, _native_ranges(worker)), host_bytes)
     image, manifest = _paths(worker, directory)
     os.makedirs(directory, exist_ok=True)
     cu, (buf,) = _cuda(), _bounce(1, chunk_bytes)
+    kept = []
+    for ptr, size in host_segments:
+        # Exact-size page-locked copy (pin_memory() rounds each block up to a power of 2).
+        host = torch.empty(size, dtype=torch.uint8)
+        torch.cuda.check_error(torch.cuda.cudart().cudaHostRegister(host.data_ptr(), size, 0))
+        rc = cu.cuMemcpyDtoH_v2(
+            ctypes.c_void_p(host.data_ptr()), ctypes.c_uint64(ptr), ctypes.c_size_t(size)
+        )
+        if rc != 0:
+            raise RuntimeError(f"weights image host copy-out failed ({rc}) at {hex(ptr)}")
+        kept.append((ptr, host))
+    worker._mlite_weights_image_host = kept
     view = memoryview(buf.numpy())
     fd = os.open(image, os.O_WRONLY | os.O_CREAT | os.O_TRUNC | os.O_DIRECT, 0o600)
     try:
@@ -144,12 +171,16 @@ def dump(worker, directory, chunk_bytes):
     finally:
         os.close(fd)
     total = sum(size for _, size in segments)
+    host_total = sum(size for _, size in host_segments)
     with open(manifest, "w") as f:
-        json.dump({"pool": pool, "segments": segments, "sums": sums}, f)
+        json.dump(
+            {"pool": pool, "host_segments": host_segments, "segments": segments, "sums": sums}, f
+        )
     return {
         "image": image,
         "bytes": total,
-        "native_bytes": sum(size for _, size in pool) - total,
+        "host_bytes": host_total,
+        "native_bytes": sum(size for _, size in pool) - total - host_total,
         "seconds": time.monotonic() - started,
     }
 
@@ -163,6 +194,9 @@ def restore(worker, directory, chunk_bytes, readers, verify):
     pool = _pool()
     if [list(p) for p in pool] != expected["pool"]:
         raise RuntimeError("weights pool layout changed since the image was written")
+    kept = getattr(worker, "_mlite_weights_image_host", [])
+    if [[ptr, host.numel()] for ptr, host in kept] != expected.get("host_segments", []):
+        raise RuntimeError("weights image host part does not match its manifest")
     jobs, offset = [], 0
     for ptr, size in expected["segments"]:
         for off in range(0, size, chunk_bytes):
@@ -184,6 +218,15 @@ def restore(worker, directory, chunk_bytes, readers, verify):
                 pool_exec.submit(read, i, *jobs[i][::2])
                 for i in range(min(len(buffers), len(jobs)))
             ]
+            # The host part copies while the readers fill the first bounce buffers.
+            for ptr, host in kept:
+                rc = cu.cuMemcpyHtoD_v2(
+                    ctypes.c_uint64(ptr),
+                    ctypes.c_void_p(host.data_ptr()),
+                    ctypes.c_size_t(host.numel()),
+                )
+                if rc != 0:
+                    raise RuntimeError(f"weights image host copy-in failed ({rc}) at {hex(ptr)}")
             for i, (_, dst, n) in enumerate(jobs):
                 slot = pending[i].result()
                 rc = cu.cuMemcpyHtoD_v2(
@@ -205,6 +248,7 @@ def restore(worker, directory, chunk_bytes, readers, verify):
             raise RuntimeError(f"weights image restore differs in allocations {changed}")
     return {
         "bytes": offset,
+        "host_bytes": sum(host.numel() for _, host in kept),
         "copy_seconds": copied,
         "seconds": time.monotonic() - started,
         "verified": bool(verify),
@@ -223,8 +267,8 @@ def install():
     if cls is None:
         return False
 
-    def mlite_weights_image_dump(self, directory, chunk_bytes):
-        return dump(self, directory, chunk_bytes)
+    def mlite_weights_image_dump(self, directory, chunk_bytes, host_bytes):
+        return dump(self, directory, chunk_bytes, host_bytes)
 
     def mlite_weights_image_restore(self, directory, chunk_bytes, readers, verify):
         return restore(self, directory, chunk_bytes, readers, verify)

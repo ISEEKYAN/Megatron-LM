@@ -1561,7 +1561,8 @@ def _patch_vllm_rollout_sleep_level() -> bool:
         return mode
 
     def image_args(self):
-        # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum.
+        # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum,
+        # bytes per rank kept in pinned host memory and restored alongside the disk read.
         custom = self.config.custom
         verify = custom["ds41_weights_image_verify"]
         if not isinstance(verify, bool):
@@ -1571,6 +1572,7 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             int(custom["ds41_weights_image_chunk_mib"]) << 20,
             int(custom["ds41_weights_image_readers"]),
             verify,
+            int(custom["ds41_weights_image_host_mib"]) << 20,
         )
 
     async def all_workers(self, method, *args):
@@ -1601,10 +1603,10 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             await self.engine.reset_encoder_cache()
         elif mode == "weights_image":
             if not getattr(self, "_verl_mlite_image_written", False):
-                directory, chunk, _, _ = image_args(self)
+                directory, chunk, _, _, host = image_args(self)
                 # The base is frozen in adapter mode: one image serves every later wake.
                 self._verl_mlite_image_dump = await all_workers(
-                    self, "mlite_weights_image_dump", directory, chunk
+                    self, "mlite_weights_image_dump", directory, chunk, host
                 )
                 self._verl_mlite_image_written = True
             await self.engine.sleep(level=2)
@@ -1636,7 +1638,7 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             started = time.monotonic()
             rest = [tag for tag in (tags or self._get_wake_up_tags()) if tag != "weights"]
             await original_wake(self, tags=["weights"])
-            restored = await all_workers(self, "mlite_weights_image_restore", *image_args(self))
+            restored = await all_workers(self, "mlite_weights_image_restore", *image_args(self)[:4])
             result = await original_wake(self, tags=rest) if rest else None
             self._verl_mlite_image_receipt = {
                 "engines": len(restored),

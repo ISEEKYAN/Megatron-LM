@@ -228,6 +228,7 @@ def image_server(server):
             'ds41_weights_image_chunk_mib': 64,
             'ds41_weights_image_readers': 8,
             'ds41_weights_image_verify': True,
+            'ds41_weights_image_host_mib': 1024,
         },
         data_parallel_size=4,
         tensor_model_parallel_size=1,
@@ -253,7 +254,7 @@ def test_image_dumps_once_and_restores_before_kv_and_publish(server, capsys):
 
     asyncio.run(step())
     asyncio.run(step())
-    dump = ('rpc', 'mlite_weights_image_dump', ('/raid/scratch/job', 64 << 20))
+    dump = ('rpc', 'mlite_weights_image_dump', ('/raid/scratch/job', 64 << 20, 1 << 30))
     restore = ('rpc', 'mlite_weights_image_restore', ('/raid/scratch/job', 64 << 20, 8, True))
     cycle = [
         ('sleep', 2),
@@ -345,3 +346,16 @@ def test_image_segments_skip_page_aligned_native_ranges():
         (16 * page, 2 * page),
     ]
     assert _segments(pool, []) == pool
+
+
+def test_image_split_moves_page_aligned_prefix_to_host():
+    from verl_mlite.rollout.weights_image import _split
+
+    page = 4096
+    segments = [(0, 3 * page), (10 * page, 4 * page)]
+    assert _split(segments, 4 * page + 100) == (
+        [(0, 3 * page), (10 * page, page)],
+        [(11 * page, 3 * page)],
+    )
+    assert _split(segments, 0) == ([], segments)
+    assert _split(segments, 1 << 40) == (segments, [])
