@@ -4,6 +4,7 @@ import gc
 import json
 import os
 import sys
+import time
 from functools import wraps
 
 import torch
@@ -157,6 +158,7 @@ def install():
             raise ValueError('Exclusive actor uses explicit boundaries, not auto param_offload')
         if getattr(engine, '_exclusive_adapter_snapshot', None) is not None:
             raise RuntimeError('Unconsumed exclusive adapter snapshot')
+        start, start_mono = time.time(), time.perf_counter()
         weights, peft = engine.get_per_tensor_param(
             layered_summon=self.layered_summon, base_sync_done=True
         )
@@ -166,24 +168,38 @@ def install():
         if not owned or any(value.device.type != 'cpu' for _, value in owned):
             raise ValueError('Adapter snapshot must own host storage before actor offload')
         engine._exclusive_adapter_snapshot = (owned, peft)
+        times = [('snapshot', time.perf_counter())]
         try:
             record(engine, 'actor_before_offload')
+            times.append(('record', time.perf_counter()))
             engine.to('cpu', model=True, optimizer=True, grad=True)
             engine._exclusive_actor_offloaded = True
+            times.append(('offload', time.perf_counter()))
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+            times.append(('release', time.perf_counter()))
             record(engine, 'before_rollout_wake')
             # One server wake restores all DEP workers. Every actor rank
             # must be parked before the first caller wakes that shared server.
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
+            times.append(('barrier', time.perf_counter()))
             # Original native RPC order/IPC/ACK remains authoritative. Its
             # get_per_tensor_param consumes the host snapshot without onload.
-            return await original(self, global_steps=global_steps, mode=mode)
+            result = await original(self, global_steps=global_steps, mode=mode)
+            times.append(('wake_publish', time.perf_counter()))
+            return result
         finally:
             engine._exclusive_adapter_snapshot = None
+            receipt = dict(pid=os.getpid(), global_steps=global_steps, start=start)
+            receipt['snapshot'] = round(times[0][1] - start_mono, 3)
+            receipt.update(
+                (name, round(t - prev, 3)) for (_, prev), (name, t) in zip(times, times[1:])
+            )
+            receipt['seconds'] = round(time.perf_counter() - start_mono, 3)
+            print('MLITE_EXCLUSIVE_SYNC ' + json.dumps(receipt), flush=True)
 
     update_weights._mlite_exclusive_actor = True
     cls.update_weights = update_weights

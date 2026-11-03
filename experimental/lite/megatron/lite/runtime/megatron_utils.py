@@ -138,10 +138,24 @@ def offload_model_to_cpu(model_list: list) -> None:
 
             for param in model_chunk.module.parameters():
                 if not param.requires_grad and param.device.type != "cpu":
-                    param.data = param.data.to("cpu", non_blocking=True)
+                    param.data = _frozen_host_copy(param)
         else:
             _reshard_fsdp2_modules(model_chunk)
             model_chunk.to("cpu")
+
+
+def _frozen_host_copy(param):
+    """Host copy of a frozen parameter for an offload.
+
+    A parameter tagged ``_mlite_host_mirror`` keeps its first host copy and reuses it on every
+    later offload: frozen bytes never change, so those offloads copy nothing. Untagged parameters
+    are copied to host on every offload.
+    """
+    if not hasattr(param, "_mlite_host_mirror"):
+        return param.data.to("cpu", non_blocking=True)
+    if param._mlite_host_mirror is None:
+        param._mlite_host_mirror = param.data.to("cpu", non_blocking=True)
+    return param._mlite_host_mirror
 
 
 def release_grad_buffers(model_list: list) -> None:

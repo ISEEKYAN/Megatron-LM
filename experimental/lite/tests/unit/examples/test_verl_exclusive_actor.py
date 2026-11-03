@@ -154,6 +154,43 @@ def test_ddp_onload_preserves_original_host_parameter():
     assert model.host.device.type == 'cpu' and torch.equal(model.host, torch.ones(3))
 
 
+def test_frozen_host_mirror_is_copied_once_across_parks():
+    path = Path(__file__).parents[3] / 'megatron/lite/runtime/megatron_utils.py'
+    spec = importlib.util.spec_from_file_location('native_runtime_mirror_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Device:
+        def __init__(self):
+            self.copies = 0
+
+        def to(self, device, **kwargs):
+            assert device == 'cpu'
+            self.copies += 1
+            return torch.full((2,), float(self.copies))
+
+    def frozen(tagged):
+        param = SimpleNamespace(requires_grad=False, device=SimpleNamespace(type='cuda'))
+        param.data = param.source = Device()
+        if tagged:
+            param._mlite_host_mirror = None
+        return param
+
+    mirrored, plain = frozen(True), frozen(False)
+    owner = SimpleNamespace(
+        module=SimpleNamespace(parameters=lambda: [mirrored, plain]),
+        buffers=[],
+        expert_parallel_buffers=[],
+    )
+    with patch.object(module, '_is_megatron_ddp', return_value=True):
+        for _ in range(3):
+            mirrored.data, plain.data = mirrored.source, plain.source
+            module.offload_model_to_cpu([owner])
+            assert mirrored.data is mirrored._mlite_host_mirror
+    assert mirrored.source.copies == 1 and torch.equal(mirrored.data, torch.ones(2))
+    assert plain.source.copies == 3
+
+
 def test_all_actor_ranks_park_before_shared_server_wake():
     m = product()
     cls, trace = fixture()

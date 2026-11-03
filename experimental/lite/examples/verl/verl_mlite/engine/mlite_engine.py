@@ -533,6 +533,9 @@ class MegatronLiteEngine(BaseEngine):
                 for parameter in self.module.parameters():
                     if not parameter.requires_grad:
                         parameter._mlite_keep_on_cpu = parameter.device.type == "cpu"
+                        if not parameter._mlite_keep_on_cpu:
+                            # Frozen bytes never change: keep one host copy across parks.
+                            parameter._mlite_host_mirror = None
                 self._exclusive_placement_recorded = True
             clear_deployment_scratch(self)
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
@@ -690,6 +693,10 @@ class MegatronLiteEngine(BaseEngine):
                 dist.barrier()
         finally:
             if parked:
+                # The load may have rewritten frozen parameters; take fresh host copies.
+                for parameter in self.module.parameters():
+                    if hasattr(parameter, "_mlite_host_mirror"):
+                        parameter._mlite_host_mirror = None
                 self.to(device="cpu", model=True, optimizer=True, grad=True)
                 torch.cuda.synchronize()
             elif reload_params_for_load:
