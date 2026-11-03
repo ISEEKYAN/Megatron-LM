@@ -128,7 +128,18 @@ def offload_model_to_cpu(model_list: list) -> None:
             for buffers in all_buffers:
                 for buffer in buffers:
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
+                        host = getattr(buffer.param_data, "cpu_data", None)
+                        data = buffer.param_data.data
+                        if (
+                            isinstance(host, torch.Tensor)
+                            and host.is_pinned()
+                            and host.shape == data.shape
+                            and host.dtype == data.dtype
+                        ):
+                            # Reuse the pinned copy of an earlier offload instead of a new one.
+                            host.copy_(data, non_blocking=True)
+                        else:
+                            buffer.param_data.cpu_data = data.cpu().pin_memory()
                         buffer.param_data_size = buffer.param_data.storage().size()
                         buffer.param_data.storage().resize_(0)
 

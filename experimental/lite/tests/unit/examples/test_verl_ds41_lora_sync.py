@@ -211,3 +211,20 @@ def test_generator_bucket_is_snapshotted_before_transport_reuse(runner):
     sync.receive_adapter(GeneratorReceiver(tensors), runner, config)
     for key, value in runner.calls[-2][2].items():
         assert torch.equal(value.view(torch.uint8), tensors[key].view(torch.uint8))
+
+
+def test_manifest_entries_hash_the_tensor_bytes():
+    import hashlib
+
+    from verl_mlite.rollout.ds41_lora import _entries
+
+    tensors = {
+        f'layers.{i}.mlp.lora_A.weight': torch.randn(3, 5, 4).to(torch.bfloat16)[:, 1:4]
+        for i in range(40)
+    }
+    entries = _entries(tensors)
+    assert [e['name'] for e in entries] == sorted(tensors)
+    for entry in entries:
+        raw = tensors[entry['name']].contiguous().view(torch.uint8).numpy().tobytes()
+        assert entry['bytes'] == len(raw)
+        assert entry['sha256'] == hashlib.sha256(raw).hexdigest()

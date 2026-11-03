@@ -2,6 +2,9 @@
 """Adapter-only DS4.1 synchronization over VERL's existing bucket transport."""
 import hashlib
 import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
 import torch
@@ -13,27 +16,25 @@ def _sha(value):
     ).hexdigest()
 
 
+def _entry(name, value):
+    if not name.startswith('layers.') or '.lora_' not in name or not name.endswith('.weight'):
+        raise ValueError(f'Adapter sync forbids base/buffer tensor {name}')
+    if value.dtype != torch.bfloat16 or value.ndim not in (2, 3) or not torch.isfinite(value).all():
+        raise ValueError(f'Invalid BF16 adapter tensor {name}')
+    raw = memoryview(value.detach().cpu().contiguous().view(torch.uint8).reshape(-1).numpy())
+    return dict(
+        name=name,
+        shape=list(value.shape),
+        dtype='bfloat16',
+        bytes=raw.nbytes,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
 def _entries(tensors):
-    result = []
-    for name, value in sorted(tensors.items()):
-        if not name.startswith('layers.') or '.lora_' not in name or not name.endswith('.weight'):
-            raise ValueError(f'Adapter sync forbids base/buffer tensor {name}')
-        if (
-            value.dtype != torch.bfloat16
-            or value.ndim not in (2, 3)
-            or not torch.isfinite(value).all()
-        ):
-            raise ValueError(f'Invalid BF16 adapter tensor {name}')
-        raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-        result.append(
-            dict(
-                name=name,
-                shape=list(value.shape),
-                dtype='bfloat16',
-                bytes=len(raw),
-                sha256=hashlib.sha256(raw).hexdigest(),
-            )
-        )
+    # Hashing and the finite check release the GIL: spread the tensors over threads.
+    with ThreadPoolExecutor(min(32, os.cpu_count() or 1)) as pool:
+        result = list(pool.map(lambda item: _entry(*item), sorted(tensors.items())))
     if not result:
         raise ValueError('Adapter sync is empty')
     return result
@@ -88,16 +89,25 @@ def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256
     ):
         raise ValueError('Adapter sync requires enabled LoRA, version and frozen base manifest')
     int(base_manifest_sha256, 16)
+    started = time.perf_counter()
     tensors = {}
     for name, value in weights:
         if name in tensors:
             raise ValueError(f'Duplicate adapter tensor {name}')
         tensors[name] = value.detach().to('cpu', copy=True).contiguous()
+    exported = time.perf_counter()
     manifest = dict(
         policy_version=int(version),
         base_manifest_sha256=base_manifest_sha256,
         tensors=_entries(tensors),
     )
+    receipt = dict(
+        tensors=len(tensors),
+        bytes=sum(t.numel() * t.element_size() for t in tensors.values()),
+        export_copy_seconds=round(exported - started, 3),
+        manifest_seconds=round(time.perf_counter() - exported, 3),
+    )
+    print('MLITE_ADAPTER_SNAPSHOT ' + json.dumps(receipt), flush=True)
     config = dict(
         peft_type='LORA',
         r=cfg.rank,
