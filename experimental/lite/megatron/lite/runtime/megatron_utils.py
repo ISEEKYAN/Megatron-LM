@@ -148,7 +148,11 @@ def offload_model_to_cpu(model_list: list) -> None:
                         buffer.grad_data.storage().resize_(0)
 
             for param in model_chunk.module.parameters():
-                if not param.requires_grad and param.device.type != "cpu":
+                if (
+                    not param.requires_grad
+                    and param.device.type != "cpu"
+                    and not getattr(param, "_mlite_keep_on_device", False)
+                ):
                     param.data = _frozen_host_copy(param)
         else:
             _reshard_fsdp2_modules(model_chunk)

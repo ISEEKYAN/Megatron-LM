@@ -561,10 +561,15 @@ class MegatronLiteEngine(BaseEngine):
             from verl_mlite.rollout.exclusive import clear_deployment_scratch
 
             if not getattr(self, "_exclusive_placement_recorded", False):
+                keep = getattr(self.engine_config, "exclusive_keep_frozen_on_gpu", False)
                 for parameter in self.module.parameters():
                     if not parameter.requires_grad:
                         parameter._mlite_keep_on_cpu = parameter.device.type == "cpu"
-                        if not parameter._mlite_keep_on_cpu:
+                        if parameter._mlite_keep_on_cpu:
+                            continue
+                        if keep:
+                            parameter._mlite_keep_on_device = True
+                        else:
                             # Frozen bytes never change: keep one host copy across parks.
                             parameter._mlite_host_mirror = None
                 self._exclusive_placement_recorded = True

@@ -58,10 +58,17 @@ def record(engine, phase):
     margin = 16 * 2**30
     report['rollout_peak_budget_bytes'] = rollout_budget
     report['required_free_margin_bytes'] = margin
+    # Frozen parameters deliberately left on the GPU (exclusive_keep_frozen_on_gpu).
+    kept = sum(
+        p.untyped_storage().nbytes()
+        for p in engine.module.parameters()
+        if getattr(p, '_mlite_keep_on_device', False) and p.is_cuda
+    )
+    report['kept_frozen_bytes'] = kept
     print('MLITE_EXCLUSIVE_ACTOR ' + json.dumps(report), flush=True)
     if phase == 'before_rollout_wake':
-        guard(process_bytes <= 16 * 2**30, 'ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
-        guard(allocated <= 4 * 2**30, 'ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
+        guard(process_bytes - kept <= 16 * 2**30, 'ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
+        guard(allocated - kept <= 4 * 2**30, 'ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
         guard(
             process_bytes + rollout_budget + margin <= report['total_bytes'],
             'ACTOR_ROLLOUT_CAPACITY_BUDGET',
@@ -79,7 +86,11 @@ def record(engine, phase):
             return value.untyped_storage().nbytes()
 
         guard(
-            not any(resident(p) for p in engine.module.parameters()),
+            not any(
+                resident(p)
+                for p in engine.module.parameters()
+                if not getattr(p, '_mlite_keep_on_device', False)
+            ),
             'ACTOR_PARAMETER_RESIDENT',
             report,
         )

@@ -230,6 +230,30 @@ def test_park_during_publish_parks_and_publishes_after_prewake():
     del cls.config.rollout.custom
 
 
+def test_frozen_kept_on_device_is_not_parked():
+    path = Path(__file__).parents[3] / 'megatron/lite/runtime/megatron_utils.py'
+    spec = importlib.util.spec_from_file_location('native_runtime_keep_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Device:
+        copies = 0
+
+        def to(self, device, **kwargs):
+            Device.copies += 1
+            return torch.zeros(1)
+
+    kept = SimpleNamespace(requires_grad=False, device=SimpleNamespace(type='cuda'))
+    kept.data = source = Device()
+    kept._mlite_keep_on_device = True
+    owner = SimpleNamespace(
+        module=SimpleNamespace(parameters=lambda: [kept]), buffers=[], expert_parallel_buffers=[]
+    )
+    with patch.object(module, '_is_megatron_ddp', return_value=True):
+        module.offload_model_to_cpu([owner])
+    assert kept.data is source and Device.copies == 0
+
+
 def test_all_actor_ranks_park_before_shared_server_wake():
     m = product()
     cls, trace = fixture()

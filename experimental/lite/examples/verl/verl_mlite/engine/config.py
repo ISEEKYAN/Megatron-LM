@@ -37,6 +37,9 @@ class MegatronLiteEngineConfig(EngineConfig):
     router_replay_mode: str = "disabled"
     grad_offload: bool = False
     exclusive_rollout: bool = False
+    # Exclusive rollout parks optimizer, grads and trainable buffers but leaves the frozen base
+    # on the GPU next to the sleeping rollout (no host copy); needs the GPU room for both.
+    exclusive_keep_frozen_on_gpu: bool = False
     load_hf_weights: bool = True
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
