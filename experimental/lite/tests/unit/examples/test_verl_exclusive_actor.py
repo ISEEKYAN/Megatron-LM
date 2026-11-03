@@ -316,3 +316,17 @@ def test_native_process_residency_and_rollout_headroom(
     assert len(warned) == (1 if error and mode != 'raise' else 0)
     if warned:
         assert error in warned[0]
+
+
+def test_host_trim_reports_rss_and_never_raises(capsys):
+    import json
+
+    pytest.importorskip('verl')
+    from verl_mlite.engine.mlite_engine import _return_freed_host_memory
+
+    _return_freed_host_memory('save_checkpoint')
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith('MLITE_HOST_TRIM ')]
+    assert len(lines) <= 1
+    if lines:
+        report = json.loads(lines[0].split(' ', 1)[1])
+        assert report['phase'] == 'save_checkpoint' and report['rss_after'] > 0

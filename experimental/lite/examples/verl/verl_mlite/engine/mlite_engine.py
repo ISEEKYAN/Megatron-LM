@@ -87,6 +87,37 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
     )
 
 
+
+def _rss_bytes():
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def _return_freed_host_memory(phase):
+    """Hand glibc's freed checkpoint staging memory back to the OS (malloc_trim).
+
+    Checkpoint save/load frees many large host buffers that glibc otherwise keeps mapped, so the
+    process stays tens of GiB above its live size into the next weight sync.
+    """
+    import ctypes
+    import json
+    import time
+
+    try:
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except OSError:
+        return
+    started, before = time.perf_counter(), _rss_bytes()
+    trim(0)
+    report = dict(
+        phase=phase,
+        pid=os.getpid(),
+        rss_before=before,
+        rss_after=_rss_bytes(),
+        seconds=round(time.perf_counter() - started, 3),
+    )
+    print("MLITE_HOST_TRIM " + json.dumps(report), flush=True)
+
 class _MegatronLiteLRScheduler:
     def __init__(
         self,
@@ -603,6 +634,7 @@ class MegatronLiteEngine(BaseEngine):
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
             aggressive_empty_cache(force_sync=True)
+            _return_freed_host_memory("save_checkpoint")
 
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")
@@ -701,6 +733,7 @@ class MegatronLiteEngine(BaseEngine):
                 torch.cuda.synchronize()
             elif reload_params_for_load:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+            _return_freed_host_memory("load_checkpoint")
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:
