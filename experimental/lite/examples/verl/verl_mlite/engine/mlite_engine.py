@@ -574,13 +574,32 @@ class MegatronLiteEngine(BaseEngine):
                             parameter._mlite_host_mirror = None
                 self._exclusive_placement_recorded = True
             clear_deployment_scratch(self)
+        if exclusive and device == "cuda":
+            self._engram_images("unpark_host")
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
+        if exclusive and device == "cpu":
+            self._engram_images("park_host")
         if exclusive:
             from verl_mlite.rollout.exclusive import extra_storage
 
             extra_storage(self, device)
             if device == "cpu" and self.device_name == "cuda":
                 _release_inactive_cuda_cache()
+
+    def _engram_images(self, action):
+        """Park or restore the frozen Engram host shards through exclusive_engram_image_dir."""
+        directory = getattr(self.engine_config, "exclusive_engram_image_dir", None)
+        if not directory:
+            return
+        import socket
+
+        tables = [m for m in self.module.modules() if callable(getattr(m, "park_host", None))]
+        if not tables:
+            return
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(directory, f"{socket.gethostname()}_rank{self._rank}")
+        for index, table in enumerate(tables):
+            getattr(table, action)(f"{stem}_engram{index}.bin")
 
     def save_checkpoint(
         self,

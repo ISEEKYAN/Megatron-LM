@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """N-gram hashing and gated row-sharded lookup with caller-supplied policies."""
+import os
 import weakref
 from types import SimpleNamespace
 
@@ -125,7 +126,42 @@ class ShardedFrozenTable(nn.Module):
     def _apply(self, fn, recurse=True):
         return self  # the frozen FP8 bytes stay on the host
 
+    def park_host(self, path):
+        """Write this shard's bytes to ``path`` once and release the pinned host buffers."""
+        if getattr(self, "_parked_shapes", None) is not None:
+            return
+        weight, scale = self.embedding.weight, self.embedding.scale
+        if not os.path.exists(path):
+            tmp = path + ".tmp"
+            with open(tmp, "wb") as f:
+                for t in (weight, scale):
+                    f.write(memoryview(t.view(torch.uint8).reshape(-1).numpy()))
+                f.flush()
+                os.fsync(f.fileno())
+                os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+            os.replace(tmp, path)
+        self._parked_shapes = ((weight.shape, weight.dtype), (scale.shape, scale.dtype))
+        self.embedding.weight = torch.empty(0, dtype=weight.dtype)
+        self.embedding.scale = torch.empty(0, dtype=scale.dtype)
+
+    def unpark_host(self, path):
+        """Read the shard written by :meth:`park_host` back into exact-size pinned buffers."""
+        shapes = getattr(self, "_parked_shapes", None)
+        if shapes is None:
+            return
+        restored = [_pinned_empty(shape, dtype) for shape, dtype in shapes]
+        with open(path, "rb") as f:
+            for t in restored:
+                view = memoryview(t.view(torch.uint8).reshape(-1).numpy())
+                if f.readinto(view) != len(view):
+                    raise OSError(f"short read of the Engram shard image {path}")
+            os.posix_fadvise(f.fileno(), 0, 0, os.POSIX_FADV_DONTNEED)
+        self.embedding.weight, self.embedding.scale = restored
+        self._parked_shapes = None
+
     def forward(self, ids):
+        if getattr(self, "_parked_shapes", None) is not None:
+            raise RuntimeError("Engram table is parked; unpark it before the forward")
         rows, size = ids.shape[0], self.group.size()
         if size > 1:  # every rank's IDs, padded to a common row count
             sizes = async_gather_from_sequence_parallel_region(
