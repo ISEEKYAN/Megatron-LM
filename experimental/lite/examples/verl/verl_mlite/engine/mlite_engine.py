@@ -682,6 +682,9 @@ class MegatronLiteEngine(BaseEngine):
                 load_model=True,
                 load_optimizer=True,
             )
+            # Restored parameters invalidate host exports captured before loading.
+            self._exclusive_initial_adapter = None
+            self._exclusive_adapter_snapshot = None
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
                 state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
