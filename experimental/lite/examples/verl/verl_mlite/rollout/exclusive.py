@@ -59,11 +59,12 @@ def record(engine, phase):
     report['rollout_peak_budget_bytes'] = rollout_budget
     report['required_free_margin_bytes'] = margin
     # Frozen parameters deliberately left on the GPU (exclusive_keep_frozen_on_gpu).
-    kept = sum(
-        p.untyped_storage().nbytes()
+    storages = {
+        p.untyped_storage().data_ptr(): p.untyped_storage().nbytes()
         for p in engine.module.parameters()
         if getattr(p, '_mlite_keep_on_device', False) and p.is_cuda
-    )
+    }
+    kept = sum(storages.values())  # parameters may be views of one storage: count it once
     report['kept_frozen_bytes'] = kept
     print('MLITE_EXCLUSIVE_ACTOR ' + json.dumps(report), flush=True)
     if phase == 'before_rollout_wake':
