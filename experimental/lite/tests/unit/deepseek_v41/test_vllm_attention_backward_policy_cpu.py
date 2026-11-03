@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """CPU dispatch proof; serving bit equality is covered by separate GPU gates."""
+
 import sys
 from types import SimpleNamespace
 
@@ -14,9 +15,10 @@ def test_sparse_backward_policy_preserves_forward_and_global_determinism(monkeyp
 
     assert ImplConfig().attention_deterministic_backward is True
     validate_impl_cfg_keys({'attention_deterministic_backward': False})
-    scratch_calls, adjoints = [], []
+    scratch_calls, adjoints, flash_calls = [], [], []
 
     def flash(**kw):
+        flash_calls.append(kw)
         out = kw['q'] * 0.5 + kw['kv'][0, 0] * 0.25
         if 'out' in kw:
             kw['out'].copy_(out)
@@ -71,9 +73,62 @@ def test_sparse_backward_policy_preserves_forward_and_global_determinism(monkeyp
                 for x in (q, kv, sink)
             )
         assert torch.equal(outputs[0], outputs[1]) and torch.equal(outputs[0], outputs[2])
+        # Gather reuses its forward output/LSE; paged still replays once.
+        assert len(flash_calls) == 3
         assert len(scratch_calls) == 2
         assert [x.get('deterministic') for x in adjoints] == [True, False, True]
         assert 'workspace' in adjoints[0] and 'workspace' not in adjoints[1]
         assert torch.are_deterministic_algorithms_enabled()
     finally:
         torch.use_deterministic_algorithms(before[0], warn_only=before[1])
+
+
+@pytest.mark.parametrize('heads', [2, 64])
+@pytest.mark.parametrize('length_limited', [False, True])
+def test_sparse_reuses_only_compatible_forward_statistics(monkeypatch, heads, length_limited):
+    from megatron.lite.model.deepseek_v41.vllm import attention
+
+    calls, captured = [], []
+
+    def flash(**kw):
+        output = kw.get('out')
+        if output is None:
+            output = torch.empty_like(kw['q'])
+        output.copy_(kw['q'] * 0.5)
+        lse = output.new_full(output.shape[:2], float(len(calls) + 1))
+        calls.append((output, lse, kw['topk_length']))
+        return output, None, lse
+
+    def backward(q, kv, out, grad, lse, sink, indices, **kw):
+        captured.append((out, lse, kw['topk_length']))
+        return dict(dq=grad * 0.5, dkv=torch.zeros_like(kv), d_sink=torch.zeros_like(sink))
+
+    monkeypatch.setitem(
+        sys.modules, 'vllm.v1.attention.ops.flashmla', SimpleNamespace(flash_mla_sparse_fwd=flash)
+    )
+    monkeypatch.setitem(
+        sys.modules,
+        'megatron.core.transformer.experimental_attention_variant.csa_utils',
+        SimpleNamespace(
+            fused_sparse_attention=SimpleNamespace(
+                _ensure_dsa_namespace=lambda: None,
+                _DSA=SimpleNamespace(sparse_attention_backward_wrapper=backward),
+            )
+        ),
+    )
+    monkeypatch.setattr(torch.Tensor, 'is_cuda', property(lambda self: True))
+    q = torch.randn(2, heads, 512, requires_grad=True)
+    kv = torch.randn(3, 512, requires_grad=True)
+    sink = torch.randn(heads, requires_grad=True)
+    lengths = torch.tensor([2, 3], dtype=torch.int32) if length_limited else None
+    output = attention._Sparse.apply(
+        q, kv, sink, torch.zeros(2, 4, dtype=torch.int32), lengths, 0.5, False
+    )
+    assert torch.equal(output, q * 0.5)
+    output.sum().backward()
+    assert torch.equal(q.grad, torch.full_like(q, 0.5))
+    assert len(calls) == (2 if length_limited else 1)
+    expected = calls[-1]
+    assert captured[0][0] is expected[0] and captured[0][1] is expected[1]
+    assert captured[0][2] is None  # Preserve the existing length-limited replay adjoint.
+    assert calls[0][2] is lengths
