@@ -1,6 +1,7 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Caller-owned sparse FlashMLA (default) or mega attention core with native parameter
 names and owners."""
+
 import functools
 
 import torch
@@ -9,7 +10,35 @@ from .linear import linear
 from .lora import adapter, add, grouped_add
 
 
-def _rotate(x, positions, cache, inverse=False):
+def _native_rotate(x, positions, cache, inverse):
+    """Existing vLLM BF16 kernel; no quantization or new kernel implementation."""
+    from vllm.models.deepseek_v4.common.ops.fused_inv_rope_fp8_quant import fused_inv_rope_fp8_quant
+
+    width = cache.shape[-1]
+    if not inverse:
+        # The upstream op rotates inversely. Reverse only its sine columns.
+        # Advanced indexing owns these small rows, so the model cache is unchanged.
+        cache = cache[positions]
+        cache[:, width // 2 :].neg_()
+        positions = torch.arange(x.shape[0], device=x.device, dtype=positions.dtype)
+    source = x.reshape(x.shape[0], -1, x.shape[-1])
+    out, _ = fused_inv_rope_fp8_quant(
+        source,
+        positions,
+        cache,
+        n_groups=1,
+        heads_per_group=source.shape[1],
+        nope_dim=x.shape[-1] - width,
+        rope_dim=width,
+        quant_group_size=32,
+        quantize=False,
+    )
+    return out.reshape(x.shape)
+
+
+def _rotate(x, positions, cache, inverse=False, inplace=False):
+    if x.is_cuda and x.dtype == torch.bfloat16 and x.numel() and not inplace:
+        return _native_rotate(x, positions, cache, inverse)
     width = cache.shape[-1]
     angles = cache[positions].float()
     cos, sin = angles.chunk(2, -1)
@@ -20,7 +49,9 @@ def _rotate(x, positions, cache, inverse=False):
     tail = x[..., -width:].float().unflatten(-1, (-1, 2))
     a, b = tail.unbind(-1)
     rotated = torch.stack((a * cos - b * sin, b * cos + a * sin), -1).flatten(-2)
-    return torch.cat((x[..., :-width], rotated.to(x.dtype)), -1)
+    out = x if inplace else x.clone(memory_format=torch.contiguous_format)
+    out[..., -width:].copy_(rotated)
+    return out
 
 
 class _QueryInputs(torch.autograd.Function):
@@ -130,7 +161,7 @@ class _Sparse(torch.autograd.Function):
         query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
         output = torch.empty_like(query)
-        flash_mla_sparse_fwd(
+        _, _, lse = flash_mla_sparse_fwd(
             q=query,
             kv=kv[:, None].contiguous(),
             indices=indices[:, None],
@@ -139,13 +170,16 @@ class _Sparse(torch.autograd.Function):
             topk_length=lengths,
             out=output,
         )
-        ctx.save_for_backward(q, kv, sink, indices)
+        # Reuse the exact statistics of this call. Paged serving and the legacy
+        # length-limited adjoint retain their existing replay below.
+        saved = (output, lse) if lengths is None else ()
+        ctx.save_for_backward(q, kv, sink, indices, *saved)
         ctx.scale = scale
         return output[:, :heads]
 
     @staticmethod
     def backward(ctx, grad):
-        q, kv, sink, indices = ctx.saved_tensors
+        q, kv, sink, indices, *statistics = ctx.saved_tensors
         if q.shape[0] == 0:
             return _sparse_gradients(
                 ctx, torch.zeros_like(q), torch.zeros_like(kv), torch.zeros_like(sink)
@@ -165,8 +199,7 @@ class _Sparse(torch.autograd.Function):
             return _sparse_gradients(
                 ctx, *(value.to(source.dtype) for value, source in zip(grads, (q, kv, sink)))
             )
-        # Replay exact FlashMLA statistics for the whole-query cuDNN adjoint.
-        from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+        # Paged forward does not expose the gathered-prefill statistics.
 
         from megatron.core.transformer.experimental_attention_variant.csa_utils import (
             fused_sparse_attention as sparse,
@@ -177,14 +210,19 @@ class _Sparse(torch.autograd.Function):
         query = torch.nn.functional.pad(q, (0, 0, 0, padded - heads)).contiguous()
         bias = torch.nn.functional.pad(sink.float(), (0, padded - heads), value=-torch.inf)
         lengths = None
-        output, _, lse = flash_mla_sparse_fwd(
-            q=query,
-            kv=kv[:, None].contiguous(),
-            indices=indices[:, None],
-            sm_scale=ctx.scale,
-            attn_sink=bias,
-            topk_length=lengths,
-        )
+        if statistics:
+            output, lse = statistics
+        else:
+            from vllm.v1.attention.ops.flashmla import flash_mla_sparse_fwd
+
+            output, _, lse = flash_mla_sparse_fwd(
+                q=query,
+                kv=kv[:, None].contiguous(),
+                indices=indices[:, None],
+                sm_scale=ctx.scale,
+                attn_sink=bias,
+                topk_length=lengths,
+            )
         dout = torch.nn.functional.pad(grad, (0, 0, 0, padded - heads)).contiguous()
         sparse._ensure_dsa_namespace()
         result = sparse._DSA.sparse_attention_backward_wrapper(
@@ -341,6 +379,7 @@ class _FP8OutputProjection(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+        need_w = getattr(ctx, 'needs_input_grad', (True, True))[1]
         if getattr(ctx, 'compact', False):
             from megatron.lite.primitive.quantization.block_fp8 import dequantize_block_fp8
 
@@ -349,14 +388,20 @@ class _FP8OutputProjection(torch.autograd.Function):
             inner = codes.shape[-1]
             # FP8 code times a power of two is exact in BF16: decode all groups at once.
             dtype = torch.bfloat16 if ctx.input_dtype == torch.bfloat16 else torch.float32
-            rows = encoded.shape[0]
-            raw = scale.contiguous().view(torch.uint8).reshape(rows, groups, -1)[..., : inner // 32]
-            sf_rows = (raw.to(torch.int32) << 23).view(torch.float32).to(dtype)
-            activation = (
-                (encoded.to(dtype).reshape(rows, groups, -1, 32) * sf_rows.unsqueeze(-1))
-                .reshape(rows, groups, inner)
-                .to(ctx.input_dtype)
-            )
+            activation = None
+            if need_w:
+                rows = encoded.shape[0]
+                raw = (
+                    scale.contiguous()
+                    .view(torch.uint8)
+                    .reshape(rows, groups, -1)[..., : inner // 32]
+                )
+                sf_rows = (raw.to(torch.int32) << 23).view(torch.float32).to(dtype)
+                activation = (
+                    (encoded.to(dtype).reshape(rows, groups, -1, 32) * sf_rows.unsqueeze(-1))
+                    .reshape(rows, groups, inner)
+                    .to(ctx.input_dtype)
+                )
             weight = (
                 dequantize_block_fp8(codes, sf, (32, 32))
                 .reshape(groups, rank, inner)
@@ -366,7 +411,6 @@ class _FP8OutputProjection(torch.autograd.Function):
             activation, weight, positions, cache = ctx.saved_tensors
         with torch.autocast(device_type=grad.device.type, enabled=False):
             g = grad.permute(1, 0, 2).bfloat16()
-            a = activation.permute(1, 0, 2).bfloat16()
             w = weight.bfloat16()
 
             def bmm(left, right):
@@ -376,14 +420,20 @@ class _FP8OutputProjection(torch.autograd.Function):
                     else torch.bmm(left.float(), right.float())
                 )
 
-            dx = bmm(g, w).permute(1, 0, 2).to(activation.dtype)
-            need_w = getattr(ctx, 'needs_input_grad', (True, True))[1]
-            dw = bmm(g.transpose(1, 2), a).reshape(ctx.weight_shape) if need_w else None
+            dtype = ctx.input_dtype if getattr(ctx, 'compact', False) else activation.dtype
+            dx = bmm(g, w).permute(1, 0, 2).to(dtype)
+            dw = (
+                bmm(g.transpose(1, 2), activation.permute(1, 0, 2).bfloat16()).reshape(
+                    ctx.weight_shape
+                )
+                if need_w
+                else None
+            )
         like = getattr(ctx, 'like', None)
         from .linear import accumulate_wgrad
 
         return (
-            _rotate(dx.reshape(ctx.shape), positions, cache),
+            _rotate(dx.reshape(ctx.shape), positions, cache, False, True),
             (
                 None
                 if dw is None
