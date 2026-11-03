@@ -1561,7 +1561,8 @@ def _patch_vllm_rollout_sleep_level() -> bool:
         return mode
 
     def image_args(self):
-        # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum.
+        # Node-local directory, bounce chunk, reader threads per rank, post-restore checksum,
+        # bytes per rank kept in pinned host memory and restored alongside the disk read.
         custom = self.config.custom
         verify = custom["ds41_weights_image_verify"]
         if not isinstance(verify, bool):
@@ -1571,6 +1572,7 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             int(custom["ds41_weights_image_chunk_mib"]) << 20,
             int(custom["ds41_weights_image_readers"]),
             verify,
+            int(custom["ds41_weights_image_host_mib"]) << 20,
         )
 
     async def all_workers(self, method, *args):
@@ -1601,10 +1603,10 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             await self.engine.reset_encoder_cache()
         elif mode == "weights_image":
             if not getattr(self, "_verl_mlite_image_written", False):
-                directory, chunk, _, _ = image_args(self)
+                directory, chunk, _, _, host = image_args(self)
                 # The base is frozen in adapter mode: one image serves every later wake.
                 self._verl_mlite_image_dump = await all_workers(
-                    self, "mlite_weights_image_dump", directory, chunk
+                    self, "mlite_weights_image_dump", directory, chunk, host
                 )
                 self._verl_mlite_image_written = True
             await self.engine.sleep(level=2)
@@ -1628,7 +1630,30 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             return ["weights", "kv_cache"]
         return ["kv_cache"] if mode == "kv_only" else original_tags(self)
 
+    def image_receipt(self, started, restored, **extra):
+        import json
+        import time
+
+        self._verl_mlite_image_receipt = {
+            "engines": len(restored),
+            "seconds": time.monotonic() - started,
+            "restore": restored,
+            "dump": self._verl_mlite_image_dump,
+            "adapter_reinstall_required": True,
+            **extra,
+        }
+        print("MLITE_WEIGHTS_IMAGE " + json.dumps(self._verl_mlite_image_receipt), flush=True)
+
     async def wake_up(self, tags=None):
+        joining = getattr(self, "_verl_mlite_image_joining", None)
+        if joining is not None and "kv_cache" not in (tags or self._get_wake_up_tags()):
+            # Weights are already mapped and restoring (an early wake); nothing more to do.
+            return None
+        if joining is not None:
+            # The adapter publish ran while the base restored; finish it before the KV cache.
+            restored = await all_workers(self, "mlite_weights_image_restore_join")
+            self._verl_mlite_image_joining = None
+            image_receipt(self, joining[0], restored, early=joining[1])
         if getattr(self, "_verl_mlite_image_pending", False):
             import time
 
@@ -1636,18 +1661,18 @@ def _patch_vllm_rollout_sleep_level() -> bool:
             started = time.monotonic()
             rest = [tag for tag in (tags or self._get_wake_up_tags()) if tag != "weights"]
             await original_wake(self, tags=["weights"])
-            restored = await all_workers(self, "mlite_weights_image_restore", *image_args(self))
+            if not rest and self.config.custom.get("ds41_weights_image_overlap_publish", False):
+                # Only the LoRA-slot allocations are filled now; the rest restores in the
+                # background until the kv_cache wake that follows the adapter publish.
+                early = await all_workers(
+                    self, "mlite_weights_image_restore_start", *image_args(self)[:4]
+                )
+                self._verl_mlite_image_joining = (started, early)
+                self._verl_mlite_image_pending = False
+                return None
+            restored = await all_workers(self, "mlite_weights_image_restore", *image_args(self)[:4])
             result = await original_wake(self, tags=rest) if rest else None
-            self._verl_mlite_image_receipt = {
-                "engines": len(restored),
-                "seconds": time.monotonic() - started,
-                "restore": restored,
-                "dump": self._verl_mlite_image_dump,
-                "adapter_reinstall_required": True,
-            }
-            import json
-
-            print("MLITE_WEIGHTS_IMAGE " + json.dumps(self._verl_mlite_image_receipt), flush=True)
+            image_receipt(self, started, restored)
             self._verl_mlite_image_pending = False
             return result
         pending = getattr(self, "_verl_mlite_reload_pending", False)

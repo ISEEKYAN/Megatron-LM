@@ -180,7 +180,7 @@ def test_real_engine_method_selects_only_shared_lora_export():
         weights, config = MegatronLiteEngine.get_per_tensor_param(engine, base_sync_done=True)
         assert set(dict(weights)) == set(source)
         assert config['_mlite_ds41']['manifest']['policy_version'] == version
-    assert calls == [dict(target='lora')] * 3
+    assert calls == [dict(target='lora', lora_on_device=True)] * 3
     with pytest.raises(ValueError, match='frozen release base'):
         MegatronLiteEngine.get_per_tensor_param(engine, base_sync_done=False)
     assert len(calls) == 3  # never falls back to a full base publication
@@ -211,3 +211,34 @@ def test_generator_bucket_is_snapshotted_before_transport_reuse(runner):
     sync.receive_adapter(GeneratorReceiver(tensors), runner, config)
     for key, value in runner.calls[-2][2].items():
         assert torch.equal(value.view(torch.uint8), tensors[key].view(torch.uint8))
+
+
+def test_manifest_entries_hash_the_tensor_bytes():
+    import hashlib
+
+    from verl_mlite.rollout.ds41_lora import _entries
+
+    tensors = {
+        f'layers.{i}.mlp.lora_A.weight': torch.randn(3, 5, 4).to(torch.bfloat16)[:, 1:4]
+        for i in range(40)
+    }
+    entries = _entries(tensors)
+    assert [e['name'] for e in entries] == sorted(tensors)
+    for entry in entries:
+        raw = tensors[entry['name']].contiguous().view(torch.uint8).numpy().tobytes()
+        assert entry['bytes'] == len(raw)
+        assert entry['sha256'] == hashlib.sha256(raw).hexdigest()
+
+
+def test_host_copies_keep_names_shapes_and_bytes():
+    from verl_mlite.rollout.ds41_lora import _to_host
+
+    tensors = {
+        'layers.1.a.lora_A.weight': torch.randn(4, 6).to(torch.bfloat16),
+        'layers.1.a.lora_B.weight': torch.randn(2, 3, 5).to(torch.bfloat16)[:, 1:],
+    }
+    out = _to_host(tensors)
+    assert list(out) == list(tensors)
+    for name, value in tensors.items():
+        assert out[name].shape == value.shape and out[name].is_contiguous()
+        assert torch.equal(out[name].view(torch.uint8), value.contiguous().view(torch.uint8))

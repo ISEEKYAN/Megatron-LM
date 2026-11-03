@@ -2,6 +2,9 @@
 """Adapter-only DS4.1 synchronization over VERL's existing bucket transport."""
 import hashlib
 import json
+import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from functools import wraps
 
 import torch
@@ -13,27 +16,25 @@ def _sha(value):
     ).hexdigest()
 
 
+def _entry(name, value):
+    if not name.startswith('layers.') or '.lora_' not in name or not name.endswith('.weight'):
+        raise ValueError(f'Adapter sync forbids base/buffer tensor {name}')
+    if value.dtype != torch.bfloat16 or value.ndim not in (2, 3) or not torch.isfinite(value).all():
+        raise ValueError(f'Invalid BF16 adapter tensor {name}')
+    raw = memoryview(value.detach().cpu().contiguous().view(torch.uint8).reshape(-1).numpy())
+    return dict(
+        name=name,
+        shape=list(value.shape),
+        dtype='bfloat16',
+        bytes=raw.nbytes,
+        sha256=hashlib.sha256(raw).hexdigest(),
+    )
+
+
 def _entries(tensors):
-    result = []
-    for name, value in sorted(tensors.items()):
-        if not name.startswith('layers.') or '.lora_' not in name or not name.endswith('.weight'):
-            raise ValueError(f'Adapter sync forbids base/buffer tensor {name}')
-        if (
-            value.dtype != torch.bfloat16
-            or value.ndim not in (2, 3)
-            or not torch.isfinite(value).all()
-        ):
-            raise ValueError(f'Invalid BF16 adapter tensor {name}')
-        raw = value.detach().cpu().contiguous().view(torch.uint8).numpy().tobytes()
-        result.append(
-            dict(
-                name=name,
-                shape=list(value.shape),
-                dtype='bfloat16',
-                bytes=len(raw),
-                sha256=hashlib.sha256(raw).hexdigest(),
-            )
-        )
+    # Hashing and the finite check release the GIL: spread the tensors over threads.
+    with ThreadPoolExecutor(min(32, os.cpu_count() or 1)) as pool:
+        result = list(pool.map(lambda item: _entry(*item), sorted(tensors.items())))
     if not result:
         raise ValueError('Adapter sync is empty')
     return result
@@ -74,6 +75,16 @@ def _snapshot_bucket(weights):
     }
 
 
+def _to_host(tensors):
+    """Own host copies of ``tensors``; same-dtype CUDA tensors go over in one D2H copy."""
+    values = list(tensors.values())
+    if not values or any(not v.is_cuda or v.dtype != values[0].dtype for v in values):
+        return {name: v.to('cpu', copy=True).contiguous() for name, v in tensors.items()}
+    flat = torch.cat([v.reshape(-1) for v in values]).cpu()
+    sizes = [v.numel() for v in values]
+    return {name: part.view(v.shape) for (name, v), part in zip(tensors.items(), flat.split(sizes))}
+
+
 def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256):
     from megatron.lite.model.deepseek_v41.vllm.lora import serving_targets
     from megatron.lite.primitive.modules.lora import normalize_lora_config
@@ -88,16 +99,32 @@ def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256
     ):
         raise ValueError('Adapter sync requires enabled LoRA, version and frozen base manifest')
     int(base_manifest_sha256, 16)
-    tensors = {}
+    started = time.perf_counter()
+    tensors, first = {}, None
     for name, value in weights:
+        if first is None:
+            first = time.perf_counter()
         if name in tensors:
             raise ValueError(f'Duplicate adapter tensor {name}')
-        tensors[name] = value.detach().to('cpu', copy=True).contiguous()
+        tensors[name] = value.detach()
+    gathered = time.perf_counter()
+    tensors = _to_host(tensors)
+    exported = time.perf_counter()
     manifest = dict(
         policy_version=int(version),
         base_manifest_sha256=base_manifest_sha256,
         tensors=_entries(tensors),
     )
+    receipt = dict(
+        tensors=len(tensors),
+        bytes=sum(t.numel() * t.element_size() for t in tensors.values()),
+        export_copy_seconds=round(exported - started, 3),
+        export_setup_seconds=round((first or gathered) - started, 3),
+        collect_seconds=round(gathered - (first or gathered), 3),
+        host_copy_seconds=round(exported - gathered, 3),
+        manifest_seconds=round(time.perf_counter() - exported, 3),
+    )
+    print('MLITE_ADAPTER_SNAPSHOT ' + json.dumps(receipt), flush=True)
     config = dict(
         peft_type='LORA',
         r=cfg.rank,
@@ -112,6 +139,7 @@ def receive_adapter(receiver, model_runner, config):
     from vllm.lora.request import LoRARequest
 
     tensors, terminal, errors = {}, False, []
+    started = time.perf_counter()
 
     def consume(weights, is_last):
         nonlocal terminal
@@ -134,6 +162,7 @@ def receive_adapter(receiver, model_runner, config):
         terminal = bool(is_last)
 
     receiver.receive_weights(on_bucket_received=consume)
+    received = time.perf_counter()
     # Drain the existing transport before rejecting metadata: an early exception
     # would strand the sender waiting for a bucket handshake.
     if errors:
@@ -154,6 +183,7 @@ def receive_adapter(receiver, model_runner, config):
         raise ValueError('Adapter policy versions must advance once per publication')
     if not terminal or _entries(tensors) != manifest['tensors']:
         raise ValueError('Partial or corrupt adapter publication')
+    verified = time.perf_counter()
     from verl.workers.rollout.vllm_rollout.utils import (
         VLLM_LORA_INT_ID,
         VLLM_LORA_NAME,
@@ -168,6 +198,13 @@ def receive_adapter(receiver, model_runner, config):
     peft = {k: v for k, v in config.items() if k != '_mlite_ds41'}
     model_runner.lora_manager.add_adapter_tensors(request, tensors, peft)
     torch.cuda.synchronize()  # ACK means actual copies/activation completed, not RPC dispatch.
+    receipt = dict(
+        receive_seconds=round(received - started, 3),
+        verify_seconds=round(verified - received, 3),
+        install_seconds=round(time.perf_counter() - verified, 3),
+        tensors=len(tensors),
+    )
+    print('MLITE_ADAPTER_RECEIVE ' + json.dumps(receipt), flush=True)
     tensors.clear()
     ack = dict(
         policy_version=version,

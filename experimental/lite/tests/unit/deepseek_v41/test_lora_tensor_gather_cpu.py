@@ -28,9 +28,15 @@ def _worker(rank, world, init, mode):
         if mode == 'corrupt':
             with pytest.raises(ValueError, match='Replicated LoRA factors differ'):
                 dict(gather_lora_tensors(local))
+            with pytest.raises(ValueError, match='Replicated LoRA factors differ'):
+                dict(gather_lora_tensors(local, on_device=True))
         else:
-            actual = dict(gather_lora_tensors(local))
             expected = {'shared': shared, 'owner0': torch.arange(6, dtype=dtype).reshape(2, 3)}
+            on_device = dict(gather_lora_tensors(local, on_device=True))
+            assert on_device.keys() == expected.keys()
+            for key, value in expected.items():
+                assert torch.equal(on_device[key].view(torch.uint8), value.view(torch.uint8))
+            actual = dict(gather_lora_tensors(local))
             assert actual.keys() == expected.keys()
             for key, value in expected.items():
                 assert torch.equal(actual[key].view(torch.uint8), value.view(torch.uint8))
@@ -48,3 +54,13 @@ def test_real_gloo_lora_tensor_gather(tmp_path, mode):
     init = 'file://' + str(Path(tmp_path) / 'gloo')
     world = int(os.environ.get('W10_LORA_TEST_WORLD', '2'))
     mp.spawn(_worker, args=(world, init, mode), nprocs=world, join=True)
+
+
+@pytest.mark.parametrize(
+    'backend, cuda', [('nccl', True), ('cpu:gloo,cuda:nccl', True), ('gloo', False)]
+)
+def test_gather_device_follows_any_nccl_backend(monkeypatch, backend, cuda):
+    from megatron.lite.model.deepseek_v41.lite import export
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    assert (export._gather_device(backend).type == 'cuda') is cuda

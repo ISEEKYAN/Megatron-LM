@@ -154,6 +154,106 @@ def test_ddp_onload_preserves_original_host_parameter():
     assert model.host.device.type == 'cpu' and torch.equal(model.host, torch.ones(3))
 
 
+def test_frozen_host_mirror_is_copied_once_across_parks():
+    path = Path(__file__).parents[3] / 'megatron/lite/runtime/megatron_utils.py'
+    spec = importlib.util.spec_from_file_location('native_runtime_mirror_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Device:
+        def __init__(self):
+            self.copies = 0
+
+        def to(self, device, **kwargs):
+            assert device == 'cpu'
+            self.copies += 1
+            return torch.full((2,), float(self.copies))
+
+    def frozen(tagged):
+        param = SimpleNamespace(requires_grad=False, device=SimpleNamespace(type='cuda'))
+        param.data = param.source = Device()
+        if tagged:
+            param._mlite_host_mirror = None
+        return param
+
+    mirrored, plain = frozen(True), frozen(False)
+    owner = SimpleNamespace(
+        module=SimpleNamespace(parameters=lambda: [mirrored, plain]),
+        buffers=[],
+        expert_parallel_buffers=[],
+    )
+    with patch.object(module, '_is_megatron_ddp', return_value=True):
+        for _ in range(3):
+            mirrored.data, plain.data = mirrored.source, plain.source
+            module.offload_model_to_cpu([owner])
+            assert mirrored.data is mirrored._mlite_host_mirror
+    assert mirrored.source.copies == 1 and torch.equal(mirrored.data, torch.ones(2))
+    assert plain.source.copies == 3
+
+
+def test_wake_before_park_submits_weights_wake_first():
+    m = product()
+    cls, trace = fixture()
+    cls.config.rollout.custom = {'ds41_weights_image_wake_before_park': True}
+
+    class Rollout:
+        async def resume(self, tags):
+            trace.append(('submit', tuple(tags)))
+            await asyncio.sleep(0)
+            trace.append(('mapped', tuple(tags)))
+
+    cls.rollout = Rollout()
+    install(m, cls)
+    asyncio.run(cls().update_weights(global_steps=1))
+    assert trace.index(('submit', ('weights',))) < trace.index('export') < trace.index('offload')
+    assert trace.index(('mapped', ('weights',))) < trace.index('wake')
+    del cls.config.rollout.custom
+
+
+def test_park_during_publish_parks_and_publishes_after_prewake():
+    m = product()
+    cls, trace = fixture()
+    cls.config.rollout.custom = {
+        'ds41_weights_image_wake_before_park': True,
+        'ds41_weights_image_park_during_publish': True,
+    }
+
+    class Rollout:
+        async def resume(self, tags):
+            trace.append(('mapped', tuple(tags)))
+
+    cls.rollout = Rollout()
+    install(m, cls)
+    asyncio.run(cls().update_weights(global_steps=1))
+    assert trace.index(('mapped', ('weights',))) < trace.index('wake')
+    assert 'offload' in trace and trace.index('export') < trace.index('offload')
+    del cls.config.rollout.custom
+
+
+def test_frozen_kept_on_device_is_not_parked():
+    path = Path(__file__).parents[3] / 'megatron/lite/runtime/megatron_utils.py'
+    spec = importlib.util.spec_from_file_location('native_runtime_keep_under_test', path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+
+    class Device:
+        copies = 0
+
+        def to(self, device, **kwargs):
+            Device.copies += 1
+            return torch.zeros(1)
+
+    kept = SimpleNamespace(requires_grad=False, device=SimpleNamespace(type='cuda'))
+    kept.data = source = Device()
+    kept._mlite_keep_on_device = True
+    owner = SimpleNamespace(
+        module=SimpleNamespace(parameters=lambda: [kept]), buffers=[], expert_parallel_buffers=[]
+    )
+    with patch.object(module, '_is_megatron_ddp', return_value=True):
+        module.offload_model_to_cpu([owner])
+    assert kept.data is source and Device.copies == 0
+
+
 def test_all_actor_ranks_park_before_shared_server_wake():
     m = product()
     cls, trace = fixture()
@@ -240,3 +340,17 @@ def test_native_process_residency_and_rollout_headroom(
     assert len(warned) == (1 if error and mode != 'raise' else 0)
     if warned:
         assert error in warned[0]
+
+
+def test_host_trim_reports_rss_and_never_raises(capsys):
+    import json
+
+    pytest.importorskip('verl')
+    from verl_mlite.engine.mlite_engine import _return_freed_host_memory
+
+    _return_freed_host_memory('save_checkpoint')
+    lines = [l for l in capsys.readouterr().out.splitlines() if l.startswith('MLITE_HOST_TRIM ')]
+    assert len(lines) <= 1
+    if lines:
+        report = json.loads(lines[0].split(' ', 1)[1])
+        assert report['phase'] == 'save_checkpoint' and report['rss_after'] > 0

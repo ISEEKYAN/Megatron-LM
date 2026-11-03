@@ -145,7 +145,7 @@ def export_hf_weights(chunks, model_cfg, ps, **kwargs):
 
     target = kwargs.pop("target", "hf")
     if target == "lora":
-        yield from _lora_weights(chunks)
+        yield from _lora_weights(chunks, on_device=kwargs.pop("lora_on_device", False))
         return
     if target not in ("release", "hf", "bf16", "vllm"):
         raise ValueError(f"Unknown DS4.1 export target, got {target!r}")
@@ -220,7 +220,7 @@ def save_hf_weights(chunks, path, model_cfg, ps, **kwargs):
         )
 
 
-def _lora_weights(chunks):
+def _lora_weights(chunks, on_device=False):
     """Merge adapter owners only after replicated factors agree byte for byte."""
     import torch.distributed as dist
 
@@ -231,27 +231,39 @@ def _lora_weights(chunks):
         if callable(sync):
             sync(force_sync=True)
     yield from gather_lora_tensors(
-        {k: v.detach() for c in chunks for k, v in lora_state(c).items()}
+        {k: v.detach() for c in chunks for k, v in lora_state(c).items()}, on_device=on_device
     )
 
 
-def gather_lora_tensors(local):
-    """Exchange only metadata as objects; gather unchanged adapter bytes in one bucket."""
+def _gather_device(backend):
+    """GPU for any NCCL-capable default group, including VERL's mixed "cpu:gloo,cuda:nccl"."""
+    if "nccl" in str(backend):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
+def gather_lora_tensors(local, on_device=False):
+    """Exchange only metadata as objects; gather unchanged adapter bytes in one bucket.
+
+    ``on_device`` keeps the gathered factors on the collective's device (views into the gathered
+    buffers) and checks replicated factors there in one batched comparison; otherwise each rank's
+    buffer is copied to host once and checked factor by factor.
+    """
+    import json
     import math
+    import time
 
     import torch.distributed as dist
 
     from megatron.lite.primitive.ckpt.hf_weights import bucketed_all_gather_into_tensor
 
+    started = time.perf_counter()
     world = dist.get_world_size()
     metadata = [None] * world
     entries = sorted(local.items())
     dist.all_gather_object(metadata, [(k, tuple(v.shape), str(v.dtype)) for k, v in entries])
-    device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if dist.get_backend() == "nccl"
-        else torch.device("cpu")
-    )
+    times = {"metadata": time.perf_counter() - started}
+    device = _gather_device(dist.get_backend())
     state = {}
     # Real deployment factors are uniformly BF16 (one collective). Keep the HF
     # exporter lossless for CPU FP32 and mixed floating-point adapter callers.
@@ -267,12 +279,40 @@ def gather_lora_tensors(local):
         if selected:
             views = packed[: lengths[dist.get_rank()]].split([v.numel() for _, v in selected])
             torch._foreach_copy_(list(views), [v.reshape(-1) for _, v in selected])
+        mark = time.perf_counter()
         gathered = bucketed_all_gather_into_tensor(
             [("adapter", packed)],
             group=None,
             group_size=world,
             buffer_max_size_bytes=maximum * world * packed.element_size(),
         )[0][2]
+        times["all_gather"] = times.get("all_gather", 0.0) + time.perf_counter() - mark
+        mark = time.perf_counter()
+        if on_device:
+            first, again = {}, []
+            for part, vector in zip(parts, gathered):
+                offset = 0
+                for key, shape in part:
+                    size = math.prod(shape)
+                    value = vector[offset : offset + size].view(shape)
+                    offset += size
+                    if key in first:
+                        if first[key].shape != value.shape:
+                            raise ValueError(f"Replicated LoRA factors differ before export: {key}")
+                        again.append((first[key], value))
+                    else:
+                        first[key] = value
+            if again and not torch.equal(
+                torch.cat([a.reshape(-1) for a, _ in again]).view(torch.uint8),
+                torch.cat([b.reshape(-1) for _, b in again]).view(torch.uint8),
+            ):
+                raise ValueError("Replicated LoRA factors differ before export")
+            times["replica_check"] = times.get("replica_check", 0.0) + time.perf_counter() - mark
+            for key, value in first.items():
+                if key in state:
+                    raise ValueError(f"LoRA factor {key} exported with two dtypes")
+                state[key] = value
+            continue
         for part, vector in zip(parts, gathered):
             # One D2H copy per rank/dtype buffer, never one copy per expert factor.
             cpu = vector.cpu()
@@ -288,4 +328,7 @@ def gather_lora_tensors(local):
                 ):
                     raise ValueError(f"Replicated LoRA factors differ before export: {key}")
                 state[key] = value
+    if on_device:
+        times.update(local=len(entries), exported=len(state))
+        print("MLITE_LORA_GATHER " + json.dumps(times), flush=True)
     yield from state.items()

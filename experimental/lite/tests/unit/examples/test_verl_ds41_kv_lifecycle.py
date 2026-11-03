@@ -228,6 +228,7 @@ def image_server(server):
             'ds41_weights_image_chunk_mib': 64,
             'ds41_weights_image_readers': 8,
             'ds41_weights_image_verify': True,
+            'ds41_weights_image_host_mib': 1024,
         },
         data_parallel_size=4,
         tensor_model_parallel_size=1,
@@ -253,7 +254,7 @@ def test_image_dumps_once_and_restores_before_kv_and_publish(server, capsys):
 
     asyncio.run(step())
     asyncio.run(step())
-    dump = ('rpc', 'mlite_weights_image_dump', ('/raid/scratch/job', 64 << 20))
+    dump = ('rpc', 'mlite_weights_image_dump', ('/raid/scratch/job', 64 << 20, 1 << 30))
     restore = ('rpc', 'mlite_weights_image_restore', ('/raid/scratch/job', 64 << 20, 8, True))
     cycle = [
         ('sleep', 2),
@@ -271,6 +272,72 @@ def test_image_dumps_once_and_restores_before_kv_and_publish(server, capsys):
     ]
     assert len(lines) == 2 and json.loads(lines[-1].split(' ', 1)[1]) == receipt
     assert not server._verl_mlite_image_pending
+
+
+def test_image_overlap_publishes_during_background_restore(server, capsys):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def step():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(step())
+    args = ('/raid/scratch/job', 64 << 20, 8, True)
+    assert [e for e in server.events if e[0] != 'rpc' or e[1] != 'mlite_weights_image_dump'] == [
+        ('sleep', 2),
+        ('reset',),
+        ('wake', ['weights']),
+        ('rpc', 'mlite_weights_image_restore_start', args),
+        ('publish_current_adapter_all_ack',),
+        ('rpc', 'mlite_weights_image_restore_join', ()),
+        ('wake', ['kv_cache']),
+    ]
+    receipt = server._verl_mlite_image_receipt
+    assert receipt['engines'] == 4 and len(receipt['early']) == 4
+    assert server._verl_mlite_image_joining is None and not server._verl_mlite_image_pending
+    assert (
+        sum(l.startswith('MLITE_WEIGHTS_IMAGE ') for l in capsys.readouterr().out.splitlines()) == 1
+    )
+
+
+def test_image_overlap_second_weights_wake_does_not_join(server):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def step():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])  # early wake, before the actor parks
+        await server.wake_up(['weights'])  # the native sync's own weights wake
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(step())
+    names = [e[1] if e[0] == 'rpc' else e[0] for e in server.events]
+    assert names[-5:] == [
+        'wake',
+        'mlite_weights_image_restore_start',
+        'publish_current_adapter_all_ack',
+        'mlite_weights_image_restore_join',
+        'wake',
+    ]
+
+
+def test_image_overlap_kv_first_wake_restores_synchronously(server):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    asyncio.run(server.wake_up(['weights', 'kv_cache']))
+    assert [e[0:2] for e in server.events[-3:]] == [
+        ('wake', ['weights']),
+        ('rpc', 'mlite_weights_image_restore'),
+        ('wake', ['kv_cache']),
+    ]
 
 
 def test_image_kv_first_wake_restores_weights_first(server):
@@ -325,3 +392,36 @@ def test_image_restore_rejects_changed_pool(tmp_path, monkeypatch):
     monkeypatch.setattr(weights_image, '_pool', lambda: [(4096, 8192)])
     with pytest.raises(RuntimeError, match='layout changed'):
         weights_image.restore(worker, str(tmp_path), 4096, 1, True)
+
+
+def test_image_segments_skip_page_aligned_native_ranges():
+    from verl_mlite.rollout.weights_image import _segments
+
+    page = 4096
+    pool = [(0, 8 * page), (16 * page, 4 * page)]
+    skip = [
+        (page + 100, 3 * page),  # unaligned start: only the interior page [2p, 3p) is skipped
+        (5 * page, 7 * page),
+        (18 * page, 30 * page),  # runs past the allocation end
+        (10, 20),  # smaller than a page: kept
+    ]
+    assert _segments(pool, skip) == [
+        (0, 2 * page),
+        (3 * page, 2 * page),
+        (7 * page, page),
+        (16 * page, 2 * page),
+    ]
+    assert _segments(pool, []) == pool
+
+
+def test_image_split_moves_page_aligned_prefix_to_host():
+    from verl_mlite.rollout.weights_image import _split
+
+    page = 4096
+    segments = [(0, 3 * page), (10 * page, 4 * page)]
+    assert _split(segments, 4 * page + 100) == (
+        [(0, 3 * page), (10 * page, page)],
+        [(11 * page, 3 * page)],
+    )
+    assert _split(segments, 0) == ([], segments)
+    assert _split(segments, 1 << 40) == (segments, [])

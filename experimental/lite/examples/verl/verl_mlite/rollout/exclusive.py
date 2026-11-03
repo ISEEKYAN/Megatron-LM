@@ -1,9 +1,11 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Park the actor before native hybrid rollout wake; reuse engine storage moves."""
+import asyncio
 import gc
 import json
 import os
 import sys
+import time
 from functools import wraps
 
 import torch
@@ -56,10 +58,18 @@ def record(engine, phase):
     margin = 16 * 2**30
     report['rollout_peak_budget_bytes'] = rollout_budget
     report['required_free_margin_bytes'] = margin
+    # Frozen parameters deliberately left on the GPU (exclusive_keep_frozen_on_gpu).
+    storages = {
+        p.untyped_storage().data_ptr(): p.untyped_storage().nbytes()
+        for p in engine.module.parameters()
+        if getattr(p, '_mlite_keep_on_device', False) and p.is_cuda
+    }
+    kept = sum(storages.values())  # parameters may be views of one storage: count it once
+    report['kept_frozen_bytes'] = kept
     print('MLITE_EXCLUSIVE_ACTOR ' + json.dumps(report), flush=True)
     if phase == 'before_rollout_wake':
-        guard(process_bytes <= 16 * 2**30, 'ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
-        guard(allocated <= 4 * 2**30, 'ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
+        guard(process_bytes - kept <= 16 * 2**30, 'ACTOR_PROCESS_RESIDENCY_ABOVE_16GIB', report)
+        guard(allocated - kept <= 4 * 2**30, 'ACTOR_GPU_RESIDENCY_ABOVE_4GIB', report)
         guard(
             process_bytes + rollout_budget + margin <= report['total_bytes'],
             'ACTOR_ROLLOUT_CAPACITY_BUDGET',
@@ -77,7 +87,11 @@ def record(engine, phase):
             return value.untyped_storage().nbytes()
 
         guard(
-            not any(resident(p) for p in engine.module.parameters()),
+            not any(
+                resident(p)
+                for p in engine.module.parameters()
+                if not getattr(p, '_mlite_keep_on_device', False)
+            ),
             'ACTOR_PARAMETER_RESIDENT',
             report,
         )
@@ -136,6 +150,18 @@ def consume_host_snapshot(engine):
     return None
 
 
+def park_on_thread(engine, device):
+    """Park the actor from a worker thread (bind the caller's device first)."""
+    if device is not None:
+        torch.cuda.set_device(device)
+    engine.to('cpu', model=True, optimizer=True, grad=True)
+    engine._exclusive_actor_offloaded = True
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def install():
     # Engine construction happens after this worker class has been defined.
     from verl.workers import engine_workers
@@ -157,33 +183,85 @@ def install():
             raise ValueError('Exclusive actor uses explicit boundaries, not auto param_offload')
         if getattr(engine, '_exclusive_adapter_snapshot', None) is not None:
             raise RuntimeError('Unconsumed exclusive adapter snapshot')
-        weights, peft = engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
-        )
-        if peft is None:
-            raise ValueError('Exclusive actor supports adapter-only publication')
-        owned = list(weights)
-        if not owned or any(value.device.type != 'cpu' for _, value in owned):
-            raise ValueError('Adapter snapshot must own host storage before actor offload')
-        engine._exclusive_adapter_snapshot = (owned, peft)
+        start, start_mono = time.time(), time.perf_counter()
+        custom = getattr(self.config.rollout, 'custom', None) or {}
+        prewake = None
+        if custom.get('ds41_weights_image_wake_before_park', False):
+            # The weights image restore is disk-bound and the rollout base fits next to the
+            # unparked actor: map it and start the restore now, under the snapshot and park.
+            prewake = asyncio.ensure_future(self.rollout.resume(tags=['weights']))
+            # Let it submit the server RPC before the blocking snapshot and park below.
+            await asyncio.sleep(0)
+        times = []
         try:
+            weights, peft = engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=True
+            )
+            if peft is None:
+                raise ValueError('Exclusive actor supports adapter-only publication')
+            owned = list(weights)
+            if not owned or any(value.device.type != 'cpu' for _, value in owned):
+                raise ValueError('Adapter snapshot must own host storage before actor offload')
+            engine._exclusive_adapter_snapshot = (owned, peft)
+            times.append(('snapshot', time.perf_counter()))
             record(engine, 'actor_before_offload')
+            times.append(('record', time.perf_counter()))
+            if prewake is not None and custom.get('ds41_weights_image_park_during_publish', False):
+                # The rollout is already mapped (wake_before_park) and the actor still fits next
+                # to it with the KV cache, so park on a thread while the adapter publishes.
+                await prewake
+                times.append(('prewake_wait', time.perf_counter()))
+                device = torch.cuda.current_device() if torch.cuda.is_available() else None
+                parking = asyncio.get_running_loop().run_in_executor(
+                    None, park_on_thread, engine, device
+                )
+                try:
+                    result = await original(self, global_steps=global_steps, mode=mode)
+                    times.append(('wake_publish', time.perf_counter()))
+                finally:
+                    await asyncio.wait([parking])
+                parking.result()
+                times.append(('park_tail', time.perf_counter()))
+                record(engine, 'before_rollout_wake')
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                times.append(('barrier', time.perf_counter()))
+                return result
             engine.to('cpu', model=True, optimizer=True, grad=True)
             engine._exclusive_actor_offloaded = True
+            times.append(('offload', time.perf_counter()))
             gc.collect()
             if torch.cuda.is_available():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
+            times.append(('release', time.perf_counter()))
+            if prewake is not None:
+                await prewake
+                times.append(('prewake_wait', time.perf_counter()))
             record(engine, 'before_rollout_wake')
             # One server wake restores all DEP workers. Every actor rank
             # must be parked before the first caller wakes that shared server.
             if torch.distributed.is_initialized():
                 torch.distributed.barrier()
+            times.append(('barrier', time.perf_counter()))
             # Original native RPC order/IPC/ACK remains authoritative. Its
             # get_per_tensor_param consumes the host snapshot without onload.
-            return await original(self, global_steps=global_steps, mode=mode)
+            result = await original(self, global_steps=global_steps, mode=mode)
+            times.append(('wake_publish', time.perf_counter()))
+            return result
         finally:
+            if prewake is not None and not prewake.done():
+                await asyncio.wait([prewake])
             engine._exclusive_adapter_snapshot = None
+            receipt = dict(pid=os.getpid(), global_steps=global_steps, start=start)
+            receipt['prewake'] = prewake is not None
+            if times:
+                receipt['snapshot'] = round(times[0][1] - start_mono, 3)
+            receipt.update(
+                (name, round(t - prev, 3)) for (_, prev), (name, t) in zip(times, times[1:])
+            )
+            receipt['seconds'] = round(time.perf_counter() - start_mono, 3)
+            print('MLITE_EXCLUSIVE_SYNC ' + json.dumps(receipt), flush=True)
 
     update_weights._mlite_exclusive_actor = True
     cls.update_weights = update_weights

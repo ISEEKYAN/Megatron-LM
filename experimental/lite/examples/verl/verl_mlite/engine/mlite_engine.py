@@ -87,6 +87,37 @@ def _is_no_padding_pad_mode(pad_mode: Any) -> bool:
     )
 
 
+
+def _rss_bytes():
+    with open("/proc/self/statm") as f:
+        return int(f.read().split()[1]) * os.sysconf("SC_PAGE_SIZE")
+
+
+def _return_freed_host_memory(phase):
+    """Hand glibc's freed checkpoint staging memory back to the OS (malloc_trim).
+
+    Checkpoint save/load frees many large host buffers that glibc otherwise keeps mapped, so the
+    process stays tens of GiB above its live size into the next weight sync.
+    """
+    import ctypes
+    import json
+    import time
+
+    try:
+        trim = ctypes.CDLL("libc.so.6").malloc_trim
+    except OSError:
+        return
+    started, before = time.perf_counter(), _rss_bytes()
+    trim(0)
+    report = dict(
+        phase=phase,
+        pid=os.getpid(),
+        rss_before=before,
+        rss_after=_rss_bytes(),
+        seconds=round(time.perf_counter() - started, 3),
+    )
+    print("MLITE_HOST_TRIM " + json.dumps(report), flush=True)
+
 class _MegatronLiteLRScheduler:
     def __init__(
         self,
@@ -459,7 +490,7 @@ class MegatronLiteEngine(BaseEngine):
                 cfg = self.handle._extras['model_cfg']
                 base = getattr(self.model_config.hf_config, 'mlite_base_manifest_sha256', '')
                 result = prepare_adapter_sync(
-                    self.runtime.export_weights(self.handle, target='lora'),
+                    self.runtime.export_weights(self.handle, target='lora', lora_on_device=True),
                     lora, cfg.num_hidden_layers, version, base,
                 )
                 self._ds41_lora_version = version
@@ -533,18 +564,45 @@ class MegatronLiteEngine(BaseEngine):
             from verl_mlite.rollout.exclusive import clear_deployment_scratch
 
             if not getattr(self, "_exclusive_placement_recorded", False):
+                keep = getattr(self.engine_config, "exclusive_keep_frozen_on_gpu", False)
                 for parameter in self.module.parameters():
                     if not parameter.requires_grad:
                         parameter._mlite_keep_on_cpu = parameter.device.type == "cpu"
+                        if parameter._mlite_keep_on_cpu:
+                            continue
+                        if keep:
+                            parameter._mlite_keep_on_device = True
+                        else:
+                            # Frozen bytes never change: keep one host copy across parks.
+                            parameter._mlite_host_mirror = None
                 self._exclusive_placement_recorded = True
             clear_deployment_scratch(self)
+        if exclusive and device == "cuda":
+            self._engram_images("unpark_host")
         self.runtime.to(self.handle, device, model=model, optimizer=optimizer, grad=grad)
+        if exclusive and device == "cpu":
+            self._engram_images("park_host")
         if exclusive:
             from verl_mlite.rollout.exclusive import extra_storage
 
             extra_storage(self, device)
             if device == "cpu" and self.device_name == "cuda":
                 _release_inactive_cuda_cache()
+
+    def _engram_images(self, action):
+        """Park or restore the frozen Engram host shards through exclusive_engram_image_dir."""
+        directory = getattr(self.engine_config, "exclusive_engram_image_dir", None)
+        if not directory:
+            return
+        import socket
+
+        tables = [m for m in self.module.modules() if callable(getattr(m, "park_host", None))]
+        if not tables:
+            return
+        os.makedirs(directory, exist_ok=True)
+        stem = os.path.join(directory, f"{socket.gethostname()}_rank{self._rank}")
+        for index, table in enumerate(tables):
+            getattr(table, action)(f"{stem}_engram{index}.bin")
 
     def save_checkpoint(
         self,
@@ -603,6 +661,7 @@ class MegatronLiteEngine(BaseEngine):
             if reload_params_for_save:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
             aggressive_empty_cache(force_sync=True)
+            _return_freed_host_memory("save_checkpoint")
 
     def _save_hf_checkpoint(self, local_path: str) -> None:
         proto = self.handle._extras.get("protocol")
@@ -693,10 +752,15 @@ class MegatronLiteEngine(BaseEngine):
                 dist.barrier()
         finally:
             if parked:
+                # The load may have rewritten frozen parameters; take fresh host copies.
+                for parameter in self.module.parameters():
+                    if hasattr(parameter, "_mlite_host_mirror"):
+                        parameter._mlite_host_mirror = None
                 self.to(device="cpu", model=True, optimizer=True, grad=True)
                 torch.cuda.synchronize()
             elif reload_params_for_load:
                 self.to(device="cpu", model=True, optimizer=False, grad=False)
+            _return_freed_host_memory("load_checkpoint")
 
     def is_mp_src_rank_with_outputs(self):
         if self.handle is None:

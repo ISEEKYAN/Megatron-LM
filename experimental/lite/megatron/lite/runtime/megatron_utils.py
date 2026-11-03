@@ -128,7 +128,18 @@ def offload_model_to_cpu(model_list: list) -> None:
             for buffers in all_buffers:
                 for buffer in buffers:
                     if buffer.param_data.storage().size() > 0:
-                        buffer.param_data.cpu_data = buffer.param_data.data.cpu().pin_memory()
+                        host = getattr(buffer.param_data, "cpu_data", None)
+                        data = buffer.param_data.data
+                        if (
+                            isinstance(host, torch.Tensor)
+                            and host.is_pinned()
+                            and host.shape == data.shape
+                            and host.dtype == data.dtype
+                        ):
+                            # Reuse the pinned copy of an earlier offload instead of a new one.
+                            host.copy_(data, non_blocking=True)
+                        else:
+                            buffer.param_data.cpu_data = data.cpu().pin_memory()
                         buffer.param_data_size = buffer.param_data.storage().size()
                         buffer.param_data.storage().resize_(0)
 
@@ -137,11 +148,29 @@ def offload_model_to_cpu(model_list: list) -> None:
                         buffer.grad_data.storage().resize_(0)
 
             for param in model_chunk.module.parameters():
-                if not param.requires_grad and param.device.type != "cpu":
-                    param.data = param.data.to("cpu", non_blocking=True)
+                if (
+                    not param.requires_grad
+                    and param.device.type != "cpu"
+                    and not getattr(param, "_mlite_keep_on_device", False)
+                ):
+                    param.data = _frozen_host_copy(param)
         else:
             _reshard_fsdp2_modules(model_chunk)
             model_chunk.to("cpu")
+
+
+def _frozen_host_copy(param):
+    """Host copy of a frozen parameter for an offload.
+
+    A parameter tagged ``_mlite_host_mirror`` keeps its first host copy and reuses it on every
+    later offload: frozen bytes never change, so those offloads copy nothing. Untagged parameters
+    are copied to host on every offload.
+    """
+    if not hasattr(param, "_mlite_host_mirror"):
+        return param.data.to("cpu", non_blocking=True)
+    if param._mlite_host_mirror is None:
+        param._mlite_host_mirror = param.data.to("cpu", non_blocking=True)
+    return param._mlite_host_mirror
 
 
 def release_grad_buffers(model_list: list) -> None:
