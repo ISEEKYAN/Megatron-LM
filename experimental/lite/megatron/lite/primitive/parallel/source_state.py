@@ -1,11 +1,33 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """One-microbatch ownership of Shared-source compressed KV tensors."""
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import contextmanager
+from contextvars import ContextVar
 from typing import Any
 
 import torch
 from torch.utils._pytree import tree_flatten, tree_unflatten
+
+_REPLAY: ContextVar = ContextVar("checkpoint_replay", default=None)
+
+
+def replayed(produce: Callable[[], Any]) -> Any:
+    """``produce()`` once per checkpointed segment: the first forward keeps the value and
+    the recompute replay takes it back in call order instead of producing it again.
+
+    For values whose backward needs only the segment's own saved inputs, so the replay
+    can skip the producer (its kernels and collectives) and return the same bits.
+    Outside a checkpoint this is ``produce()``.
+    """
+    memo = _REPLAY.get()
+    if memo is None:
+        return produce()
+    values, recording = memo
+    if recording:
+        values.append(produce())
+        return values[-1]
+    return values.popleft()
 
 
 class KVSourceState:
@@ -62,6 +84,7 @@ class KVSourceState:
         argument_count = len(args)
         logical_mode = self.grad_mode
         metadata = []
+        memo = deque()
 
         def segment(*saved):
             local_leaves = list(leaves)
@@ -70,6 +93,7 @@ class KVSourceState:
             inputs = tree_unflatten(local_leaves, input_spec)
             old_values, old_active, old_mode = self.values, self.active, self._logical_grad_mode
             self.values, self.active, self._logical_grad_mode = dict(inputs), True, logical_mode
+            token = _REPLAY.set((memo, not metadata))
             try:
                 result = function(*saved[:argument_count])
                 published = {
@@ -99,6 +123,7 @@ class KVSourceState:
                     )
                 return tuple(values[i] for i in tensor_slots)
             finally:
+                _REPLAY.reset(token)
                 self.values, self.active, self._logical_grad_mode = old_values, old_active, old_mode
 
         output = checkpoint_fn(segment, False, *args, *saved_sources)

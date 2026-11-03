@@ -11,6 +11,7 @@ from contextlib import nullcontext
 import torch
 
 from megatron.lite.primitive.modules.lora import disable_lora_adapters
+from megatron.lite.primitive.parallel.source_state import replayed
 
 from . import experts
 from .batching import metadata
@@ -187,31 +188,41 @@ class _Hooks(torch.autograd.Function):
             owner.experts.linear_fc1.weight0.shape[0] // 2,
             lora_rank=rank,
         )
-        max_rows = torch.tensor(x.shape[0], device=x.device)
-        torch.distributed.all_reduce(max_rows, torch.distributed.ReduceOp.MAX, group=owner.ep_group)
-        max_rows = int(max_rows)
-        packed = frozen_weights(owner)
-        outputs = []
-        for i in range(max(1, (max_rows + capacity - 1) // capacity)):
-            sl = slice(i * capacity, (i + 1) * capacity)
-            # Empty input ranks can own remote expert rows. Bound the down grid
-            # by the largest source, never this rank's local token count.
-            bound = min(capacity, max_rows - i * capacity)
-            if ctx.base_only:
-                outputs.append(
-                    experts.launch(
-                        x[sl],
-                        scores[sl],
-                        ids[sl],
-                        packed,
-                        buffer,
-                        owner.config.activation_func_clamp_value,
-                        owner.ep_group.size(),
+
+        def launch():
+            max_rows = torch.tensor(x.shape[0], device=x.device)
+            torch.distributed.all_reduce(
+                max_rows, torch.distributed.ReduceOp.MAX, group=owner.ep_group
+            )
+            max_rows = int(max_rows)
+            packed = frozen_weights(owner)
+            outputs = []
+            for i in range(max(1, (max_rows + capacity - 1) // capacity)):
+                sl = slice(i * capacity, (i + 1) * capacity)
+                # Empty input ranks can own remote expert rows. Bound the down grid
+                # by the largest source, never this rank's local token count.
+                bound = min(capacity, max_rows - i * capacity)
+                if ctx.base_only:
+                    outputs.append(
+                        experts.launch(
+                            x[sl],
+                            scores[sl],
+                            ids[sl],
+                            packed,
+                            buffer,
+                            owner.config.activation_func_clamp_value,
+                            owner.ep_group.size(),
+                        )
                     )
-                )
-            else:
-                outputs.append(_launch(owner, x[sl], scores[sl], ids[sl], packed, buffer, bound))
-        return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+                else:
+                    outputs.append(
+                        _launch(owner, x[sl], scores[sl], ids[sl], packed, buffer, bound)
+                    )
+            return outputs[0] if len(outputs) == 1 else torch.cat(outputs)
+
+        # The adjoint replays from the saved inputs alone: a checkpoint recompute reuses
+        # the first forward's rows instead of the native launch and its EP row collective.
+        return replayed(launch)
 
     @staticmethod
     def backward(ctx, grad):
