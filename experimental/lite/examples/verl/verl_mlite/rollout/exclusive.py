@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Park the actor before native hybrid rollout wake; reuse engine storage moves."""
+import asyncio
 import gc
 import json
 import os
@@ -159,17 +160,26 @@ def install():
         if getattr(engine, '_exclusive_adapter_snapshot', None) is not None:
             raise RuntimeError('Unconsumed exclusive adapter snapshot')
         start, start_mono = time.time(), time.perf_counter()
-        weights, peft = engine.get_per_tensor_param(
-            layered_summon=self.layered_summon, base_sync_done=True
-        )
-        if peft is None:
-            raise ValueError('Exclusive actor supports adapter-only publication')
-        owned = list(weights)
-        if not owned or any(value.device.type != 'cpu' for _, value in owned):
-            raise ValueError('Adapter snapshot must own host storage before actor offload')
-        engine._exclusive_adapter_snapshot = (owned, peft)
-        times = [('snapshot', time.perf_counter())]
+        custom = getattr(self.config.rollout, 'custom', None) or {}
+        prewake = None
+        if custom.get('ds41_weights_image_wake_before_park', False):
+            # The weights image restore is disk-bound and the rollout base fits next to the
+            # unparked actor: map it and start the restore now, under the snapshot and park.
+            prewake = asyncio.ensure_future(self.rollout.resume(tags=['weights']))
+            # Let it submit the server RPC before the blocking snapshot and park below.
+            await asyncio.sleep(0)
+        times = []
         try:
+            weights, peft = engine.get_per_tensor_param(
+                layered_summon=self.layered_summon, base_sync_done=True
+            )
+            if peft is None:
+                raise ValueError('Exclusive actor supports adapter-only publication')
+            owned = list(weights)
+            if not owned or any(value.device.type != 'cpu' for _, value in owned):
+                raise ValueError('Adapter snapshot must own host storage before actor offload')
+            engine._exclusive_adapter_snapshot = (owned, peft)
+            times.append(('snapshot', time.perf_counter()))
             record(engine, 'actor_before_offload')
             times.append(('record', time.perf_counter()))
             engine.to('cpu', model=True, optimizer=True, grad=True)
@@ -180,6 +190,9 @@ def install():
                 torch.cuda.synchronize()
                 torch.cuda.empty_cache()
             times.append(('release', time.perf_counter()))
+            if prewake is not None:
+                await prewake
+                times.append(('prewake_wait', time.perf_counter()))
             record(engine, 'before_rollout_wake')
             # One server wake restores all DEP workers. Every actor rank
             # must be parked before the first caller wakes that shared server.
@@ -192,9 +205,13 @@ def install():
             times.append(('wake_publish', time.perf_counter()))
             return result
         finally:
+            if prewake is not None and not prewake.done():
+                await asyncio.wait([prewake])
             engine._exclusive_adapter_snapshot = None
             receipt = dict(pid=os.getpid(), global_steps=global_steps, start=start)
-            receipt['snapshot'] = round(times[0][1] - start_mono, 3)
+            receipt['prewake'] = prewake is not None
+            if times:
+                receipt['snapshot'] = round(times[0][1] - start_mono, 3)
             receipt.update(
                 (name, round(t - prev, 3)) for (_, prev), (name, t) in zip(times, times[1:])
             )

@@ -191,6 +191,25 @@ def test_frozen_host_mirror_is_copied_once_across_parks():
     assert plain.source.copies == 3
 
 
+def test_wake_before_park_submits_weights_wake_first():
+    m = product()
+    cls, trace = fixture()
+    cls.config.rollout.custom = {'ds41_weights_image_wake_before_park': True}
+
+    class Rollout:
+        async def resume(self, tags):
+            trace.append(('submit', tuple(tags)))
+            await asyncio.sleep(0)
+            trace.append(('mapped', tuple(tags)))
+
+    cls.rollout = Rollout()
+    install(m, cls)
+    asyncio.run(cls().update_weights(global_steps=1))
+    assert trace.index(('submit', ('weights',))) < trace.index('export') < trace.index('offload')
+    assert trace.index(('mapped', ('weights',))) < trace.index('wake')
+    del cls.config.rollout.custom
+
+
 def test_all_actor_ranks_park_before_shared_server_wake():
     m = product()
     cls, trace = fixture()

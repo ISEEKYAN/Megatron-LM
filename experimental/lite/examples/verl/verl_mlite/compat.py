@@ -1646,6 +1646,9 @@ def _patch_vllm_rollout_sleep_level() -> bool:
 
     async def wake_up(self, tags=None):
         joining = getattr(self, "_verl_mlite_image_joining", None)
+        if joining is not None and "kv_cache" not in (tags or self._get_wake_up_tags()):
+            # Weights are already mapped and restoring (an early wake); nothing more to do.
+            return None
         if joining is not None:
             # The adapter publish ran while the base restored; finish it before the KV cache.
             restored = await all_workers(self, "mlite_weights_image_restore_join")

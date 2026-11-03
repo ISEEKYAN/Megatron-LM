@@ -304,6 +304,29 @@ def test_image_overlap_publishes_during_background_restore(server, capsys):
     )
 
 
+def test_image_overlap_second_weights_wake_does_not_join(server):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def step():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])  # early wake, before the actor parks
+        await server.wake_up(['weights'])  # the native sync's own weights wake
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(step())
+    names = [e[1] if e[0] == 'rpc' else e[0] for e in server.events]
+    assert names[-5:] == [
+        'wake',
+        'mlite_weights_image_restore_start',
+        'publish_current_adapter_all_ack',
+        'mlite_weights_image_restore_join',
+        'wake',
+    ]
+
+
 def test_image_overlap_kv_first_wake_restores_synchronously(server):
     image_server(server)
     server.config.custom['ds41_weights_image_overlap_publish'] = True
