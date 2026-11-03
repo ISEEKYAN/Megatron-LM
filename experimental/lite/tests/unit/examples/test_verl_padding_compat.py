@@ -1,32 +1,34 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Real VERL padding can run without the optional FlashAttention CUDA package."""
-import sys
-from pathlib import Path
+import builtins
+from types import SimpleNamespace
 
 import pytest
 import torch
 
-sys.path.insert(0, str(Path(__file__).resolve().parents[3] / 'examples/verl'))
-from verl_mlite import compat
-
 pytestmark = pytest.mark.optional
 
 
-def _missing(name):
-    def functions():
-        raise ModuleNotFoundError(name=name)
+def _block_flash_attention_import(monkeypatch, missing_dependency='flash_attn'):
+    original_import = builtins.__import__
 
-    return functions
+    def without_flash_attention(name, *args, **kwargs):
+        if name == 'flash_attn.bert_padding':
+            raise ModuleNotFoundError(name=missing_dependency)
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', without_flash_attention)
 
 
 def test_padding_fallback_real_verl_roundtrip_and_gradient(monkeypatch):
+    pytest.importorskip(
+        "verl.utils.attention_padding_utils", reason="requires VERL native padding fallback"
+    )
     from tensordict import TensorDict
     from verl.utils import attention_utils as attention
     from verl.workers.utils.padding import left_right_2_no_padding, no_padding_2_padding
 
-    monkeypatch.setattr(attention, '_get_attention_functions', _missing('flash_attn'))
-    assert compat._patch_verl_padding_helpers()
-    assert compat._patch_verl_padding_helpers()  # idempotent
+    _block_flash_attention_import(monkeypatch)
     mask = torch.tensor([[0, 1, 1, 1, 1], [1, 1, 1, 1, 0]])
     values = torch.arange(20, dtype=torch.float32).reshape(2, 5, 2).requires_grad_()
     unpacked, indices, offsets, maximum, lengths = attention.unpad_input(values, mask)
@@ -60,16 +62,30 @@ def test_padding_keeps_installed_native_provider(monkeypatch):
     from verl.utils import attention_utils as attention
 
     sentinel = (object(),) * 4
-    monkeypatch.setattr(attention, '_get_attention_functions', lambda: sentinel)
-    assert compat._patch_verl_padding_helpers()
-    assert attention._get_attention_functions() is sentinel
+    provider = SimpleNamespace(
+        **dict(zip(('index_first_axis', 'pad_input', 'rearrange', 'unpad_input'), sentinel))
+    )
+    original_import = builtins.__import__
+
+    def with_flash_attention(name, *args, **kwargs):
+        if name == 'flash_attn.bert_padding':
+            return provider
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, '__import__', with_flash_attention)
+    assert attention._get_attention_functions() == sentinel
 
 
-def test_padding_does_not_hide_other_missing_dependency(monkeypatch):
-    from verl.utils import attention_utils as attention
+@pytest.mark.parametrize('missing_dependency', ['flash_attn', 'flash_attn_2_cuda'])
+def test_padding_uses_native_fallback_when_provider_cannot_import(monkeypatch, missing_dependency):
+    pytest.importorskip(
+        "verl.utils.attention_padding_utils", reason="requires VERL native padding fallback"
+    )
+    from verl.utils import attention_padding_utils, attention_utils
 
-    monkeypatch.setattr(attention, '_get_attention_functions', _missing('flash_attn_2_cuda'))
-    assert compat._patch_verl_padding_helpers()
-    with pytest.raises(ModuleNotFoundError) as caught:
-        attention._get_attention_functions()
-    assert caught.value.name == 'flash_attn_2_cuda'
+    _block_flash_attention_import(monkeypatch, missing_dependency)
+    expected = tuple(
+        getattr(attention_padding_utils, name)
+        for name in ('index_first_axis', 'pad_input', 'rearrange', 'unpad_input')
+    )
+    assert attention_utils._get_attention_functions() == expected
