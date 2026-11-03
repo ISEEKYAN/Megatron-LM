@@ -138,6 +138,18 @@ def consume_host_snapshot(engine):
     return None
 
 
+def park_on_thread(engine, device):
+    """Park the actor from a worker thread (bind the caller's device first)."""
+    if device is not None:
+        torch.cuda.set_device(device)
+    engine.to('cpu', model=True, optimizer=True, grad=True)
+    engine._exclusive_actor_offloaded = True
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+        torch.cuda.empty_cache()
+
+
 def install():
     # Engine construction happens after this worker class has been defined.
     from verl.workers import engine_workers
@@ -182,6 +194,27 @@ def install():
             times.append(('snapshot', time.perf_counter()))
             record(engine, 'actor_before_offload')
             times.append(('record', time.perf_counter()))
+            if prewake is not None and custom.get('ds41_weights_image_park_during_publish', False):
+                # The rollout is already mapped (wake_before_park) and the actor still fits next
+                # to it with the KV cache, so park on a thread while the adapter publishes.
+                await prewake
+                times.append(('prewake_wait', time.perf_counter()))
+                device = torch.cuda.current_device() if torch.cuda.is_available() else None
+                parking = asyncio.get_running_loop().run_in_executor(
+                    None, park_on_thread, engine, device
+                )
+                try:
+                    result = await original(self, global_steps=global_steps, mode=mode)
+                    times.append(('wake_publish', time.perf_counter()))
+                finally:
+                    await asyncio.wait([parking])
+                parking.result()
+                times.append(('park_tail', time.perf_counter()))
+                record(engine, 'before_rollout_wake')
+                if torch.distributed.is_initialized():
+                    torch.distributed.barrier()
+                times.append(('barrier', time.perf_counter()))
+                return result
             engine.to('cpu', model=True, optimizer=True, grad=True)
             engine._exclusive_actor_offloaded = True
             times.append(('offload', time.perf_counter()))

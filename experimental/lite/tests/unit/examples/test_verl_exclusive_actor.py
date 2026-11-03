@@ -210,6 +210,26 @@ def test_wake_before_park_submits_weights_wake_first():
     del cls.config.rollout.custom
 
 
+def test_park_during_publish_parks_and_publishes_after_prewake():
+    m = product()
+    cls, trace = fixture()
+    cls.config.rollout.custom = {
+        'ds41_weights_image_wake_before_park': True,
+        'ds41_weights_image_park_during_publish': True,
+    }
+
+    class Rollout:
+        async def resume(self, tags):
+            trace.append(('mapped', tuple(tags)))
+
+    cls.rollout = Rollout()
+    install(m, cls)
+    asyncio.run(cls().update_weights(global_steps=1))
+    assert trace.index(('mapped', ('weights',))) < trace.index('wake')
+    assert 'offload' in trace and trace.index('export') < trace.index('offload')
+    del cls.config.rollout.custom
+
+
 def test_all_actor_ranks_park_before_shared_server_wake():
     m = product()
     cls, trace = fixture()
