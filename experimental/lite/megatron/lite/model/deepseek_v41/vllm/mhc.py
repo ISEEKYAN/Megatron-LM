@@ -2,41 +2,95 @@
 """Caller-stream overlap kernels with the W9-b5 owned mHC graph VJP."""
 import torch
 
-from megatron.core.transformer.hyper_connection import _sinkhorn_iterations
 
+def _post_backward(grad, output, residual, post, comb):
+    """Adapt Core's H_res.T @ residual adjoint; comb already has that orientation."""
+    from megatron.core.fusions.fused_mhc_kernels import _triton_h_post_bda_bwd
 
-def _reference(values, pre, gamma, fn, scale, base, output, residual, post, comb, options):
-    eps, hc_eps, sinkhorn_eps, iterations, broadcast, pending = options
-    copies, width = values.shape[-2:]
-    stream = values
-    if pending:
-        mixed = torch.einsum("...ij,...id->...jd", comb.float(), residual.float())
-        stream = (mixed + post.float().unsqueeze(-1) * output.float().unsqueeze(-2)).to(
-            values.dtype
-        )
-    if broadcast:
-        token = stream[..., 0, :].float()
-        weight = fn.reshape(-1, copies, width).sum(1)
-    else:
-        token, weight = stream.flatten(-2).float(), fn
-    projected = torch.nn.functional.linear(token, weight.float()) * torch.rsqrt(
-        token.square().mean(-1, keepdim=True) + eps
+    copies, width = residual.shape[-2:]
+    dc, dh, dp, dy, _ = _triton_h_post_bda_bwd(
+        grad.reshape(-1, 1, copies, width),
+        comb.reshape(-1, 1, copies, copies),
+        residual.reshape(-1, 1, copies, width),
+        post.reshape(-1, 1, copies),
+        output.reshape(-1, 1, width),
+        None,
     )
+    return dy.reshape_as(output), dh.reshape_as(residual), dp.reshape_as(post), dc.reshape_as(comb)
+
+
+def _joint_backward(saved, options, grads, required):
+    """Differentiate each boundary once, using Core's fused Sinkhorn and Post adjoints."""
+    from megatron.core.fusions.fused_mhc_kernels import _triton_sinkhorn_bwd
+
+    values, pre, gamma, fn, scale, base, output, residual, post, comb, stream = saved
+    eps, _, sinkhorn_eps, iterations, broadcast, pending = options
+    copies, width = stream.shape[-2:]
+    token = (stream[..., 0, :] if broadcast else stream.flatten(-2)).float()
+    weight = (fn.reshape(-1, copies, width).sum(1) if broadcast else fn).float()
+    inverse = torch.rsqrt(token.square().mean(-1, keepdim=True) + eps)
+    projected = torch.nn.functional.linear(token, weight) * inverse
     a, b, c = projected.split((copies, copies, copies * copies), -1)
     ba, bb, bc = base.float().split((copies, copies, copies * copies))
-    next_pre = torch.sigmoid(a * scale[0] + ba) + hc_eps
-    next_post = 2 * torch.sigmoid(b * scale[1] + bb)
-    next_comb = _sinkhorn_iterations(
-        (c * scale[2] + bc).reshape(*token.shape[:-1], copies, copies), iterations, sinkhorn_eps
+    sa, sb = torch.sigmoid(a * scale[0] + ba), torch.sigmoid(b * scale[1] + bb)
+    gs, ga, gb, gc, gn = grads
+    da = torch.zeros_like(a) if ga is None else ga.float() * sa * (1 - sa)
+    db = torch.zeros_like(b) if gb is None else gb.float() * 2 * sb * (1 - sb)
+    if gc is None:
+        dc = torch.zeros_like(c)
+    else:
+        logits = (c * scale[2] + bc).reshape(*token.shape[:-1], copies, copies)
+        # Core's adjoint takes exp(logits - row_max), before the first row normalization.
+        initial = torch.exp(logits - logits.amax(-1, keepdim=True))
+        dc = _triton_sinkhorn_bwd(gc.float(), initial, iterations, sinkhorn_eps).flatten(-2)
+    dbase = (
+        torch.cat((da, db, dc), -1).reshape(-1, base.numel()).sum(0).to(base.dtype)
+        if required[5]
+        else None
     )
+    dscale = (
+        torch.stack(((da * a).sum(), (db * b).sum(), (dc * c).sum())).to(scale.dtype)
+        if required[4]
+        else None
+    )
+    dp = torch.cat((da * scale[0], db * scale[1], dc * scale[2]), -1)
+    dlinear = dp * inverse
+    dtoken = torch.matmul(dlinear, weight)
+    dtoken -= token * inverse.square() * (dp * projected).sum(-1, keepdim=True) / token.shape[-1]
+    dfn = None
+    if required[3]:
+        dweight = dlinear.reshape(-1, weight.shape[0]).T @ token.reshape(-1, token.shape[-1])
+        dfn = (
+            dweight.to(fn.dtype).unsqueeze(1).expand(-1, copies, -1).reshape_as(fn)
+            if broadcast
+            else dweight.to(fn.dtype)
+        )
+
+    # Reuse the projection cast instead of materializing a second FP32 stream.
+    sf = None if broadcast else token.reshape_as(stream)
     collapsed = (
-        stream[..., 0, :]
-        if broadcast
-        else (stream.float() * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
+        stream[..., 0, :] if broadcast else (sf * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
     )
-    rounded_gamma = gamma + (gamma.bfloat16().to(gamma.dtype) - gamma).detach()
-    normed = torch.nn.functional.rms_norm(collapsed, (width,), rounded_gamma, eps)
-    return stream, next_pre, next_post, next_comb, normed
+    x = collapsed.float()
+    rn = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
+    gn = torch.zeros_like(x) if gn is None else gn.float()
+    scaled = gn * gamma.bfloat16().float()
+    dx = (rn * (scaled - x * rn.square() * (scaled * x).mean(-1, keepdim=True))).to(stream.dtype)
+    dgamma = (gn * x * rn).reshape(-1, width).sum(0).to(gamma.dtype) if required[2] else None
+    if broadcast:
+        dstream = torch.zeros_like(stream)
+        dstream[..., 0, :] = dtoken.to(stream.dtype) + dx
+        dpre = None
+    else:
+        dstream = dtoken.reshape_as(stream).to(stream.dtype)
+        dstream = dstream + (dx.float().unsqueeze(-2) * pre.unsqueeze(-1)).to(stream.dtype)
+        dpre = (dx.float().unsqueeze(-2) * sf).sum(-1).to(pre.dtype) if required[1] else None
+    if gs is not None:
+        dstream = dstream + gs
+    if pending:
+        dy, dh, dpost, dcomb = _post_backward(dstream, output, residual, post, comb)
+        return None, dpre, dgamma, dfn, dscale, dbase, dy, dh, dpost, dcomb
+    return dstream.to(values.dtype), dpre, dgamma, dfn, dscale, dbase, None, None, None, None
 
 
 class _Joint(torch.autograd.Function):
@@ -51,7 +105,8 @@ class _Joint(torch.autograd.Function):
 
         eps, hc_eps, sinkhorn_eps, iterations, broadcast, pending = options
         copies, width = values.shape[-2:]
-        ctx.save_for_backward(values, pre, gamma, fn, scale, base, output, residual, post, comb)
+        saved_fn = fn
+        ctx.set_materialize_grads(False)
         ctx.options = options
         kwargs = dict(
             norm_weight=gamma.bfloat16(), norm_eps=eps, stream=torch.cuda.current_stream()
@@ -84,6 +139,19 @@ class _Joint(torch.autograd.Function):
                 stream, fn, scale, base, eps, hc_eps, sinkhorn_eps, 2.0, iterations, **kwargs
             )
         prefix = values.shape[:-2]
+        ctx.save_for_backward(
+            values,
+            pre,
+            gamma,
+            saved_fn,
+            scale,
+            base,
+            output,
+            residual,
+            post,
+            comb,
+            stream.reshape_as(values),
+        )
         return (
             stream.reshape_as(values),
             new_pre.reshape(*prefix, copies),
@@ -95,22 +163,9 @@ class _Joint(torch.autograd.Function):
     @staticmethod
     def backward(ctx, *grad_outputs):
         required = ctx.needs_input_grad[:10]
-        with (
-            torch.enable_grad(),
-            torch.autocast(device_type=ctx.saved_tensors[0].device.type, enabled=False),
-        ):
-            live = [x.detach().requires_grad_(need) for x, need in zip(ctx.saved_tensors, required)]
-            result = _reference(*live, ctx.options)
-            pairs = [
-                (v, g) for v, g in zip(result, grad_outputs) if g is not None and v.requires_grad
-            ]
-            parameters = [x for x, need in zip(live, required) if need]
-            gradients = iter(
-                torch.autograd.grad(
-                    [v for v, _ in pairs], parameters, [g for _, g in pairs], allow_unused=True
-                )
-            )
-        return (*[next(gradients) if need else None for need in required], None)
+        with torch.autocast(device_type=ctx.saved_tensors[0].device.type, enabled=False):
+            gradients = _joint_backward(ctx.saved_tensors, ctx.options, grad_outputs, required)
+        return (*[g if need else None for g, need in zip(gradients, required)], None)
 
 
 def joint(values, previous_pre, gamma, mixes, *, pending=None, broadcast=False):
@@ -157,12 +212,7 @@ class _Post(torch.autograd.Function):
     def backward(ctx, grad):
         output, residual, post, comb = ctx.saved_tensors
         with torch.autocast(device_type=grad.device.type, enabled=False):
-            g = grad.float()
-            dy = (g * post.float().unsqueeze(-1)).sum(-2)
-            dh = torch.einsum("...ij,...jd->...id", comb.float(), g)
-            dp = (g * output.float().unsqueeze(-2)).sum(-1)
-            dc = torch.einsum("...id,...jd->...ij", residual.float(), g)
-        return dy.to(output.dtype), dh.to(residual.dtype), dp.to(post.dtype), dc.to(comb.dtype)
+            return _post_backward(grad, output, residual, post, comb)
 
 
 def post_mix(output, residual, post, comb):
