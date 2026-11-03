@@ -75,6 +75,16 @@ def _snapshot_bucket(weights):
     }
 
 
+def _to_host(tensors):
+    """Own host copies of ``tensors``; same-dtype CUDA tensors go over in one D2H copy."""
+    values = list(tensors.values())
+    if not values or any(not v.is_cuda or v.dtype != values[0].dtype for v in values):
+        return {name: v.to('cpu', copy=True).contiguous() for name, v in tensors.items()}
+    flat = torch.cat([v.reshape(-1) for v in values]).cpu()
+    sizes = [v.numel() for v in values]
+    return {name: part.view(v.shape) for (name, v), part in zip(tensors.items(), flat.split(sizes))}
+
+
 def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256):
     from megatron.lite.model.deepseek_v41.vllm.lora import serving_targets
     from megatron.lite.primitive.modules.lora import normalize_lora_config
@@ -94,7 +104,8 @@ def prepare_adapter_sync(weights, cfg, num_layers, version, base_manifest_sha256
     for name, value in weights:
         if name in tensors:
             raise ValueError(f'Duplicate adapter tensor {name}')
-        tensors[name] = value.detach().to('cpu', copy=True).contiguous()
+        tensors[name] = value.detach()
+    tensors = _to_host(tensors)
     exported = time.perf_counter()
     manifest = dict(
         policy_version=int(version),

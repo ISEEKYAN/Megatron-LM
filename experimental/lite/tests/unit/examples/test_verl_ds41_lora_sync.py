@@ -228,3 +228,17 @@ def test_manifest_entries_hash_the_tensor_bytes():
         raw = tensors[entry['name']].contiguous().view(torch.uint8).numpy().tobytes()
         assert entry['bytes'] == len(raw)
         assert entry['sha256'] == hashlib.sha256(raw).hexdigest()
+
+
+def test_host_copies_keep_names_shapes_and_bytes():
+    from verl_mlite.rollout.ds41_lora import _to_host
+
+    tensors = {
+        'layers.1.a.lora_A.weight': torch.randn(4, 6).to(torch.bfloat16),
+        'layers.1.a.lora_B.weight': torch.randn(2, 3, 5).to(torch.bfloat16)[:, 1:],
+    }
+    out = _to_host(tensors)
+    assert list(out) == list(tensors)
+    for name, value in tensors.items():
+        assert out[name].shape == value.shape and out[name].is_contiguous()
+        assert torch.equal(out[name].view(torch.uint8), value.contiguous().view(torch.uint8))
