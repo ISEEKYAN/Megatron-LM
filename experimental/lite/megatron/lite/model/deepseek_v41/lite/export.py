@@ -235,6 +235,13 @@ def _lora_weights(chunks, on_device=False):
     )
 
 
+def _gather_device(backend):
+    """GPU for any NCCL-capable default group, including VERL's mixed "cpu:gloo,cuda:nccl"."""
+    if "nccl" in str(backend):
+        return torch.device("cuda", torch.cuda.current_device())
+    return torch.device("cpu")
+
+
 def gather_lora_tensors(local, on_device=False):
     """Exchange only metadata as objects; gather unchanged adapter bytes in one bucket.
 
@@ -256,11 +263,7 @@ def gather_lora_tensors(local, on_device=False):
     entries = sorted(local.items())
     dist.all_gather_object(metadata, [(k, tuple(v.shape), str(v.dtype)) for k, v in entries])
     times = {"metadata": time.perf_counter() - started}
-    device = (
-        torch.device("cuda", torch.cuda.current_device())
-        if dist.get_backend() == "nccl"
-        else torch.device("cpu")
-    )
+    device = _gather_device(dist.get_backend())
     state = {}
     # Real deployment factors are uniformly BF16 (one collective). Keep the HF
     # exporter lossless for CPU FP32 and mixed floating-point adapter callers.

@@ -54,3 +54,13 @@ def test_real_gloo_lora_tensor_gather(tmp_path, mode):
     init = 'file://' + str(Path(tmp_path) / 'gloo')
     world = int(os.environ.get('W10_LORA_TEST_WORLD', '2'))
     mp.spawn(_worker, args=(world, init, mode), nprocs=world, join=True)
+
+
+@pytest.mark.parametrize(
+    'backend, cuda', [('nccl', True), ('cpu:gloo,cuda:nccl', True), ('gloo', False)]
+)
+def test_gather_device_follows_any_nccl_backend(monkeypatch, backend, cuda):
+    from megatron.lite.model.deepseek_v41.lite import export
+
+    monkeypatch.setattr(torch.cuda, 'current_device', lambda: 0)
+    assert (export._gather_device(backend).type == 'cuda') is cuda
