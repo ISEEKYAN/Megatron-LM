@@ -168,6 +168,44 @@ def test_initialize_warms_before_offload_and_optimizer_keeps_allocator_cache(
     assert engine.module is model and engine.handle is handle and handle._optimizer is optimizer
 
 
+def test_full_determinism_keeps_algorithms_without_uninitialized_fill(engine_module, monkeypatch):
+    import types
+
+    engine = object.__new__(engine_module.MegatronLiteEngine)
+    engine.engine_config = SimpleNamespace(
+        full_determinism=True,
+        seed=7,
+        param_offload=False,
+        optimizer_offload=False,
+        grad_offload=False,
+    )
+    engine.device_name = "cuda"
+    engine.model_config = SimpleNamespace(local_path="unused")
+    engine._build_mlite_config = lambda: object()
+    handle = SimpleNamespace(_optimizer=None, _lr_scheduler=None)
+    runtime = SimpleNamespace(build_model=lambda: handle)
+    utils = types.ModuleType("verl.workers.engine.utils")
+    utils.enable_full_determinism = lambda seed: torch.use_deterministic_algorithms(
+        True, warn_only=True
+    )
+    monkeypatch.setitem(sys.modules, "verl.workers.engine.utils", utils)
+    monkeypatch.setattr(engine_module, "create_runtime", lambda *a, **kw: runtime)
+    monkeypatch.setattr(engine_module.torch.cuda, "current_device", lambda: 0)
+    monkeypatch.setattr(engine_module, "_release_inactive_cuda_cache", lambda: None)
+    engine._extract_primary_module = lambda: object()
+    engine.to = lambda **kw: None
+    deterministic = torch.are_deterministic_algorithms_enabled()
+    warn_only = torch.is_deterministic_algorithms_warn_only_enabled()
+    fill = torch.utils.deterministic.fill_uninitialized_memory
+    try:
+        engine.initialize()
+        assert torch.are_deterministic_algorithms_enabled()
+        assert not torch.utils.deterministic.fill_uninitialized_memory
+    finally:
+        torch.use_deterministic_algorithms(deterministic, warn_only=warn_only)
+        torch.utils.deterministic.fill_uninitialized_memory = fill
+
+
 def test_release_only_synchronizes_and_returns_unused_allocator_blocks(memory_module, monkeypatch):
     calls = []
     monkeypatch.setattr(torch.cuda, "synchronize", lambda: calls.append("synchronize"))
