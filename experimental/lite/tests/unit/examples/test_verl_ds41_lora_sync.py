@@ -180,7 +180,7 @@ def test_real_engine_method_selects_only_shared_lora_export():
         weights, config = MegatronLiteEngine.get_per_tensor_param(engine, base_sync_done=True)
         assert set(dict(weights)) == set(source)
         assert config['_mlite_ds41']['manifest']['policy_version'] == version
-    assert calls == [dict(target='lora')] * 3
+    assert calls == [dict(target='lora', lora_on_device=True)] * 3
     with pytest.raises(ValueError, match='frozen release base'):
         MegatronLiteEngine.get_per_tensor_param(engine, base_sync_done=False)
     assert len(calls) == 3  # never falls back to a full base publication

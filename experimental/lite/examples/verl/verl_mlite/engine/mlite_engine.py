@@ -456,7 +456,7 @@ class MegatronLiteEngine(BaseEngine):
                 cfg = self.handle._extras['model_cfg']
                 base = getattr(self.model_config.hf_config, 'mlite_base_manifest_sha256', '')
                 result = prepare_adapter_sync(
-                    self.runtime.export_weights(self.handle, target='lora'),
+                    self.runtime.export_weights(self.handle, target='lora', lora_on_device=True),
                     lora, cfg.num_hidden_layers, version, base,
                 )
                 self._ds41_lora_version = version

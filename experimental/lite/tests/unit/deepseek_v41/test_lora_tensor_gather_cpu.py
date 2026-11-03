@@ -28,9 +28,15 @@ def _worker(rank, world, init, mode):
         if mode == 'corrupt':
             with pytest.raises(ValueError, match='Replicated LoRA factors differ'):
                 dict(gather_lora_tensors(local))
+            with pytest.raises(ValueError, match='Replicated LoRA factors differ'):
+                dict(gather_lora_tensors(local, on_device=True))
         else:
-            actual = dict(gather_lora_tensors(local))
             expected = {'shared': shared, 'owner0': torch.arange(6, dtype=dtype).reshape(2, 3)}
+            on_device = dict(gather_lora_tensors(local, on_device=True))
+            assert on_device.keys() == expected.keys()
+            for key, value in expected.items():
+                assert torch.equal(on_device[key].view(torch.uint8), value.view(torch.uint8))
+            actual = dict(gather_lora_tensors(local))
             assert actual.keys() == expected.keys()
             for key, value in expected.items():
                 assert torch.equal(actual[key].view(torch.uint8), value.view(torch.uint8))
