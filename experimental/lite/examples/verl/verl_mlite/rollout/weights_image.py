@@ -185,13 +185,91 @@ def dump(worker, directory, chunk_bytes, host_bytes):
     }
 
 
-def restore(worker, directory, chunk_bytes, readers, verify):
-    """Read this rank's image back into the freshly mapped weights pool; returns a receipt."""
+def _tensors(owner):
+    """CUDA tensors held directly by ``owner``'s attributes (or in a list, tuple or dict)."""
+    for value in vars(owner).values():
+        if isinstance(value, dict):
+            values = value.values()
+        elif isinstance(value, (list, tuple)):
+            values = value
+        else:
+            values = (value,)
+        for t in values:
+            if isinstance(t, torch.Tensor) and t.is_cuda:
+                yield t
+
+
+def _lora_ranges(worker):
+    """Device byte ranges an adapter publish may write: every tensor owned by a LoRA layer
+    (slots, per-expert slot copies) or its punica wrapper, kernel views of the adapter
+    (``_views``), and any attribute named like a LoRA tensor."""
+    tensors = []
+    for module in worker.model_runner.model.modules():
+        if callable(getattr(module, "set_lora", None)):
+            tensors += _tensors(module)
+            tensors += list(module.parameters(recurse=False)) + list(module.buffers(recurse=False))
+            punica = getattr(module, "punica_wrapper", None)
+            if punica is not None:
+                tensors += _tensors(punica)
+        views = getattr(module, "_views", None)
+        if isinstance(views, dict):
+            tensors += [t for t in views.values() if isinstance(t, torch.Tensor) and t.is_cuda]
+        for name, value in vars(module).items():
+            if "lora" in name.lower():
+                values = value if isinstance(value, (list, tuple)) else (value,)
+                tensors += [t for t in values if isinstance(t, torch.Tensor) and t.is_cuda]
+    ranges = set()
+    for t in tensors:
+        if t.untyped_storage().nbytes():
+            lo = t.untyped_storage().data_ptr()
+            ranges.add((lo, lo + t.untyped_storage().nbytes()))
+    return sorted(ranges)
+
+
+def _copy_in(cu, fd, image, jobs, buffers, readers):
+    """Read ``jobs`` [(file_offset, device_ptr, n)] from ``fd`` through the bounce buffers."""
+    views = [memoryview(b.numpy()) for b in buffers]
+
+    def read(slot, file_offset, n):
+        if os.preadv(fd, [views[slot][:n]], file_offset) != n:
+            raise OSError(f"short read from {image} at {file_offset}")
+        return slot
+
+    with ThreadPoolExecutor(readers) as pool_exec:
+        pending = [
+            pool_exec.submit(read, i, *jobs[i][::2]) for i in range(min(len(buffers), len(jobs)))
+        ]
+        for i, (_, dst, n) in enumerate(jobs):
+            slot = pending[i].result()
+            rc = cu.cuMemcpyHtoD_v2(
+                ctypes.c_uint64(dst), ctypes.c_void_p(buffers[slot].data_ptr()), ctypes.c_size_t(n)
+            )
+            if rc != 0:
+                raise RuntimeError(f"weights image copy-in failed ({rc}) at {hex(dst)}")
+            follow = i + len(buffers)
+            if follow < len(jobs):
+                pending.append(pool_exec.submit(read, slot, *jobs[follow][::2]))
+
+
+def _verify(pool, expected, indices):
+    sums = _sums([pool[i] for i in indices])
+    changed = [i for i, s in zip(indices, sums) if s != expected["sums"][i]]
+    if changed:
+        raise RuntimeError(f"weights image restore differs in allocations {changed}")
+
+
+def restore(worker, directory, chunk_bytes, readers, verify, background=False):
+    """Read this rank's image back into the freshly mapped weights pool; returns a receipt.
+
+    With ``background`` only the allocations holding LoRA slots are restored (and verified)
+    before returning, so the adapter publish can rewrite those slots while a thread restores
+    the rest; ``join`` waits for that thread and verifies the remaining allocations.
+    """
     started = time.monotonic()
     image, manifest = _paths(worker, directory)
     with open(manifest) as f:
         expected = json.load(f)
-    pool = _pool()
+    pool = [tuple(p) for p in _pool()]
     if [list(p) for p in pool] != expected["pool"]:
         raise RuntimeError("weights pool layout changed since the image was written")
     kept = getattr(worker, "_mlite_weights_image_host", [])
@@ -203,56 +281,87 @@ def restore(worker, directory, chunk_bytes, readers, verify):
             n = min(chunk_bytes, size - off)
             jobs.append((offset, ptr + off, n))
             offset += n
+    first = range(len(pool))
+    if background:
+        lora = _lora_ranges(worker)
+        first = [
+            i
+            for i, (base, size) in enumerate(pool)
+            if any(lo < base + size and hi > base for lo, hi in lora)
+        ]
+    early = [(pool[i][0], pool[i][0] + pool[i][1]) for i in first]
+
+    def owned(dst):
+        return any(lo <= dst < hi for lo, hi in early)
+
+    now = [job for job in jobs if owned(job[1])] if background else jobs
+    later = [job for job in jobs if not owned(job[1])] if background else []
     cu, buffers = _cuda(), _bounce(2 * readers, chunk_bytes)
-    views = [memoryview(b.numpy()) for b in buffers]
+    if background:
+        # Driver calls on the restore thread need this context made current there too.
+        context = ctypes.c_void_p()
+        rc = cu.cuCtxGetCurrent(ctypes.byref(context))
+        if rc != 0 or not context.value:
+            raise RuntimeError(f"weights image restore has no current CUDA context ({rc})")
     fd = os.open(image, os.O_RDONLY | os.O_DIRECT)
-
-    def read(slot, file_offset, n):
-        if os.preadv(fd, [views[slot][:n]], file_offset) != n:
-            raise OSError(f"short read from {image} at {file_offset}")
-        return slot
-
     try:
-        with ThreadPoolExecutor(readers) as pool_exec:
-            pending = [
-                pool_exec.submit(read, i, *jobs[i][::2])
-                for i in range(min(len(buffers), len(jobs)))
-            ]
-            # The host part copies while the readers fill the first bounce buffers.
-            for ptr, host in kept:
-                rc = cu.cuMemcpyHtoD_v2(
-                    ctypes.c_uint64(ptr),
-                    ctypes.c_void_p(host.data_ptr()),
-                    ctypes.c_size_t(host.numel()),
-                )
-                if rc != 0:
-                    raise RuntimeError(f"weights image host copy-in failed ({rc}) at {hex(ptr)}")
-            for i, (_, dst, n) in enumerate(jobs):
-                slot = pending[i].result()
-                rc = cu.cuMemcpyHtoD_v2(
-                    ctypes.c_uint64(dst),
-                    ctypes.c_void_p(buffers[slot].data_ptr()),
-                    ctypes.c_size_t(n),
-                )
-                if rc != 0:
-                    raise RuntimeError(f"weights image copy-in failed ({rc}) at {hex(dst)}")
-                follow = i + len(buffers)
-                if follow < len(jobs):
-                    pending.append(pool_exec.submit(read, slot, *jobs[follow][::2]))
-    finally:
+        # The host part is a few GiB over C2C; copy all of it before the disk part.
+        for ptr, host in kept:
+            rc = cu.cuMemcpyHtoD_v2(
+                ctypes.c_uint64(ptr),
+                ctypes.c_void_p(host.data_ptr()),
+                ctypes.c_size_t(host.numel()),
+            )
+            if rc != 0:
+                raise RuntimeError(f"weights image host copy-in failed ({rc}) at {hex(ptr)}")
+        _copy_in(cu, fd, image, now, buffers, readers)
+    except BaseException:
         os.close(fd)
-    copied = time.monotonic() - started
-    if verify:
-        changed = [i for i, s in enumerate(_sums(pool)) if s != expected["sums"][i]]
-        if changed:
-            raise RuntimeError(f"weights image restore differs in allocations {changed}")
-    return {
+        raise
+    receipt = {
         "bytes": offset,
         "host_bytes": sum(host.numel() for _, host in kept),
-        "copy_seconds": copied,
-        "seconds": time.monotonic() - started,
         "verified": bool(verify),
     }
+    if not background:
+        os.close(fd)
+        receipt["copy_seconds"] = time.monotonic() - started
+        if verify:
+            _verify(pool, expected, range(len(pool)))
+        receipt["seconds"] = time.monotonic() - started
+        return receipt
+    if verify:
+        _verify(pool, expected, first)
+    receipt["early_bytes"] = sum(n for _, _, n in now)
+    receipt["early_allocations"] = len(first)
+    receipt["early_seconds"] = time.monotonic() - started
+    done = set(first)
+    rest = [i for i in range(len(pool)) if i not in done]
+
+    def finish():
+        try:
+            if cu.cuCtxSetCurrent(context) != 0:
+                raise RuntimeError("weights image restore thread cannot enter the CUDA context")
+            _copy_in(cu, fd, image, later, buffers, readers)
+        finally:
+            os.close(fd)
+        receipt["copy_seconds"] = time.monotonic() - started
+        if verify:
+            _verify(pool, expected, rest)
+        receipt["seconds"] = time.monotonic() - started
+        return receipt
+
+    worker._mlite_weights_image_join = ThreadPoolExecutor(1).submit(finish)
+    return dict(receipt)
+
+
+def join(worker):
+    """Wait for a background restore; returns its receipt."""
+    future = getattr(worker, "_mlite_weights_image_join", None)
+    if future is None:
+        raise RuntimeError("no background weights image restore to join")
+    worker._mlite_weights_image_join = None
+    return future.result()
 
 
 def install():
@@ -273,6 +382,14 @@ def install():
     def mlite_weights_image_restore(self, directory, chunk_bytes, readers, verify):
         return restore(self, directory, chunk_bytes, readers, verify)
 
+    def mlite_weights_image_restore_start(self, directory, chunk_bytes, readers, verify):
+        return restore(self, directory, chunk_bytes, readers, verify, background=True)
+
+    def mlite_weights_image_restore_join(self):
+        return join(self)
+
     cls.mlite_weights_image_dump = mlite_weights_image_dump
     cls.mlite_weights_image_restore = mlite_weights_image_restore
+    cls.mlite_weights_image_restore_start = mlite_weights_image_restore_start
+    cls.mlite_weights_image_restore_join = mlite_weights_image_restore_join
     return True

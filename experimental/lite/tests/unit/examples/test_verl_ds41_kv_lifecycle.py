@@ -274,6 +274,49 @@ def test_image_dumps_once_and_restores_before_kv_and_publish(server, capsys):
     assert not server._verl_mlite_image_pending
 
 
+def test_image_overlap_publishes_during_background_restore(server, capsys):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+
+    async def step():
+        await server._sleep_hybrid()
+        await server.wake_up(['weights'])
+        server.events.append(('publish_current_adapter_all_ack',))
+        await server.wake_up(['kv_cache'])
+
+    asyncio.run(step())
+    args = ('/raid/scratch/job', 64 << 20, 8, True)
+    assert [e for e in server.events if e[0] != 'rpc' or e[1] != 'mlite_weights_image_dump'] == [
+        ('sleep', 2),
+        ('reset',),
+        ('wake', ['weights']),
+        ('rpc', 'mlite_weights_image_restore_start', args),
+        ('publish_current_adapter_all_ack',),
+        ('rpc', 'mlite_weights_image_restore_join', ()),
+        ('wake', ['kv_cache']),
+    ]
+    receipt = server._verl_mlite_image_receipt
+    assert receipt['engines'] == 4 and len(receipt['early']) == 4
+    assert server._verl_mlite_image_joining is None and not server._verl_mlite_image_pending
+    assert (
+        sum(l.startswith('MLITE_WEIGHTS_IMAGE ') for l in capsys.readouterr().out.splitlines()) == 1
+    )
+
+
+def test_image_overlap_kv_first_wake_restores_synchronously(server):
+    image_server(server)
+    server.config.custom['ds41_weights_image_overlap_publish'] = True
+    compat._patch_vllm_rollout_sleep_level()
+    asyncio.run(server._sleep_hybrid())
+    asyncio.run(server.wake_up(['weights', 'kv_cache']))
+    assert [e[0:2] for e in server.events[-3:]] == [
+        ('wake', ['weights']),
+        ('rpc', 'mlite_weights_image_restore'),
+        ('wake', ['kv_cache']),
+    ]
+
+
 def test_image_kv_first_wake_restores_weights_first(server):
     image_server(server)
     compat._patch_vllm_rollout_sleep_level()
