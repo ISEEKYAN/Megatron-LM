@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Packed-context byte/VJP controls; GPU gates exercise native forwards."""
+
 from types import SimpleNamespace
 
 import pytest
@@ -396,3 +397,24 @@ def test_paged_cp_metadata_preserves_global_slots_and_local_positions(world, rat
         qlen = layout.query_cu[req + 1] - layout.query_cu[req]
         positions = layout.query_seq[req] - qlen + local - layout.query_cu[req]
         raw_equal(positions.long(), layout.positions)
+
+
+def test_frozen_woa_backward_does_not_materialize_unused_activation(monkeypatch):
+    monkeypatch.setattr(attention, '_rotate', lambda x, *_: x)
+    torch.manual_seed(732)
+    packed, sf = quantize_block_fp8(torch.randn(64, 128), (32, 32), scale_format='e8m0')
+    weight = dequantize_block_fp8(packed, sf, (32, 32)).reshape(2, 32, 128).bfloat16()
+    ctx = SimpleNamespace(
+        compact=True,
+        input_dtype=torch.bfloat16,
+        saved_tensors=(None, None, packed, sf, torch.arange(3), torch.empty(0)),
+        shape=(3, 4, 64),
+        weight_shape=(64, 128),
+        weight_dtype=torch.bfloat16,
+        needs_input_grad=(True, False, False, False, False),
+    )
+    grad = torch.randn(3, 2, 32).bfloat16()
+    dx, dw, *metadata = attention._FP8OutputProjection.backward(ctx, grad)
+    expected = torch.bmm(grad.permute(1, 0, 2).float(), weight.float()).permute(1, 0, 2)
+    assert torch.equal(dx, expected.bfloat16().reshape(ctx.shape))
+    assert dw is None and metadata == [None, None, None]
