@@ -60,30 +60,88 @@ def test_native_hook_rank_rejected_before_kernel_import(monkeypatch, rank):
         fused_lora.factors(owner)
 
 
+class _Grouped(torch.nn.Module):
+    def __init__(self, n, shape):
+        super().__init__()
+        self.num_gemms = n
+        for i in range(n):
+            self.register_parameter(f'weight{i}', torch.nn.Parameter(torch.zeros(shape)))
+
+
+class _Routed(torch.nn.Module):
+    def __init__(self):
+        super().__init__()
+        self.rank, self.scale = 8, 1.0
+        self.fc1_lora_a = torch.nn.Parameter(torch.zeros(8, 2))
+        self.fc2_lora_b = torch.nn.Parameter(torch.zeros(2, 8))
+        self.fc1_lora_b, self.fc2_lora_a = _Grouped(2, (4, 8)), _Grouped(2, (8, 2))
+
+    @staticmethod
+    def per_expert(grouped):
+        return [getattr(grouped, f'weight{i}') for i in range(grouped.num_gemms)]
+
+
 @pytest.mark.parametrize('requires_x', [False, True])
-def test_hook_backward_is_explicit_replay_not_native_or_additive_surrogate(monkeypatch, requires_x):
-    parameter = torch.nn.Parameter(torch.tensor(3.0))
-    group = SimpleNamespace(size=lambda: 1)
+def test_hook_backward_is_explicit_adjoint_not_a_moe_replay(monkeypatch, requires_x):
+    from megatron.lite.model.deepseek_v41.vllm import moe_adjoint
+
+    routed = _Routed()
+    slots = [torch.nn.Linear(2, 8, bias=False) for _ in range(3)]
     owner = SimpleNamespace(
-        ep_group=group,
-        num_local_experts=1,
-        experts=SimpleNamespace(linear_fc1=SimpleNamespace(weight0=torch.empty(256, 128))),
-        _lora_rows=lambda x, scores, ids: x * parameter + scores.sum(-1, keepdim=True),
+        ep_group=SimpleNamespace(size=lambda: 1),
+        num_local_experts=2,
+        config=SimpleNamespace(activation_func_clamp_value=10),
+        experts=SimpleNamespace(
+            linear_fc1=SimpleNamespace(weight0=torch.empty(4, 2), weight1=torch.empty(4, 2)),
+            linear_fc2=SimpleNamespace(weight0=torch.empty(2, 2), weight1=torch.empty(2, 2)),
+        ),
+        shared_experts='shared',
+        _lora_rows=lambda *a: pytest.fail('whole-MoE replay in backward'),
     )
-    monkeypatch.setattr(fused_lora, 'factors', lambda _: (SimpleNamespace(rank=8),))
+    monkeypatch.setattr(fused_lora, 'factors', lambda _: (routed, *slots))
     monkeypatch.setattr(fused_lora.experts, 'symm_buffer', lambda *a, **kw: object())
     monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
     monkeypatch.setattr(fused_lora, 'frozen_weights', lambda _: ())
-    monkeypatch.setattr(fused_lora, '_launch', lambda o, x, *a: x * 100 + parameter * 1000)
+    monkeypatch.setattr(fused_lora, '_launch', lambda o, x, *a: x * 100)
+    monkeypatch.setattr(fused_lora.experts, 'quantize_activation', lambda x: (x, None))
+    # Shared expert: token-local replay, x * w (w = slot 0 weight sum)
+    monkeypatch.setattr(
+        fused_lora.experts, 'shared_rows', lambda x, m, e, limit: x * slots[0].weight.sum()
+    )
+
+    def routed_adjoint(x, scores, ids, grad, fc1, fc2, lora, limit, group, overlap):
+        assert lora is routed and len(fc1) == len(fc2) == 2 and limit == 10
+        shared = overlap()
+        tagged = (
+            torch.full((8, 2), 1.0),
+            torch.stack([torch.full((4, 8), 2.0 + i) for i in range(2)]),
+            torch.stack([torch.full((8, 2), 4.0 + i) for i in range(2)]),
+            torch.full((2, 8), 6.0),
+        )
+        return torch.full(x.shape, 3.0), torch.full(scores.shape, 2.0), tagged, shared
+
+    monkeypatch.setattr(moe_adjoint, 'routed_adjoint', routed_adjoint)
     x = torch.tensor([[2.0, 4.0]], requires_grad=requires_x)
     scores = torch.tensor([[0.25, 0.75]], requires_grad=True)
-    ids = torch.tensor([[0, 0]], dtype=torch.int64)
-    result = fused_lora._Hooks.apply(x, scores, ids, owner, parameter)
-    assert torch.equal(result.detach(), x.detach() * 100 + parameter.detach() * 1000)
+    ids = torch.tensor([[0, 1]], dtype=torch.int64)
+    result = fused_lora.forward(owner, x, scores, ids)
+    assert torch.equal(result.detach(), x.detach() * 100)
     result.sum().backward()
-    assert parameter.grad.item() == 6
+    assert torch.equal(routed.fc1_lora_a.grad, torch.full((8, 2), 1.0))
+    assert torch.equal(routed.fc2_lora_b.grad, torch.full((2, 8), 6.0))
+    for i in range(2):
+        assert torch.equal(
+            getattr(routed.fc1_lora_b, f'weight{i}').grad, torch.full((4, 8), 2.0 + i)
+        )
+        assert torch.equal(
+            getattr(routed.fc2_lora_a, f'weight{i}').grad, torch.full((8, 2), 4.0 + i)
+        )
     assert torch.equal(scores.grad, torch.full_like(scores, 2.0))
-    assert torch.equal(x.grad, torch.full_like(x, 3.0)) if requires_x else x.grad is None
+    if requires_x:
+        assert torch.equal(x.grad, 3.0 + torch.full_like(x, float(slots[0].weight.sum())))
+        assert torch.equal(slots[0].weight.grad, torch.full_like(slots[0].weight, 6.0))
+    else:
+        assert x.grad is None
 
 
 def test_frozen_payloads_remain_native_and_per_layer_not_a_decoded_cache():
@@ -155,7 +213,8 @@ def test_native_gate_up_shrink_is_one_call_with_three_slices(monkeypatch, rows):
 
 
 @pytest.mark.parametrize('rows', [0, 3])
-def test_disabled_base_uses_native_launch_and_replay_stays_disabled(monkeypatch, rows):
+def test_disabled_base_uses_native_launch_and_adjoint_stays_disabled(monkeypatch, rows):
+    from megatron.lite.model.deepseek_v41.vllm import moe_adjoint
     from megatron.lite.primitive.modules.lora import LinearLoRA, disable_lora_adapters
 
     class Owner(torch.nn.Module):
@@ -164,12 +223,15 @@ def test_disabled_base_uses_native_launch_and_replay_stays_disabled(monkeypatch,
             self.lora = LinearLoRA(2, 2, rank=1, alpha=1)
             self.ep_group = SimpleNamespace(size=lambda: 1)
             self.num_local_experts = 1
-            self.experts = SimpleNamespace(linear_fc1=SimpleNamespace(weight0=torch.empty(4, 2)))
+            self.experts = SimpleNamespace(
+                linear_fc1=SimpleNamespace(weight0=torch.empty(4, 2)),
+                linear_fc2=SimpleNamespace(weight0=torch.empty(2, 2)),
+            )
+            self.shared_experts = 'shared'
             self.config = SimpleNamespace(activation_func_clamp_value=10)
 
         def _lora_rows(self, x, scores, ids):
-            assert self.lora.disabled
-            return x * 3 + scores.sum(-1, keepdim=True)
+            pytest.fail('whole-MoE replay in backward')
 
     owner = Owner()
     calls = []
@@ -182,8 +244,19 @@ def test_disabled_base_uses_native_launch_and_replay_stays_disabled(monkeypatch,
         calls.append((packed, buf, limit, ep_size))
         return x * 7 + scores.sum(-1, keepdim=True)
 
+    def shared_rows(x, module, encoded, limit):
+        assert owner.lora.disabled
+        return x * 2
+
+    def routed_adjoint(x, scores, ids, grad, fc1, fc2, lora, limit, group, overlap):
+        assert lora is None
+        return torch.ones_like(x), torch.full_like(scores, 2.0), None, overlap()
+
     monkeypatch.setattr(fused_lora.experts, 'symm_buffer', buffer)
     monkeypatch.setattr(fused_lora.experts, 'launch', launch)
+    monkeypatch.setattr(fused_lora.experts, 'shared_rows', shared_rows)
+    monkeypatch.setattr(fused_lora.experts, 'quantize_activation', lambda x: (x, None))
+    monkeypatch.setattr(moe_adjoint, 'routed_adjoint', routed_adjoint)
     monkeypatch.setattr(fused_lora, 'frozen_weights', lambda _: 'native-packed')
     monkeypatch.setattr(torch.distributed, 'all_reduce', lambda *a, **kw: None)
     monkeypatch.setattr(

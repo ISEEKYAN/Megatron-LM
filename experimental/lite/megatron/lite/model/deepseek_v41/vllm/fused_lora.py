@@ -215,27 +215,84 @@ class _Hooks(torch.autograd.Function):
 
     @staticmethod
     def backward(ctx, grad):
+        from .moe_adjoint import routed_adjoint
+
         x, scores, ids, *parameters = ctx.saved_tensors
-        x = x.detach().requires_grad_(ctx.needs_input_grad[0])
-        scores = scores.detach().requires_grad_(ctx.needs_input_grad[1])
-        inputs = (x, scores, *parameters)
-        active = [p for p in inputs if p.requires_grad]
-        # Native hooks expose no pre-SwiGLU L1. Recompute the old BF16 graph,
-        # retaining its grouped TE backward, explicitly an approximate adjoint.
-        # A disabled forward must stay disabled during backward even when the
-        # caller has already exited its temporary disable context.
-        replay = disable_lora_adapters(ctx.owner) if ctx.base_only else nullcontext()
-        with torch.enable_grad(), replay:
-            result = ctx.owner._lora_rows(x, scores, ids)
-        values = iter(torch.autograd.grad(result, active, grad, allow_unused=True))
-        grads = tuple(next(values) if p.requires_grad else None for p in inputs)
-        return grads[0], grads[1], None, None, *grads[2:]
+        owner = ctx.owner
+        need_x, need_s = ctx.needs_input_grad[:2]
+
+        # Disabled adapters stay disabled in backward, even after the caller's
+        # temporary disable context has exited.
+        def replay():
+            return disable_lora_adapters(owner) if ctx.base_only else nullcontext()
+
+        with replay():
+            lora = None if ctx.base_only else factors(owner)[0]
+            shared_params = [] if ctx.base_only else _shared_parameters(owner)
+        limit = owner.config.activation_func_clamp_value
+
+        def shared():
+            # The single shared expert is token-local: its small graph is replayed
+            # here, with no dispatch, while the routed rows are in flight.
+            x_ = x.detach().requires_grad_(need_x)
+            active = ([x_] if need_x else []) + [p for p in shared_params if p.requires_grad]
+            if not active:
+                return {}
+            with torch.enable_grad(), replay():
+                out = experts.shared_rows(
+                    x_, owner.shared_experts, experts.quantize_activation(x.detach()), limit
+                )
+            values = torch.autograd.grad(out, active, grad, allow_unused=True)
+            return {('x' if p is x_ else id(p)): g for p, g in zip(active, values)}
+
+        fc1 = [
+            getattr(owner.experts.linear_fc1, f'weight{i}') for i in range(owner.num_local_experts)
+        ]
+        fc2 = [
+            getattr(owner.experts.linear_fc2, f'weight{i}') for i in range(owner.num_local_experts)
+        ]
+        with torch.autocast(device_type=grad.device.type, enabled=False):
+            dx, dscores, low_rank, shared_grads = routed_adjoint(
+                x, scores, ids, grad, fc1, fc2, lora, limit, owner.ep_group, shared
+            )
+        grads = dict(shared_grads)
+        if need_x:
+            dx_shared = grads.pop('x', None)
+            dx = (dx if dx_shared is None else dx + dx_shared.float()).to(x.dtype)
+        if lora is not None:
+            da1, db1, da2, db2 = low_rank
+            grads[id(lora.fc1_lora_a)] = da1
+            grads[id(lora.fc2_lora_b)] = db2
+            for p, g in zip(lora.per_expert(lora.fc1_lora_b), db1.unbind(0)):
+                grads[id(p)] = g
+            for p, g in zip(lora.per_expert(lora.fc2_lora_a), da2.unbind(0)):
+                grads[id(p)] = g
+        ordered = () if ctx.base_only else _parameters(owner)
+        if len(ordered) != len(parameters):
+            raise RuntimeError('LoRA parameter set changed between forward and backward')
+        out = []
+        for p, need in zip(ordered, ctx.needs_input_grad[4:]):
+            g = grads.get(id(p)) if need else None
+            out.append(None if g is None else g.to(p.dtype))
+        return (
+            dx if need_x else None,
+            dscores.to(scores.dtype) if need_s else None,
+            None,
+            None,
+            *out,
+        )
+
+
+def _shared_parameters(owner):
+    return [p for m in factors(owner)[1:] for p in m.parameters()]
+
+
+def _parameters(owner):
+    return tuple(factors(owner)[0].parameters()) + tuple(_shared_parameters(owner))
 
 
 def forward(owner, x, scores, ids):
-    gu, *shared = factors(owner)
-    parameters = tuple(gu.parameters()) + tuple(p for m in shared for p in m.parameters())
-    return _Hooks.apply(x, scores, ids, owner, *parameters)
+    return _Hooks.apply(x, scores, ids, owner, *_parameters(owner))
 
 
 def base_forward(owner, x, scores, ids):
