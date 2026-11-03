@@ -1,5 +1,6 @@
 # Copyright (c) 2026 NVIDIA CORPORATION & AFFILIATES. All rights reserved.
 """Caller-stream overlap kernels with the W9-b5 owned mHC graph VJP."""
+
 import torch
 
 
@@ -17,6 +18,51 @@ def _post_backward(grad, output, residual, post, comb):
         None,
     )
     return dy.reshape_as(output), dh.reshape_as(residual), dp.reshape_as(post), dc.reshape_as(comb)
+
+
+def _rms_adjoint(grad, x, inverse, weight=None, weight_grad=False):
+    """Use Torch's existing CUDA RMS adjoint; CPU is a math-reference path."""
+    if x.is_cuda:
+        dx, dw = torch.ops.aten._fused_rms_norm_backward(
+            grad.contiguous(),
+            x.contiguous(),
+            [x.shape[-1]],
+            inverse.contiguous(),
+            weight,
+            [True, weight_grad],
+        )
+        return dx, dw
+    scaled = grad if weight is None else grad * weight
+    dx = inverse * (scaled - x * inverse.square() * (scaled * x).mean(-1, keepdim=True))
+    dw = (grad * x * inverse).reshape(-1, x.shape[-1]).sum(0) if weight_grad else None
+    return dx, dw
+
+
+def _aggregate_adjoint(grad, stream, pre):
+    """Core7b's existing cuTile aggregate adjoint, with device-owned layout."""
+    if stream.is_cuda:
+        from megatron.core.fusions.fused_mhc_kernels import _cutile_h_aggregate_bwd
+
+        copies, width = stream.shape[-2:]
+        dh, dp = _cutile_h_aggregate_bwd(
+            grad.reshape(-1, 1, width),
+            stream.reshape(-1, 1, copies, width),
+            pre.reshape(-1, 1, copies),
+        )
+        return dh.reshape_as(stream), dp.reshape_as(pre)
+    g = grad.float().unsqueeze(-2)
+    return (g * pre.unsqueeze(-1)).to(stream.dtype), (g * stream.float()).sum(-1).to(pre.dtype)
+
+
+def _aggregate_recompute(stream, pre):
+    if stream.is_cuda:
+        from megatron.core.fusions.fused_mhc_kernels import _triton_h_aggregate_fwd
+
+        copies, width = stream.shape[-2:]
+        return _triton_h_aggregate_fwd(
+            stream.reshape(-1, 1, copies, width), pre.reshape(-1, 1, copies)
+        ).reshape(*stream.shape[:-2], width)
+    return (stream.float() * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
 
 
 def _joint_backward(saved, options, grads, required):
@@ -54,11 +100,10 @@ def _joint_backward(saved, options, grads, required):
         else None
     )
     dp = torch.cat((da * scale[0], db * scale[1], dc * scale[2]), -1)
-    dlinear = dp * inverse
-    dtoken = torch.matmul(dlinear, weight)
-    dtoken -= token * inverse.square() * (dp * projected).sum(-1, keepdim=True) / token.shape[-1]
+    dtoken, _ = _rms_adjoint(torch.matmul(dp, weight), token, inverse)
     dfn = None
     if required[3]:
+        dlinear = dp * inverse
         dweight = dlinear.reshape(-1, weight.shape[0]).T @ token.reshape(-1, token.shape[-1])
         dfn = (
             dweight.to(fn.dtype).unsqueeze(1).expand(-1, copies, -1).reshape_as(fn)
@@ -66,25 +111,25 @@ def _joint_backward(saved, options, grads, required):
             else dweight.to(fn.dtype)
         )
 
-    # Reuse the projection cast instead of materializing a second FP32 stream.
-    sf = None if broadcast else token.reshape_as(stream)
-    collapsed = (
-        stream[..., 0, :] if broadcast else (sf * pre.unsqueeze(-1)).sum(-2).to(stream.dtype)
-    )
+    # Round at the same boundary as the eager adjoint and release wide FP32 temporaries.
+    dtoken = dtoken.to(stream.dtype)
+    del token, inverse, projected
+    collapsed = stream[..., 0, :] if broadcast else _aggregate_recompute(stream, pre)
     x = collapsed.float()
     rn = torch.rsqrt(x.square().mean(-1, keepdim=True) + eps)
     gn = torch.zeros_like(x) if gn is None else gn.float()
-    scaled = gn * gamma.bfloat16().float()
-    dx = (rn * (scaled - x * rn.square() * (scaled * x).mean(-1, keepdim=True))).to(stream.dtype)
-    dgamma = (gn * x * rn).reshape(-1, width).sum(0).to(gamma.dtype) if required[2] else None
+    dx, dgamma = _rms_adjoint(gn, x, rn, gamma.bfloat16().float(), required[2])
+    dx = dx.to(stream.dtype)
+    dgamma = dgamma.to(gamma.dtype) if required[2] else None
+    del x, rn, gn, collapsed
     if broadcast:
         dstream = torch.zeros_like(stream)
         dstream[..., 0, :] = dtoken.to(stream.dtype) + dx
         dpre = None
     else:
-        dstream = dtoken.reshape_as(stream).to(stream.dtype)
-        dstream = dstream + (dx.float().unsqueeze(-2) * pre.unsqueeze(-1)).to(stream.dtype)
-        dpre = (dx.float().unsqueeze(-2) * sf).sum(-1).to(pre.dtype) if required[1] else None
+        aggregate_stream, aggregate_pre = _aggregate_adjoint(dx, stream, pre)
+        dstream = dtoken.reshape_as(stream).to(stream.dtype) + aggregate_stream
+        dpre = aggregate_pre if required[1] else None
     if gs is not None:
         dstream = dstream + gs
     if pending:
