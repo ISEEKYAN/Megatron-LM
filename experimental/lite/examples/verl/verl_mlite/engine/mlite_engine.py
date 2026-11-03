@@ -308,6 +308,9 @@ class MegatronLiteEngine(BaseEngine):
             from verl.workers.engine.utils import enable_full_determinism
 
             enable_full_determinism(seed=self.engine_config.seed)
+            # Keep the deterministic algorithms, but not their NaN pre-fill of every new
+            # allocation: each op output and empty() would otherwise pay a full write.
+            torch.utils.deterministic.fill_uninitialized_memory = False
 
         self._mlite_config = self._build_mlite_config()
         self.runtime = create_runtime(
