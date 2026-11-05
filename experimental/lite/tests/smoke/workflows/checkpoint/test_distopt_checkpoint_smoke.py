@@ -24,10 +24,7 @@ from megatron.lite.runtime.contracts.config import OptimizerConfig as LiteOptimi
 from megatron.lite.runtime.contracts.config import ParallelConfig
 from megatron.lite.runtime.contracts.handle import ModelHandle
 
-pytestmark = [
-    pytest.mark.gpus(2),
-    pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1"),
-]
+pytestmark = [pytest.mark.gpus(2), pytest.mark.env(CUDA_DEVICE_MAX_CONNECTIONS="1")]
 
 
 class TinyDense(nn.Module):

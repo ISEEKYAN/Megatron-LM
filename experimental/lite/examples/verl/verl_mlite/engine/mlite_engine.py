@@ -12,6 +12,15 @@ from typing import Any
 
 import torch
 import torch.distributed as dist
+from tensordict import TensorDict
+from verl.trainer.config import CheckpointConfig
+from verl.utils import tensordict_utils as tu
+from verl.utils.device import get_device_id, get_device_name
+from verl.utils.memory_utils import aggressive_empty_cache
+from verl.workers.config import HFModelConfig, OptimizerConfig
+from verl_mlite import qat_export
+from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
+
 from megatron.lite.model import resolve_model_type_from_hf
 from megatron.lite.primitive.ckpt import load_training_checkpoint, save_training_checkpoint
 from megatron.lite.primitive.modules import router_replay
@@ -21,15 +30,6 @@ from megatron.lite.runtime.backends.mlite.config import MegatronLiteConfig
 from megatron.lite.runtime.contracts import LossContext, PackedBatch
 from megatron.lite.runtime.contracts.config import OptimizerConfig as MegatronLiteOptimizerConfig
 from megatron.lite.runtime.contracts.config import ParallelConfig, RuntimeConfig
-from tensordict import TensorDict
-
-from verl.trainer.config import CheckpointConfig
-from verl.utils import tensordict_utils as tu
-from verl.utils.device import get_device_id, get_device_name
-from verl.utils.memory_utils import aggressive_empty_cache
-from verl.workers.config import HFModelConfig, OptimizerConfig
-from verl_mlite import qat_export
-from verl_mlite.compat import _patch_bucketed_weight_sender, load_verl_engine_api
 
 try:
     # Recent VERL wraps per-step metric values in a Metric aggregator that
@@ -385,10 +385,7 @@ class MegatronLiteEngine(BaseEngine):
             for key in ("limit", "include_mtp_only", "include_local_prefixes")
             if key in kwargs
         }
-        export_kwargs.update(
-            buffer_max_size_bytes=2 * 1024**3,
-            cpu=False,
-        )
+        export_kwargs.update(buffer_max_size_bytes=2 * 1024**3, cpu=False)
         if self.engine_config.resync_format is not None:
             export_kwargs["target"] = self.engine_config.resync_format
             if self.engine_config.resync_config:
@@ -755,9 +752,15 @@ class MegatronLiteEngine(BaseEngine):
             )
 
         runtime_loss_fn = None
-        reduced_outputs = [] if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs() else None
+        reduced_outputs = (
+            []
+            if (loss_function is not None or forward_only) and self.is_mp_src_rank_with_outputs()
+            else None
+        )
         if loss_function is not None or forward_only:
-            runtime_loss_fn = self._make_runtime_loss_fn(loss_function, num_micro_batches, reduced_outputs)
+            runtime_loss_fn = self._make_runtime_loss_fn(
+                loss_function, num_micro_batches, reduced_outputs
+            )
 
         replay_specs = [
             runtime_batch.routed_experts is not None
@@ -788,10 +791,12 @@ class MegatronLiteEngine(BaseEngine):
             # Pass Metric aggregators through unchanged (reduce_metrics folds them);
             # list-wrap plain scalars as the legacy contract expects.
             "metrics": {
-                key: value
-                if isinstance(value, list)
-                or (_VerlMetric is not None and isinstance(value, _VerlMetric))
-                else [value]
+                key: (
+                    value
+                    if isinstance(value, list)
+                    or (_VerlMetric is not None and isinstance(value, _VerlMetric))
+                    else [value]
+                )
                 for key, value in metrics.items()
             },
         }
@@ -830,10 +835,7 @@ class MegatronLiteEngine(BaseEngine):
         )
 
     def _make_runtime_loss_context(
-        self,
-        micro_batch: TensorDict,
-        *,
-        loss_scale: float,
+        self, micro_batch: TensorDict, *, loss_scale: float
     ) -> LossContext:
         return LossContext(
             temperature=float(self._scalar_temperature(micro_batch)),
@@ -906,15 +908,10 @@ class MegatronLiteEngine(BaseEngine):
         micro_batch: TensorDict, input_ids: torch.Tensor
     ) -> torch.Tensor:
         """Build the R3 mask while inputs are still jagged."""
-        return router_replay.build_r3_replay_mask(
-            input_ids, micro_batch["response_mask"]
-        )
+        return router_replay.build_r3_replay_mask(input_ids, micro_batch["response_mask"])
 
     def _build_verl_model_output(
-        self,
-        *,
-        raw_output: dict[str, torch.Tensor],
-        runtime_batch: PackedBatch,
+        self, *, raw_output: dict[str, torch.Tensor], runtime_batch: PackedBatch
     ) -> dict[str, torch.Tensor]:
         log_probs = raw_output.get("log_probs")
         if log_probs is None:
