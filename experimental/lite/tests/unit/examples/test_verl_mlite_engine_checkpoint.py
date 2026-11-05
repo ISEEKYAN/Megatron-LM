@@ -201,6 +201,41 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
     assert load_kwargs["load_optimizer"] is True
 
 
+@pytest.mark.parametrize(
+    ("load_contents", "loads_optimizer"),
+    [
+        (None, True),
+        (["model", "optimizer", "extra"], True),
+        (["model", "optimizer"], True),
+        (["model"], False),
+        (["model", "extra"], False),
+    ],
+)
+def test_load_checkpoint_honors_load_contents(
+    tmp_path, monkeypatch, load_contents, loads_optimizer
+):
+    checkpoint_config = {} if load_contents is None else {"load_contents": load_contents}
+    engine, module, optimizer, scheduler, parallel, parallel_state, _, _ = _initialized_engine(
+        checkpoint_config=checkpoint_config
+    )
+    torch.save({"step": 23, "lr": 0.125}, tmp_path / "lr_scheduler.pt")
+    load_calls = []
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        lambda *args, **kwargs: load_calls.append((args, kwargs)),
+    )
+
+    engine.load_checkpoint(str(tmp_path))
+
+    assert len(load_calls) == 1
+    load_args, load_kwargs = load_calls[0]
+    assert load_args == (module, optimizer, str(tmp_path), parallel, parallel_state)
+    assert load_kwargs["load_model"] is True
+    assert load_kwargs["load_optimizer"] is loads_optimizer
+    expected_scheduler = {"step": 23, "lr": 0.125} if loads_optimizer else None
+    assert scheduler.loaded_state == expected_scheduler
+
+
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):
     engine, *_ = _initialized_engine(checkpoint_config={"save_contents": ["hf_model"]})
     engine.handle._model = engine.module
