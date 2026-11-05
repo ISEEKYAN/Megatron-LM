@@ -240,3 +240,85 @@ def test_native_process_residency_and_rollout_headroom(
     assert len(warned) == (1 if error and mode != 'raise' else 0)
     if warned:
         assert error in warned[0]
+
+
+class _DeviceTensor(torch.Tensor):
+    """CPU stand-in for a CUDA tensor; each ``to`` is a real copy, like D2H/H2D."""
+
+    is_cuda = True
+    copies = 0
+
+    def to(self, device, *args, **kwargs):
+        _DeviceTensor.copies += 1
+        moved = self.as_subclass(torch.Tensor).clone()
+        return moved.as_subclass(_HostTensor if device == 'cpu' else _DeviceTensor)
+
+
+class _HostTensor(_DeviceTensor):
+    is_cuda = False
+
+
+def test_round_trip_keeps_attribute_shared_by_modules():
+    # DS4.1 deployment attention caches vLLM's process-wide RoPE table on every layer
+    # (``_deployment_rope``): one tensor referenced by many modules.
+    m = product()
+    _DeviceTensor.copies = 0
+    shared = torch.arange(8.0).as_subclass(_DeviceTensor)
+    root = torch.nn.Module()
+    layers = [torch.nn.Module() for _ in range(3)]
+    for index, layer in enumerate(layers):
+        root.add_module(str(index), layer)
+        layer._deployment_rope = shared
+    engine = SimpleNamespace(module=root)
+
+    m.extra_storage(engine, 'cpu')
+    assert len({id(layer._deployment_rope) for layer in layers}) == 1
+    m.extra_storage(engine, 'cuda')
+    assert len({id(layer._deployment_rope) for layer in layers}) == 1
+    assert torch.equal(layers[0]._deployment_rope.as_subclass(torch.Tensor), torch.arange(8.0))
+    assert _DeviceTensor.copies == 2
+
+
+def test_round_trip_is_bitwise_and_keeps_buffer_and_attribute_sharing():
+    m = product()
+    gen = torch.Generator().manual_seed(7)
+
+    def device(*shape, dtype=torch.bfloat16):
+        return torch.randn(*shape, generator=gen).to(dtype).as_subclass(_DeviceTensor)
+
+    rope = device(16, 4, dtype=torch.float32)  # one table for every layer
+    root = torch.nn.Module()
+    layers = []
+    for index in range(4):
+        layer = torch.nn.Linear(4, 4)
+        layer.register_buffer('bias_vl', device(4))
+        layer.register_buffer('absent', None)
+        layer._deployment_rope = rope
+        layer.scale = 0.5  # non-tensor attributes are left alone
+        root.add_module(str(index), layer)
+        layers.append(layer)
+    root.register_buffer('mask', device(8, dtype=torch.int64))
+    engine = SimpleNamespace(module=root)
+    plain = lambda value: value.as_subclass(torch.Tensor).clone()
+    params = {n: (p, plain(p)) for n, p in root.named_parameters()}
+    buffers = {n: plain(b) for n, b in root.named_buffers()}
+    rope_bits = plain(rope)
+
+    m.extra_storage(engine, 'cpu')
+    assert all(not b.is_cuda for b in root.buffers())
+    assert len({id(layer._deployment_rope) for layer in layers}) == 1
+    assert not layers[0]._deployment_rope.is_cuda
+    m.extra_storage(engine, 'cuda')
+
+    for name, (owner, bits) in params.items():  # Core DDP owns parameter moves
+        assert dict(root.named_parameters())[name] is owner
+        assert torch.equal(owner, bits)
+    for name, value in root.named_buffers():
+        assert value.is_cuda and torch.equal(value.as_subclass(torch.Tensor), buffers[name])
+    assert all(layer.absent is None and layer.scale == 0.5 for layer in layers)
+    restored = {id(layer._deployment_rope) for layer in layers}
+    pointers = {layer._deployment_rope.data_ptr() for layer in layers}
+    assert len(restored) == 1 and len(pointers) == 1
+    assert layers[0]._deployment_rope.is_cuda
+    assert torch.equal(layers[0]._deployment_rope.as_subclass(torch.Tensor), rope_bits)
+    assert engine._exclusive_extra_storage == []
