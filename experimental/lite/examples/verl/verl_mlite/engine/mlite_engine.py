@@ -553,6 +553,10 @@ class MegatronLiteEngine(BaseEngine):
         del hdfs_path, del_local_after_load, kwargs
         self._require_initialized()
 
+        # Mirrors save_contents: without "optimizer" (e.g. evaluation), only weights are restored, so a
+        # checkpoint saved under another learning rate still loads; optimizer and scheduler state are skipped.
+        load_contents = self.checkpoint_config.get("load_contents", None)
+        load_optimizer = load_contents is None or "optimizer" in load_contents
         placement_fn, expert_classifier = self._checkpoint_hooks()
         reload_params_for_load = self.is_param_offload_enabled
         if reload_params_for_load:
@@ -568,10 +572,14 @@ class MegatronLiteEngine(BaseEngine):
                 get_placements=placement_fn,
                 is_expert=expert_classifier,
                 load_model=True,
-                load_optimizer=True,
+                load_optimizer=load_optimizer,
             )
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
-            if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):
+            if (
+                load_optimizer
+                and self.handle._lr_scheduler is not None
+                and os.path.exists(scheduler_path)
+            ):
                 state = torch.load(scheduler_path, map_location="cpu", weights_only=False)
                 self.handle._lr_scheduler.load_state_dict(state)
             if dist.is_initialized():
