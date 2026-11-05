@@ -110,10 +110,17 @@ def load_training_checkpoint(
     load_parameter_state_update_legacy_format: bool = False,
     load_model: bool = True,
     load_optimizer: bool = True,
+    allow_lr_change: bool = False,
 ) -> int:
-    """Load training checkpoint with automatic resharding across different parallel configs."""
+    """Load training checkpoint with automatic resharding across different parallel configs.
+
+    ``allow_lr_change=True`` lets a DistributedOptimizer checkpoint resume under a different
+    learning rate (see ``load_dist_opt_checkpoint``); other checkpoint formats reject it.
+    """
     if use_dcp is None:
         use_dcp = True
+    if allow_lr_change and not (use_dcp and _supports_dist_opt_distckpt(model, optimizer)):
+        raise ValueError("allow_lr_change is only supported for dist_opt checkpoints.")
     if not use_dcp:
         return _load_local_training_checkpoint(
             model,
@@ -125,7 +132,12 @@ def load_training_checkpoint(
     ckpt_path = _resolve_step_checkpoint_path(path)
     if _supports_dist_opt_distckpt(model, optimizer):
         step = _load_dist_opt_checkpoint(
-            model, optimizer, ckpt_path, load_model=load_model, load_optimizer=load_optimizer
+            model,
+            optimizer,
+            ckpt_path,
+            load_model=load_model,
+            load_optimizer=load_optimizer,
+            allow_lr_change=allow_lr_change,
         )
         if load_rng:
             _load_rng_sidecar(ckpt_path)
@@ -216,11 +228,17 @@ def _load_dist_opt_checkpoint(
     *,
     load_model: bool,
     load_optimizer: bool,
+    allow_lr_change: bool = False,
 ) -> int:
     from megatron.lite.primitive.ckpt.distckpt import load_dist_opt_checkpoint
 
     return load_dist_opt_checkpoint(
-        model, optimizer, path, load_model=load_model, load_optimizer=load_optimizer
+        model,
+        optimizer,
+        path,
+        load_model=load_model,
+        load_optimizer=load_optimizer,
+        allow_lr_change=allow_lr_change,
     )
 
 
