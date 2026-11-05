@@ -56,14 +56,14 @@ def _engine_config(**kwargs):
     return MegatronLiteEngineConfig(**values)
 
 
-def _initialized_engine(*, checkpoint_config=None, param_offload=False):
+def _initialized_engine(*, checkpoint_config=None, param_offload=False, **engine_kwargs):
     from verl_mlite.engine.mlite_engine import MegatronLiteEngine
 
     engine = MegatronLiteEngine(
         model_config=SimpleNamespace(
             local_path="/tmp/qwen35", hf_config={"model_type": "qwen3_5_moe"}, mtp=None
         ),
-        engine_config=_engine_config(param_offload=param_offload),
+        engine_config=_engine_config(param_offload=param_offload, **engine_kwargs),
         optimizer_config=_optimizer_config(),
         checkpoint_config=checkpoint_config or {},
     )
@@ -199,6 +199,21 @@ def test_load_checkpoint_restores_scheduler_and_param_offload_reload(tmp_path, m
     assert load_kwargs["is_expert"] is expert_classifier
     assert load_kwargs["load_model"] is True
     assert load_kwargs["load_optimizer"] is True
+    assert load_kwargs["allow_lr_change"] is False
+
+
+def test_load_checkpoint_forwards_allow_lr_change_on_load(tmp_path, monkeypatch):
+    engine = _initialized_engine(allow_lr_change_on_load=True)[0]
+    load_calls = []
+    monkeypatch.setattr(
+        "verl_mlite.engine.mlite_engine.load_training_checkpoint",
+        lambda *args, **kwargs: load_calls.append(kwargs),
+    )
+
+    engine.load_checkpoint(str(tmp_path))
+
+    assert len(load_calls) == 1
+    assert load_calls[0]["allow_lr_change"] is True
 
 
 def test_hf_model_save_fails_loudly_when_protocol_has_no_export(tmp_path):

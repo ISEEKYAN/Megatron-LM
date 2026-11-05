@@ -569,6 +569,7 @@ class MegatronLiteEngine(BaseEngine):
                 is_expert=expert_classifier,
                 load_model=True,
                 load_optimizer=True,
+                allow_lr_change=self.engine_config.allow_lr_change_on_load,
             )
             scheduler_path = os.path.join(local_path, _LR_SCHEDULER_STATE)
             if self.handle._lr_scheduler is not None and os.path.exists(scheduler_path):

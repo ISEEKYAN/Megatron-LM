@@ -16,6 +16,7 @@ from megatron.core.distributed import DistributedDataParallel, DistributedDataPa
 from megatron.core.optimizer import OptimizerConfig, get_megatron_optimizer
 from megatron.core.transformer import TransformerConfig
 from megatron.lite.primitive.ckpt import attach_model_sharded_state_dict
+from megatron.lite.primitive.ckpt.distckpt import _iter_distributed_optimizers
 from megatron.lite.primitive.optimizers.megatron_wrap import build_dist_opt_stack
 from megatron.lite.primitive.parallel import ParallelState, init_parallel
 from megatron.lite.runtime.backends.mlite.runtime import MegatronLiteRuntime
@@ -187,7 +188,7 @@ def _dist_opt_handle(wrapped_chunks, optimizer, ps: ParallelState, parallel: Par
     )
 
 
-def _build_model_and_dist_opt():
+def _build_model_and_dist_opt(lr: float = 1.0e-3):
     torch.manual_seed(2468)
     model = TinyDense().bfloat16().cuda()
     ddp_config = DistributedDataParallelConfig(use_distributed_optimizer=True)
@@ -195,7 +196,7 @@ def _build_model_and_dist_opt():
         TransformerConfig(num_attention_heads=1, num_layers=1), ddp_config, model
     )
     optimizer = get_megatron_optimizer(
-        OptimizerConfig(optimizer="adam", lr=1.0e-3, bf16=True, use_distributed_optimizer=True),
+        OptimizerConfig(optimizer="adam", lr=lr, bf16=True, use_distributed_optimizer=True),
         [wrapped],
     )
     attach_model_sharded_state_dict([wrapped], _single_node_parallel_state())
@@ -275,6 +276,69 @@ def test_dist_opt_checkpoint_load_matches_uninterrupted_training_single_node(tmp
     _train_step(direct_model, direct_optimizer, x1)
     _train_step(loaded_model, loaded_optimizer, x1)
     _assert_model_close(direct_model, loaded_model)
+
+
+def _adam_moments(optimizer) -> dict[tuple[int, int, int, str], torch.Tensor]:
+    moments = {}
+    for opt_idx, dist_opt in enumerate(_iter_distributed_optimizers(optimizer)):
+        inner = dist_opt.optimizer
+        for group_idx, group in enumerate(inner.param_groups):
+            for param_idx, param in enumerate(group["params"]):
+                for key in ("exp_avg", "exp_avg_sq"):
+                    moments[(opt_idx, group_idx, param_idx, key)] = (
+                        inner.state[param][key].detach().cpu().clone()
+                    )
+    return moments
+
+
+def _param_group_lrs(optimizer) -> list[tuple[float, float]]:
+    return [
+        (group["max_lr"], group["lr"])
+        for dist_opt in _iter_distributed_optimizers(optimizer)
+        for group in dist_opt.optimizer.param_groups
+    ]
+
+
+@pytest.mark.gpus(1)
+def test_dist_opt_checkpoint_resumes_under_changed_lr_keeping_adam_moments(tmp_path):
+    old_lr, new_lr = 3.0e-5, 1.0e-4
+    runtime = MegatronLiteRuntime.__new__(MegatronLiteRuntime)
+
+    def handle(model, optimizer):
+        return ModelHandle(model=model, optimizer=optimizer, _extras={"model_chunks": [model]})
+
+    saved_model, saved_optimizer = _build_model_and_dist_opt(lr=old_lr)
+    torch.manual_seed(1357)
+    x0 = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    x1 = torch.randn(4, 8, device="cuda", dtype=torch.bfloat16)
+    _train_step(saved_model, saved_optimizer, x0)
+    assert _param_group_lrs(saved_optimizer) == [(old_lr, old_lr)]
+    saved_moments = _adam_moments(saved_optimizer)
+    assert saved_moments
+    checkpoint_dir = _shared_tmp_path(tmp_path)
+    runtime.save_checkpoint(handle(saved_model, saved_optimizer), checkpoint_dir, step=1)
+
+    # Default: Megatron-Core pairs param groups by an identity that includes max_lr.
+    strict_model, strict_optimizer = _build_model_and_dist_opt(lr=new_lr)
+    with pytest.raises(KeyError):
+        runtime.load_checkpoint(handle(strict_model, strict_optimizer), checkpoint_dir)
+
+    loaded_model, loaded_optimizer = _build_model_and_dist_opt(lr=new_lr)
+    step = runtime.load_checkpoint(
+        handle(loaded_model, loaded_optimizer), checkpoint_dir, allow_lr_change=True
+    )
+
+    assert step == 1
+    loaded_moments = _adam_moments(loaded_optimizer)
+    assert loaded_moments.keys() == saved_moments.keys()
+    for key, saved in saved_moments.items():
+        assert torch.equal(loaded_moments[key], saved), key
+    assert _param_group_lrs(loaded_optimizer) == [(new_lr, new_lr)]
+    _assert_model_close(saved_model, loaded_model)
+
+    loss = _train_step(loaded_model, loaded_optimizer, x1)
+    assert torch.isfinite(loss)
+    assert _param_group_lrs(loaded_optimizer) == [(new_lr, new_lr)]
 
 
 @pytest.mark.gpus(8)

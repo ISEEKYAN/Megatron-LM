@@ -4,7 +4,7 @@
 from __future__ import annotations
 
 import os
-from collections.abc import Callable, Iterable, MutableMapping
+from collections.abc import Callable, Iterable, Mapping, MutableMapping
 from dataclasses import replace
 from types import MethodType
 from typing import Any
@@ -99,8 +99,16 @@ def load_dist_opt_checkpoint(
     *,
     load_model: bool = True,
     load_optimizer: bool = True,
+    allow_lr_change: bool = False,
 ) -> int:
-    """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer."""
+    """Load a mcore dist_checkpointing checkpoint into model and DistributedOptimizer.
+
+    Megatron-Core pairs every current optimizer param group with its saved counterpart by
+    ``param_group_identifier_keys``, which include ``max_lr``/``min_lr``. A checkpoint saved
+    with a different learning rate therefore fails to load with a ``KeyError``. With
+    ``allow_lr_change=True`` the saved groups take the current groups' ``max_lr``/``min_lr``/``lr``
+    before the hand-off (see ``_apply_lr_change``); optimizer moments load unchanged.
+    """
 
     metadata = _dist_opt_checkpoint_metadata(optimizer)
     model_sd = _model_sharded_state_dict(model) if load_model or load_optimizer else {}
@@ -134,6 +142,8 @@ def load_dist_opt_checkpoint(
     if load_model:
         _load_model_state_dict(model, state_dict)
     if load_optimizer and optimizer is not None and "optimizer" in state_dict:
+        if allow_lr_change:
+            _apply_lr_change(optimizer, state_dict["optimizer"])
         load_patches = _patch_native_optimizer_step_load(optimizer)
         try:
             optimizer.load_state_dict(state_dict["optimizer"])
@@ -145,6 +155,131 @@ def load_dist_opt_checkpoint(
         if callable(reload_model_params):
             reload_model_params()
     return int(state_dict.get("step", 0))
+
+
+_LR_IDENTITY_KEYS = ("max_lr", "min_lr")
+_LR_FIELDS = (*_LR_IDENTITY_KEYS, "lr")
+
+
+def _apply_lr_change(optimizer: Any, optimizer_state: Any) -> None:
+    """Retarget saved param groups' lr identity to the current optimizer before loading.
+
+    Walks the (possibly chained) optimizer the same way ``ChainedOptimizer.load_state_dict``
+    splits its state and rewrites each DistributedOptimizer's saved groups in place. Only the
+    learning-rate fields change; weight decay, betas and eps still come from the checkpoint,
+    as in a regular load.
+    """
+
+    for dist_opt, state in _pair_distributed_optimizer_states(optimizer, optimizer_state):
+        saved_groups = _saved_param_groups(state)
+        for group_idx, old, new in _rewrite_saved_lr_identity(
+            dist_opt.optimizer.param_groups, saved_groups
+        ):
+            _log_rank0(f"allow_lr_change: saved param group {group_idx} lr fields {old} -> {new}")
+
+
+def _pair_distributed_optimizer_states(optimizer: Any, state: Any) -> Iterable[tuple[Any, Any]]:
+    chained = getattr(optimizer, "chained_optimizers", None)
+    if isinstance(chained, Iterable):
+        chained = list(chained)
+        if len(chained) == 1:
+            yield from _pair_distributed_optimizer_states(chained[0], state)
+            return
+        if not isinstance(state, Mapping) or len(state) != len(chained):
+            raise ValueError(
+                f"Expected {len(chained)} chained optimizer states, got "
+                f"{len(state) if isinstance(state, Mapping) else type(state).__name__}."
+            )
+        for child, (_, child_state) in zip(chained, sorted(state.items())):
+            yield from _pair_distributed_optimizer_states(child, child_state)
+        return
+    if not any(dist_opt is optimizer for dist_opt in _iter_distributed_optimizers(optimizer)):
+        raise ValueError(
+            f"allow_lr_change supports DistributedOptimizer only, got {type(optimizer).__name__}."
+        )
+    yield optimizer, state
+
+
+def _saved_param_groups(state: Any) -> list[MutableMapping]:
+    groups = state.get("optimizer", {}).get("param_groups") if isinstance(state, Mapping) else None
+    if not isinstance(groups, list):
+        raise ValueError(
+            "allow_lr_change expects saved DistributedOptimizer param groups at "
+            "state['optimizer']['param_groups']."
+        )
+    return groups
+
+
+def _rewrite_saved_lr_identity(
+    current_groups: list[Mapping], saved_groups: list[MutableMapping]
+) -> list[tuple[int, dict[str, Any], dict[str, Any]]]:
+    """Give each saved group the lr identity of the current group it pairs with.
+
+    Groups are paired by Megatron-Core's ``param_group_identifier_keys`` without
+    ``max_lr``/``min_lr``. Returns ``(saved_group_index, old, new)`` lr fields for every
+    changed group. Leaves the groups untouched when every current group already has an exact
+    saved match, and refuses when the reduced identity would pair groups ambiguously.
+    """
+
+    from megatron.core.optimizer import param_group_identifier_keys
+
+    full_keys = tuple(param_group_identifier_keys)
+    reduced_keys = tuple(key for key in full_keys if key not in _LR_IDENTITY_KEYS)
+
+    saved_full = {_group_identifier(group, full_keys) for group in saved_groups}
+    if all(_group_identifier(group, full_keys) in saved_full for group in current_groups):
+        return []
+
+    current_by_reduced = _unique_by_identifier(current_groups, reduced_keys, "current")
+    saved_by_reduced = _unique_by_identifier(saved_groups, reduced_keys, "saved")
+    missing = [key for key in current_by_reduced if key not in saved_by_reduced]
+    if missing:
+        raise ValueError(
+            f"allow_lr_change: no saved param group matches current group(s) {missing} on "
+            f"{reduced_keys}; only {_LR_IDENTITY_KEYS} and lr may differ."
+        )
+
+    changes: list[tuple[int, dict[str, Any], dict[str, Any]]] = []
+    for group_idx, saved in enumerate(saved_groups):
+        current = current_by_reduced.get(_group_identifier(saved, reduced_keys))
+        if current is None:
+            continue
+        old = {key: saved.get(key) for key in _LR_FIELDS}
+        for key in _LR_FIELDS:
+            if key in current:
+                saved[key] = current[key]
+            else:
+                saved.pop(key, None)
+        new = {key: saved.get(key) for key in _LR_FIELDS}
+        if old != new:
+            changes.append((group_idx, old, new))
+    return changes
+
+
+def _unique_by_identifier(
+    groups: list[Mapping], keys: tuple[str, ...], side: str
+) -> dict[tuple, Mapping]:
+    by_identifier: dict[tuple, Mapping] = {}
+    for group in groups:
+        identifier = _group_identifier(group, keys)
+        if identifier in by_identifier:
+            raise ValueError(
+                f"allow_lr_change: {side} param groups differ only by {_LR_IDENTITY_KEYS}; "
+                f"identifier {identifier} on {keys} is ambiguous, refusing to pair."
+            )
+        by_identifier[identifier] = group
+    return by_identifier
+
+
+def _group_identifier(group: Mapping, keys: tuple[str, ...]) -> tuple:
+    # Same lookup as Megatron-Core's DistributedOptimizer.load_state_dict, including the
+    # NeMo ``pre_<key>`` aliases and missing == None.
+    return tuple(group[key] if key in group else group.get(f"pre_{key}") for key in keys)
+
+
+def _log_rank0(msg: str) -> None:
+    if not torch.distributed.is_initialized() or torch.distributed.get_rank() == 0:
+        print(f"[megatron.lite] {msg}", flush=True)
 
 
 def _synchronize_native_optimizer_steps(optimizer: Any) -> None:

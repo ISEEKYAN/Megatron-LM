@@ -36,6 +36,9 @@ class MegatronLiteEngineConfig(EngineConfig):
     resync_config: dict[str, Any] = field(default_factory=dict)
     router_replay_mode: str = "disabled"
     load_hf_weights: bool = True
+    # Resume a DistributedOptimizer checkpoint saved under a different optimizer lr; the
+    # Adam moments load unchanged and the lr follows the current optimizer config.
+    allow_lr_change_on_load: bool = False
     impl_cfg: dict[str, Any] = field(default_factory=dict)
 
     def __post_init__(self) -> None:

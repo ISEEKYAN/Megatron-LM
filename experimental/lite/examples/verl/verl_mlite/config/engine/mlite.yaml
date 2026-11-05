@@ -14,6 +14,8 @@ resync_format: null
 resync_config: {}
 router_replay_mode: disabled
 load_hf_weights: true
+# Resume a dist_opt checkpoint saved under a different optimizer lr (Adam moments are kept).
+allow_lr_change_on_load: false
 
 model_name: auto
 impl: lite
