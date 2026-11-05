@@ -89,25 +89,38 @@ def record(engine, phase):
 
 
 def extra_storage(engine, device):
-    """Move non-DDP buffers/attributes too; frozen native codes stay native."""
+    """Move non-DDP buffers/attributes too; frozen native codes stay native.
+
+    A tensor referenced from several modules (DS4.1 deployment attention caches vLLM's
+    process-wide RoPE table on every layer) moves once and every reference is rebound to
+    that one copy, so a round trip keeps it shared instead of multiplying it per module.
+    """
+    moved = {}
+
+    def move(value):
+        key = id(value)
+        if key not in moved:
+            moved[key] = (value, value.to(device))  # keep the source alive: ids stay unique
+        return moved[key][1]
+
     if device == 'cpu':
         paths = list(getattr(engine, '_exclusive_extra_storage', ()))
         for module in engine.module.modules():
             for name, value in list(module._buffers.items()):
                 if value is not None and value.is_cuda:
                     paths.append((module, name, True))
-                    module._buffers[name] = value.to('cpu')
+                    module._buffers[name] = move(value)
             for name, value in list(vars(module).items()):
                 if isinstance(value, torch.Tensor) and value.is_cuda:
                     paths.append((module, name, False))
-                    setattr(module, name, value.to('cpu'))
+                    setattr(module, name, move(value))
         engine._exclusive_extra_storage = paths
     else:
         for module, name, buffer in getattr(engine, '_exclusive_extra_storage', ()):
             if buffer:
-                module._buffers[name] = module._buffers[name].to(device)
+                module._buffers[name] = move(module._buffers[name])
             else:
-                setattr(module, name, getattr(module, name).to(device))
+                setattr(module, name, move(getattr(module, name)))
         engine._exclusive_extra_storage = []
 
 
